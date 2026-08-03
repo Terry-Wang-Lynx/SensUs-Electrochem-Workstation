@@ -206,6 +206,9 @@ def tail_lines(path: Path, idle_timeout: float | None = None):
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 IT_DONE_RE = re.compile(r"^IT_DONE\s+native=(\d+)\s+expected=(\d+)\s+elapsed_ms=(\d+)\s*$")
 IT_START_RE = re.compile(r"^IT_START\s+run=(\d+)\s+target_mv=(-?\d+)\s*$")
+IT_ABORTED_RE = re.compile(
+    r"^IT_ABORTED\s+reason=(restart|stop)\s+native=(\d+)\s+elapsed_ms=(\d+)\s*$"
+)
 POTENTIAL_FAULT_RE = re.compile(r"^POTENTIAL_FAULT\s+.+$")
 
 
@@ -229,6 +232,16 @@ def parse_it_start(line: str) -> tuple[int, int] | None:
 
     match = IT_START_RE.match(ANSI_RE.sub("", line).strip())
     return None if match is None else tuple(int(value) for value in match.groups())
+
+
+def parse_it_aborted(line: str) -> tuple[str, int, int] | None:
+    """Return the reason, sample count and elapsed time for an aborted run."""
+
+    match = IT_ABORTED_RE.match(ANSI_RE.sub("", line).strip())
+    if match is None:
+        return None
+    reason, native, elapsed_ms = match.groups()
+    return reason, int(native), int(elapsed_ms)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -284,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     samples: list[Sample] = []
     junk = 0
     potential_fault: str | None = None
+    aborted_reason: str | None = None
     acquisition_started = args.trigger is None
     stop = False
     t0 = time.monotonic()
@@ -323,6 +337,15 @@ def main(argv: list[str] | None = None) -> int:
                     run_number, target_mv = started
                     print(f"[collect] 固件开始第 {run_number} 轮 IT:E={target_mv}mV",
                           file=sys.stderr)
+                    continue
+                aborted = parse_it_aborted(clean_line)
+                if aborted is not None:
+                    reason, native, elapsed_ms = aborted
+                    print(f"[collect] 固件中止上一轮:{reason},native={native},"
+                          f"elapsed={elapsed_ms}ms", file=sys.stderr)
+                    if reason == "stop" or acquisition_started:
+                        aborted_reason = reason
+                        break
                     continue
                 fault = parse_potential_fault(clean_line)
                 if fault is not None:
@@ -375,6 +398,10 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 收尾完整性检查 ----
     print(f"\n[collect] 共 {len(samples)} 样本,忽略 {junk} 行非数据输出 → {args.out}",
           file=sys.stderr)
+    if aborted_reason is not None:
+        print(f"[collect] 本轮已由硬件中止:{aborted_reason}", file=sys.stderr)
+        return 3
+
     if not samples:
         print("⚠️ 一个样本都没收到。排查顺序:", file=sys.stderr)
         print("   1) ioreg -p IOUSB -l -w 0 | grep J_Link   ← 探头还在 USB 上?",

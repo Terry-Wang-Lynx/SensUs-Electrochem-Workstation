@@ -20,7 +20,12 @@ from pa_host.record import (  # noqa: E402
     parse_line,
     sample_to_row,
 )
-from pa_host.collect import parse_it_done, parse_it_start, parse_potential_fault  # noqa: E402
+from pa_host.collect import (  # noqa: E402
+    parse_it_aborted,
+    parse_it_done,
+    parse_it_start,
+    parse_potential_fault,
+)
 
 _n = 0
 
@@ -82,6 +87,10 @@ def main() -> int:
         "普通数据行不会误触发完成")
     chk(parse_it_start("IT_START run=3 target_mv=200") == (3, 200),
         "无需复位即可识别新一轮测量开始")
+    chk(parse_it_aborted("IT_ABORTED reason=restart native=741 elapsed_ms=92001")
+        == ("restart", 741, 92001), "识别运行中重新开始标记")
+    chk(parse_it_aborted("IT_ABORTED reason=stop native=12 elapsed_ms=1510")
+        == ("stop", 12, 1510), "识别硬件停止标记")
 
     print("\n=== 电位审计故障标记 ===")
     fault = ("POTENTIAL_FAULT sample=80 target_mv=200 expected_daca=1067 "

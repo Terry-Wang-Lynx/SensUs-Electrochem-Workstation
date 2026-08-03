@@ -530,30 +530,46 @@ static int audit_polarization(int32_t e_mv, uint32_t sample_count)
  * 一次上电可执行多轮测量。测量间隙保持恒电位,不再通过 MCU/AFE 复位来
  * “开始”下一轮,避免电极每轮都经历失控再重新极化的伪阶跃。
  */
+enum control_command {
+	CONTROL_NONE = 0,
+	CONTROL_START,
+	CONTROL_STOP,
+};
+
+static enum control_command poll_control_command(void)
+{
+	static char command[16];
+	static size_t used;
+	char ch;
+
+	while (SEGGER_RTT_Read(0U, &ch, 1U) == 1U) {
+		if (ch == '\r' || ch == '\n') {
+			command[used] = '\0';
+			used = 0U;
+			if (strcmp(command, "START") == 0) {
+				return CONTROL_START;
+			}
+			if (strcmp(command, "STOP") == 0) {
+				return CONTROL_STOP;
+			}
+			continue;
+		}
+		if (used + 1U < sizeof(command)) {
+			command[used++] = ch;
+		} else {
+			used = 0U;
+		}
+	}
+	return CONTROL_NONE;
+}
+
 static void wait_for_start_command(void)
 {
-	char command[16];
-	size_t used = 0U;
-
 	printk("IT_READY target_mv=%d\n", WP_E_MV);
 	while (1) {
-		char ch;
-
 		board_guards_feed();
-		while (SEGGER_RTT_Read(0U, &ch, 1U) == 1U) {
-			if (ch == '\r' || ch == '\n') {
-				command[used] = '\0';
-				if (strcmp(command, "START") == 0) {
-					return;
-				}
-				used = 0U;
-				continue;
-			}
-			if (used + 1U < sizeof(command)) {
-				command[used++] = ch;
-			} else {
-				used = 0U;
-			}
+		if (poll_control_command() == CONTROL_START) {
+			return;
 		}
 		k_msleep(20);
 	}
@@ -943,8 +959,12 @@ int main(void)
 	board_guards_feed();
 
 	uint32_t run_number = 0U;
+	bool start_pending = false;
 	while (1) {
-		wait_for_start_command();
+		if (!start_pending) {
+			wait_for_start_command();
+		}
+		start_pending = false;
 		run_number++;
 		last_sat = 0U;
 		printk("IT_START run=%u target_mv=%d\n", run_number, WP_E_MV);
@@ -998,11 +1018,22 @@ int main(void)
 	uint32_t native_samples = 0U;
 	uint32_t conversion_errors = 0U;
 	bool potential_fault = false;
+	bool restart_requested = false;
+	bool stop_requested = false;
 	LOG_INF("进入 AUTO i-t 采集: %u native samples (约8Hz; host重采样10Hz), E=%d mV",
 		WP_EXPECTED_SAMPLE_COUNT, WP_E_MV);
 
 	while (native_samples < WP_EXPECTED_SAMPLE_COUNT) {
 		board_guards_feed();
+		enum control_command command = poll_control_command();
+		if (command == CONTROL_START) {
+			restart_requested = true;
+			break;
+		}
+		if (command == CONTROL_STOP) {
+			stop_requested = true;
+			break;
+		}
 		uint16_t left = (uint16_t)(WP_EXPECTED_SAMPLE_COUNT - native_samples);
 		uint16_t n = drain_fifo(left);
 		native_samples += n;
@@ -1040,6 +1071,14 @@ int main(void)
 	LOG_INF("i-t 测量结束:elapsed=%lld ms,native=%u/%u,empty polls=%u,E 已恢复为 %d mV",
 		(long long)(k_uptime_get() - measurement_start_ms), native_samples,
 		WP_EXPECTED_SAMPLE_COUNT, conversion_errors, WP_STARTUP_E_MV);
+	if (restart_requested || stop_requested) {
+		const char *reason = restart_requested ? "restart" : "stop";
+		printk("IT_ABORTED reason=%s native=%u elapsed_ms=%lld\n", reason,
+		       native_samples,
+		       (long long)(k_uptime_get() - measurement_start_ms));
+		start_pending = restart_requested;
+		continue;
+	}
 	if (potential_fault) {
 		LOG_ERR("本轮因电位寄存器审计失败而提前结束;原始数据保留但不得用于标定/预测");
 	}

@@ -46,6 +46,11 @@ make run
 
 - `POTENTIAL_AUDIT`：控制寄存器与目标电位一致
 - `POTENTIAL_FAULT`：连续两次回读不一致，本轮立即停止且禁止进入标定/预测
+- `IT_ABORTED`：收到新的开始或停止命令；立即结束旧轮次，不复位 AFE
+
+固件会在测量过程中持续读取控制命令。即使上位机在上一轮中途断开，下一次
+点击开始也会先结束遗留轮次，再发出新的 `IT_START`，因此实时曲线不会因等待
+旧轮次而保持空白。
 
 这项审计能确认数字控制状态，但不能替代示波器对实际 `WE-RE` 模拟电压的直接测量。45 µM 历史数据的专门排查见 [docs/45uM-current-transition-analysis.md](docs/45uM-current-transition-analysis.md)。
 

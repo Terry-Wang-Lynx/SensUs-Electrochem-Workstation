@@ -338,6 +338,7 @@ class MeasurementController:
         self.settings = dict(SettingsController.DEFAULTS)
         self.bridge_process: subprocess.Popen[str] | None = None
         self.bridge_log_handle: Any = None
+        self.user_stop_requested = False
 
     def start(self, metadata: dict[str, Any] | None = None,
               on_complete: Any = None,
@@ -362,6 +363,7 @@ class MeasurementController:
             self.summary = None
             self.workflow_result = None
             self.error = ""
+            self.user_stop_requested = False
             self.state = "running"
             self.message = "已启动硬件测量，等待 RTT 数据"
             self.on_complete = on_complete
@@ -473,9 +475,25 @@ class MeasurementController:
             process = self.process
             if self.state != "running" or process is None:
                 return self.snapshot()
-            self.message = "正在停止上位机收数"
-            process.terminate()
+            self.user_stop_requested = True
+            self.message = "正在停止硬件测量"
+            try:
+                with socket.create_connection(("127.0.0.1", 19021), timeout=1) as conn:
+                    conn.sendall(b"STOP\n")
+            except OSError:
+                process.terminate()
+            else:
+                threading.Thread(
+                    target=self._terminate_if_running,
+                    args=(process, 1.5), daemon=True,
+                ).start()
             return self.snapshot()
+
+    @staticmethod
+    def _terminate_if_running(process: subprocess.Popen[str], delay_s: float) -> None:
+        time.sleep(delay_s)
+        if process.poll() is None:
+            process.terminate()
 
     def _watch(self, log_handle: Any) -> None:
         assert self.process is not None
@@ -490,6 +508,12 @@ class MeasurementController:
         with self.lock:
             self.finished_at = time.time()
             if return_code != 0:
+                if self.user_stop_requested and return_code in (3, -15):
+                    self.state = "idle"
+                    self.error = ""
+                    self.message = "测量已停止"
+                    self._notify_complete()
+                    return
                 self.state = "error"
                 self.error = (
                     f"采集进程退出码 {return_code}。请查看 {self.run_dir / 'collector.log'}"
