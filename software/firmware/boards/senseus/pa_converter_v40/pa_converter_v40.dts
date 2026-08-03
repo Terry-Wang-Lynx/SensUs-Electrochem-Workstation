@@ -1,0 +1,141 @@
+/*
+ * pA-Converter V4.0 —— 自定义板(nRF52833-QDAA / QFN40)
+ *
+ * 🔴 引脚全部来自 **PCB 实解**(`hardware/ver4.0/.../pA-converter-v40.kicad_pcb`),
+ *    不是原理图导出。依据见 docs/ver4.0/07-可观测性与调试/AFE-v4-调试口真值与bring-up流程.md §1。
+ *
+ * 🔴 三条硬约束在本文件/defconfig 里结构化落死,不靠 overlay 覆盖:
+ *    1. DC/DC 电感未贴 ⇒ 严禁 DCDCEN=1(否则连 SWD 一起砖化)→ defconfig 里
+ *       CONFIG_BOARD_ENABLE_DCDC=n,并在 board_guards.c 运行时再断言一次
+ *    2. LFXO 已砍 ⇒ 用内部 LFRC(±500ppm)→ defconfig CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC
+ *    3. 调试口无 UART ⇒ console 走 RTT,uart0 关闭
+ *
+ * ⚠️ INTB(MAX30131 的中断输出)在 PCB 上悬空 —— 本板**没有**中断线,
+ *    固件只能轮询(用户 2026-07-31 拍板:接受轮询,不飞线)。故此处不声明 int-gpios。
+ */
+
+/dts-v1/;
+
+#include <nordic/nrf52833_qdaa.dtsi>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
+#include <zephyr/dt-bindings/regulator/nrf5x.h>
+
+/ {
+	model = "pA-Converter V4.0 (custom)";
+	compatible = "senseus,pa-converter-v40";
+
+	chosen {
+		zephyr,flash = &flash0;
+		zephyr,sram = &sram0;
+		zephyr,code-partition = &slot0_partition;
+	};
+
+	aliases {
+		afe0 = &max30131;
+	};
+};
+
+&pinctrl {
+	/*
+	 * SPI1 → MAX30131(4 线 SPI,mode 0,≤8MHz)
+	 *   SCLK : P0.05
+	 *   MOSI : P1.09   🔴 **在 port 1**,极易误写成 P0.09
+	 *   MISO : P0.04
+	 *   CSN  : P0.11   (由 cs-gpios 管,不进 pinctrl)
+	 */
+	spi1_default: spi1_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 9)>,
+				<NRF_PSEL(SPIM_MISO, 0, 4)>;
+		};
+	};
+
+	spi1_sleep: spi1_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 9)>,
+				<NRF_PSEL(SPIM_MISO, 0, 4)>;
+			low-power-enable;
+		};
+	};
+};
+
+&spi1 {
+	status = "okay";
+	compatible = "nordic,nrf-spim";
+	pinctrl-0 = <&spi1_default>;
+	pinctrl-1 = <&spi1_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	/* CSN = P0.11,低有效 */
+	cs-gpios = <&gpio0 11 GPIO_ACTIVE_LOW>;
+
+	/*
+	 * MAX30131:SPI mode 0(CPOL=0 / CPHA=0)⇒ 不写 spi-cpol / spi-cpha。
+	 * 频率保守取 4MHz(器件上限 8MHz);WLP 封装 + 细线,先稳后快。
+	 * 🔴 这里只做总线声明,寄存器语义全在 lib/max30131/(已单测),
+	 *    不写 Zephyr sensor driver —— 避免把已验证的换算逻辑再抄一遍。
+	 */
+	max30131: max30131@0 {
+		compatible = "senseus,max30131";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+		label = "MAX30131";
+	};
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+/* 🔴 MOSI 在 P1.09,**必须**开 gpio1,否则 pinctrl 拿不到该脚 */
+&gpio1 {
+	status = "okay";
+};
+
+&gpiote {
+	status = "okay";
+};
+
+/* 看门狗:CR2032 brownout 可落进 POR 盲区不自恢复,必配(见 board_guards.c) */
+&wdt0 {
+	status = "okay";
+};
+
+/*
+ * 🔴🔴 DC/DC 严禁使能 —— 本板的 DCC 电感(L4 15nH + L3 10µH + C14 47nF)**未贴**,
+ * 置成 DCDC 模式会让芯片彻底不工作,**连 SWD 都上不来**(= 一烧就砖,只能 recover 抢)。
+ *
+ * SoC 的 nrf52833.dtsi 默认已是 LDO,但这里**显式再写一遍**:
+ * 让约束在板文件里可见,而不是依赖上游默认值哪天变了没人发现。
+ * (旧机制 CONFIG_BOARD_ENABLE_DCDC 已从 Zephyr 移除,devicetree 是现在唯一入口。)
+ */
+&reg1 {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+/* 调试口 CN1 只有 SWDIO/SWCLK/nRESET/VTref/GND —— 无 UART */
+&uart0 {
+	status = "disabled";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* 无 MCUboot(无 OTA 需求):整片给 app,尾部留 settings */
+		slot0_partition: partition@0 {
+			label = "image-0";
+			reg = <0x00000000 0x0007E000>;
+		};
+
+		storage_partition: partition@7e000 {
+			label = "storage";
+			reg = <0x0007E000 0x00002000>;
+		};
+	};
+};

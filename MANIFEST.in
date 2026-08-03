@@ -1,0 +1,11 @@
+include README.md
+include Launch_Electrochem_Workstation.command
+recursive-include software/firmware *.c *.h *.conf *.yml *.yaml *.dts *.cmake *.txt CMakeLists.txt Makefile Kconfig Kconfig.* *_defconfig
+recursive-include software/host/pa_host/gui *.html *.js *.css
+recursive-include software/host/tests *.py
+recursive-include docs *.md
+exclude software/firmware/src/measurement_config.h
+prune software/firmware/build
+prune software/firmware/tests/build
+prune software/host/sensus_electrochem_workstation.egg-info
+prune measurements

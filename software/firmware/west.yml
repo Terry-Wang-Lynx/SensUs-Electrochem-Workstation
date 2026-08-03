@@ -1,0 +1,29 @@
+# west 清单 —— ⚠️ **本工程实际不用这份清单构建**,保留作参考/可移植性。
+#
+# 实际采用的是 **freestanding application** 方式(2026-07-31 落地):
+# NCS 工作区独立放在 `~/ncs`(不放进本仓库,免得 6GB 第三方代码污染 git),
+# 应用留在本仓库,构建时用绝对路径引用:
+#
+#   export PATH="<repo>/.venv/bin:$PATH"          # west 装在项目 .venv 里
+#   cd ~/ncs && west build -b pa_converter_v40 <repo>/software/firmware
+#
+# 已装环境(2026-07-31 实测):
+#   NCS            v3.4.0        (~/ncs,浅克隆 --narrow -o=--depth=1)
+#   Zephyr SDK     1.0.1         (~/zephyr-sdk-1.0.1,仅 arm-zephyr-eabi)
+#   west 1.4.0 要求 / 实装 1.5.0;cmake/ninja/gperf/dtc 走 brew
+#
+# 若将来想改成 T2 星型拓扑(本应用即 manifest repo),用下面这份 + `west init -l`。
+# 注意 revision 要与 ~/ncs 里的实际版本一致,否则两套 SDK 会打架。
+manifest:
+  remotes:
+    - name: nrfconnect
+      url-base: https://github.com/nrfconnect
+
+  projects:
+    - name: sdk-nrf
+      remote: nrfconnect
+      revision: v3.4.0
+      import: true
+
+  self:
+    path: application

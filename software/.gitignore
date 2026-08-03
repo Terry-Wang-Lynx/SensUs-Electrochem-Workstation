@@ -1,0 +1,19 @@
+# 构建产物与缓存(源码入库,产物不入库)
+firmware/tests/build/
+firmware/build/
+firmware/twister-out*/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# west workspace 拉下来的依赖(NCS/Zephyr 由 west.yml 锁版本重建,不入库)
+firmware/.west/
+firmware/modules/
+firmware/nrf/
+firmware/zephyr/
+firmware/bootloader/
+
+# 本地采集数据(体积大且是运行产物;结论回灌 docs/,原始数据走 outputs/)
+*.csv
+*.png
+!host/tests/**/*.csv

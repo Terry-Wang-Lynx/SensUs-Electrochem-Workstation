@@ -1,0 +1,12 @@
+identifier: pa_converter_v40
+name: pA-Converter V4.0 (custom)
+type: mcu
+arch: arm
+toolchain:
+  - zephyr
+ram: 128
+flash: 512
+supported:
+  - gpio
+  - spi
+  - watchdog

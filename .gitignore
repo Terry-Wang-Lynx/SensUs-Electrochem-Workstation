@@ -1,0 +1,26 @@
+# Local environments and Python caches
+.venv/
+.venv-installed
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Package and build products
+build/
+dist/
+*.egg-info/
+software/firmware/build/
+software/firmware/tests/build/
+software/firmware/twister-out*/
+
+# Generated hardware configuration and experimental data
+software/firmware/src/measurement_config.h
+measurements/
+
+# Local secrets and editor files
+.env
+.env.*
+!.env.example
+**/.DS_Store
+.history/
+.playwright-mcp/

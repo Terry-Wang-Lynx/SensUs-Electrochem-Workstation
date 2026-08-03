@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SensUs 电化学工作站</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">S</span><div><strong>SensUs</strong><small>电化学工作站</small></div></div>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-view="measure"><span>⌁</span>实时测量</button>
+        <button class="nav-item" data-view="calibrate"><span>⌗</span>标定与漂移</button>
+        <button class="nav-item" data-view="schedule"><span>◷</span>稳定化 / 自动</button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="device-row"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small>J-Link · MAX30131</small></div></div>
+        <div class="firmware-note" id="firmwareNote">+0.2 V · 500 nA FSR</div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div><h1 id="pageTitle">实时测量</h1><p id="pageSubtitle">180 秒 IT 检测与末 20 秒稳态分析</p></div>
+        <div class="clock" id="clock"></div>
+      </header>
+
+      <section class="view active" id="view-measure">
+        <section class="panel workflow-bar">
+          <div class="workflow-heading"><div><h2>数据流程</h2><p id="workflowMessage">设置保存目录后，先标定再测试</p></div><div class="live-badge" id="workflowBadge">待配置</div></div>
+          <div class="workflow-body">
+            <div class="workflow-steps"><span class="active" id="calibrationStep"><b>1</b> 采集标定点</span><i></i><span id="selectionStep"><b>2</b> 选择范围</span><i></i><span id="testStep"><b>3</b> 稳定化 / 测试</span></div>
+            <label class="save-directory">自动保存目录<div class="directory-row"><input id="saveDirectory" placeholder="例如：/Users/lynx/Documents/实验数据"><button class="secondary" id="applySaveDirectory">应用目录</button></div></label>
+            <button class="text-button reset-calibration" id="resetCalibration">新建标定批次</button>
+          </div>
+        </section>
+        <div class="workspace-grid">
+          <section class="panel chart-panel">
+            <div class="panel-head"><div><h2>IT 曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small>nA</small><em id="liveCurrentTime">尚无数据</em></div><div class="segmented" id="chartWindow"><button data-window="all">全程</button><button data-window="20">20 s</button><button class="active" data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
+            <div class="chart-wrap"><canvas id="itChart" aria-label="IT 电流时间曲线"></canvas><div class="chart-legend"><span><i class="valid-point"></i>有效点</span><span><i class="invalid-point"></i>异常点</span></div><div class="empty-chart" id="chartEmpty">开始测量后显示实时电流</div></div>
+            <div class="metric-strip">
+              <div><span>稳态电流</span><strong id="steadyCurrent">--</strong><small>nA</small></div>
+              <div><span>标准差</span><strong id="steadySd">--</strong><small>nA</small></div>
+              <div><span>显示原生点</span><strong id="validCount">--</strong><small>/ ≈ 1452</small></div>
+              <div><span>进度</span><strong id="progressValue">0</strong><small>%</small></div>
+            </div>
+          </section>
+
+          <aside class="panel control-panel">
+            <div class="panel-head"><div><h2>IT 条件</h2><p id="settingsMessage">参数尚未应用到硬件</p></div><div class="live-badge" id="settingsBadge">未应用</div></div>
+            <div class="it-settings">
+              <label>测量方法<select disabled><option>恒电位 IT</option></select></label>
+              <div class="field-pair">
+                <label>测试电位<div class="input-unit"><input id="potentialV" type="number" min="-0.4" max="0.39" step="0.01" value="0.2"><span>V</span></div></label>
+                <label>测量时长<div class="input-unit"><input id="durationS" type="number" min="10" max="3600" step="1" value="180"><span>s</span></div></label>
+              </div>
+              <div class="field-pair">
+                <label>硬件采样频率<select id="sensPeriodCode"><option value="0">8.06 Hz</option><option value="1">4.13 Hz</option><option value="2">2.10 Hz</option><option value="3">1.06 Hz</option><option value="4">0.53 Hz</option><option value="5">0.27 Hz</option></select></label>
+                <label>输出采样频率<div class="input-unit"><input id="sampleRateHz" type="number" min="0.5" max="10" step="0.5" value="10"><span>Hz</span></div></label>
+              </div>
+              <label>末段拟合窗口<div class="input-unit"><input id="fitWindowS" type="number" min="1" step="1" value="20"><span>s</span></div></label>
+              <div class="field-pair">
+                <label>电流量程<select id="fsrNA"><option value="50">50 nA</option><option value="100">100 nA</option><option value="250">250 nA</option><option value="500" selected>500 nA</option><option value="1000">1 µA</option><option value="2000">2 µA</option></select></label>
+                <label>偏置电流<select id="offsetNA"><option value="9nA">9 nA</option><option value="19nA" selected>19 nA</option><option value="40nA">40 nA</option><option value="80nA">80 nA</option><option value="10pct" data-pct="10">10% FSR</option><option value="20pct" data-pct="20">20% FSR</option><option value="50pct" data-pct="50">50% FSR</option></select></label>
+              </div>
+              <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
+              <button class="secondary full apply-settings" id="applySettings">应用条件并烧录硬件</button>
+            </div>
+            <div class="sample-role-block"><span>本轮用途</span><div class="segmented role-segmented" id="sampleRole"><button class="active" data-role="calibration">标定</button><button data-role="test">测试</button></div></div>
+            <label>样品名称<input id="sampleName" placeholder="例如：未知样品 01"></label>
+            <label><span id="concentrationLabel">已知浓度（标定必填）</span><div class="input-unit"><input id="knownConcentration" type="number" min="0" step="0.001" placeholder="请输入标定浓度"><span>µM</span></div></label>
+            <div class="auto-save-preview"><span>自动保存</span><strong id="autoSaveName">样品名称-浓度.csv</strong></div>
+            <div class="action-row"><button class="primary" id="startMeasure">开始标定测量</button><button class="icon-button" id="stopMeasure" title="停止当前测量" disabled>■</button></div>
+            <button class="secondary full" id="useForCalibration" hidden disabled>将结果加入标定</button>
+            <button class="secondary full" id="predictConcentration" hidden disabled>根据标定模型预测浓度</button>
+            <div class="prediction-result" id="predictionResult" hidden><span>自动预测浓度</span><strong>--</strong><small>µM</small></div>
+            <div class="saved-result" id="savedResult" hidden><span>已保存</span><strong id="savedResultPath"></strong></div>
+            <div class="notice error" id="measureError" hidden></div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="view-calibrate">
+        <div class="calibration-layout">
+          <section class="panel points-panel">
+            <div class="panel-head"><div><h2>候选标定点</h2><p>保留全部采集点，仅选中范围用于测试曲线</p></div><button class="text-button" id="addPoint">＋ 手动点</button></div>
+            <div class="range-selector">
+              <div><strong>按采集顺序选择连续范围</strong><span id="selectedCount">已选 0 / 0</span></div>
+              <label>起点<select id="rangeStart"></select></label><span>至</span><label>终点<select id="rangeEnd"></select></label>
+              <button class="secondary" id="applyPointRange">选择此范围</button><button class="text-button" id="clearPointSelection">清空</button>
+            </div>
+            <div class="table-wrap"><table><thead><tr><th>使用</th><th>#</th><th>采集时间</th><th>标签</th><th>浓度 / µM</th><th>电流 / nA</th><th></th></tr></thead><tbody id="pointsBody"></tbody></table></div>
+            <div class="fit-actions"><label>拟合模型<select id="fitDegree"><option value="1">线性</option><option value="2">二次</option></select></label><button class="primary" id="fitCalibration">用选中点生成测试曲线</button></div>
+          </section>
+          <section class="panel calibration-panel">
+            <div class="panel-head"><div><h2>当前测试曲线</h2><p id="calibrationStatus">先采集标定点，再选择范围</p></div></div>
+            <div class="chart-wrap calibration-chart"><canvas id="calibrationChart"></canvas><div class="empty-chart" id="calibrationEmpty">添加数据后拟合曲线</div></div>
+            <div class="model-metrics"><div><span>R²</span><strong id="modelR2">--</strong></div><div><span>RMSE</span><strong id="modelRmse">--</strong></div><div><span>灵敏度</span><strong id="modelSlope">--</strong></div></div>
+            <div class="model-path" id="modelPath">尚未生成测试曲线</div>
+          </section>
+          <section class="panel drift-panel">
+            <div class="panel-head"><div><h2>过渡期漂移校正</h2><p id="driftStatus">稳定化 IT 完成后可计算电流漂移</p></div><label class="inline-toggle"><input id="applyDrift" type="checkbox"><span>将 bias 加入测试曲线</span></label></div>
+            <div class="drift-body">
+              <div class="drift-fields">
+                <label>稳定化溶液<input id="driftSolution" placeholder="例如：5 µM 左旋多巴"></label>
+                <label>已知浓度<div class="input-unit"><input id="driftConcentration" type="number" min="0" step="0.001"><span>µM</span></div></label>
+                <label>起始记录<select id="driftStart"></select></label>
+                <label>结束记录<select id="driftEnd"></select></label>
+                <button class="secondary" id="calculateDrift">计算漂移</button>
+              </div>
+              <div class="drift-metrics">
+                <div><span>起始电流</span><strong id="driftStartCurrent">--</strong><small>nA</small></div>
+                <div><span>结束电流</span><strong id="driftEndCurrent">--</strong><small>nA</small></div>
+                <div><span>曲线 bias</span><strong id="driftBias">--</strong><small>nA</small></div>
+                <div><span>漂移斜率</span><strong id="driftSlope">--</strong><small>nA/h</small></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-schedule">
+        <div class="schedule-layout">
+          <section class="panel scheduler-control">
+            <div class="panel-head"><div><h2>定时连续测量</h2><p>按固定起始间隔自动运行 IT</p></div><div class="live-badge" id="scheduleBadge">未运行</div></div>
+            <div class="form-grid">
+              <label>测量方法<select disabled><option id="scheduleMethodLabel">恒电位 IT · 当前条件</option></select></label>
+              <label>任务类型<select id="scheduleRole"><option value="stabilization">稳定化 IT（不改曲线）</option><option value="test">测试并自动预测</option><option value="calibration">收集候选标定点</option></select></label>
+              <label>测量间隔<div class="input-unit"><input id="intervalMinutes" type="number" min="3.25" step="0.25" value="5"><span>分钟</span></div></label>
+              <label>测量次数<div class="input-unit"><input id="maxRuns" type="number" min="0" step="1" value="0"><span>0 = 连续</span></div></label>
+              <label>阶段持续时间<div class="input-unit"><input id="totalMinutes" type="number" min="0" step="1" value="60"><span>分钟</span></div></label>
+              <label>样品前缀<input id="schedulePrefix" value="自动样品"></label>
+              <label>已知浓度（可选）<div class="input-unit"><input id="scheduleConcentration" type="number" min="0" step="0.001"><span>µM</span></div></label>
+              <label class="checkbox-row"><input id="startNow" type="checkbox" checked><span>启动后立即测量第一次</span></label>
+            </div>
+            <div class="schedule-mode-note" id="scheduleModeNote">连续运行稳定化 IT；原始点全部保存，当前测试曲线保持锁定。</div>
+            <div class="schedule-summary"><span id="scheduleMessage">自动测量未启动</span><strong id="nextRun">--</strong></div>
+            <div class="action-row"><button class="primary" id="startSchedule">启动自动测量</button><button class="danger" id="stopSchedule" disabled>停止计划</button></div>
+            <div class="notice error" id="scheduleError" hidden></div>
+          </section>
+          <section class="panel history-panel">
+            <div class="panel-head"><div><h2>自动测量记录</h2><p><span id="completedRuns">0</span> 次已完成</p></div></div>
+            <div class="history-list" id="historyList"><div class="empty-history">暂无自动测量记录</div></div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

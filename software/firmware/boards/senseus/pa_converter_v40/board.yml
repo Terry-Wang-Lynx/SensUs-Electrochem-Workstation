@@ -1,0 +1,6 @@
+board:
+  name: pa_converter_v40
+  full_name: pA-Converter V4.0 (custom)
+  vendor: senseus
+  socs:
+    - name: nrf52833

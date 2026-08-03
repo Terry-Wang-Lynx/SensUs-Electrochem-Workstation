@@ -1,0 +1,2 @@
+# pA-Converter V4.0(自定义板)—— 刻意留空。
+# 板选择逻辑在 Kconfig.pa_converter_v40;默认值在 Kconfig.defconfig。

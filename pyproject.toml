@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sensus-electrochem-workstation"
+version = "0.1.0"
+description = "Local GUI and acquisition workflow for the SensUs MAX30131 electrochemistry workstation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+analysis = ["scipy>=1.10"]
+dev = ["build>=1.2", "pytest>=8"]
+
+[project.scripts]
+sensus-workstation = "pa_host.gui_server:main"
+sensus-it = "pa_host.it_tool:main"
+sensus-collect = "pa_host.collect:main"
+sensus-analyze = "pa_host.analyze:main"
+
+[project.urls]
+Repository = "https://github.com/Terry-Wang-Lynx/SensUs-Electrochem-Workstation"
+
+[tool.setuptools]
+package-dir = {"" = "software/host"}
+
+[tool.setuptools.packages.find]
+where = ["software/host"]
+include = ["pa_host*"]
+
+[tool.setuptools.package-data]
+pa_host = ["gui/*.html", "gui/*.js", "gui/*.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["software/host/tests"]

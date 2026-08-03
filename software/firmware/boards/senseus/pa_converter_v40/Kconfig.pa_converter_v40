@@ -1,0 +1,5 @@
+# pA-Converter V4.0(自定义板)· hwmv2 入口
+
+config BOARD_PA_CONVERTER_V40
+	bool "pA-Converter V4.0 (custom)"
+	select SOC_NRF52833_QDAA

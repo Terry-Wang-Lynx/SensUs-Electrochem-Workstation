@@ -1,0 +1,20 @@
+# pA-Converter V4.0 板级默认值 —— 三条硬约束在此结构化落死
+
+# 🔴 [1] LFXO 已砍(BOM 里没有 32.768kHz 晶体)→ 用内部 LFRC
+#     代价:±500ppm(≈±43s/天),放弃 RTC 时间权威,绝对时间靠上位机对齐
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC=y
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_500PPM=y
+
+# 🔴 [2] DC/DC 严禁使能 —— 见 .dts 里的 `&reg1`。
+#     ⚠️ 2026-07-31 实测:`CONFIG_BOARD_ENABLE_DCDC` **已从 Zephyr 整体移除**
+#     (NCS 3.4 / Zephyr 4.x),写了会报 "undefined symbol" 并中止构建。
+#     现在唯一机制是 devicetree 的 regulator-initial-mode;
+#     board_guards.c 运行时再断言一次,双保险。
+
+# 🔴 [3] 调试口无 UART → console 走 RTT(在 prj.conf 里开)
+CONFIG_SERIAL=n
+CONFIG_UART_CONSOLE=n
+
+CONFIG_GPIO=y
+CONFIG_ARM_MPU=y
+CONFIG_HW_STACK_PROTECTION=y

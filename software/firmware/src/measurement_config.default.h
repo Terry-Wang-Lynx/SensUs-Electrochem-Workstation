@@ -1,0 +1,15 @@
+#ifndef SENSUS_MEASUREMENT_CONFIG_H
+#define SENSUS_MEASUREMENT_CONFIG_H
+
+/* Safe source-tree defaults; the GUI writes measurement_config.h at runtime. */
+#define GUI_WP_FSR MAX30131_FSR_2000NA
+#define GUI_WP_OFFSET_SEL MAX30131_OFFSET_50PCT_FSR
+#define GUI_WP_START_E_MV 200
+#define GUI_WP_E_MV 200
+#define GUI_PRESTEP_DURATION_MS 0U
+#define GUI_MEASUREMENT_DURATION_MS 120000U
+
+#define GUI_SENS_PERIOD_CODE 0x0U
+#define GUI_SENS_PERIOD_MS 124U
+
+#endif

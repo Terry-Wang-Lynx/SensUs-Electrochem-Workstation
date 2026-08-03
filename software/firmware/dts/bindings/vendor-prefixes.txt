@@ -1,0 +1,5 @@
+# 项目自有 vendor 前缀(Zephyr 主表 dts/bindings/vendor-prefixes.txt 里没有)
+# 格式: <prefix><TAB><vendor name>
+# 不加这行,hwmv2 会因 board.yml 的 vendor 与 dts 的 compatible 前缀未注册而告警。
+
+senseus	Senseus

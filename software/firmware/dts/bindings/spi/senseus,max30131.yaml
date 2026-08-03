@@ -1,0 +1,13 @@
+# MAX30131 单通道集成电化学 AFE(SPI 从设备)的最小 binding。
+#
+# 只为让 Zephyr 生成 SPI_DT_SPEC_GET() 需要的 devicetree 宏 ——
+# 🔴 **刻意不写成 Zephyr sensor driver**:寄存器语义、FIFO 解包、counts↔电流
+#    全在 lib/max30131/(139 项断言已钉死),写 driver 等于把已验证的逻辑再抄一遍。
+#
+# 时序:SPI mode 0(CPOL=0/CPHA=0)⇒ dts 里不写 spi-cpol/spi-cpha;上限 8MHz。
+
+description: MAX30131 single-channel electrochemical AFE (SPI)
+
+compatible: "senseus,max30131"
+
+include: [spi-device.yaml]
