@@ -113,6 +113,8 @@ def _cmd_measure(args: argparse.Namespace) -> int:
             cmd += ["--reset-before-read"]
     else:
         cmd += ["--socket", args.socket or "127.0.0.1:19021"]
+    if getattr(args, "cmd_file", None):
+        cmd += ["--cmd-file", str(args.cmd_file)]
     if args.raw_log:
         cmd += ["--raw-log", str(args.raw_log)]
     if args.trigger:
@@ -139,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="连接 RTT 后触发一轮测量；默认 START")
     measure.add_argument("--out", type=Path, required=True)
     measure.add_argument("--raw-log", type=Path)
+    measure.add_argument("--cmd-file", type=Path,
+                         help="命令文件:采集器会把新增行经自己的 RTT socket 转发给固件")
     measure.add_argument("--duration", type=float, default=205.0)
     measure.add_argument("--idle-timeout", type=float, default=25.0)
     measure.set_defaults(func=_cmd_measure, start_jlink=False)

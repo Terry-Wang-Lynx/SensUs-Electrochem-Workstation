@@ -389,6 +389,14 @@ class MeasurementController:
         self.started_at: float | None = None
         self.finished_at: float | None = None
         self.process: subprocess.Popen[str] | None = None
+        self.cmd_path: Path | None = None   # 方案 C:在线切档命令文件
+        # 方案 C:运行时档位真值。**不能用 SettingsController 的值代替** ——
+        # 那是"最后一次烧录进去的编译期默认",而 RANGE 命令会在运行中改掉它,
+        # 两者可以不一致。唯一权威来源是固件回的 RANGE_APPLIED 行。
+        self.range_runtime: dict[str, Any] = {
+            "pending": None, "applied": None, "rejected": None, "at": None,
+        }
+        self._rtt_pos = 0
         self.summary: dict[str, Any] | None = None
         self.workflow_result: dict[str, Any] | None = None
         self.thread: threading.Thread | None = None
@@ -415,6 +423,10 @@ class MeasurementController:
             self.raw_path = Path(live_raw_path) if live_raw_path else self.run_dir / "raw.csv"
             self.raw_path.parent.mkdir(parents=True, exist_ok=True)
             self.raw_log = self.run_dir / "rtt.log"
+            self.cmd_path = self.run_dir / "cmd.txt"
+            self.range_runtime = {"pending": None, "applied": None,
+                                  "rejected": None, "at": None}
+            self._rtt_pos = 0
             self.resampled_path = self.run_dir / "resampled_10hz.csv"
             self.summary_path = self.run_dir / "summary.json"
             self.plot_path = self.run_dir / "it_curve.png"
@@ -448,6 +460,10 @@ class MeasurementController:
                 str(FIRMWARE_ELF),
                 "--probe-serial",
                 JLINK_SERIAL,
+                # 方案 C:命令文件。外部另开 telnet 连接写下行**无效**
+                # (JLinkExe 只转发采集器持有的那个连接)⇒ 必须走这个文件。
+                "--cmd-file",
+                str(self.cmd_path),
                 "--out",
                 str(self.raw_path),
                 "--raw-log",
@@ -525,6 +541,28 @@ class MeasurementController:
                 ).start()
             return self.snapshot()
 
+    def send_range(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """方案 C:测量进行中在线切换 FSR / offset 档,**不复位、不中断极化**。
+
+        为什么必须经采集器的命令文件:JLinkExe 的 RTT telnet 只把采集器持有的
+        那个连接的输入送进下行通道,另开连接写命令目标端收不到(2026-08-09 实测)。
+        """
+        with self.lock:
+            if self.state != "running" or self.cmd_path is None:
+                raise RuntimeError("只有测量进行中才能在线切档")
+            fsr = int(payload["fsr_code"])
+            sel = int(payload["offset_sel"])
+            if not (0 <= fsr <= 5) or not (0 <= sel <= 7):
+                raise ValueError("fsr_code 需 0–5(50n/100n/250n/500n/1µ/2µ),"
+                                 "offset_sel 需 0–7(0/10%/20%/50%FS,9/19/40/80nA)")
+            line = f"RANGE {fsr} {sel}"
+            with self.cmd_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            self.range_runtime = {**self.range_runtime, "pending": line,
+                                  "rejected": None, "at": time.time()}
+            return _json_safe({"sent": line, "cmd_file": str(self.cmd_path),
+                               "note": "固件会回 RANGE_APPLIED / RANGE_REJECT,见 rtt.log"})
+
     @staticmethod
     def _terminate_tree(process: subprocess.Popen[str]) -> None:
         """整棵进程组收掉,而不是只收第一层。
@@ -553,9 +591,11 @@ class MeasurementController:
         assert self.process is not None
         process = self.process
         while process.poll() is None:
+            self._scan_range_events()
             with self.lock:
                 self.message = self._progress_message()
             time.sleep(0.8)
+        self._scan_range_events()
         return_code = process.wait()
         log_handle.close()
         self._stop_bridge()
@@ -594,6 +634,42 @@ class MeasurementController:
                 self.error = f"测量已落盘，但分析失败：{exc}"
                 self.message = "分析失败，原始数据仍已保存"
         self._notify_complete()
+
+    def _scan_range_events(self) -> None:
+        """增量扫 rtt.log,取固件回的 RANGE_APPLIED / RANGE_REJECT。
+
+        为什么读文件而不是解析 collector 的 stdout:这两行走的是 RTT 上行,
+        由 collector 的 --raw-log 落到 rtt.log;stdout 里只有它自己的进度信息。
+        用读位置增量读 ⇒ 不重复处理、也不受文件增长影响。
+        """
+        if self.raw_log is None or not self.raw_log.exists():
+            return
+        try:
+            with self.raw_log.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(self._rtt_pos)
+                fresh = fh.read()
+                self._rtt_pos = fh.tell()
+        except OSError:
+            return
+        for line in fresh.splitlines():
+            line = line.strip()
+            if "RANGE_APPLIED" in line:
+                kv: dict[str, Any] = {}
+                for tok in line[line.index("RANGE_APPLIED"):].split()[1:]:
+                    if "=" in tok:
+                        k, _, v = tok.partition("=")
+                        try:
+                            kv[k] = int(v)
+                        except ValueError:
+                            kv[k] = v
+                with self.lock:
+                    self.range_runtime = {"pending": None, "applied": kv,
+                                          "rejected": None, "at": time.time()}
+            elif "RANGE_REJECT" in line:
+                with self.lock:
+                    self.range_runtime = {**self.range_runtime, "pending": None,
+                                          "rejected": line[line.index("RANGE_REJECT"):],
+                                          "at": time.time()}
 
     def _notify_complete(self) -> None:
         snapshot = self.snapshot()
@@ -651,6 +727,9 @@ class MeasurementController:
                 "state": self.state,
                 "message": self.message,
                 "error": self.error,
+                # 方案 C:运行时档位。**与 settings 里的 fsr_nA/offset_nA 不是一回事** ——
+                # 那是最后一次烧录的编译期默认值,RANGE 命令能在运行中改掉实际档位。
+                "range_runtime": self.range_runtime,
                 "run_id": self.run_id,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
@@ -1671,6 +1750,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not APP.settings.snapshot()["applied"]:
                     raise RuntimeError("请先将当前 IT 条件应用到硬件")
                 result = APP.start_measurement(payload)
+            elif self.path == "/api/range":
+                result = APP.measurement.send_range(payload)
             elif self.path == "/api/measurement/stop":
                 result = APP.measurement.stop()
             elif self.path == "/api/calibration/load":

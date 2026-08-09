@@ -36,7 +36,25 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 /* ================================================================== */
 /* 工作点(与 docs/ver4.0/05-IC应用设计/U1 一致,全部在单测里断言)     */
 /* ================================================================== */
-#define WP_FSR        GUI_WP_FSR
+/*
+ * 🔴 2026-08-09(方案 C):FSR / offset 从**编译期常量**改为**运行时变量**。
+ *
+ * 动机 —— 打破一个死锁:原来改量程必须重编译 + 烧录 + **复位 MCU**,而复位会
+ * 中断极化(DAC 回默认态,电解池失去设定电位),重新加回后必然引入一个初始
+ * 瞬态。实测该瞬态峰值可超过 1 µA(r5 达 +672 nA、r6 撞 1 µA 轨 22 s),
+ * 而还原侧可测上限 = offset;**电流一超过 offset,WE 就被顶出设定电位、
+ * 恒电位环开环**(datasheet p41,已过 critic,见 05-IC应用设计:14)。
+ * ⇒ 想用小量程拿细 LSB,就必然先经历一段开环瞬态;而想避开瞬态就得用大 offset
+ *   ⇒ 参数调优无法化解,只能让"换档"不再需要复位。
+ *
+ * 改后流程:大 offset 起步 → 等瞬态自然衰减到远低于目标 offset →
+ *           **在线切档(只写 0x23/0x24,不动 DACA/DACB,极化全程不中断)** → 采数。
+ *
+ * 初值仍取自 measurement_config.h ⇒ 不发 RANGE 命令时行为与改动前逐位一致。
+ * 命令格式见 poll_control_command() 与 apply_range()。
+ */
+static max30131_fsr_t        wp_fsr        = GUI_WP_FSR;
+#define WP_FSR        wp_fsr
 /*
  * 🔴 2026-08-01 由 SEL4(9nA)升到 SEL5(19nA)—— **不是优化,是修 bug**。
  * 依据:docs/左旋多巴标定/ 的 CHI660E 实测(E=−0.2V,与本工作点相同),
@@ -47,7 +65,11 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
  * 代价:基线热漂随 offset 放大(≈offset×0.034%/°C),9nA→3.1pA/°C 变 19nA→6.5pA/°C。
  * 该权衡有单测把关:test_ldopa_calibration_currents_fit_the_range。
  */
-#define WP_OFFSET_SEL GUI_WP_OFFSET_SEL
+static max30131_offset_sel_t wp_offset_sel = GUI_WP_OFFSET_SEL;
+#define WP_OFFSET_SEL wp_offset_sel
+
+/* 方案 C:在线切档。定义在 set_fsr_and_offset() 之后,这里先前向声明。 */
+static int apply_range(int fsr_code, int off_code);
 #define WP_REF        MAX30131_REF_1536MV      /* 内部 1.536V;CR2032 EOL 2.0V 只此档 */
 
 #define WP_V_WE_MV    400                      /* WE 电位 0.4V */
@@ -55,7 +77,31 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 #define WP_STARTUP_E_MV GUI_WP_START_E_MV      /* 用户可见的阶跃起始电位 */
 #define WP_PRESTEP_DURATION_MS GUI_PRESTEP_DURATION_MS
 #define WP_RUN_STARTUP_DIAGNOSTIC false         /* i-t 正式测量不扫其他电位 */
-#define WP_RUN_AFE_GAIN_CALIBRATION false       /* 10Hz 模式由上位机做浓度标定;不阻塞采样 */
+/*
+ * 双档增益标定开关。🔴 **保持 false —— 2026-08-09 实测它当前产不出有效结果。**
+ *
+ * 那次实测(FSR 1µA + offset 50%FS,重复两轮):
+ *   步1 500nA 参考档 counts=4282 → offset 真值 32669 pA,而 SEL6 规格窗口是
+ *       [34000, 46000] ⇒ **低于下限 3.9%**,被自身合理性闸门判作废
+ *   步2 1µA 目标档 counts=2438 → FSR 真值 878177 pA(标称 1e6)⇒ **−12.1%**,
+ *       也会撞 ±10% 闸门(出厂增益规格只有 ±1~2%,不该差这么多)
+ *   另有一轮步1 三次转换全读到 counts=1(≈0)后放弃 —— 模式切换后的第一次
+ *   转换不稳定,非确定性(重试机制存在但 3 次不够)
+ * ⇒ 两条独立测量同向偏低,根因未定。可疑方向:步1 在慢钟组(500nA,
+ *   CONV_TIME 0x4 = 1882ms)、步2 在快钟组(1µA,同码却是 471ms),
+ *   两步的实际积分时间差 4 倍而代码只写了一次 CONV_TIME。**需查 datasheet 定案。**
+ *
+ * 即使修好,也**不该无条件开**:步2 反解精度受 ADC ±80LSB 限制,
+ * FSR 越大越差(50nA ±0.15% / 250nA ±0.76% / 500nA ±1.53% / 1µA ±3.05% /
+ * 2µA ±6.10%),交叉点约 FSR 655nA。而增益误差不被标定曲线截距吸收
+ * ⇒ 仅 FSR ≤250nA 时全套才明显净赚。
+ *
+ * 🟢 真正无条件净赚的是**步3**(工作档 offset-only 零电流基线):它消掉
+ *    offset 源容差与 ADC 固有偏移,且**不依赖步1/步2 的跨档推理**。
+ *    但现在三步绑死(步1 一作废就 goto restore,步3 根本不跑),要单独用需改结构。
+ * 详见 docs/troubleshooting/electrochem-workstation-烧录与rtt取数.md §12
+ */
+#define WP_RUN_AFE_GAIN_CALIBRATION false
 
 /* ADC 时钟源:false = 34.952kHz(慢钟),true = 40.96kHz。 */
 #define WP_CLK_40K    false
@@ -117,8 +163,46 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 /* 轮询间隔:比一个采样周期短,保证不漏 FIFO(256 深)。 */
 #define POLL_INTERVAL_MS 20
 
-/* 饱和预警余量(counts)。2% FS —— 离边界还有 1311 counts 就开始报,给上位机反应余地。 */
-#define SAT_MARGIN_COUNTS 1311U
+/*
+ * 饱和预警余量(counts):离边界还有多少 counts 就开始报 sat,给上位机反应余地。
+ *
+ * 🔴 2026-08-09 改:原为写死 `1311U`(= 2% FS)。那个值是按"offset 占满量程
+ *    一半"这类大 offset 场景定的。**offset 小时余量会超过 offset 本身**,于是
+ *    零电流附近整个有效测量区都被误判成饱和:
+ *      FSR 1µA + offset 19nA ⇒ 1311 counts = 20.0 nA > offset 19 nA
+ *      ⇒ 判据退化成「I ≥ −1.0 nA 就报 sat」
+ *      ⇒ 末段 −2~−3 nA 的真实数据紧贴阈值,噪声让 counts 反复跨过 1311,
+ *        界面上红黑交替(实测该轮 126 个样本属此类误报;另有 728 个是**真**
+ *        饱和 —— counts 恒为 8、连续 91.3 s 顶在 offset 轨上,那部分不是误报)。
+ *
+ *    改为按**零电流码**(= offset×2^16/FSR)的固定比例取。这样余量在**电流**
+ *    维度上恒等于 offset 的 5%,与 FSR 选哪档无关,物理含义一致。
+ *    保留 1311 作上限 ⇒ 大 offset 配置(如 50%FS)的行为与改动前逐位一致,
+ *    不引入回归。下限 8 counts = 13bit 的一个码步长,保证真饱和一定报得出来。
+ */
+#define SAT_MARGIN_FRACTION_PCT 5      /* 取零电流码的 5% */
+#define SAT_MARGIN_COUNTS_MAX   1311U  /* 2% FS,原值,作上限(不回归) */
+#define SAT_MARGIN_COUNTS_MIN   8U     /* ≥1 个 13bit 码步长 */
+
+static uint16_t sat_margin_counts(void)
+{
+	int32_t fsr_pa = max30131_fsr_pa(WP_FSR);
+	int32_t off_pa = max30131_offset_pa(WP_OFFSET_SEL, WP_FSR);
+	int64_t zero_code, m;
+
+	if (fsr_pa <= 0 || off_pa <= 0) {
+		return SAT_MARGIN_COUNTS_MAX;
+	}
+	zero_code = ((int64_t)off_pa * 65536) / fsr_pa;   /* I=0 对应的 counts */
+	m = zero_code * SAT_MARGIN_FRACTION_PCT / 100;
+	if (m > (int64_t)SAT_MARGIN_COUNTS_MAX) {
+		m = SAT_MARGIN_COUNTS_MAX;
+	}
+	if (m < (int64_t)SAT_MARGIN_COUNTS_MIN) {
+		m = SAT_MARGIN_COUNTS_MIN;
+	}
+	return (uint16_t)m;
+}
 
 /* ================================================================== */
 /*
@@ -386,6 +470,17 @@ static int afe_configure(void)
 	LOG_INF("可测量程:还原 ≤%d pA(=offset,最坏 min 档只有 %d pA)/ 氧化 ≤%d pA",
 		max30131_max_reduction_pa(off_pa), max30131_max_reduction_pa(off_lo),
 		max30131_max_oxidation_pa(fsr_pa, off_pa));
+	/* 🔴 把 sat 预警阈值显式打出来 —— 2026-08-09 踩过:阈值不可见时,
+	 * 余量误报看起来和真饱和一模一样(界面都是红点),排查绕了一大圈。 */
+	{
+		uint16_t sm = sat_margin_counts();
+		int32_t sm_pa = (int32_t)(((int64_t)sm * fsr_pa) / 65536);
+
+		LOG_INF("sat 预警余量:%u counts = %d pA ⇒ 还原侧 I ≥ %d pA 报 sat / "
+			"氧化侧 I ≤ %d pA 报 sat", sm, sm_pa,
+			max30131_max_reduction_pa(off_pa) - sm_pa,
+			-(max30131_max_oxidation_pa(fsr_pa, off_pa) - sm_pa));
+	}
 	LOG_INF("参考:左旋多巴标定实测稳态最大 12800 pA(浓度 50)⇒ %s",
 		max30131_max_reduction_pa(off_lo) > 12800 ? "最坏档位也够 ✅"
 							 : "🔴 余量不足,查 offset 档位");
@@ -592,7 +687,7 @@ enum control_command {
 
 static enum control_command poll_control_command(void)
 {
-	static char command[16];
+	static char command[32];   /* 16→32:要装下 "RANGE <fsr> <sel>" */
 	static size_t used;
 	char ch;
 
@@ -605,6 +700,24 @@ static enum control_command poll_control_command(void)
 			}
 			if (strcmp(command, "STOP") == 0) {
 				return CONTROL_STOP;
+			}
+			/*
+			 * `RANGE <fsr_code> <offset_sel>` —— 在线切档,**就地生效**。
+			 * 刻意不返回新的 control_command:两个调用点
+			 * (wait_for_start_command / 采集循环)都能白拿到这个能力,
+			 * 不必改它们的 START/STOP 语义 —— 那是本轮已经踩过两次回归的地方。
+			 * 切档不打断本轮采集,也不动极化。
+			 */
+			if (strncmp(command, "RANGE ", 6) == 0) {
+				int a = -1, b = -1;
+
+				if (sscanf(command + 6, "%d %d", &a, &b) == 2) {
+					(void)apply_range(a, b);
+				} else {
+					printk("RANGE_REJECT reason=parse raw=%s\n",
+					       command);
+				}
+				continue;
 			}
 			continue;
 		}
@@ -650,6 +763,76 @@ static void wait_for_start_command(void)
 static int set_fsr_and_offset(max30131_fsr_t fsr, max30131_offset_sel_t off)
 {
 	return max30131_spi_write_reg(0x23U, max30131_enc_s1_config4(fsr, off));
+}
+
+/*
+ * 方案 C 的落点:在线切换量程/偏置档。
+ *
+ * 只写两个寄存器:
+ *   0x23 S1_CONFIG4 = FSR + OFFSET_SEL
+ *   0x24 S1_CONFIG5 = CONV_TIME  ← **必须跟着改**:FSR 码 ≤3 走慢钟、>3 走 4× 快钟,
+ *        同一个 CONV_TIME 码两组的积分时间差 4 倍。不跟着改就会 conv > SENS_PERIOD
+ *        ⇒ INVALID_CFG、AFE 不出数(2026-08-09 已因写死 CONV_TIME 栽过一次)。
+ *
+ * 🔴 **绝不触碰 DACA/DACB** —— 那是极化电位。整个切档过程恒电位环保持闭合、
+ *    电极一直在设定电位上,所以不产生新的初始瞬态。这正是方案 C 的全部意义。
+ *
+ * ⚠️ 未知:AUTO=1 运行中写 0x23/0x24 是否立即生效。datasheet 明确 SENSOR_CAL 和
+ *    手动转换在 AUTO=1 下被静默忽略,但没说这两个寄存器。**必须实测**:切档后
+ *    counts 应跳到新档位预期值。不生效的话会安静地继续用旧档换算 ⇒ 见 RANGE_APPLIED
+ *    行与实际 counts 是否自洽。
+ *
+ * 切换前后 `counts` 不可比(LSB 与零点都变了);`fa` 仍是物理电流,可比。
+ * RANGE_APPLIED 行就是给上位机/事后分析定位切换点用的。
+ */
+static int apply_range(int fsr_code, int off_code)
+{
+	max30131_fsr_t f;
+	max30131_offset_sel_t o;
+	uint8_t ct;
+	max30131_err_t e;
+	uint8_t bits;
+
+	if (fsr_code < 0 || fsr_code > 5 || off_code < 0 || off_code > 7) {
+		printk("RANGE_REJECT reason=arg fsr=%d offset_sel=%d\n",
+		       fsr_code, off_code);
+		return -EINVAL;
+	}
+	f = (max30131_fsr_t)fsr_code;
+	o = (max30131_offset_sel_t)off_code;
+	ct = max30131_fsr_uses_fast_clock(f) ? 0x1U : 0x0U;
+
+	e = max30131_check_period_vs_conv(ct, WP_SENS_PERIOD_CODE, WP_CLK_40K, f);
+	if (e != MAX30131_OK) {
+		printk("RANGE_REJECT reason=period fsr=%d conv_code=%u err=%d\n",
+		       fsr_code, ct, (int)e);
+		return -EINVAL;
+	}
+	/* offset 不能超过 FSR,否则还原侧上限无意义、氧化侧为 0 */
+	if (max30131_offset_pa(o, f) > max30131_fsr_pa(f)) {
+		printk("RANGE_REJECT reason=offset_gt_fsr fsr=%d offset_sel=%d\n",
+		       fsr_code, off_code);
+		return -EINVAL;
+	}
+	if (set_fsr_and_offset(f, o) != 0 ||
+	    max30131_spi_write_reg(MAX30131_REG_S1_CONFIG5,
+				   max30131_enc_s1_config5(ct, true)) != 0) {
+		printk("RANGE_REJECT reason=spi fsr=%d offset_sel=%d\n",
+		       fsr_code, off_code);
+		return -EIO;
+	}
+	wp_fsr = f;
+	wp_offset_sel = o;
+	bits = max30131_conv_time_bits(ct);
+
+	printk("RANGE_APPLIED fsr_code=%d offset_sel=%d fsr_pa=%d off_pa=%d "
+	       "bits=%u lsb_eff_fa=%d sat_margin=%u red_max_pa=%d ox_max_pa=%d\n",
+	       fsr_code, off_code, max30131_fsr_pa(f), max30131_offset_pa(o, f),
+	       bits, max30131_lsb_fa(f) << (16U - bits), sat_margin_counts(),
+	       max30131_max_reduction_pa(max30131_offset_pa(o, f)),
+	       max30131_max_oxidation_pa(max30131_fsr_pa(f),
+					 max30131_offset_pa(o, f)));
+	return 0;
 }
 
 /* 切 IOFFSET_CONV(0=信号+offset,1=仅 offset) */
@@ -941,7 +1124,7 @@ static uint16_t drain_fifo(uint16_t max_emit)
 		 * 🔴 饱和时读数**不再是测量**(恒电位环已开环),必须标记,
 		 * 否则上位机会把一段废数据当真数据去算 σ 与标定曲线。
 		 */
-		uint8_t sat = max30131_saturation_flags(s.counts, SAT_MARGIN_COUNTS);
+		uint8_t sat = max30131_saturation_flags(s.counts, sat_margin_counts());
 
 		if (sat != 0U && sat != last_sat) { /* 只在状态翻转时告警,避免刷屏 */
 			if (sat & MAX30131_SAT_LOW) {

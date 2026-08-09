@@ -102,6 +102,8 @@ RTT_TELNET_PORT = 19021
 # 🔴 按**挂钟时间**重发,不依赖 socket 空闲 —— 固件仍在吐上一轮数据时永不空闲。
 TRIGGER_RESEND_INTERVAL_S = 1.0
 TRIGGER_MAX_RESENDS = 20
+# 命令文件轮询间隔(方案 C:外部命令经采集器 socket 转发给固件)
+CMD_POLL_INTERVAL_S = 0.5
 DEFAULT_ELF = Path("/tmp/pabuild/firmware/zephyr/zephyr.elf")
 
 
@@ -169,7 +171,8 @@ def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
 
 def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                       idle_timeout: float | None = None,
-                      trigger: str | None = None):
+                      trigger: str | None = None,
+                      cmd_file: Path | None = None):
     """连 RTT telnet 服务,按行 yield。"""
     deadline = time.monotonic() + connect_timeout
     sock = None
@@ -205,8 +208,37 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
     buf = b""
     last_data = time.monotonic()
     last_trigger_at = time.monotonic()
+    # 🔴 命令转发通道(方案 C 的主机侧)。
+    #    为什么需要它:JLinkExe 的 RTT telnet **只把采集器持有的那个连接**的输入
+    #    送进目标下行通道 —— 2026-08-09 实测,另开一个连接写 `STOP`/`RANGE`
+    #    目标端毫无反应(顺带说明 gui_server.stop() 里那句 STOP-over-telnet
+    #    从来没生效过,停止一直是靠 killpg 兜的)。
+    #    所以外部想给固件下命令,只能把命令交给采集器,由它用自己的 socket 转发。
+    #    机制:append-only 文本文件,一行一条命令;这里按读位置只发新增行,
+    #    不截断文件 ⇒ 无写读竞态,事后还能查发过什么。
+    last_cmd_poll = 0.0
+    cmd_pos = 0
     with sock:
         while True:
+            # 与重发同理:必须在循环顶部按**挂钟时间**判。数据以 8 样本/秒连续流入时
+            # recv 永不超时,挂在超时分支上的轮询一次都不会执行。
+            if cmd_file is not None and \
+                    time.monotonic() - last_cmd_poll >= CMD_POLL_INTERVAL_S:
+                last_cmd_poll = time.monotonic()
+                try:
+                    if cmd_file.exists():
+                        with cmd_file.open("r", encoding="utf-8") as fh:
+                            fh.seek(cmd_pos)
+                            fresh = fh.read()
+                            cmd_pos = fh.tell()
+                        for raw_cmd in fresh.splitlines():
+                            raw_cmd = raw_cmd.strip()
+                            if not raw_cmd or raw_cmd.startswith("#"):
+                                continue
+                            sock.sendall((raw_cmd + "\n").encode("ascii"))
+                            print(f"[collect] 已转发命令:{raw_cmd}", file=sys.stderr)
+                except OSError as exc:
+                    print(f"[collect] ⚠️ 读命令文件失败:{exc}", file=sys.stderr)
             # 🔴 重发闸门必须在循环顶部按**时间**判,不能挂在 except socket.timeout 上。
             #    2026-08-09 踩过第二次:固件仍在吐上一轮数据时是 8 样本/秒连续流,
             #    `recv` 永不超时 ⇒ 挂在超时分支上的重发一次都不会执行。而"上一轮还在
@@ -332,6 +364,9 @@ def main(argv: list[str] | None = None) -> int:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--start-jlink", action="store_true",
                      help="★推荐★ 自己起 JLinkExe(SetRTTAddr + rtt start)并读 telnet")
+    measure_cmd_help = ("命令文件(append-only,一行一条,如 `RANGE 2 5`)。"
+                        "采集器用自己的 RTT socket 转发 —— 另开连接写下行无效,见模块内注释")
+    ap.add_argument("--cmd-file", type=Path, default=None, help=measure_cmd_help)
     src.add_argument("--socket", metavar="HOST:PORT",
                      help="连已在跑的 RTT telnet(如 127.0.0.1:19021)")
     src.add_argument("--tail", type=Path, help="跟读一个 RTT 日志文件")
@@ -362,12 +397,13 @@ def main(argv: list[str] | None = None) -> int:
         addr = args.rtt_address or find_rtt_address(args.elf)
         proc = start_jlink_rtt(addr, args.probe_serial, args.port,
                                args.reset_before_read)
-        lines = read_socket_lines("127.0.0.1", args.port,
+        lines = read_socket_lines("127.0.0.1", args.port, cmd_file=args.cmd_file,
                                   idle_timeout=args.idle_timeout,
                                   trigger=args.trigger)
     elif args.socket:
         host, _, port_s = args.socket.partition(":")
         lines = read_socket_lines(host or "127.0.0.1", int(port_s or args.port),
+                                  cmd_file=args.cmd_file,
                                   idle_timeout=args.idle_timeout,
                                   trigger=args.trigger)
     else:

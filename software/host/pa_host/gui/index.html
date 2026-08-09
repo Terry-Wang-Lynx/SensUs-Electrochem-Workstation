@@ -67,6 +67,17 @@
               </div>
               <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
               <button class="secondary full apply-settings" id="applySettings">应用条件并烧录硬件</button>
+              <div class="range-live" id="rangeLive">
+                <div class="range-live-head"><span>运行档位<em>(硬件真值)</em></span><div class="live-badge" id="rangeBadge">未知</div></div>
+                <strong id="rangeNow">—</strong>
+                <small id="rangeDetail">开始测量后可在线切档,不复位、不中断极化</small>
+                <div class="field-pair range-pick">
+                  <label>量程<select id="rangeFsr"><option value="0">50 nA</option><option value="1">100 nA</option><option value="2">250 nA</option><option value="3">500 nA</option><option value="4" selected>1 µA</option><option value="5">2 µA</option></select></label>
+                  <label>偏置<select id="rangeOff"><option value="1">10% FSR</option><option value="2">20% FSR</option><option value="3" selected>50% FSR</option><option value="4">9 nA</option><option value="5">19 nA</option><option value="6">40 nA</option><option value="7">80 nA</option></select></label>
+                </div>
+                <button class="secondary full" id="applyRange" disabled>在线切档(不复位)</button>
+                <div class="notice error" id="rangeError" hidden></div>
+              </div>
             </div>
             <div class="sample-role-block"><span>本轮用途</span><div class="segmented role-segmented" id="sampleRole"><button class="active" data-role="calibration">标定</button><button data-role="test">测试</button></div></div>
             <label>样品名称<input id="sampleName" placeholder="例如：未知样品 01"></label>

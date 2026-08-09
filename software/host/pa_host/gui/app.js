@@ -136,8 +136,52 @@ function drawAll(){
   $('calibrationEmpty').hidden=series.length>0;drawChart($('calibrationChart'),series,{xlabel:'浓度 (µM)',ylabel:'电流 (nA)'});
 }
 
+// ── 方案 C:运行档位(硬件真值)────────────────────────────────────────────
+// 🔴 刻意与「IT 条件」里的 fsr_nA/offset_nA 分开显示:那两个是**最后一次烧录进去的
+//    编译期默认值**,而 RANGE 命令能在运行中改掉实际档位,两者可以不一致。
+//    唯一权威来源是固件回的 RANGE_APPLIED(服务端从 rtt.log 增量解析)。
+const FSR_LABEL=['50 nA','100 nA','250 nA','500 nA','1 µA','2 µA'];
+const OFF_LABEL=['0','10% FSR','20% FSR','50% FSR','9 nA','19 nA','40 nA','80 nA'];
+function renderRange(data){
+  const r=data.range_runtime||{}, box=$('rangeLive'), running=data.state==='running';
+  const a=r.applied;
+  box.classList.toggle('switching', Boolean(r.pending));
+  if(r.pending){
+    $('rangeBadge').textContent='动态量程切换中…'; $('rangeBadge').className='live-badge';
+    $('rangeDetail').textContent=`已下发 ${r.pending},等固件回 RANGE_APPLIED`;
+  } else if(r.rejected){
+    $('rangeBadge').textContent='切档被拒'; $('rangeBadge').className='live-badge error';
+    $('rangeDetail').textContent=r.rejected;
+  } else if(a){
+    $('rangeBadge').textContent='已切档'; $('rangeBadge').className='live-badge running';
+    $('rangeDetail').textContent=`还原侧 ≤${fmt(a.red_max_pa/1000,1)} nA · 氧化侧 ≤${fmt(a.ox_max_pa/1000,1)} nA · sat 余量 ${a.sat_margin} counts`;
+  } else {
+    $('rangeBadge').textContent=running?'编译期默认':'未知';
+    $('rangeBadge').className='live-badge';
+    $('rangeDetail').textContent=running
+      ? '本轮尚未在线切档,当前用的是烧录进去的默认档位'
+      : '开始测量后可在线切档,不复位、不中断极化';
+  }
+  $('rangeNow').textContent = a
+    ? `${FSR_LABEL[a.fsr_code]} / offset ${fmt(a.off_pa/1000,0)} nA · ${a.bits} bit · LSB ${fmt(a.lsb_eff_fa/1000,1)} pA`
+    : '—';
+  // 只有测量进行中才能切:命令要经采集器的 RTT socket 转发,采集器不在就没人转发
+  $('applyRange').disabled=!running;
+}
+$('applyRange').onclick=async()=>{
+  try{
+    $('rangeError').hidden=true; $('applyRange').disabled=true;
+    const body={fsr_code:Number($('rangeFsr').value), offset_sel:Number($('rangeOff').value)};
+    const r=await post('/api/range', body);
+    toast(`已下发 ${r.sent}`);
+    updateMeasurement(await api('/api/status'));
+  }catch(e){ errorBox('rangeError', e); }
+  finally{ $('applyRange').disabled=state.measurement?.state!=='running'; }
+};
+
 function updateMeasurement(data){
   state.measurement=data; const running=data.state==='running', complete=data.state==='completed';
+  renderRange(data);
   $('measureMessage').textContent=data.message||''; $('liveBadge').textContent=running?'采集中':complete?'已完成':data.state==='error'?'错误':'待机'; $('liveBadge').className=`live-badge ${running?'running':data.state==='error'?'error':''}`;
   $('stopMeasure').disabled=!running; $('useForCalibration').disabled=!complete||data.summary?.steady_current_nA==null; $('predictConcentration').disabled=!complete||data.summary?.steady_current_nA==null;
   const s=data.summary||{}; $('steadyCurrent').textContent=fmt(s.steady_current_nA); $('steadySd').textContent=fmt(s.steady_sd_nA);
