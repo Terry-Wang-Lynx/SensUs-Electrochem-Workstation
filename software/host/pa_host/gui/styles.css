@@ -25,6 +25,13 @@
 .range-live .full{width:100%;margin:10px 0 0;padding:8px 12px;font-size:12px}
 .range-live .notice{margin:9px 0 0;padding:8px}
 .range-live.switching{border-left-color:var(--amber);background:#fdf8f0}
+/* 两相测量的相位区块。刻意放在「运行档位」上方 —— 相位决定该不该切档,
+   而不是反过来。琥珀=还原瞬态(此时切小 offset 必撞轨),绿=已过零并稳定。 */
+.phase-live{background:#f7f9f7;border-left-color:#9aa7ab}
+.phase-live.reduction{border-left-color:var(--amber);background:#fdf8f0}
+.phase-live.ready{border-left-color:var(--green);background:#f2f7f5}
+.phase-live .phase-auto{margin:9px 0 0;font-size:10px;color:var(--muted)}
+.phase-live .phase-auto input{width:14px;height:14px}
 /* 重烧会丢运行时档位的告警。用 amber 而非 red:这不是错误,是一个后果提示。 */
 .notice.warn{background:#fdf7ee;color:#8a5a12;border:1px solid #e8d4ae}
 /* 错误详情顶到 .panel-head 的副标题上:变红、允许断词换行,最多 3 行后截断

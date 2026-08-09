@@ -68,6 +68,14 @@
               <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
               <div class="notice warn" id="reflashWarn" hidden></div>
               <button class="secondary full apply-settings" id="applySettings">应用条件并烧录硬件</button>
+              <div class="range-live phase-live" id="phaseLive">
+                <div class="range-live-head"><span>测量相位<em>(E=+200 mV,信号为氧化)</em></span><div class="live-badge" id="phaseBadge">待机</div></div>
+                <strong id="phaseNow">—</strong>
+                <small id="phaseDetail">开始测量后显示：还原瞬态 → 过零 → 氧化稳态</small>
+                <button class="secondary full" id="switchMeasRange" disabled>切到测量档（250 nA / offset 9 nA）</button>
+                <label class="inline-toggle phase-auto"><input type="checkbox" id="autoSwitchRange"><span>过零并稳定后自动切档</span></label>
+                <div class="notice error" id="phaseError" hidden></div>
+              </div>
               <div class="range-live" id="rangeLive">
                 <div class="range-live-head"><span>运行档位<em>(硬件真值)</em></span><div class="live-badge" id="rangeBadge">未知</div></div>
                 <strong id="rangeNow">—</strong>

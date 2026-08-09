@@ -183,6 +183,60 @@ function renderReflashWarn(applied){
     `而上面这组条件是 ${s.fsr_nA} nA / offset ${s.offset_nA} nA。`+
     `点「应用条件并烧录硬件」会复位 MCU ⇒ 丢掉在线切档结果、并重新引入初始瞬态。`;
 }
+// 两相测量。工作点 E=+200mV 驱动**氧化**,信号走器件原生方向、不受 offset 限制;
+// 但复位放生电极后的**起始瞬态是还原方向**(实测起点 ≥500nA),而还原侧上限就是
+// offset。所以:瞬态期要大 offset(否则撞轨、电极根本不在 +200mV),测量期要小
+// offset(它只白占量程+白加容差)。两者靠 RANGE 在线切档分开在时间上满足。
+function renderTransient(data){
+  const p=data.transient||{}, auto=data.auto_switch||{}, box=$('phaseLive');
+  const running=data.state==='running', atTarget=isMeasRange(data.range_runtime?.applied);
+  box.classList.toggle('reduction', p.phase==='reduction');
+  box.classList.toggle('ready', Boolean(p.ready)||atTarget);
+  const drift=p.drift_pa_s==null?null:Math.abs(p.drift_pa_s);
+  const driftTxt=drift==null?'—':`${fmt(drift,1)} pA/s`;
+  if(!p.phase||p.phase==='idle'){
+    $('phaseBadge').textContent=running?'等首个样本':'待机';
+    $('phaseBadge').className='live-badge';
+    $('phaseNow').textContent='—';
+    $('phaseDetail').textContent='开始测量后显示：还原瞬态 → 过零 → 氧化稳态';
+  } else if(p.phase==='reduction'){
+    $('phaseBadge').textContent='还原瞬态'; $('phaseBadge').className='live-badge';
+    $('phaseNow').textContent=`尚未过零 · 已 ${fmt(p.elapsed_s,0)} s`;
+    $('phaseDetail').textContent=
+      `电流还在还原侧（受 offset 天花板约束那一侧），末 20 s 漂移 ${driftTxt}。`+
+      `等它过零再切档 —— 现在切到 9 nA 会立刻撞轨、丢掉电位控制。`;
+  } else {
+    const ok=Boolean(p.ready);
+    $('phaseBadge').textContent=ok?'氧化稳态 · 可切档':'氧化稳态 · 未稳定';
+    $('phaseBadge').className=`live-badge ${ok?'running':''}`;
+    $('phaseNow').textContent=
+      `过零于 t = ${fmt(p.crossed_at_s,1)} s（已 ${fmt(p.since_cross_s,0)} s）`;
+    $('phaseDetail').textContent=
+      `末 20 s 漂移 ${driftTxt}（建议 ≤ ${fmt(p.drift_threshold_pa_s,0)} pA/s）`+
+      (p.window_railed?` · ⚠️ 末窗仍有 ${p.window_railed} 个撞轨样本`:'')+
+      (p.railed_frac>0.02?` · ⚠️ 本轮 ${fmt(p.railed_frac*100,0)}% 样本撞过轨，那部分电位是错的`:'');
+  }
+  $('switchMeasRange').disabled=!running||p.phase!=='oxidation'||atTarget;
+  $('switchMeasRange').textContent=atTarget
+    ? '已在测量档（250 nA / offset 9 nA）'
+    : '切到测量档（250 nA / offset 9 nA）';
+  if($('autoSwitchRange')!==document.activeElement) $('autoSwitchRange').checked=Boolean(auto.enabled);
+}
+function isMeasRange(a){ return Boolean(a)&&Number(a.fsr_pa)===250000&&Number(a.off_pa)===9000 }
+$('switchMeasRange').onclick=async()=>{
+  try{
+    $('phaseError').hidden=true; $('switchMeasRange').disabled=true;
+    const r=await post('/api/range/measurement',{});
+    toast(`已下发 ${r.sent}`);
+    updateMeasurement(await api('/api/status'));
+  }catch(e){ errorBox('phaseError', e); }
+};
+$('autoSwitchRange').onchange=async()=>{
+  try{
+    $('phaseError').hidden=true;
+    await post('/api/range/auto',{enabled:$('autoSwitchRange').checked});
+  }catch(e){ errorBox('phaseError', e); $('autoSwitchRange').checked=!$('autoSwitchRange').checked }
+};
 $('applyRange').onclick=async()=>{
   try{
     $('rangeError').hidden=true; $('applyRange').disabled=true;
@@ -196,7 +250,7 @@ $('applyRange').onclick=async()=>{
 
 function updateMeasurement(data){
   state.measurement=data; const running=data.state==='running', complete=data.state==='completed';
-  renderRange(data);
+  renderRange(data); renderTransient(data);
   $('measureMessage').textContent=data.message||''; $('liveBadge').textContent=running?'采集中':complete?'已完成':data.state==='error'?'错误':'待机'; $('liveBadge').className=`live-badge ${running?'running':data.state==='error'?'error':''}`;
   $('stopMeasure').disabled=!running; $('useForCalibration').disabled=!complete||data.summary?.steady_current_nA==null; $('predictConcentration').disabled=!complete||data.summary?.steady_current_nA==null;
   const s=data.summary||{}; $('steadyCurrent').textContent=fmt(s.steady_current_nA); $('steadySd').textContent=fmt(s.steady_sd_nA);

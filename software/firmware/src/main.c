@@ -107,6 +107,27 @@ static int apply_range(int fsr_code, int off_code);
 #define WP_CLK_40K    false
 
 /*
+ * 🔬 A/B 实验(2026-08-09):`Sn_IOS_MODE`(0x22 bit3)的极性在 datasheet 里**自相矛盾**。
+ *   - 寄存器图 p96:`0` = offset 仅 ADC 转换期间;`1` = **常在**。且 **Reset = 0b1**。
+ *   - 正文 p33–34:置 `1` = **仅 ADC 转换期间**(与寄存器图相反)。
+ *   两处都同意"默认是常在",但只有寄存器图自洽(复位值 == 它自己说的默认行为),
+ *   所以此前判寄存器图为准、取 0x08。
+ *
+ * 为什么要做 A/B:每轮收尾会写 `CONVERT_START=(AUTO=0,CONVERT=0)` 停转换,而 p40 说
+ *   **不转换时 WE 由固定 50nA 偏置、转换时才换成编程 offset** ⇒ 轮次边界上 WE 节点的
+ *   抽流有一次 `(offset − 50nA)` 阶跃(500nA 档 = **450nA**)。实测每轮开头都有一次
+ *   几百 nA 的**还原方向**跳变,且**无复位、无电位阶跃时同样出现**
+ *   (it_20260809_182600:上一轮末 +25.88nA → 本轮首 +499.88nA 撞轨,只隔 142ms
+ *   一个采样周期,seq/ms 连续 ⇒ 排除复位;固件日志 `无阶跃` + DAC 回读逐位相同 ⇒ 排除电位阶跃)。
+ *   量级与这个阶跃相符。**若正文才是对的,则 IOS_MODE=1 恰好选中"仅转换期间"= 扰动最大档。**
+ *
+ *   A(原)= 0x08(IOS_MODE=1)   B(本次)= 0x00(IOS_MODE=0)
+ *   判据:① 运行第一个样本的 counts/fa;② **无复位**轮次边界的跳变幅度。
+ *   这一位同时判定 datasheet 哪一边对 —— 无论结果如何都要回灌 05 文档 §7。
+ */
+#define WP_S1_CONFIG3 0x00U   /* A/B 组 B;原值 0x08 */
+
+/*
  * 🔴 2026-08-09:0x0(31ms/12bit)→ 0x1(60ms/13bit)。
  *    动机是 50Hz 市电抑制,不是分辨率。积分窗对 f 的抑制 = |sinc(f·T)|,
  *    零点在 T = k/f;对 50Hz 即 T = k×20ms:
@@ -339,7 +360,7 @@ static int afe_configure(void)
 		  "S1_CONFIG1: WE/CE_AMP_EN=1, WE_DAC_MX=00→DACA, "
 		  "🔴CE_DAC_MX=01→DACB(不写则两放大器共用 DACA、E=0), CHOP_EN=1" },
 		{ 0x21U, 0x90U, "S1_CONFIG2: 3 端电极 + WE drive" },
-		{ 0x22U, 0x08U, "S1_CONFIG3(critic 修正,原 00 且语义反)" },
+		{ 0x22U, WP_S1_CONFIG3, "S1_CONFIG3:IOS_MODE(见文件头 A/B 说明)" },
 		{ 0x23U, max30131_enc_s1_config4(WP_FSR, WP_OFFSET_SEL),
 		  "S1_CONFIG4: configured FSR/offset" },
 		/* 🔴 改用编码函数而非字面量 —— WP_CONV_TIME_CODE 现在随 FSR 分组变,

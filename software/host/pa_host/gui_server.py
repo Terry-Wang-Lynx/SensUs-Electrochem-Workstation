@@ -83,6 +83,85 @@ NCS_VENV_ACTIVATE = Path(
     os.environ.get("SENSUS_NCS_VENV_ACTIVATE", "~/ncs/.venv/bin/activate")
 ).expanduser()
 
+# ── 两相测量:还原瞬态 → 过零 → 氧化稳态 ────────────────────────────────
+# 工作点 E=+200mV 驱动**氧化**,所以稳态电流走器件的原生方向(流出 WE),
+# 不受 offset 天花板约束。但复位会把恒电位仪关掉、电极被放生漂到开路电位,
+# 而实测 OCP 比 +200mV 更正 ⇒ 重新加上 +200mV 是一次**向下**阶跃 ⇒ 起始瞬态
+# 是**还原**方向、实测起点 ≥500nA。还原方向的可测上限就是 offset 本身
+# (datasheet p41),所以两个相位要的 offset 恰好相反:
+#   瞬态期:offset 必须大(否则撞轨 ⇒ 电极根本不在 +200mV,那段数据条件是错的)
+#   测量期:offset 必须小(它只是白占量程 + 白加绝对容差)
+# 复位会重新制造瞬态,所以"改 offset 必须重烧"曾让这两件事无法同时满足;
+# 方案 C 的 RANGE 命令在线切档打破了这个循环。详见
+# docs/troubleshooting/electrochem-workstation-烧录与rtt取数.md §14。
+MEAS_FSR_CODE = 2        # 250nA:增益 max ±1%(trimmed 档)、慢钟组、天花板 240nA
+MEAS_OFFSET_SEL = 4      # SEL4 = 9nA 绝对档,容差 7–11nA(±2nA,对比 50%FS 的 ±50nA)
+SETTLE_WINDOW_S = 20.0   # 漂移速率的拟合窗口,与 FIT_WINDOW_S 取数窗口一致
+SETTLE_DRIFT_PA_S = 20.0 # 建议阈值,仅作提示;真正的判据交给人看数字
+
+
+def _transient_phase(times: list[float], currents: list[float],
+                     valid: list[bool]) -> dict[str, Any]:
+    """判断当前处于还原瞬态还是氧化稳态,并给出末窗漂移速率。
+
+    符号约定:``currents`` 是固件换算出的**还原电流**(nA),>0 = 还原
+    (非原生方向,受 offset 天花板限制),<0 = 氧化(原生方向)。
+
+    过零判据刻意取"**最后一个非负样本之后**",而不是"第一次过零" ——
+    实测 r12 在零附近来回穿了 25 次,取首次会早报 ~7s。
+    """
+    n = len(times)
+    if n == 0:
+        return {"phase": "idle", "n": 0}
+    last_nonneg = -1
+    for i in range(n - 1, -1, -1):
+        if currents[i] >= 0.0:
+            last_nonneg = i
+            break
+    if last_nonneg == n - 1:
+        phase = "reduction"            # 末点仍在还原侧,瞬态未结束
+        crossed_at = None
+    else:
+        phase = "oxidation"
+        crossed_at = times[last_nonneg + 1] if last_nonneg >= 0 else times[0]
+
+    # 末窗最小二乘斜率(pA/s)。纯 python:这里不值得为 5 行拟合引 numpy。
+    t_end = times[-1]
+    win_idx = [i for i in range(n) if times[i] >= t_end - SETTLE_WINDOW_S]
+    win = [(times[i], currents[i]) for i in win_idx if valid[i]]
+    # 末窗里只要还有撞轨样本,就说明电位控制在这段时间内失过效 ⇒ 不许算"已稳定"。
+    # (实测 r10:全程 59% 撞轨,末段却已平静 —— 只看斜率会把它判成可切档。)
+    win_railed = sum(1 for i in win_idx if not valid[i])
+    drift_pa_s: float | None = None
+    if len(win) >= 4:
+        m = len(win)
+        sx = sum(p[0] for p in win)
+        sy = sum(p[1] for p in win)
+        sxx = sum(p[0] * p[0] for p in win)
+        sxy = sum(p[0] * p[1] for p in win)
+        den = m * sxx - sx * sx
+        if den > 0:
+            # nA/s → pA/s;再取负号,让"氧化电流在长大"显示为正的漂移量级
+            drift_pa_s = -(m * sxy - sx * sy) / den * 1000.0
+    railed = sum(1 for v in valid if not v)
+    return {
+        "phase": phase,
+        "n": n,
+        "crossed_at_s": crossed_at,
+        "since_cross_s": (t_end - crossed_at) if crossed_at is not None else None,
+        "elapsed_s": t_end,
+        "drift_pa_s": drift_pa_s,
+        "drift_threshold_pa_s": SETTLE_DRIFT_PA_S,
+        "railed_samples": railed,
+        "railed_frac": railed / n,
+        "window_railed": win_railed,
+        # ready 只是"这几个提示条件都满足",不是"数据一定可信" —— 20pA/s 是我拍的,
+        # 真正该看的是 drift_pa_s 本身相对你信号大小的占比。
+        "ready": bool(phase == "oxidation" and drift_pa_s is not None
+                      and abs(drift_pa_s) <= SETTLE_DRIFT_PA_S
+                      and win_railed == 0),
+    }
+
 
 def ncs_venv_prefix() -> str:
     """``source <ncs venv>/bin/activate && `` 前缀,venv 不存在时返回空串。
@@ -397,6 +476,10 @@ class MeasurementController:
             "pending": None, "applied": None, "rejected": None, "at": None,
         }
         self._rtt_pos = 0
+        # 两相测量:过零并稳定后切到测量档。默认**手动** —— 自动切档会往数据里
+        # 注入一个跨档直流台阶(§13b 实测 +22.9nA),这一步该由人点。
+        self.auto_switch_meas = False
+        self._auto_switch_done = False
         self.summary: dict[str, Any] | None = None
         self.workflow_result: dict[str, Any] | None = None
         self.thread: threading.Thread | None = None
@@ -427,6 +510,7 @@ class MeasurementController:
             self.range_runtime = {"pending": None, "applied": None,
                                   "rejected": None, "at": None}
             self._rtt_pos = 0
+            self._auto_switch_done = False
             self.resampled_path = self.run_dir / "resampled_10hz.csv"
             self.summary_path = self.run_dir / "summary.json"
             self.plot_path = self.run_dir / "it_curve.png"
@@ -563,6 +647,56 @@ class MeasurementController:
             return _json_safe({"sent": line, "cmd_file": str(self.cmd_path),
                                "note": "固件会回 RANGE_APPLIED / RANGE_REJECT,见 rtt.log"})
 
+    def switch_to_measurement_range(self) -> dict[str, Any]:
+        """切到测量档(FSR 250nA + offset SEL4=9nA)。
+
+        只在**已过零进入氧化稳态之后**才该调用:小 offset 把还原侧上限压到 9nA,
+        此后任何还原方向的摆动都会立刻撞轨失去电位控制。
+        """
+        return self.send_range({"fsr_code": MEAS_FSR_CODE,
+                                "offset_sel": MEAS_OFFSET_SEL})
+
+    def set_auto_switch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            self.auto_switch_meas = bool(payload.get("enabled"))
+            return _json_safe({"enabled": self.auto_switch_meas,
+                               "target": {"fsr_code": MEAS_FSR_CODE,
+                                          "offset_sel": MEAS_OFFSET_SEL}})
+
+    def _at_measurement_range(self) -> bool:
+        applied = (self.range_runtime or {}).get("applied") or {}
+        try:
+            return (int(applied.get("fsr_pa", -1)) == 250_000
+                    and int(applied.get("off_pa", -1)) == 9_000)
+        except (TypeError, ValueError):
+            return False
+
+    def _maybe_auto_switch(self) -> None:
+        """勾了自动切档时,过零并稳定后切一次(且只切一次)。"""
+        with self.lock:
+            if (not self.auto_switch_meas or self._auto_switch_done
+                    or self.state != "running" or self.cmd_path is None):
+                return
+            if self.range_runtime.get("pending") or self._at_measurement_range():
+                return
+        try:
+            snap = self.snapshot()
+        except Exception:                                  # noqa: BLE001
+            return
+        if not (snap.get("transient") or {}).get("ready"):
+            return
+        with self.lock:
+            if self._auto_switch_done:                     # 双检:snapshot 期间没持锁
+                return
+            self._auto_switch_done = True
+        try:
+            self.switch_to_measurement_range()
+        except Exception as exc:                           # noqa: BLE001
+            with self.lock:
+                self._auto_switch_done = False
+                self.range_runtime = {**self.range_runtime,
+                                      "rejected": f"自动切档失败:{exc}"}
+
     @staticmethod
     def _terminate_tree(process: subprocess.Popen[str]) -> None:
         """整棵进程组收掉,而不是只收第一层。
@@ -592,6 +726,7 @@ class MeasurementController:
         process = self.process
         while process.poll() is None:
             self._scan_range_events()
+            self._maybe_auto_switch()
             with self.lock:
                 self.message = self._progress_message()
             time.sleep(0.8)
@@ -730,6 +865,14 @@ class MeasurementController:
                 # 方案 C:运行时档位。**与 settings 里的 fsr_nA/offset_nA 不是一回事** ——
                 # 那是最后一次烧录的编译期默认值,RANGE 命令能在运行中改掉实际档位。
                 "range_runtime": self.range_runtime,
+                "transient": _transient_phase(data["time_s"], data["current_nA"],
+                                              data["valid"]),
+                "auto_switch": {
+                    "enabled": self.auto_switch_meas,
+                    "done": self._auto_switch_done,
+                    "target": {"fsr_code": MEAS_FSR_CODE,
+                               "offset_sel": MEAS_OFFSET_SEL},
+                },
                 "run_id": self.run_id,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
@@ -1752,6 +1895,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = APP.start_measurement(payload)
             elif self.path == "/api/range":
                 result = APP.measurement.send_range(payload)
+            elif self.path == "/api/range/measurement":
+                result = APP.measurement.switch_to_measurement_range()
+            elif self.path == "/api/range/auto":
+                result = APP.measurement.set_auto_switch(payload)
             elif self.path == "/api/measurement/stop":
                 result = APP.measurement.stop()
             elif self.path == "/api/calibration/load":
