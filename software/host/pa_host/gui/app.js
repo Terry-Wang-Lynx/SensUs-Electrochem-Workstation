@@ -183,7 +183,15 @@ function renderSettings(data){
   $('potentialV').value=s.potential_v; $('durationS').value=s.duration_s; $('sensPeriodCode').value=String(s.sens_period_code??0); $('sampleRateHz').value=s.target_rate_hz; $('fitWindowS').value=s.fit_window_s; $('fsrNA').value=String(s.fsr_nA);renderOffsetLabels(s.fsr_nA);$('offsetNA').value=s.offset_mode||`${s.offset_nA??19}nA`;
   $('outputPoints').textContent=`${Math.round(s.duration_s*s.target_rate_hz)} 点 · 原生 ${fmt(nativeRate,2)} Hz`;
   pages.measure[1]=`${s.duration_s} 秒 IT 检测与末 ${s.fit_window_s} 秒稳态分析`; if($('view-measure').classList.contains('active'))$('pageSubtitle').textContent=pages.measure[1]; $('validCount').nextElementSibling.textContent=`/ ${Math.round(s.duration_s*s.target_rate_hz)}`;
-  $('settingsMessage').textContent=data.message; $('settingsBadge').textContent=data.state==='applying'?'应用中':data.applied?'已应用':'未应用'; $('settingsBadge').className=`live-badge ${data.applied?'running':data.state==='error'?'error':''}`;
+  // state==='error' 时把真正的 data.error 顶到消息栏,而不是只显示笼统的 data.message。
+  // 起因:2026-08-09 烧录失败(`command not found: west`)整个过程 <1s,label 闪一下就
+  // 弹回,真实原因只进了右下角那个小 #measureError 框 ⇒ 现象看起来是「点了没反应」。
+  const settingsFailed=data.state==='error', failDetail=String(data.error||'').trim();
+  $('settingsMessage').textContent=settingsFailed&&failDetail?failDetail:data.message; $('settingsMessage').title=settingsFailed&&failDetail?failDetail:''; $('settingsMessage').classList.toggle('error-text',settingsFailed&&!!failDetail);
+  $('settingsBadge').textContent=data.state==='applying'?'应用中':settingsFailed?'失败':data.applied?'已应用':'未应用'; $('settingsBadge').className=`live-badge ${settingsFailed?'error':data.applied?'running':''}`;
+  // 🔴 error 必须排在 applied 前面:apply() 失败时服务端**不会**把 applied 复位成 false
+  //    (板上仍是上一次的固件,所以它保持 true)。原来的 `applied?'running':...` 顺序
+  //    会让徽章文案写「失败」却配绿色 running 样式 —— 2026-08-09 用浏览器实测到。
   $('firmwareNote').textContent=`${signedPotential(s.potential_v)} V 恒电位 · ${s.fsr_nA} nA FSR`; $('scheduleMethodLabel').textContent=`恒电位 IT · ${s.duration_s} 秒 · ${signedPotential(s.potential_v)} V`;
   const minInterval=(s.duration_s+10)/60; $('intervalMinutes').min=minInterval.toFixed(2); if(Number($('intervalMinutes').value)<minInterval)$('intervalMinutes').value=Math.ceil(minInterval*4)/4;
   updateStartState(); $('startSchedule').disabled=state.schedule?.active||!data.applied;

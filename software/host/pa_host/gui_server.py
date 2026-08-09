@@ -15,10 +15,13 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -41,7 +44,11 @@ from .it import (
     save_summary,
     summarize_run,
 )
-from .collect import find_rtt_address
+from .collect import (
+    DEVICE as JLINK_DEVICE,
+    JLINK_EXE,
+    SPEED_KHZ as JLINK_SPEED_KHZ,
+)
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -72,6 +79,20 @@ SETTINGS_PATH = PROJECT_DIR / "measurements" / "gui_settings.json"
 WORKFLOW_PATH = PROJECT_DIR / "measurements" / "gui_workflow.json"
 DEFAULT_SAVE_DIR = PROJECT_DIR / "measurements" / "experiment_data"
 JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "29734569")
+NCS_VENV_ACTIVATE = Path(
+    os.environ.get("SENSUS_NCS_VENV_ACTIVATE", "~/ncs/.venv/bin/activate")
+).expanduser()
+
+
+def ncs_venv_prefix() -> str:
+    """``source <ncs venv>/bin/activate && `` 前缀,venv 不存在时返回空串。
+
+    west 不在系统 PATH 上而在 NCS 的 venv 内;返回空串是为了兼容 west 已在
+    PATH 上的机器(以及 CI),此时让 west 自己去报错,而不是先报 activate 缺失。
+    """
+    if not NCS_VENV_ACTIVATE.exists():
+        return ""
+    return f"source {shlex.quote(str(NCS_VENV_ACTIVATE))} && "
 FSR_OPTIONS = {
     50: "MAX30131_FSR_50NA",
     100: "MAX30131_FSR_100NA",
@@ -161,6 +182,43 @@ class SettingsController:
         if not FIRMWARE_HEX.exists():
             return ""
         return hashlib.sha256(FIRMWARE_HEX.read_bytes()).hexdigest()
+
+    @staticmethod
+    def _flash_firmware() -> None:
+        """用 JLinkExe V8.80 把 hex 烧进片子。
+
+        🔴 为什么不是 openocd:Homebrew 的 openocd **没有编 jlink 驱动**
+        (`Error: The specified adapter driver was not found (jlink)`;libjaylink
+        不在其依赖里,`brew` 的稳定 bottle 同样没有,重装无效)。JLinkExe V8.80 是本项目
+        唯一验证过能连这两支克隆探头的通道,见
+        docs/troubleshooting/jlink-v9克隆-swd-turnaround不松线.md。2026-08-09 换。
+
+        🔴 必须查输出标记:JLinkExe 连不上目标时也可能 exit 0,不能只靠 returncode。
+        成功标记取自 2026-08-09 实测输出(`O.K.` + `Script processing completed.`)。
+        """
+        script = f"loadfile {FIRMWARE_HEX}\nr\ng\nq\n"
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jlink", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(script)
+            script_path = Path(handle.name)
+        try:
+            done = subprocess.run(
+                [
+                    str(JLINK_EXE), "-device", JLINK_DEVICE, "-if", "SWD",
+                    "-speed", str(JLINK_SPEED_KHZ), "-autoconnect", "1",
+                    "-NoGui", "1", "-ExitOnError", "1",
+                    "-SelectEmuBySN", JLINK_SERIAL,
+                    "-CommanderScript", str(script_path),
+                ],
+                cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+            )
+        finally:
+            script_path.unlink(missing_ok=True)
+        blob = f"{done.stdout}\n{done.stderr}"
+        if "O.K." not in blob or "Script processing completed." not in blob:
+            tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
+            raise RuntimeError("JLinkExe 烧录未确认成功:" + " | ".join(tail))
 
     @staticmethod
     def same_analysis_protocol(first: dict[str, Any], second: dict[str, Any]) -> bool:
@@ -259,7 +317,13 @@ class SettingsController:
         )
         try:
             FIRMWARE_CONFIG.write_text(header)
+            # 🔴 west 装在 NCS 自己的 venv 里(默认 ~/ncs/.venv/bin/west)。
+            #    `zephyr-env.sh` 只把 $ZEPHYR_BASE/scripts 塞进 PATH,**不激活该 venv**
+            #    ⇒ 不先激活就是 `zsh:1: command not found: west`,按钮看起来"没反应"
+            #    (失败 <1s,label 闪一下就弹回去)。2026-08-09 实测确认。
+            #    只在这个子 shell 里激活:NCS venv 与本工作站 venv 依赖冲突,不可合并。
             build = (
+                f"{ncs_venv_prefix()}"
                 "source ~/ncs/zephyr/zephyr-env.sh && "
                 "west build -b pa_converter_v40 -d software/firmware/build "
                 "software/firmware -- -DBOARD_ROOT=$PWD/software/firmware "
@@ -269,19 +333,15 @@ class SettingsController:
                 ["/bin/zsh", "-lc", build], cwd=PROJECT_DIR,
                 check=True, capture_output=True, text=True,
             )
-            subprocess.run([
-                "openocd", "-f", "interface/jlink.cfg",
-                "-c", f"adapter serial {JLINK_SERIAL}",
-                "-c", "transport select swd",
-                "-f", "target/nrf52.cfg",
-                "-c", f"program {FIRMWARE_HEX} verify reset exit",
-            ], cwd=PROJECT_DIR, check=True, capture_output=True, text=True)
+            self._flash_firmware()
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps({
                 "settings": settings,
                 "firmware_sha256": self._firmware_hash(),
             }, indent=2, ensure_ascii=False))
-        except (subprocess.CalledProcessError, OSError) as exc:
+        # RuntimeError:_flash_firmware() 的「exit 0 但没烧成」判据会抛它,
+        # 不接住的话会变成未处理 500,state 停在 "applying",前端只能看到通用错误。
+        except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
             output = getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or str(exc)
             detail = output.strip().splitlines()
             with self.lock:
@@ -377,8 +437,17 @@ class MeasurementController:
                 "-m",
                 "pa_host.it_tool",
                 "measure",
-                "--socket",
-                "127.0.0.1:19021",
+                # 🔴 2026-08-09:原来是 `--socket 127.0.0.1:19021` + 自己起一条
+                #    openocd RTT 桥。但 Homebrew 的 openocd 没编 jlink 驱动
+                #    (`adapter driver was not found (jlink)`),这条桥从来起不来。
+                #    改成让 collector 走它自己那条已实现且验证过的 JLinkExe V8.80
+                #    通道:它负责 SetRTTAddr + rtt start,RTT 仍出在 telnet 19021,
+                #    并且 finally 里有 terminate/wait/kill 的完整回收(禁 pkill)。
+                "--start-jlink",
+                "--elf",
+                str(FIRMWARE_ELF),
+                "--probe-serial",
+                JLINK_SERIAL,
                 "--out",
                 str(self.raw_path),
                 "--raw-log",
@@ -392,7 +461,6 @@ class MeasurementController:
             ]
             log_handle = (self.run_dir / "collector.log").open("w", buffering=1)
             try:
-                self._start_bridge()
                 self.process = subprocess.Popen(
                     command,
                     cwd=PROJECT_DIR,
@@ -400,6 +468,13 @@ class MeasurementController:
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    # 🔴 自成进程组:进程树是
+                    #      gui_server → it_tool → pa_host.collect → JLinkExe
+                    #    只 terminate 第一层(it_tool)的话,孙进程 collect 与曾孙
+                    #    JLinkExe 都活下来,**并且不会因 idle-timeout 自愈**
+                    #    (2026-08-09 实测:停止 60s 后两者仍在跑、19021 仍被占,
+                    #    下一次烧录/测量就会撞上探头被占)。有了进程组才能整棵收掉。
+                    start_new_session=True,
                 )
             except Exception:
                 log_handle.close()
@@ -411,53 +486,14 @@ class MeasurementController:
             self.thread.start()
             return self.snapshot()
 
-    def _start_bridge(self) -> None:
-        assert self.run_dir is not None
-        rtt_address = find_rtt_address(FIRMWARE_ELF)
-        self.bridge_log_handle = (self.run_dir / "openocd.log").open("w", buffering=1)
-        command = [
-            "openocd", "-f", "interface/jlink.cfg",
-            "-c", f"adapter serial {JLINK_SERIAL}",
-            "-c", "transport select swd",
-            "-c", "adapter speed 4000",
-            "-f", "target/nrf52.cfg",
-            "-c", "init",
-            "-c", f'rtt setup 0x{rtt_address:08x} 0x800 "SEGGER RTT"',
-            "-c", "rtt server start 19021 0",
-        ]
-        self.bridge_process = subprocess.Popen(
-            command, cwd=PROJECT_DIR, stdout=self.bridge_log_handle,
-            stderr=subprocess.STDOUT, text=True,
-        )
-        deadline = time.monotonic() + 12
-        while time.monotonic() < deadline:
-            if self.bridge_process.poll() is not None:
-                raise RuntimeError("OpenOCD 硬件桥启动失败")
-            try:
-                with socket.create_connection(("127.0.0.1", 4444), timeout=0.4):
-                    break
-            except OSError:
-                time.sleep(0.2)
-        else:
-            raise RuntimeError("等待 OpenOCD 硬件桥超时")
-        self._openocd_telnet(
-			'rtt stop\n'
-			f'rtt setup 0x{rtt_address:08x} 0x800 "SEGGER RTT"\n'
-			'rtt start\nexit\n'
-        )
-
-    @staticmethod
-    def _openocd_telnet(commands: str) -> None:
-        with socket.create_connection(("127.0.0.1", 4444), timeout=3) as connection:
-            connection.sendall(commands.encode("ascii"))
-            connection.settimeout(0.4)
-            try:
-                while connection.recv(4096):
-                    pass
-            except (TimeoutError, socket.timeout):
-                pass
-
     def _stop_bridge(self) -> None:
+        """收掉硬件桥子进程。
+
+        🔴 2026-08-09 起本类不再自己起桥(collector 用 `--start-jlink` 自己持有
+        JLinkExe,见 start() 里的注释),`bridge_process` 恒为 None ⇒ 本方法实际是
+        no-op。保留是因为 start()/stop()/_watch() 三处的清理路径都调它,留着比
+        删掉三处调用更不容易出错;若将来又需要外部桥,这里是唯一的挂载点。
+        """
         process = self.bridge_process
         if process is not None and process.poll() is None:
             process.terminate()
@@ -481,7 +517,7 @@ class MeasurementController:
                 with socket.create_connection(("127.0.0.1", 19021), timeout=1) as conn:
                     conn.sendall(b"STOP\n")
             except OSError:
-                process.terminate()
+                self._terminate_tree(process)
             else:
                 threading.Thread(
                     target=self._terminate_if_running,
@@ -490,10 +526,28 @@ class MeasurementController:
             return self.snapshot()
 
     @staticmethod
-    def _terminate_if_running(process: subprocess.Popen[str], delay_s: float) -> None:
+    def _terminate_tree(process: subprocess.Popen[str]) -> None:
+        """整棵进程组收掉,而不是只收第一层。
+
+        🔴 只 `process.terminate()` 收不干净:树是
+        it_tool → pa_host.collect → JLinkExe,`terminate` 只打到 it_tool,
+        collect 与 JLinkExe 会一直活着占住探头和 telnet 19021(实测 60s 不自愈)。
+        配合 Popen(start_new_session=True) 才能用 killpg 一次收完。
+        JLinkExe 本身**不理 SIGTERM**(实测),但它父进程 collect 一退、stdin 管道
+        EOF,它就会自己退 —— 所以关键是让 collect 收到信号并跑完它的 finally。
+        """
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            process.terminate()
+
+    @classmethod
+    def _terminate_if_running(cls, process: subprocess.Popen[str], delay_s: float) -> None:
         time.sleep(delay_s)
         if process.poll() is None:
-            process.terminate()
+            cls._terminate_tree(process)
 
     def _watch(self, log_handle: Any) -> None:
         assert self.process is not None

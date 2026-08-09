@@ -60,7 +60,22 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 /* ADC 时钟源:false = 34.952kHz(慢钟),true = 40.96kHz。 */
 #define WP_CLK_40K    false
 
-#define WP_CONV_TIME_CODE   0x0U               /* 31ms / 12 位(1000nA 快速档) */
+/*
+ * 🔴 2026-08-09:0x0(31ms/12bit)→ 0x1(60ms/13bit)。
+ *    动机是 50Hz 市电抑制,不是分辨率。积分窗对 f 的抑制 = |sinc(f·T)|,
+ *    零点在 T = k/f;对 50Hz 即 T = k×20ms:
+ *      0x0: 31ms = 1.55×20ms(离零点最远)⇒ 50Hz 仅衰减 −13.9 dB
+ *      0x1: 60ms = 3.00×20ms(正中零点)  ⇒ 数学上完全抑制
+ *    实测后果(2026-08-09,real-4.08uM-r2,1451 样本,去趋势 + 真实时间戳
+ *    Lomb-Scargle):50Hz 被 fs=7.956Hz 折叠到 2.294Hz,|50−6×7.956|=2.263Hz,
+ *    反推所需市电 = 50.031Hz ⇒ 认定为市电折叠。残差 std 4.9nA、峰峰 18nA
+ *    = 37 个 LSB,**不是量化噪声**。
+ *    白拿的两项:60ms < SENS_PERIOD 124ms ⇒ 8.06Hz 速率不损失;位数 12→13。
+ *    ⚠️ 现实抑制受内部振荡器(标称 34.952kHz)精度与电网 ±0.05Hz 限制,
+ *       时钟差 1% 即退化到约 −34 dB —— 仍比 −13.9 dB 好 20 dB。
+ *    分析脚本:analysis/20260809-IT曲线周期波动/
+ */
+#define WP_CONV_TIME_CODE   0x1U               /* 60ms / 13 位(1000nA 快速档) */
 #define WP_SENS_PERIOD_CODE GUI_SENS_PERIOD_CODE
 
 /* 每批攒多少样本再取。轮询模式下这只决定读取粒度,不再是唤醒条件。 */
@@ -218,7 +233,10 @@ static int afe_configure(void)
 		{ 0x22U, 0x08U, "S1_CONFIG3(critic 修正,原 00 且语义反)" },
 		{ 0x23U, max30131_enc_s1_config4(WP_FSR, WP_OFFSET_SEL),
 		  "S1_CONFIG4: configured FSR/offset" },
-		{ 0x24U, 0x01U, "S1_CONFIG5: CONV_TIME=0x0(12bit)" },
+		/* 0x03 = CONV_TIME=0x1 进 bit[4:1] | S1_SELECT=1 进 bit0。
+		 * 与 WP_CONV_TIME_CODE 必须一致 —— 10Hz 工作流跳过双档标定,
+		 * 真正生效的是这张静态表,不是 restore 路径那次写。 */
+		{ 0x24U, 0x03U, "S1_CONFIG5: CONV_TIME=0x1(13bit, 60ms=3x20ms → 50Hz sinc 零点)" },
 		{ 0x68U, 0x01U, "REFERENCE CONTROL: 内部基准 1.536V + REF_EN=1" },
 		{ 0x80U, 0x00U, "CONVERT SETUP1: DC, IOFFSET_CONV=00, SENS_PERIOD=0000(124ms)" },
 	};
@@ -323,8 +341,18 @@ static int afe_configure(void)
 	 * 而 05 文档明确:手动转换必须在 AUTO=1 **之前**做(AUTO=1 下手动请求被静默忽略)。
 	 * AUTO 由 afe_start_auto() 在自检之后启动。
 	 */
-	LOG_INF("AFE 就绪:FSR=%d pA / offset=%d pA / LSB=%d fA", fsr_pa, off_pa,
-		max30131_lsb_fa(WP_FSR));
+	/*
+	 * 🔴 两个 LSB 必须都打出来。max30131_lsb_fa() 给的是 **16 位帧** 的 LSB
+	 *    (FSR/2^16),但 CONV_TIME 决定的实际位数 n<16 时,结果左对齐进 16 位帧、
+	 *    低 (16−n) 位恒为 0 ⇒ 真实量化台阶是它的 2^(16−n) 倍。
+	 *    2026-08-09 踩过:只打帧 LSB 会让分辨率看起来好 8~16 倍
+	 *    (实证:1504 个样本的 counts 无一例外是 16 的倍数 @12bit)。
+	 */
+	uint8_t adc_bits = max30131_conv_time_bits(WP_CONV_TIME_CODE);
+	int32_t lsb_frame_fa = max30131_lsb_fa(WP_FSR);
+	int32_t lsb_eff_fa = lsb_frame_fa << (16U - adc_bits);
+	LOG_INF("AFE 就绪:FSR=%d pA / offset=%d pA / %u bit / LSB 有效=%d fA(帧 %d fA)",
+		fsr_pa, off_pa, adc_bits, lsb_eff_fa, lsb_frame_fa);
 	/* 🔴 把两个方向的可测上限显式打出来 —— 别让"量程够不够"停留在文档里 */
 	int32_t off_lo = 0, off_hi = 0;
 

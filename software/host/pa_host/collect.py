@@ -62,11 +62,31 @@ JLINK_V880_DIR = Path(
     "/Applications/STM32CubeIDE.app/Contents/Eclipse/plugins/"
     "com.st.stm32cube.ide.mcu.externaltools.jlink.macos64_2.5.100.202509120932/tools/bin"
 )
-JLINK_EXE = Path(
-    os.environ.get("SENSUS_JLINK_EXE")
-    or shutil.which("JLinkExe")
-    or (JLINK_V880_DIR / "JLinkExe")
-)
+def _resolve_jlink_exe() -> Path:
+    """选 JLinkExe:显式 env > V8.80 > PATH。
+
+    🔴 这个顺序不能反。本机 `shutil.which("JLinkExe")` 解析到
+    /usr/local/bin/JLinkExe → /Applications/SEGGER/JLink_V946/JLinkExe = V9.46,
+    而 V9.x 的 DLL 丢了对克隆固件的 legacy 回退,连不上任何目标
+    (见 docs/troubleshooting/jlink-v9克隆-swd-turnaround不松线.md)。
+    原实现把 which() 排在 V8.80 前面 ⇒ 本文件顶部「只能用 V8.80」的注释
+    与实际行为相反,默认就挑中了坏的那支。2026-08-09 修。
+    """
+    override = os.environ.get("SENSUS_JLINK_EXE")
+    if override:
+        return Path(override)
+    v880 = JLINK_V880_DIR / "JLinkExe"
+    if v880.exists():
+        return v880
+    found = shutil.which("JLinkExe")
+    if found:
+        print(f"[collect] ⚠️ 回退到 PATH 里的 {found};若是 V9.x 会连不上克隆探头,"
+              f"请设 SENSUS_JLINK_EXE 指向 V8.80", file=sys.stderr)
+        return Path(found)
+    return v880
+
+
+JLINK_EXE = _resolve_jlink_exe()
 
 # 从 ELF 提 _SEGGER_RTT 用
 ZEPHYR_SDK_NM = Path(
@@ -78,6 +98,10 @@ ZEPHYR_SDK_NM = Path(
 DEVICE = "nRF52833_xxAA"
 SPEED_KHZ = 4000
 RTT_TELNET_PORT = 19021
+# 触发命令未被固件确认前的重发间隔与最大次数。
+# 🔴 按**挂钟时间**重发,不依赖 socket 空闲 —— 固件仍在吐上一轮数据时永不空闲。
+TRIGGER_RESEND_INTERVAL_S = 1.0
+TRIGGER_MAX_RESENDS = 20
 DEFAULT_ELF = Path("/tmp/pabuild/firmware/zephyr/zephyr.elf")
 
 
@@ -159,14 +183,53 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
         sys.exit(f"连不上 RTT telnet {host}:{port}(等了 {connect_timeout:.0f}s)")
 
     print(f"[collect] 已连上 {host}:{port}", file=sys.stderr)
-    if trigger:
-        sock.sendall((trigger.rstrip("\r\n") + "\n").encode("ascii"))
-        print(f"[collect] 已发送硬件命令:{trigger}", file=sys.stderr)
+    # 🔴 触发命令必须**重发到固件确认**,不能只发一次。2026-08-09 实测的竞态:
+    #    JLinkExe 在**进程启动时**就监听 -RTTTelnetPort,早于它处理 stdin 里的
+    #    `connect` / `exec SetRTTAddr` / `rtt start`。于是这里一连上就发的第一条
+    #    START 被写进还没接通的下行通道、直接丢掉;固件停在 `IT_READY` 空转,
+    #    最后「共 0 样本」。上行看着完全正常(能读到 boot log 和 IT_READY),
+    #    所以这个坑从上行日志上看不出来。
+    #    重发直到看见 `IT_START` 为止;看见就立刻停 —— 固件的运行态循环同样接
+    #    CONTROL_START,多发一条会被当成再起一轮。
+    trigger_bytes = (
+        (trigger.rstrip("\r\n") + "\n").encode("ascii") if trigger else None
+    )
+    trigger_pending = trigger_bytes is not None
+    resends = 0
+    warned_unacked = False
+    if trigger_bytes:
+        sock.sendall(trigger_bytes)
+        print(f"[collect] 已发送硬件命令:{trigger}(未确认前每秒重发)",
+              file=sys.stderr)
     sock.settimeout(1.0)
     buf = b""
     last_data = time.monotonic()
+    last_trigger_at = time.monotonic()
     with sock:
         while True:
+            # 🔴 重发闸门必须在循环顶部按**时间**判,不能挂在 except socket.timeout 上。
+            #    2026-08-09 踩过第二次:固件仍在吐上一轮数据时是 8 样本/秒连续流,
+            #    `recv` 永不超时 ⇒ 挂在超时分支上的重发一次都不会执行。而"上一轮还在
+            #    吐"恰恰就是需要重发的那个场景 —— 等于把重发放在了它唯一不可能触发
+            #    的位置。现象:collector.log 只有最初那一条发送、没有「固件已确认」,
+            #    rtt.log 里连 IT_START 都没有,界面「设备测量中」而曲线永远空。
+            if trigger_pending and time.monotonic() - last_trigger_at >= TRIGGER_RESEND_INTERVAL_S:
+                if resends < TRIGGER_MAX_RESENDS:
+                    try:
+                        sock.sendall(trigger_bytes)
+                    except OSError:
+                        return
+                    resends += 1
+                    last_trigger_at = time.monotonic()
+                elif not warned_unacked:
+                    # 预算用完还没确认 ⇒ 后面收到的样本会被 acquisition_started
+                    # 门禁全部丢掉。必须在这里就喊出来,否则表现为「一直在测、
+                    # 曲线永远空」,要等整轮结束才看到「共 0 样本」。
+                    warned_unacked = True
+                    print(f"[collect] 🔴 重发 {resends} 次仍未收到干净的 IT_START ⇒ "
+                          f"接下来的样本会被全部丢弃。固件可能仍在跑上一轮"
+                          f"(rtt.log 里若有 ms 持续增长的 S 行即是)。",
+                          file=sys.stderr)
             try:
                 chunk = sock.recv(4096)
                 if not chunk:
@@ -175,8 +238,24 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                 buf += chunk
                 while b"\n" in buf:
                     raw, buf = buf.split(b"\n", 1)
-                    yield raw.decode("utf-8", "replace")
+                    line = raw.decode("utf-8", "replace")
+                    # 🔴 必须用与下游门禁**完全相同**的判据 parse_it_start()。
+                    #    2026-08-09 踩过:这里原本写 `"IT_START" in line`(子串),
+                    #    而固件上一轮样本流未停时,`IT_START` printk 会和样本行的
+                    #    `S` 前缀在 RTT 里交织成 `SIT_START run=1 target_mv=200`。
+                    #    子串判据匹配上了 ⇒ 停止重发并打印「固件已确认」,可是
+                    #    IT_START_RE 是 `^IT_START…` 锚定的、匹配不上 ⇒
+                    #    acquisition_started 一直 False,734 个样本被静默丢弃,
+                    #    界面上就是「设备测量中」但曲线永远空着。**日志在骗人。**
+                    #    判据一致后,残行不算确认 ⇒ 继续重发 ⇒ 固件打出干净的
+                    #    `IT_START run=2 …`,门禁才真的开。
+                    if trigger_pending and parse_it_start(line) is not None:
+                        trigger_pending = False
+                        print(f"[collect] 固件已确认 {trigger}"
+                              f"(重发 {resends} 次)", file=sys.stderr)
+                    yield line
             except socket.timeout:
+                # 重发已移到循环顶部按时间判(见上),这里只管空闲超时。
                 if idle_timeout is not None and time.monotonic() - last_data > idle_timeout:
                     return
 
@@ -309,6 +388,11 @@ def main(argv: list[str] | None = None) -> int:
         print("\n[collect] 收到 Ctrl-C,收尾…", file=sys.stderr)
 
     signal.signal(signal.SIGINT, _on_sigint)
+    # GUI 停止测量走 killpg(SIGTERM)。SIGTERM 的默认动作会立刻终止本进程,
+    # 下面的 finally 不执行 —— 探头仍会释放(进程一死,stdin 管道 EOF 就把
+    # JLinkExe 带走,2026-08-09 已实测),但 CSV 收尾与统计行不会写完。
+    # 接住它是为了让用户点「停止」时数据文件是完整收尾的。
+    signal.signal(signal.SIGTERM, _on_sigint)
 
     raw_out = args.raw_log.open("w", buffering=1) if args.raw_log else None
     try:
