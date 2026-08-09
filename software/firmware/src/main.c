@@ -75,7 +75,32 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
  *       时钟差 1% 即退化到约 −34 dB —— 仍比 −13.9 dB 好 20 dB。
  *    分析脚本:analysis/20260809-IT曲线周期波动/
  */
-#define WP_CONV_TIME_CODE   0x1U               /* 60ms / 13 位(1000nA 快速档) */
+/*
+ * 🔴🔴 2026-08-09 二次修正:必须按 FSR 分组选,**不能写死**。
+ *    FSR 码 ≤3(50/100/250/500nA)走慢钟,>3(1000/2000nA)走 4× 快钟
+ *    ⇒ 同一个 CONV_TIME 码,两组的积分时间差 4 倍
+ *    (max30131.c 里 conv_slow_clk0_ms / conv_fast_clk0_ms 是两张表)。
+ *
+ *    在 SENS_PERIOD=0x0(124ms / 8.06Hz)前提下:
+ *      码   位数   慢钟(≤500nA)          快钟(1/2µA)
+ *      0x0   12    124ms  −30.4dB ✅      31ms  −13.9dB ✅
+ *      0x1   13    241ms  ❌ 超 period     60ms  sinc 零点 ✅
+ *      0x2   14    476ms  ❌ 超 period    119ms  −41.5dB ✅
+ *
+ *    ⇒ 慢钟组只有 0x0 可用,而它本来就有 −30.4dB,50Hz 从不是问题;
+ *      需要处置的只有快钟组的 31ms/−13.9dB。
+ *
+ *    🔴 我第一版写死 0x1 是回归:FSR 一旦切到 ≤500nA,conv 241ms > period 124ms
+ *      ⇒ INVALID_CFG,AFE 不出数、固件到不了 IT_START、采集器收 0 样本退 1。
+ *      只在 FSR 2µA 下验证过就提交,是"验证条件比真实使用条件窄"的又一次重犯。
+ *
+ *    快钟组选 0x1 的依据与实测见 outputs/20260809-IT曲线周期波动/README.md
+ *    (残差 std 4.905→0.907nA,2.29Hz 峰功率 −23.0dB)。
+ *    ⚠️ 0x2(119ms/14bit/−41.5dB,同样塞得进 124ms)可能更优:多一位、且靠
+ *      sinc 包络而非精确零点,对时钟误差更钝。**未实测,不盲改。**
+ */
+#define WP_CONV_TIME_CODE \
+	(max30131_fsr_uses_fast_clock(WP_FSR) ? 0x1U : 0x0U)
 #define WP_SENS_PERIOD_CODE GUI_SENS_PERIOD_CODE
 
 /* 每批攒多少样本再取。轮询模式下这只决定读取粒度,不再是唤醒条件。 */
@@ -233,10 +258,11 @@ static int afe_configure(void)
 		{ 0x22U, 0x08U, "S1_CONFIG3(critic 修正,原 00 且语义反)" },
 		{ 0x23U, max30131_enc_s1_config4(WP_FSR, WP_OFFSET_SEL),
 		  "S1_CONFIG4: configured FSR/offset" },
-		/* 0x03 = CONV_TIME=0x1 进 bit[4:1] | S1_SELECT=1 进 bit0。
-		 * 与 WP_CONV_TIME_CODE 必须一致 —— 10Hz 工作流跳过双档标定,
-		 * 真正生效的是这张静态表,不是 restore 路径那次写。 */
-		{ 0x24U, 0x03U, "S1_CONFIG5: CONV_TIME=0x1(13bit, 60ms=3x20ms → 50Hz sinc 零点)" },
+		/* 🔴 改用编码函数而非字面量 —— WP_CONV_TIME_CODE 现在随 FSR 分组变,
+		 * 写死会和它脱钩。10Hz 工作流跳过双档标定,真正生效的是这张表,
+		 * 不是 restore 路径那次写,所以这里必须自适应。 */
+		{ 0x24U, max30131_enc_s1_config5(WP_CONV_TIME_CODE, true),
+		  "S1_CONFIG5: CONV_TIME 随 FSR 分组(慢钟 0x0/12bit,快钟 0x1/13bit)" },
 		{ 0x68U, 0x01U, "REFERENCE CONTROL: 内部基准 1.536V + REF_EN=1" },
 		{ 0x80U, 0x00U, "CONVERT SETUP1: DC, IOFFSET_CONV=00, SENS_PERIOD=0000(124ms)" },
 	};
