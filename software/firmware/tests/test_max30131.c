@@ -676,6 +676,23 @@ TEST(test_manual_gain_calibration)
 	CHECK_EQ(max30131_cal_fsr_pa(10000, 0), 0);
 }
 
+TEST(test_cv_eis_range_and_current_conversion)
+{
+	CHECK_EQ(max30131_eis_fsr_ua(MAX30131_EIS_FSR_4UA), 4);
+	CHECK_EQ(max30131_eis_fsr_ua(MAX30131_EIS_FSR_8UA), 8);
+	CHECK_EQ(max30131_eis_fsr_ua(MAX30131_EIS_FSR_20UA), 20);
+	CHECK_EQ(max30131_eis_fsr_ua(MAX30131_EIS_FSR_40UA), 40);
+
+	/* 50% offset centers zero at code 32768. CV/SWV has the documented 3/2 gain. */
+	CHECK_EQ(max30131_cv_counts_to_iwe_fa(32768, MAX30131_EIS_FSR_20UA, 0), 0);
+	CHECK_NEAR(max30131_cv_counts_to_iwe_fa(0, MAX30131_EIS_FSR_20UA, 0),
+		   -15000000000LL, 1);
+	CHECK_NEAR(max30131_cv_counts_to_iwe_fa(65535, MAX30131_EIS_FSR_20UA, 0),
+		   14999542236LL, 1);
+	/* Offset code 6 moves the zero-current code to 8192 (0.125 FSR). */
+	CHECK_EQ(max30131_cv_counts_to_iwe_fa(8192, MAX30131_EIS_FSR_20UA, 6), 0);
+}
+
 /* ================================================================== */
 int main(void)
 {
@@ -702,5 +719,6 @@ int main(void)
 	RUN(test_period_must_be_ge_conv_time);
 	RUN(test_diff_conversion_cancels_adc_offset_and_offset_tolerance);
 	RUN(test_manual_gain_calibration);
+	RUN(test_cv_eis_range_and_current_conversion);
 	return mt_report();
 }

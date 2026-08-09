@@ -50,17 +50,22 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 #define WP_OFFSET_SEL GUI_WP_OFFSET_SEL
 #define WP_REF        MAX30131_REF_1536MV      /* 内部 1.536V;CR2032 EOL 2.0V 只此档 */
 
-#define WP_V_WE_MV    400                      /* WE 电位 0.4V */
+#define WP_METHOD_CV  GUI_MEASUREMENT_MODE_CV
+#define WP_V_WE_MV    GUI_WP_V_WE_MV           /* IT=0.4V;CV=0.8V 共模 */
 #define WP_E_MV       GUI_WP_E_MV              /* E = V_WE - V_RE */
 #define WP_STARTUP_E_MV GUI_WP_START_E_MV      /* 用户可见的阶跃起始电位 */
 #define WP_PRESTEP_DURATION_MS GUI_PRESTEP_DURATION_MS
 #define WP_RUN_STARTUP_DIAGNOSTIC false         /* i-t 正式测量不扫其他电位 */
 #define WP_RUN_AFE_GAIN_CALIBRATION false       /* 10Hz 模式由上位机做浓度标定;不阻塞采样 */
+#define WP_IT_USE_EIS GUI_IT_USE_EIS
+#define WP_IT_EIS_FSR GUI_IT_EIS_FSR
+#define WP_IT_SAMPLE_INTERVAL_MS GUI_IT_SAMPLE_INTERVAL_MS
 
 /* ADC 时钟源:false = 34.952kHz(慢钟),true = 40.96kHz。 */
 #define WP_CLK_40K    false
 
-#define WP_CONV_TIME_CODE   0x0U               /* 31ms / 12 位(1000nA 快速档) */
+#define WP_S1_CONFIG2       0x92U               /* RS=1: 串联 60 kohm 稳定电阻 */
+#define WP_CONV_TIME_CODE   0x0U               /* 31ms / 12 位(1000/2000nA 快速档) */
 #define WP_SENS_PERIOD_CODE GUI_SENS_PERIOD_CODE
 
 /* 每批攒多少样本再取。轮询模式下这只决定读取粒度,不再是唤醒条件。 */
@@ -69,6 +74,18 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 /* 本轮 i-t 试验的电位保持时间。到时后固件停转换并保持配置的空闲电位。 */
 #define WP_MEASUREMENT_DURATION_MS GUI_MEASUREMENT_DURATION_MS
 #define WP_EXPECTED_SAMPLE_COUNT  ((WP_MEASUREMENT_DURATION_MS + GUI_SENS_PERIOD_MS - 1U) / GUI_SENS_PERIOD_MS)
+
+#define WP_CV_LOW_E_MV GUI_CV_LOW_E_MV
+#define WP_CV_HIGH_E_MV GUI_CV_HIGH_E_MV
+#define WP_CV_SCAN_RATE_MV_S GUI_CV_SCAN_RATE_MV_S
+#define WP_CV_CYCLES GUI_CV_CYCLES
+#define WP_CV_STEP_MV GUI_CV_STEP_MV
+#define WP_CV_STEP_INTERVAL_MS GUI_CV_STEP_INTERVAL_MS
+#define WP_CV_QUIET_DURATION_MS GUI_CV_QUIET_DURATION_MS
+#define WP_CV_EIS_FSR GUI_CV_EIS_FSR
+#define WP_EIS_OFFSET 0U /* centered EIS ADC span for bidirectional CV current */
+#define WP_CV_EXPECTED_SAMPLE_COUNT \
+	(2U * ((WP_CV_HIGH_E_MV - WP_CV_LOW_E_MV) / WP_CV_STEP_MV) * WP_CV_CYCLES)
 
 /* 标定阶段暂时放慢积分,让 500nA 参考档也有完整转换时间;正式测量再切回快速档。 */
 #define CAL_CONV_TIME_CODE         0x4U
@@ -102,12 +119,20 @@ static uint8_t last_sat; /* 只在饱和状态翻转时告警 */
  * 用 printk 而不是 LOG_*:LOG 会加时间戳/等级前缀,破坏行协议。
  * 诊断信息仍走 LOG_*,record.py 会忽略不匹配的行。
  */
-static void emit_sample(uint16_t counts, int32_t fa, uint8_t tag, bool auto_mode,
-			uint8_t ovf, uint8_t sat)
+static void emit_sample(uint16_t counts, int64_t fa, uint8_t tag, bool auto_mode,
+			uint8_t ovf, uint8_t sat, bool cv_mode,
+			int32_t potential_mv, uint16_t cycle, int8_t direction)
 {
-	printk("S seq=%u ms=%u counts=%u fa=%d tag=%u auto=%u ovf=%u sat=%u\n",
-	       seq++, (uint32_t)k_uptime_get_32(), counts, fa, tag,
-	       auto_mode ? 1U : 0U, ovf, sat);
+	if (cv_mode) {
+		printk("S seq=%u ms=%u counts=%u fa=%lld tag=%u auto=%u ovf=%u sat=%u "
+		       "mv=%d cycle=%u dir=%+d\n",
+		       seq++, (uint32_t)k_uptime_get_32(), counts, (long long)fa, tag,
+		       auto_mode ? 1U : 0U, ovf, sat, potential_mv, cycle, direction);
+	} else {
+		printk("S seq=%u ms=%u counts=%u fa=%lld tag=%u auto=%u ovf=%u sat=%u\n",
+		       seq++, (uint32_t)k_uptime_get_32(), counts, (long long)fa, tag,
+		       auto_mode ? 1U : 0U, ovf, sat);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -214,13 +239,16 @@ static int afe_configure(void)
 		{ 0x20U, 0xC5U,
 		  "S1_CONFIG1: WE/CE_AMP_EN=1, WE_DAC_MX=00→DACA, "
 		  "🔴CE_DAC_MX=01→DACB(不写则两放大器共用 DACA、E=0), CHOP_EN=1" },
-		{ 0x21U, 0x90U, "S1_CONFIG2: 3 端电极 + WE drive" },
+		{ 0x21U, WP_S1_CONFIG2, "S1_CONFIG2: 3 端电极 + WE drive" },
 		{ 0x22U, 0x08U, "S1_CONFIG3(critic 修正,原 00 且语义反)" },
 		{ 0x23U, max30131_enc_s1_config4(WP_FSR, WP_OFFSET_SEL),
 		  "S1_CONFIG4: configured FSR/offset" },
-		{ 0x24U, 0x01U, "S1_CONFIG5: CONV_TIME=0x0(12bit)" },
+		{ 0x24U, max30131_enc_s1_config5(WP_CONV_TIME_CODE, true),
+		  "S1_CONFIG5: configured CONV_TIME + channel select" },
 		{ 0x68U, 0x01U, "REFERENCE CONTROL: 内部基准 1.536V + REF_EN=1" },
-		{ 0x80U, 0x00U, "CONVERT SETUP1: DC, IOFFSET_CONV=00, SENS_PERIOD=0000(124ms)" },
+		{ 0x80U, max30131_enc_convert_setup1(false, 0U, false,
+						       WP_SENS_PERIOD_CODE),
+		  "CONVERT SETUP1: DC + configured SENS_PERIOD" },
 	};
 
 	for (size_t i = 0; i < ARRAY_SIZE(cfg); i++) {
@@ -469,6 +497,53 @@ static int set_polarization(int32_t e_mv)
 	return 0;
 }
 
+/* CV 扫描时 DACA 保持共模，只更新设定 RE 的 DACB。逐步写入不等待 15 ms；
+ * 采样 ADC 仍按独立的 124 ms 周期运行。 */
+static int set_polarization_cv_step(int32_t e_mv)
+{
+	max30131_polarization_t pol;
+
+	if (max30131_polarization_from_e(WP_V_WE_MV, e_mv,
+					 max30131_ref_mv(WP_REF), &pol) != MAX30131_OK) {
+		return -EINVAL;
+	}
+	return write_dac_verified(MAX30131_REG_DACB_MSB, MAX30131_REG_DACB_ENLSB,
+				  pol.code_b, "CV DACB");
+}
+
+static uint32_t cv_half_sweep_ms(void)
+{
+	return (uint32_t)(((int64_t)(WP_CV_HIGH_E_MV - WP_CV_LOW_E_MV) * 1000) /
+			  WP_CV_SCAN_RATE_MV_S);
+}
+
+static void cv_state_at_ms(uint32_t elapsed_ms, int32_t *potential_mv,
+			   uint16_t *cycle, int8_t *direction)
+{
+	uint32_t half_ms = cv_half_sweep_ms();
+	uint32_t total_ms = half_ms * 2U * WP_CV_CYCLES;
+	if (total_ms > 0U && elapsed_ms >= total_ms) {
+		*potential_mv = WP_CV_LOW_E_MV;
+		*cycle = WP_CV_CYCLES;
+		*direction = -1;
+		return;
+	}
+	uint32_t bounded = MIN(elapsed_ms, total_ms > 0U ? total_ms - 1U : 0U);
+	uint32_t segment = bounded / half_ms;
+	uint32_t within_ms = bounded % half_ms;
+	int32_t delta_mv = (int32_t)(((int64_t)WP_CV_SCAN_RATE_MV_S * within_ms) /
+				     1000);
+
+	*cycle = (uint16_t)(segment / 2U + 1U);
+	if ((segment & 1U) == 0U) {
+		*direction = 1;
+		*potential_mv = MIN(WP_CV_HIGH_E_MV, WP_CV_LOW_E_MV + delta_mv);
+	} else {
+		*direction = -1;
+		*potential_mv = MAX(WP_CV_LOW_E_MV, WP_CV_HIGH_E_MV - delta_mv);
+	}
+}
+
 /*
  * 采集中只读审计 DAC 寄存器,不重写电位。连续两次回读不一致才判故障,
  * 以免把一次 SPI 传输错误误报为真实的电位寄存器跳变。
@@ -481,6 +556,9 @@ static int audit_polarization(int32_t e_mv, uint32_t sample_count)
 	uint16_t daca = 0U;
 	uint16_t dacb = 0U;
 	uint8_t s1_config1 = 0U;
+	uint8_t s1_config2 = 0U;
+	uint8_t s1_config5 = 0U;
+	uint8_t convert_setup1 = 0U;
 	uint8_t reference_control = 0U;
 	uint8_t system_control = 0U;
 
@@ -495,21 +573,32 @@ static int audit_polarization(int32_t e_mv, uint32_t sample_count)
 		int rc_b = max30131_spi_read_burst(MAX30131_REG_DACB_MSB, dacb_raw,
 						     sizeof(dacb_raw));
 		int rc_s1 = max30131_spi_read_reg(MAX30131_REG_S1_CONFIG1, &s1_config1);
+		int rc_s2 = max30131_spi_read_reg(MAX30131_REG_S1_CONFIG2, &s1_config2);
+		int rc_s5 = max30131_spi_read_reg(MAX30131_REG_S1_CONFIG5, &s1_config5);
+		int rc_conv = max30131_spi_read_reg(MAX30131_REG_CONVERT_SETUP1,
+						      &convert_setup1);
 		int rc_ref = max30131_spi_read_reg(MAX30131_REG_REFERENCE_CONTROL,
 						      &reference_control);
 		int rc_sys = max30131_spi_read_reg(MAX30131_REG_SYSTEM_CONTROL,
 						      &system_control);
 
-		if (rc_a == 0 && rc_b == 0 && rc_s1 == 0 && rc_ref == 0 && rc_sys == 0) {
+		if (rc_a == 0 && rc_b == 0 && rc_s1 == 0 && rc_s2 == 0 && rc_s5 == 0 &&
+		    rc_conv == 0 && rc_ref == 0 && rc_sys == 0) {
 			daca = max30131_dec_dac_code(daca_raw[0], daca_raw[1]);
 			dacb = max30131_dec_dac_code(dacb_raw[0], dacb_raw[1]);
 			if (daca == expected.code_a && dacb == expected.code_b &&
-			    s1_config1 == 0xC5U && reference_control == 0x01U &&
+			    s1_config1 == 0xC5U && s1_config2 == WP_S1_CONFIG2 &&
+			    s1_config5 == max30131_enc_s1_config5(WP_CONV_TIME_CODE, true) &&
+			    convert_setup1 == max30131_enc_convert_setup1(
+				false, 0U, false, WP_SENS_PERIOD_CODE) &&
+			    reference_control == 0x01U &&
 			    system_control == max30131_enc_system_control(false, false, false,
 									 WP_CLK_40K)) {
 				printk("POTENTIAL_AUDIT sample=%u target_mv=%d daca=%u dacb=%u "
-				       "s1c1=%u ref=%u sys=%u\n", sample_count, e_mv, daca,
-				       dacb, s1_config1, reference_control, system_control);
+				       "s1c1=%u s1c2=%u s1c5=%u conv1=%u ref=%u sys=%u\n",
+				       sample_count, e_mv, daca, dacb, s1_config1, s1_config2,
+				       s1_config5, convert_setup1, reference_control,
+				       system_control);
 				return 0;
 			}
 		}
@@ -517,10 +606,12 @@ static int audit_polarization(int32_t e_mv, uint32_t sample_count)
 	}
 
 	printk("POTENTIAL_FAULT sample=%u target_mv=%d expected_daca=%u "
-	       "expected_dacb=%u actual_daca=%u actual_dacb=%u s1c1=%u ref=%u sys=%u\n",
+	       "expected_dacb=%u actual_daca=%u actual_dacb=%u s1c1=%u s1c2=%u "
+	       "s1c5=%u conv1=%u ref=%u sys=%u\n",
 	       sample_count, e_mv, expected.code_a, expected.code_b, daca, dacb,
-	       s1_config1, reference_control, system_control);
-	LOG_ERR("采集中电位寄存器异常:E=%d mV,DACA %u/%u,DACB %u/%u;停止本轮采集",
+	       s1_config1, s1_config2, s1_config5, convert_setup1, reference_control,
+	       system_control);
+	LOG_ERR("采集中电位/测量配置异常:E=%d mV,DACA %u/%u,DACB %u/%u;停止本轮采集",
 		e_mv, daca, expected.code_a, dacb, expected.code_b);
 	log_status1("(电位审计故障)");
 	return -EIO;
@@ -565,7 +656,13 @@ static enum control_command poll_control_command(void)
 
 static void wait_for_start_command(void)
 {
-	printk("IT_READY target_mv=%d\n", WP_E_MV);
+	if (WP_METHOD_CV) {
+		printk("CV_READY low_mv=%d high_mv=%d rate_mv_s=%u cycles=%u\n",
+		       WP_CV_LOW_E_MV, WP_CV_HIGH_E_MV,
+		       WP_CV_SCAN_RATE_MV_S, WP_CV_CYCLES);
+	} else {
+		printk("IT_READY target_mv=%d\n", WP_E_MV);
+	}
 	while (1) {
 		board_guards_feed();
 		if (poll_control_command() == CONTROL_START) {
@@ -573,6 +670,234 @@ static void wait_for_start_command(void)
 		}
 		k_msleep(20);
 	}
+}
+
+/* CV uses the dedicated EIS ADC. The DC ADC tops out at 2 uA and cannot
+ * represent the historical -6.46 to +10.38 uA CV current span. */
+static int configure_eis_adc(int32_t initial_e_mv, max30131_eis_fsr_t eis_fsr)
+{
+	uint16_t daca_code;
+	uint16_t dacb_code;
+	int32_t vref_mv = max30131_ref_mv(WP_REF);
+	if (max30131_dac_code_from_mv(WP_V_WE_MV + initial_e_mv, vref_mv,
+				       &daca_code) != MAX30131_OK ||
+	    max30131_dac_code_from_mv(WP_V_WE_MV, vref_mv, &dacb_code) != MAX30131_OK) {
+		return -ERANGE;
+	}
+	if (write_dac_verified(MAX30131_REG_DACA_MSB, MAX30131_REG_DACA_ENLSB,
+			       daca_code, "CV DACA start") != 0 ||
+	    write_dac_verified(MAX30131_REG_DACB_MSB, MAX30131_REG_DACB_ENLSB,
+			       dacb_code, "CV DACB common") != 0) {
+		return -EIO;
+	}
+
+	const struct {
+		uint8_t addr;
+		uint8_t value;
+	} cv_cfg[] = {
+		{ MAX30131_REG_EIS_SETUP1, 0x00U }, /* DACA staircase, WE drive */
+		{ MAX30131_REG_EIS_SETUP2, 0x00U },
+		{ MAX30131_REG_EIS_CLOCK_SETUP, 0x09U }, /* 3.2 ms step */
+		/* 3-terminal: WE/CE amplifiers on, SC open, SRB closed, tracking RC. */
+		{ MAX30131_REG_EIS_AFE1, 0x99U },
+		/* Stabilization, centered offset, and hardware current limit. */
+		{ MAX30131_REG_EIS_AFE2,
+		  BIT(MAX30131_EIS_RS_Pos) | (WP_EIS_OFFSET << MAX30131_EIS_OFFSET_Pos) |
+		  BIT(MAX30131_EIS_ILIM_EN_Pos) },
+		{ MAX30131_REG_EIS_ADC_FS_RANGE, (uint8_t)eis_fsr },
+		{ MAX30131_REG_EIS_SETUP3, 0x00U },
+		/* One DAC LSB dither, 200 us integration, CV mode. */
+		{ MAX30131_REG_CV_SETUP1,
+		  BIT(MAX30131_CV_INTEG_Pos) | MAX30131_CV_AC_MODE },
+		{ MAX30131_REG_CONVERT_SETUP1,
+		  max30131_enc_convert_setup1(true, 0U, false, 0U) },
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cv_cfg); i++) {
+		if (max30131_spi_write_reg(cv_cfg[i].addr, cv_cfg[i].value) != 0) {
+			return -EIO;
+		}
+	}
+	k_msleep(15);
+	LOG_INF("EIS ADC ready:FSR=%d uA,WE drive,centered span=-%d..+%d uA",
+		max30131_eis_fsr_ua(eis_fsr),
+		max30131_eis_fsr_ua(eis_fsr) * 3 / 4,
+		max30131_eis_fsr_ua(eis_fsr) * 3 / 4);
+	return 0;
+}
+
+static void restore_dc_after_cv(void)
+{
+	(void)max30131_spi_write_reg(MAX30131_REG_CONVERT_START,
+				     max30131_enc_convert_start(false, false));
+	(void)max30131_spi_write_reg(MAX30131_REG_EIS_AFE1, 0x00U);
+	(void)max30131_spi_write_reg(MAX30131_REG_CONVERT_SETUP1,
+		max30131_enc_convert_setup1(false, 0U, false, WP_SENS_PERIOD_CODE));
+	(void)set_polarization(WP_STARTUP_E_MV);
+}
+
+static int eis_measure_point(int32_t e_mv, uint16_t cycle, int8_t direction,
+			     bool cv_mode, max30131_eis_fsr_t eis_fsr)
+{
+	uint16_t start_code;
+	int32_t vref_mv = max30131_ref_mv(WP_REF);
+	if (max30131_dac_code_from_mv(WP_V_WE_MV + e_mv, vref_mv,
+				       &start_code) != MAX30131_OK ||
+	    start_code >= MAX30131_DAC_CODE_MAX) {
+		return -ERANGE;
+	}
+	if (write_dac_verified(MAX30131_REG_DACA_MSB, MAX30131_REG_DACA_ENLSB,
+			       start_code, "EIS DACA") != 0) {
+		return -EIO;
+	}
+	uint16_t stop_code = start_code + 1U;
+	if (max30131_spi_write_reg(MAX30131_REG_CV_DAC_STOP_MSB,
+				   (uint8_t)(stop_code >> 4)) != 0 ||
+	    max30131_spi_write_reg(MAX30131_REG_CV_DAC_STOP_LSB,
+				   (uint8_t)(stop_code & 0x0FU)) != 0 ||
+	    max30131_spi_write_reg(MAX30131_REG_FIFO_CONFIG2,
+				   max30131_enc_fifo_config2(true, true, false, false)) != 0) {
+		return -EIO;
+	}
+
+	uint8_t status;
+	(void)max30131_spi_read_reg(MAX30131_REG_STATUS1, &status);
+	if (max30131_spi_write_reg(MAX30131_REG_CONVERT_START,
+				   max30131_enc_convert_start(false, true)) != 0) {
+		return -EIO;
+	}
+	int64_t deadline_ms = k_uptime_get() + 30;
+	while (1) {
+		uint8_t convert = 0U;
+		if (max30131_spi_read_reg(MAX30131_REG_CONVERT_START, &convert) != 0) {
+			return -EIO;
+		}
+		if ((convert & BIT(MAX30131_CSTART_CONVERT_Pos)) == 0U) {
+			break;
+		}
+		if (k_uptime_get() >= deadline_ms) {
+			return -ETIMEDOUT;
+		}
+		k_usleep(250);
+	}
+
+	uint8_t cnt_raw[2];
+	if (max30131_spi_read_burst(MAX30131_REG_FIFO_COUNTER1, cnt_raw,
+				    sizeof(cnt_raw)) != 0) {
+		return -EIO;
+	}
+	uint8_t ovf = cnt_raw[0] & 0x7FU;
+	uint16_t count = max30131_fifo_available(
+		ovf, (uint16_t)(((uint16_t)(cnt_raw[0] & 0x80U) << 1) | cnt_raw[1]));
+	uint16_t used = 0U;
+	uint16_t counts = 0U;
+	for (uint16_t i = 0U; i < count; i++) {
+		uint8_t raw[MAX30131_FIFO_BYTES_PER_WORD];
+		max30131_fifo_word_t word;
+		if (max30131_spi_read_burst(MAX30131_REG_FIFO_DATA, raw, sizeof(raw)) != 0 ||
+		    max30131_fifo_unpack(raw, &word) != MAX30131_OK) {
+			return -EIO;
+		}
+		if (!word.tag_is_8bit && word.tag == MAX30131_FIFO_TAG_S1_EIS_REAL) {
+			/* A one-step mini-CV returns to its starting potential. Use the
+			 * final conversion, which is the sample at the requested point. */
+			counts = word.counts;
+			used++;
+		}
+	}
+	if (used == 0U) {
+		return -ENODATA;
+	}
+	uint8_t sat = max30131_saturation_flags(counts, SAT_MARGIN_COUNTS);
+	/* Match the project's convention: cathodic/reduction current is positive. */
+	int64_t reduction_fa = -max30131_cv_counts_to_iwe_fa(
+		counts, eis_fsr, WP_EIS_OFFSET);
+	emit_sample(counts, reduction_fa, MAX30131_FIFO_TAG_S1_EIS_REAL, false,
+		    ovf, sat, cv_mode, e_mv, cycle, direction);
+	return 0;
+}
+
+static int run_cv_measurement(uint32_t *sample_count, uint32_t *timing_overruns,
+			      enum control_command *command_out)
+{
+	*sample_count = 0U;
+	*timing_overruns = 0U;
+	*command_out = CONTROL_NONE;
+	if (configure_eis_adc(WP_CV_LOW_E_MV, WP_CV_EIS_FSR) != 0) {
+		return -EIO;
+	}
+	uint32_t half_steps = (uint32_t)(WP_CV_HIGH_E_MV - WP_CV_LOW_E_MV) /
+			      WP_CV_STEP_MV;
+	int64_t started_ms = k_uptime_get();
+	for (uint16_t cycle = 1U; cycle <= WP_CV_CYCLES; cycle++) {
+		for (uint8_t segment = 0U; segment < 2U; segment++) {
+			int8_t direction = segment == 0U ? 1 : -1;
+			for (uint32_t step = 0U; step < half_steps; step++) {
+				board_guards_feed();
+				enum control_command command = poll_control_command();
+				if (command != CONTROL_NONE) {
+					*command_out = command;
+					return 0;
+				}
+				int32_t e_mv = direction > 0
+					? WP_CV_LOW_E_MV + (int32_t)(step * WP_CV_STEP_MV)
+					: WP_CV_HIGH_E_MV - (int32_t)(step * WP_CV_STEP_MV);
+				int rc = eis_measure_point(e_mv, cycle, direction, true,
+							   WP_CV_EIS_FSR);
+				if (rc != 0) {
+					LOG_ERR("CV EIS point failed:E=%d mV,cycle=%u,rc=%d",
+						e_mv, cycle, rc);
+					return rc;
+				}
+				(*sample_count)++;
+				int64_t next_ms = started_ms +
+					(int64_t)(*sample_count) * WP_CV_STEP_INTERVAL_MS;
+				int64_t remaining_ms = next_ms - k_uptime_get();
+				if (remaining_ms > 0) {
+					k_msleep((int32_t)remaining_ms);
+				} else {
+					(*timing_overruns)++;
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+static int run_it_eis_measurement(uint32_t *sample_count, uint32_t *timing_overruns,
+				  enum control_command *command_out)
+{
+	*sample_count = 0U;
+	*timing_overruns = 0U;
+	*command_out = CONTROL_NONE;
+	if (configure_eis_adc(WP_E_MV, WP_IT_EIS_FSR) != 0) {
+		return -EIO;
+	}
+	uint32_t expected = (WP_MEASUREMENT_DURATION_MS + WP_IT_SAMPLE_INTERVAL_MS - 1U) /
+			    WP_IT_SAMPLE_INTERVAL_MS;
+	int64_t started_ms = k_uptime_get();
+	while (*sample_count < expected) {
+		board_guards_feed();
+		enum control_command command = poll_control_command();
+		if (command != CONTROL_NONE) {
+			*command_out = command;
+			return 0;
+		}
+		int rc = eis_measure_point(WP_E_MV, 0U, 0, false, WP_IT_EIS_FSR);
+		if (rc != 0) {
+			LOG_ERR("IT EIS point failed:rc=%d", rc);
+			return rc;
+		}
+		(*sample_count)++;
+		int64_t next_ms = started_ms +
+			(int64_t)(*sample_count) * WP_IT_SAMPLE_INTERVAL_MS;
+		int64_t remaining_ms = next_ms - k_uptime_get();
+		if (remaining_ms > 0) {
+			k_msleep((int32_t)remaining_ms);
+		} else {
+			(*timing_overruns)++;
+		}
+	}
+	return 0;
 }
 
 /* ================================================================== */
@@ -808,7 +1133,7 @@ static void selftest_diagnose_baseline(void)
 /* 轮询取数                                                            */
 /* ------------------------------------------------------------------ */
 /* 读取 FIFO,最多上报 max_emit 个 S1-DC 样本,返回实际数量。 */
-static uint16_t drain_fifo(uint16_t max_emit)
+static uint16_t drain_fifo(uint16_t max_emit, uint32_t start_index, bool cv_mode)
 {
 	uint8_t cnt_raw[2] = { 0, 0 };
 	uint16_t emitted = 0U;
@@ -905,7 +1230,16 @@ static uint16_t drain_fifo(uint16_t max_emit)
 		}
 		last_sat = sat;
 
-		emit_sample(s.counts, fa, s.tag, s.auto_mode, ovf, sat);
+		int32_t potential_mv = 0;
+		uint16_t cycle = 0U;
+		int8_t direction = 0;
+		if (cv_mode) {
+			uint32_t sample_elapsed_ms =
+				(start_index + emitted + 1U) * GUI_SENS_PERIOD_MS;
+			cv_state_at_ms(sample_elapsed_ms, &potential_mv, &cycle, &direction);
+		}
+		emit_sample(s.counts, fa, s.tag, s.auto_mode, ovf, sat, cv_mode,
+			    potential_mv, cycle, direction);
 		emitted++;
 		if (emitted >= max_emit) {
 			break;
@@ -967,34 +1301,114 @@ int main(void)
 		start_pending = false;
 		run_number++;
 		last_sat = 0U;
-		printk("IT_START run=%u target_mv=%d\n", run_number, WP_E_MV);
+		bool stop_requested = false;
+		if (WP_METHOD_CV) {
+			printk("CV_START run=%u low_mv=%d high_mv=%d rate_mv_s=%u cycles=%u\n",
+			       run_number, WP_CV_LOW_E_MV, WP_CV_HIGH_E_MV,
+			       WP_CV_SCAN_RATE_MV_S, WP_CV_CYCLES);
+		} else {
+			printk("IT_START run=%u target_mv=%d\n", run_number, WP_E_MV);
+		}
 
-	if (WP_PRESTEP_DURATION_MS > 0U) {
-		LOG_INF("IT 阶跃前保持:E=%d mV,hold=%u ms", WP_STARTUP_E_MV,
-			WP_PRESTEP_DURATION_MS);
+	uint32_t hold_ms = WP_METHOD_CV ? WP_CV_QUIET_DURATION_MS :
+					      WP_PRESTEP_DURATION_MS;
+	if (hold_ms > 0U) {
+		LOG_INF("%s 扫描前保持:E=%d mV,hold=%u ms",
+			WP_METHOD_CV ? "CV" : "IT", WP_STARTUP_E_MV, hold_ms);
 		uint32_t waited_ms = 0U;
-		while (waited_ms < WP_PRESTEP_DURATION_MS) {
-			uint32_t chunk_ms = MIN(1000U, WP_PRESTEP_DURATION_MS - waited_ms);
+		while (waited_ms < hold_ms) {
+			uint32_t chunk_ms = MIN(100U, hold_ms - waited_ms);
 			board_guards_feed();
+			if (poll_control_command() == CONTROL_STOP) {
+				printk("%s_ABORTED reason=stop native=0 elapsed_ms=%u\n",
+				       WP_METHOD_CV ? "CV" : "IT", waited_ms);
+				waited_ms = hold_ms;
+				stop_requested = true;
+				break;
+			}
 			k_msleep(chunk_ms);
 			waited_ms += chunk_ms;
 		}
 	}
+	if (stop_requested) {
+		continue;
+	}
 
-	const char *step_direction = WP_E_MV < WP_STARTUP_E_MV ? "高→低" :
-		WP_E_MV > WP_STARTUP_E_MV ? "低→高" : "无阶跃";
-	LOG_INF("IT 电位阶跃:%d → %d mV(%s)", WP_STARTUP_E_MV, WP_E_MV,
-		step_direction);
-	/* 正式 i-t 测量从用户配置的起始电位阶跃到目标电位。 */
-	if (set_polarization(WP_E_MV) != 0) {
-		LOG_ERR("施加测量电位 E=%d mV 失败,停在此处", WP_E_MV);
+	int32_t active_potential_mv = WP_METHOD_CV ? WP_CV_LOW_E_MV : WP_E_MV;
+	if (!WP_METHOD_CV) {
+		const char *step_direction = WP_E_MV < WP_STARTUP_E_MV ? "高→低" :
+			WP_E_MV > WP_STARTUP_E_MV ? "低→高" : "无阶跃";
+		LOG_INF("IT 电位阶跃:%d → %d mV(%s)", WP_STARTUP_E_MV, WP_E_MV,
+			step_direction);
+	}
+	if (set_polarization(active_potential_mv) != 0) {
+		LOG_ERR("施加测量电位 E=%d mV 失败,停在此处", active_potential_mv);
 		while (1) {
 			board_guards_feed();
 			k_msleep(1000);
 		}
 	}
-	LOG_INF("i-t 测量电位已施加:E=%d mV, duration=%d ms", WP_E_MV,
+	LOG_INF("%s 测量开始:E=%d mV,duration=%d ms",
+		WP_METHOD_CV ? "CV" : "IT", active_potential_mv,
 		WP_MEASUREMENT_DURATION_MS);
+
+	if (WP_METHOD_CV) {
+		uint32_t cv_samples = 0U;
+		uint32_t timing_overruns = 0U;
+		enum control_command cv_command = CONTROL_NONE;
+		int64_t cv_started_ms = k_uptime_get();
+		int cv_rc = run_cv_measurement(&cv_samples, &timing_overruns, &cv_command);
+		restore_dc_after_cv();
+		int64_t cv_elapsed_ms = k_uptime_get() - cv_started_ms;
+		LOG_INF("CV EIS measurement ended:elapsed=%lld ms,native=%u/%u,overruns=%u",
+			(long long)cv_elapsed_ms, cv_samples, WP_CV_EXPECTED_SAMPLE_COUNT,
+			timing_overruns);
+		if (cv_command != CONTROL_NONE) {
+			const char *reason = cv_command == CONTROL_START ? "restart" : "stop";
+			printk("CV_ABORTED reason=%s native=%u elapsed_ms=%lld\n",
+			       reason, cv_samples, (long long)cv_elapsed_ms);
+			start_pending = cv_command == CONTROL_START;
+			continue;
+		}
+		if (cv_rc != 0) {
+			printk("CV_ABORTED reason=hardware native=%u elapsed_ms=%lld\n",
+			       cv_samples, (long long)cv_elapsed_ms);
+			continue;
+		}
+		printk("CV_DONE native=%u expected=%u elapsed_ms=%lld cycles=%u\n",
+		       cv_samples, WP_CV_EXPECTED_SAMPLE_COUNT,
+		       (long long)cv_elapsed_ms, WP_CV_CYCLES);
+		continue;
+	}
+	if (WP_IT_USE_EIS) {
+		uint32_t it_samples = 0U;
+		uint32_t timing_overruns = 0U;
+		enum control_command it_command = CONTROL_NONE;
+		uint32_t expected = (WP_MEASUREMENT_DURATION_MS +
+			WP_IT_SAMPLE_INTERVAL_MS - 1U) / WP_IT_SAMPLE_INTERVAL_MS;
+		int64_t it_started_ms = k_uptime_get();
+		int it_rc = run_it_eis_measurement(&it_samples, &timing_overruns,
+						&it_command);
+		restore_dc_after_cv();
+		int64_t it_elapsed_ms = k_uptime_get() - it_started_ms;
+		LOG_INF("IT wide-range EIS ended:elapsed=%lld ms,native=%u/%u,overruns=%u",
+			(long long)it_elapsed_ms, it_samples, expected, timing_overruns);
+		if (it_command != CONTROL_NONE) {
+			const char *reason = it_command == CONTROL_START ? "restart" : "stop";
+			printk("IT_ABORTED reason=%s native=%u elapsed_ms=%lld\n",
+			       reason, it_samples, (long long)it_elapsed_ms);
+			start_pending = it_command == CONTROL_START;
+			continue;
+		}
+		if (it_rc != 0) {
+			printk("IT_ABORTED reason=hardware native=%u elapsed_ms=%lld\n",
+			       it_samples, (long long)it_elapsed_ms);
+			continue;
+		}
+		printk("IT_DONE native=%u expected=%u elapsed_ms=%lld\n", it_samples,
+		       expected, (long long)it_elapsed_ms);
+		continue;
+	}
 
 	/*
 	 * MAX30131 的 SENS_PERIOD 最短约 124ms,硬件原生上限约 8.06Hz,达不到
@@ -1005,7 +1419,7 @@ int main(void)
 	if (max30131_spi_write_reg(MAX30131_REG_FIFO_CONFIG2,
 					max30131_enc_fifo_config2(true, true, false, true)) != 0 ||
 		afe_start_auto() != 0) {
-		LOG_ERR("AUTO i-t 转换启动失败");
+		LOG_ERR("AUTO %s 转换启动失败", WP_METHOD_CV ? "CV" : "IT");
 		(void)set_polarization(WP_STARTUP_E_MV);
 		while (1) {
 			board_guards_feed();
@@ -1015,13 +1429,15 @@ int main(void)
 
 	int64_t measurement_start_ms = k_uptime_get();
 	int64_t next_potential_audit_ms = measurement_start_ms + 1000;
+	int64_t next_cv_step_ms = measurement_start_ms + WP_CV_STEP_INTERVAL_MS;
 	uint32_t native_samples = 0U;
 	uint32_t conversion_errors = 0U;
 	bool potential_fault = false;
 	bool restart_requested = false;
-	bool stop_requested = false;
-	LOG_INF("进入 AUTO i-t 采集: %u native samples (约8Hz; host重采样10Hz), E=%d mV",
-		WP_EXPECTED_SAMPLE_COUNT, WP_E_MV);
+	stop_requested = false;
+	LOG_INF("进入 AUTO %s 采集:%u native samples,period=%u ms",
+		WP_METHOD_CV ? "CV" : "IT", WP_EXPECTED_SAMPLE_COUNT,
+		GUI_SENS_PERIOD_MS);
 
 	while (native_samples < WP_EXPECTED_SAMPLE_COUNT) {
 		board_guards_feed();
@@ -1034,13 +1450,31 @@ int main(void)
 			stop_requested = true;
 			break;
 		}
-		uint16_t left = (uint16_t)(WP_EXPECTED_SAMPLE_COUNT - native_samples);
-		uint16_t n = drain_fifo(left);
-		native_samples += n;
 		int64_t now_ms = k_uptime_get();
+		if (WP_METHOD_CV && now_ms >= next_cv_step_ms) {
+			uint16_t cycle;
+			int8_t direction;
+			int32_t requested_mv;
+			cv_state_at_ms((uint32_t)(now_ms - measurement_start_ms),
+				       &requested_mv, &cycle, &direction);
+			if (requested_mv != active_potential_mv) {
+				if (set_polarization_cv_step(requested_mv) != 0) {
+					potential_fault = true;
+					break;
+				}
+				active_potential_mv = requested_mv;
+			}
+			do {
+				next_cv_step_ms += WP_CV_STEP_INTERVAL_MS;
+			} while (next_cv_step_ms <= now_ms);
+		}
+		uint16_t left = (uint16_t)(WP_EXPECTED_SAMPLE_COUNT - native_samples);
+		uint16_t n = drain_fifo(left, native_samples, WP_METHOD_CV);
+		native_samples += n;
+		now_ms = k_uptime_get();
 
 		if (now_ms >= next_potential_audit_ms) {
-			if (audit_polarization(WP_E_MV, native_samples) != 0) {
+			if (audit_polarization(active_potential_mv, native_samples) != 0) {
 				potential_fault = true;
 				break;
 			}
@@ -1057,7 +1491,8 @@ int main(void)
 		}
 		if (k_uptime_get() - measurement_start_ms >
 			WP_MEASUREMENT_DURATION_MS + 10000) {
-			LOG_ERR("AUTO i-t 超过时限:仅获得 %u/%u 个原生样本",
+			LOG_ERR("AUTO %s 超过时限:仅获得 %u/%u 个原生样本",
+				WP_METHOD_CV ? "CV" : "IT",
 				native_samples, WP_EXPECTED_SAMPLE_COUNT);
 			break;
 		}
@@ -1068,12 +1503,14 @@ int main(void)
 	(void)max30131_spi_write_reg(MAX30131_REG_CONVERT_START,
 					 max30131_enc_convert_start(false, false));
 	(void)set_polarization(WP_STARTUP_E_MV);
-	LOG_INF("i-t 测量结束:elapsed=%lld ms,native=%u/%u,empty polls=%u,E 已恢复为 %d mV",
+	LOG_INF("%s 测量结束:elapsed=%lld ms,native=%u/%u,empty polls=%u,E 恢复为 %d mV",
+		WP_METHOD_CV ? "CV" : "IT",
 		(long long)(k_uptime_get() - measurement_start_ms), native_samples,
 		WP_EXPECTED_SAMPLE_COUNT, conversion_errors, WP_STARTUP_E_MV);
 	if (restart_requested || stop_requested) {
 		const char *reason = restart_requested ? "restart" : "stop";
-		printk("IT_ABORTED reason=%s native=%u elapsed_ms=%lld\n", reason,
+		printk("%s_ABORTED reason=%s native=%u elapsed_ms=%lld\n",
+		       WP_METHOD_CV ? "CV" : "IT", reason,
 		       native_samples,
 		       (long long)(k_uptime_get() - measurement_start_ms));
 		start_pending = restart_requested;
@@ -1083,9 +1520,15 @@ int main(void)
 		LOG_ERR("本轮因电位寄存器审计失败而提前结束;原始数据保留但不得用于标定/预测");
 	}
 	/* 机器可读完成标记:上位机收到后立即收尾,不再等待 duration/idle timeout。 */
-	printk("IT_DONE native=%u expected=%u elapsed_ms=%lld\n", native_samples,
-	       WP_EXPECTED_SAMPLE_COUNT,
-	       (long long)(k_uptime_get() - measurement_start_ms));
+	if (WP_METHOD_CV) {
+		printk("CV_DONE native=%u expected=%u elapsed_ms=%lld cycles=%u\n",
+		       native_samples, WP_EXPECTED_SAMPLE_COUNT,
+		       (long long)(k_uptime_get() - measurement_start_ms), WP_CV_CYCLES);
+	} else {
+		printk("IT_DONE native=%u expected=%u elapsed_ms=%lld\n", native_samples,
+		       WP_EXPECTED_SAMPLE_COUNT,
+		       (long long)(k_uptime_get() - measurement_start_ms));
+	}
 	}
 
 	return 0;

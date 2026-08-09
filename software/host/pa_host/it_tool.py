@@ -103,8 +103,8 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     # Keep this wrapper transparent: collect.py owns the RTT protocol and raw CSV.
     cmd = [sys.executable, "-m", "pa_host.collect",
            "--out", str(args.out), "--duration", str(args.duration),
-           "--idle-timeout", str(args.idle_timeout), "--progress-every", "100",
-           "--it-10hz"]
+           "--idle-timeout", str(args.idle_timeout), "--progress-every", "100"]
+    cmd += ["--cv"] if args.cv else ["--it-10hz"]
     if args.start_jlink:
         cmd += ["--start-jlink", "--elf", str(args.elf)]
         if args.probe_serial:
@@ -141,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     measure.add_argument("--raw-log", type=Path)
     measure.add_argument("--duration", type=float, default=205.0)
     measure.add_argument("--idle-timeout", type=float, default=25.0)
+    measure.add_argument("--cv", action="store_true",
+                         help="接收固件 CV 标记和逐点电位元数据")
     measure.set_defaults(func=_cmd_measure, start_jlink=False)
 
     summary = sub.add_parser("summarize-run", help="取最后 20s 有效数据计算稳态电流")

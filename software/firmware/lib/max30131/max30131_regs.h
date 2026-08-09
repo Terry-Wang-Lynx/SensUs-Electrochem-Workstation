@@ -61,6 +61,7 @@
 
 /* Table 9 中本设计会遇到的 tag */
 #define MAX30131_FIFO_TAG_S1_DC 0x0u  /* Sensor 1 DC Current(16-bit counts) */
+#define MAX30131_FIFO_TAG_S1_EIS_REAL 0x4u /* Sensor 1 EIS real / CV / SWV */
 #define MAX30131_FIFO_TAG_EMPTY 0xFEu /* 读空 FIFO 的哨兵 tag(8-bit tag) */
 
 /* ------------------------------------------------------------------ */
@@ -141,6 +142,29 @@
 #define MAX30131_DAC_MX_B 1u
 #define MAX30131_DAC_MX_C 2u
 #define MAX30131_DAC_MX_D 3u
+
+/* ------------------------------------------------------------------ */
+/* EIS / CV ADC and waveform generator                                */
+/* ------------------------------------------------------------------ */
+#define MAX30131_REG_EIS_SETUP1 0x78u
+#define MAX30131_EIS_DAC_SEL_Pos 6u /* [7:6] */
+#define MAX30131_REG_EIS_SETUP2 0x79u
+#define MAX30131_REG_EIS_CLOCK_SETUP 0x7Au
+#define MAX30131_REG_EIS_AFE1 0x7Bu
+#define MAX30131_REG_EIS_AFE2 0x7Cu
+#define MAX30131_EIS_RS_Pos 7u
+#define MAX30131_EIS_OFFSET_Pos 4u /* [6:4] */
+#define MAX30131_EIS_ILIM_EN_Pos 3u
+#define MAX30131_REG_EIS_ADC_FS_RANGE 0x7Du
+#define MAX30131_REG_EIS_SETUP3 0x7Fu
+
+#define MAX30131_REG_CV_SETUP1 0xA0u
+#define MAX30131_CV_DAC_INC_Pos 4u /* [7:4] */
+#define MAX30131_CV_INTEG_Pos 2u
+#define MAX30131_CV_AC_MODE_Pos 0u /* [1:0] */
+#define MAX30131_CV_AC_MODE 0x1u
+#define MAX30131_REG_CV_DAC_STOP_MSB 0xA1u /* stop code [11:4] */
+#define MAX30131_REG_CV_DAC_STOP_LSB 0xA2u /* stop code [3:0] */
 
 /* ------------------------------------------------------------------ */
 /* 转换控制                                                            */

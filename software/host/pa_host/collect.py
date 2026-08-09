@@ -160,8 +160,10 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
 
     print(f"[collect] 已连上 {host}:{port}", file=sys.stderr)
     if trigger:
-        sock.sendall((trigger.rstrip("\r\n") + "\n").encode("ascii"))
-        print(f"[collect] 已发送硬件命令:{trigger}", file=sys.stderr)
+        commands = "STOP\nSTART" if trigger == "FRESH_START" else trigger.rstrip("\r\n")
+        sock.sendall((commands + "\n").encode("ascii"))
+        label = "STOP → START" if trigger == "FRESH_START" else trigger
+        print(f"[collect] 已发送硬件命令:{label}", file=sys.stderr)
     sock.settimeout(1.0)
     buf = b""
     last_data = time.monotonic()
@@ -207,7 +209,17 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 IT_DONE_RE = re.compile(r"^IT_DONE\s+native=(\d+)\s+expected=(\d+)\s+elapsed_ms=(\d+)\s*$")
 IT_START_RE = re.compile(r"^IT_START\s+run=(\d+)\s+target_mv=(-?\d+)\s*$")
 IT_ABORTED_RE = re.compile(
-    r"^IT_ABORTED\s+reason=(restart|stop)\s+native=(\d+)\s+elapsed_ms=(\d+)\s*$"
+    r"^IT_ABORTED\s+reason=(restart|stop|hardware)\s+native=(\d+)\s+elapsed_ms=(\d+)\s*$"
+)
+CV_START_RE = re.compile(
+    r"^CV_START\s+run=(\d+)\s+low_mv=(-?\d+)\s+high_mv=(-?\d+)\s+"
+    r"rate_mv_s=(\d+)\s+cycles=(\d+)\s*$"
+)
+CV_DONE_RE = re.compile(
+    r"^CV_DONE\s+native=(\d+)\s+expected=(\d+)\s+elapsed_ms=(\d+)\s+cycles=(\d+)\s*$"
+)
+CV_ABORTED_RE = re.compile(
+    r"^CV_ABORTED\s+reason=(restart|stop|hardware)\s+native=(\d+)\s+elapsed_ms=(\d+)\s*$"
 )
 POTENTIAL_FAULT_RE = re.compile(r"^POTENTIAL_FAULT\s+.+$")
 
@@ -244,6 +256,24 @@ def parse_it_aborted(line: str) -> tuple[str, int, int] | None:
     return reason, int(native), int(elapsed_ms)
 
 
+def parse_cv_start(line: str) -> tuple[int, int, int, int, int] | None:
+    match = CV_START_RE.match(ANSI_RE.sub("", line).strip())
+    return None if match is None else tuple(int(value) for value in match.groups())
+
+
+def parse_cv_done(line: str) -> tuple[int, int, int, int] | None:
+    match = CV_DONE_RE.match(ANSI_RE.sub("", line).strip())
+    return None if match is None else tuple(int(value) for value in match.groups())
+
+
+def parse_cv_aborted(line: str) -> tuple[str, int, int] | None:
+    match = CV_ABORTED_RE.match(ANSI_RE.sub("", line).strip())
+    if match is None:
+        return None
+    reason, native, elapsed_ms = match.groups()
+    return reason, int(native), int(elapsed_ms)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="从 RTT 实时收数并落盘 CSV")
     ap.add_argument("--out", required=True, type=Path, help="输出 CSV 路径")
@@ -274,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="每 N 个样本打一次进度到 stderr")
     ap.add_argument("--it-10hz", action="store_true",
                     help="10Hz i-t 工作流:接受固件 AUTO 原生约8Hz样本,交由上位机重采样")
+    ap.add_argument("--cv", action="store_true",
+                    help="CV 工作流:等待 CV 标记并保存逐点电位、圈数与方向")
     ap.add_argument("--trigger", default=None,
                     help="连接 RTT 后发送命令，并等待对应 IT_START 后再收数")
     args = ap.parse_args(argv)
@@ -314,7 +346,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with args.out.open("a", buffering=1) as out:
             if new_file:
-                out.write("# pA-Converter V4.0 实时采集\n")
+                method = "CV" if args.cv else "IT"
+                out.write(f"# pA-Converter V4.0 {method} 实时采集\n")
                 out.write(f"# 起始 unix 时间: {time.time():.3f}\n")
                 out.write(",".join(CSV_COLUMNS) + "\n")
 
@@ -338,26 +371,39 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[collect] 固件开始第 {run_number} 轮 IT:E={target_mv}mV",
                           file=sys.stderr)
                     continue
-                aborted = parse_it_aborted(clean_line)
+                cv_started = parse_cv_start(clean_line)
+                if cv_started is not None:
+                    acquisition_started = True
+                    run_number, low_mv, high_mv, rate_mv_s, cycles = cv_started
+                    print(f"[collect] 固件开始第 {run_number} 轮 CV:"
+                          f"{low_mv}→{high_mv}mV,{rate_mv_s}mV/s,{cycles}圈",
+                          file=sys.stderr)
+                    continue
+                aborted = parse_cv_aborted(clean_line) if args.cv else parse_it_aborted(clean_line)
                 if aborted is not None:
                     reason, native, elapsed_ms = aborted
                     print(f"[collect] 固件中止上一轮:{reason},native={native},"
                           f"elapsed={elapsed_ms}ms", file=sys.stderr)
-                    if reason == "stop" or acquisition_started:
+                    if acquisition_started:
                         aborted_reason = reason
                         break
+                    # FRESH_START deliberately stops a stale firmware run before
+                    # waiting for the following START marker.
                     continue
                 fault = parse_potential_fault(clean_line)
                 if fault is not None:
                     potential_fault = fault
                     print(f"[collect] 电位寄存器审计失败:{fault}", file=sys.stderr)
                     continue
-                done = parse_it_done(clean_line) if args.it_10hz else None
+                done = parse_cv_done(clean_line) if args.cv else (
+                    parse_it_done(clean_line) if args.it_10hz else None
+                )
                 if done is not None:
                     if not acquisition_started:
                         continue
-                    native, expected, elapsed_ms = done
-                    print(f"[collect] 固件报告 IT 完成:{native}/{expected} 样本,"
+                    native, expected, elapsed_ms = done[:3]
+                    method = "CV" if args.cv else "IT"
+                    print(f"[collect] 固件报告 {method} 完成:{native}/{expected} 样本,"
                           f"elapsed={elapsed_ms}ms,立即收尾", file=sys.stderr)
                     break
                 s = parse_line(clean_line)
@@ -376,8 +422,13 @@ def main(argv: list[str] | None = None) -> int:
                     flag = ""
                     if s.sat:
                         flag = f"  🔴SAT={s.sat}"
+                    potential = (
+                        f" | {s.potential_mv / 1000:+.3f} V · 圈 {s.cycle}"
+                        if s.potential_mv is not None else ""
+                    )
                     print(f"[collect] {len(samples)} 样本 | 最新 "
-                          f"{s.fa / 1000:.3f} pA (counts={s.counts}){flag}",
+                          f"{s.fa / 1_000_000:.3f} nA (counts={s.counts})"
+                          f"{potential}{flag}",
                           file=sys.stderr)
     finally:
         if raw_out is not None:
@@ -420,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if (rep.seq_gaps or rep.ovf_events or rep.bad_tag
-            or (rep.manual_mode and not args.it_10hz)
+            or (rep.manual_mode and not (args.it_10hz or args.cv))
             or rep.saturated):
         print("⚠️ 完整性检查有异常,先解释清楚再拿去算指标:", file=sys.stderr)
         if rep.seq_gaps:
@@ -432,7 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         if rep.bad_tag:
             print(f"   - 异常 tag {rep.bad_tag} 个 → 非 Sensor1-DC 样本混入",
                   file=sys.stderr)
-        if rep.manual_mode and not args.it_10hz:
+        if rep.manual_mode and not (args.it_10hz or args.cv):
             print(f"   - 手动模式样本 {rep.manual_mode} 个 → AUTO 未真正生效",
                   file=sys.stderr)
         if rep.saturated:
@@ -449,7 +500,8 @@ def main(argv: list[str] | None = None) -> int:
         print("   🔴 丢样会让 Allan 偏差与 PSD 失真(时间轴不均匀),别直接下结论。",
               file=sys.stderr)
     else:
-        mode_text = "10Hz 工作流(原生约8Hz)" if args.it_10hz else "全 AUTO"
+        mode_text = ("CV 逐点电位" if args.cv else
+                     "10Hz 工作流(原生约8Hz)" if args.it_10hz else "全 AUTO")
         print(f"✅ 完整性检查通过(序号连续、无溢出、tag 合法、{mode_text})",
               file=sys.stderr)
 

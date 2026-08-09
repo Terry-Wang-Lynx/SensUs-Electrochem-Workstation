@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, sampleRole: 'calibration', chartWindowS: 5, lastHandledRunId: null };
+const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, sampleRole: 'calibration', method: 'it', chartWindowS: 5, lastHandledRunId: null };
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
   calibrate: ['标定与漂移', '选择标定范围并管理过渡期 bias'],
@@ -20,8 +20,9 @@ function concentrationValue(){return $('knownConcentration').value===''?null:$('
 function previewFilename(){const sample=($('sampleName').value||'样品名称').trim().replace(/[\\/:*?"<>|]/g,'_'), concentration=concentrationValue();$('autoSaveName').textContent=`${sample}-${concentration===null?'unknown':`${Number(concentration)}uM`}.csv`}
 function updateStartState(){
   const running=state.measurement?.state==='running', ready=state.workflow?.calibration_ready;
-  $('startMeasure').disabled=running||!state.settings?.applied||!state.workflow?.save_dir||(state.sampleRole==='test'&&!ready);
-  $('startMeasure').textContent=state.sampleRole==='calibration'?'开始标定测量':'开始测试并预测';
+  const cv=state.method==='cv';
+  $('startMeasure').disabled=running||!state.settings?.applied||!state.workflow?.save_dir||(!cv&&state.sampleRole==='test'&&!ready);
+  $('startMeasure').textContent=cv?'开始 CV 扫描':state.sampleRole==='calibration'?'开始标定测量':'开始测试并预测';
 }
 function setSampleRole(role, quiet=false){
   if(role==='test'&&!state.workflow?.calibration_ready){if(!quiet)toast('请先选择标定点并生成测试曲线');return}
@@ -34,14 +35,17 @@ function setSampleRole(role, quiet=false){
 }
 function renderWorkflow(data){
   state.workflow=data;$('saveDirectory').value=data.save_dir||'';
+  const cv=state.method==='cv';
+  document.querySelector('.workflow-steps').hidden=cv;
+  $('resetCalibration').hidden=cv;
   const labels={collect:'采集中',select:'待选范围',stabilization:'稳定化中',test:'曲线已锁定'};
-  $('workflowBadge').textContent=labels[data.stage]||'待配置';$('workflowBadge').className=`live-badge ${data.calibration_ready?'running':''}`;
-  $('workflowMessage').textContent=data.calibration_ready?`测试曲线采用 ${data.selected_points_count} / ${data.points_count} 个候选点；后续采集不会自动改写`:data.points_count&&!data.settings_match?'当前 IT 条件与已有标定不同；请恢复原条件或新建标定批次':`已记录 ${data.points_count} 个候选点，请到“标定与漂移”选择用于拟合的范围`;
+  $('workflowBadge').textContent=cv?'自动保存':labels[data.stage]||'待配置';$('workflowBadge').className=`live-badge ${cv||data.calibration_ready?'running':''}`;
+  $('workflowMessage').textContent=cv?'CV 原始点、标准 CSV、汇总与曲线图将在扫描结束后写入当前目录':data.calibration_ready?`测试曲线采用 ${data.selected_points_count} / ${data.points_count} 个候选点；后续采集不会自动改写`:data.points_count&&!data.settings_match?'当前 IT 条件与已有标定不同；请恢复原条件或新建标定批次':`已记录 ${data.points_count} 个候选点，请到“标定与漂移”选择用于拟合的范围`;
   $('calibrationStep').classList.toggle('active',data.stage==='collect');$('selectionStep').classList.toggle('active',data.stage==='select');$('testStep').classList.toggle('active',['stabilization','test'].includes(data.stage));
   const testButton=$('sampleRole').querySelector('[data-role="test"]');testButton.disabled=!data.calibration_ready;
   ['test','stabilization'].forEach(role=>$('scheduleRole').querySelector(`option[value="${role}"]`).disabled=!data.calibration_ready);
   if(!data.calibration_ready&&['test','stabilization'].includes($('scheduleRole').value))$('scheduleRole').value='calibration';
-  if(!data.calibration_ready&&state.sampleRole==='test')setSampleRole('calibration',true);
+  if(!cv&&!data.calibration_ready&&state.sampleRole==='test')setSampleRole('calibration',true);
   const latest=data.latest_result;if(latest){$('savedResult').hidden=false;$('savedResultPath').textContent=latest.data_path||latest.raw_path||latest.summary_path||''}
   renderScheduleMode();
   updateStartState();
@@ -53,7 +57,9 @@ async function handleWorkflowCompletion(data){
   $('savedResult').hidden=false;$('savedResultPath').textContent=result.data_path||result.raw_path||result.summary_path||'';
   if(result.export_error){toast(`自动保存失败：${result.export_error}`);return}
   if(result.state!=='completed'){toast('未完成的数据已保存为原始文件');return}
-  if(result.sample_role==='calibration'){
+  if(result.sample_role==='cv'){
+    toast('CV 扫描完成，全部原生电流点已保存');
+  }else if(result.sample_role==='calibration'){
     toast('候选标定点已保存；当前测试曲线未被改写');
   }else if(result.sample_role==='stabilization'){
     toast('稳定化 IT 已保存；测试曲线保持锁定');
@@ -111,24 +117,28 @@ function drawChart(canvas, series, options = {}) {
 }
 function drawAll(){
   const d = state.measurement?.data || {};
-  const rawPoints = [], validPoints = [], invalidPoints = [];
-  (d.time_s || []).forEach((time, i) => {
-    const point = [time, d.current_nA[i]];
-    rawPoints.push(point);
-    (d.valid?.[i] === false ? invalidPoints : validPoints).push(point);
-  });
-  const duration = Number(state.measurement?.settings?.duration_s || state.settings?.settings?.duration_s || 180);
-  const latest = rawPoints.at(-1)?.[0] || 0;
-  const xmin = state.chartWindowS === null ? 0 : Math.max(0, latest - state.chartWindowS);
-  const xmax = state.chartWindowS === null ? duration : Math.max(state.chartWindowS, latest);
-  const visible = points => points.filter(point => point[0] >= xmin && point[0] <= xmax);
-  const itSeries = [
-    {points: visible(rawPoints), color: '#9aa7aa', width: 0.7},
-    {points: visible(validPoints), color: '#167b74', width: 0, dots: true, pointRadius: 1.5},
-    {points: visible(invalidPoints), color: '#c33c54', width: 0, dots: true, pointRadius: 1.7},
-  ];
-  $('chartEmpty').hidden = rawPoints.length > 0;
-  drawChart($('itChart'), itSeries, {xmin, xmax, xlabel: '时间 (s)', ylabel: '电流 (nA)'});
+  const current = d.current_nA || [], allSeries=[];
+  if(state.method==='cv' && d.potential_v){
+    const maxCycle=Math.max(0,...(d.cycle||[]));
+    const keep=state.chartWindowS===null?Infinity:state.chartWindowS;
+    const firstCycle=Math.max(1,maxCycle-keep+1);
+    for(let cycle=firstCycle;cycle<=maxCycle;cycle++){
+      const valid=[],invalid=[];
+      d.potential_v.forEach((potential,i)=>{if(d.cycle[i]!==cycle)return;const point=[potential,current[i]/1000];(d.valid?.[i]===false?invalid:valid).push(point)});
+      if(valid.length)allSeries.push({points:valid,color:cycle===maxCycle?'#117a65':'#9aa7aa',width:cycle===maxCycle?1.2:.55,dots:true,pointRadius:cycle===maxCycle?1.25:.8});
+      if(invalid.length)allSeries.push({points:invalid,color:'#b94444',width:0,dots:true,pointRadius:1.6});
+    }
+    $('chartEmpty').hidden=current.length>0;
+    drawChart($('itChart'),allSeries,{xmin:Number(state.settings?.settings?.cv_low_v??-.6),xmax:Number(state.settings?.settings?.cv_high_v??.6),xlabel:'电位 vs RE (V)',ylabel:'电流 (µA)'});
+  }else{
+    const rawPoints=[],validPoints=[],invalidPoints=[];
+    (d.time_s||[]).forEach((time,i)=>{const point=[time,current[i]];rawPoints.push(point);(d.valid?.[i]===false?invalidPoints:validPoints).push(point)});
+    const duration=Number(state.measurement?.settings?.duration_s||state.settings?.settings?.duration_s||180),latest=rawPoints.at(-1)?.[0]||0;
+    const xmin=state.chartWindowS===null?0:Math.max(0,latest-state.chartWindowS),xmax=state.chartWindowS===null?duration:Math.max(state.chartWindowS,latest),visible=points=>points.filter(point=>point[0]>=xmin&&point[0]<=xmax);
+    allSeries.push({points:visible(rawPoints),color:'#9aa7aa',width:.7},{points:visible(validPoints),color:'#167b74',width:0,dots:true,pointRadius:1.5},{points:visible(invalidPoints),color:'#c33c54',width:0,dots:true,pointRadius:1.7});
+    $('chartEmpty').hidden=rawPoints.length>0;
+    drawChart($('itChart'),allSeries,{xmin,xmax,xlabel:'时间 (s)',ylabel:'电流 (nA)'});
+  }
   const c=state.calibration, series=[];
   if(c.curve)series.push({points:c.curve.concentration_um.map((x,i)=>[x,c.curve.current_nA[i]]),color:'#c77a18',width:2});
   const selected=(c.points||[]).filter(p=>p.selected);
@@ -140,13 +150,20 @@ function updateMeasurement(data){
   state.measurement=data; const running=data.state==='running', complete=data.state==='completed';
   $('measureMessage').textContent=data.message||''; $('liveBadge').textContent=running?'采集中':complete?'已完成':data.state==='error'?'错误':'待机'; $('liveBadge').className=`live-badge ${running?'running':data.state==='error'?'error':''}`;
   $('stopMeasure').disabled=!running; $('useForCalibration').disabled=!complete||data.summary?.steady_current_nA==null; $('predictConcentration').disabled=!complete||data.summary?.steady_current_nA==null;
-  const s=data.summary||{}; $('steadyCurrent').textContent=fmt(s.steady_current_nA); $('steadySd').textContent=fmt(s.steady_sd_nA);
+  const s=data.summary||{}, cv=(data.settings?.method||state.method)==='cv';
+  if(cv){
+    $('steadyCurrent').textContent=data.latest_sample?fmt(data.latest_sample.potential_v,3):'--';
+    $('steadySd').textContent=data.latest_sample?String(data.latest_sample.cycle||'--'):'--';
+  }else{
+    $('steadyCurrent').textContent=fmt(s.steady_current_nA);$('steadySd').textContent=fmt(s.steady_sd_nA);
+  }
   const live=data.latest_sample;
-  $('liveCurrent').textContent=live?fmt(live.current_nA,3):'--';
-  $('liveCurrentTime').textContent=live?`t = ${fmt(live.time_s,2)} s · 点 ${Number(live.index)+1}`:'尚无数据';
+  $('liveCurrent').textContent=live?fmt(cv?live.current_nA/1000:live.current_nA,3):'--';
+  $('liveCurrentUnit').textContent=cv?'µA':'nA';
+  $('liveCurrentTime').textContent=live?(cv?`${fmt(live.potential_v,3)} V · 第 ${live.cycle} 圈 · 点 ${Number(live.index)+1}`:`t = ${fmt(live.time_s,2)} s · 点 ${Number(live.index)+1}`):'尚无数据';
   $('liveCurrentBox').classList.toggle('invalid',Boolean(live&&!live.valid));
-  const latest=data.data?.time_s?.at(-1)||0, duration=Number(data.settings?.duration_s||180), nativeCount=data.data?.time_s?.length||0;
-  const nativeRate=1000/[124,242,476,945,1882,3757][Number(data.settings?.sens_period_code||0)], expectedNative=Math.round(duration*nativeRate);
+  const latest=data.data?.time_s?.at(-1)||0, duration=Number(data.settings?.duration_s||180), nativeCount=data.data?.time_s?.length||0,wideIt=!cv&&Number(data.settings?.fsr_nA)>2000;
+  const nativeRate=cv?Number(data.settings?.cv_scan_rate_v_s)/Number(data.settings?.cv_step_v):wideIt?Number(data.settings?.target_rate_hz):1000/[124,242,476,945,1882,3757][Number(data.settings?.sens_period_code||0)], expectedNative=Math.round(duration*nativeRate);
   $('validCount').textContent=nativeCount||'--'; $('validCount').nextElementSibling.textContent=`/ ≈ ${expectedNative}`;
   $('progressValue').textContent=complete?100:Math.min(100,Math.round(latest/duration*100));
   const hardwareState=data.state==='error'?'error':running?'busy':data.state==='completed'?'ok':'';
@@ -159,7 +176,9 @@ async function measurementRefreshLoop(){
   await refreshMeasurement();
   const running = state.measurement?.state === 'running';
   const duration = Number(state.measurement?.settings?.duration_s || 180);
-  setTimeout(measurementRefreshLoop, running ? (duration <= 300 ? 100 : 500) : 1000);
+  /* Long CV runs still render every native point; batching UI refreshes keeps
+   * the 72,000-point status payload responsive without decimation. */
+  setTimeout(measurementRefreshLoop, running ? (duration <= 300 ? 100 : 2000) : 1000);
 }
 $('chartWindow').addEventListener('click', event => {
   const button = event.target.closest('button[data-window]');
@@ -175,22 +194,35 @@ $('sampleName').addEventListener('input',previewFilename);$('knownConcentration'
 $('applySaveDirectory').onclick=async()=>{try{renderWorkflow(await post('/api/workflow/config',{save_dir:$('saveDirectory').value}));state.calibration=await api('/api/calibration');renderCalibration();toast('保存目录已应用')}catch(e){errorBox('measureError',e)}};
 $('resetCalibration').onclick=async()=>{if(!confirm('开始一套新标定？现有标定文件会保留为带时间戳的归档。'))return;try{renderWorkflow(await post('/api/workflow/reset-calibration'));state.calibration=await api('/api/calibration');renderCalibration();setSampleRole('calibration',true);toast('已开始新的标定')}catch(e){errorBox('measureError',e)}};
 
-function readSettings(){const potential=Number($('potentialV').value);return {initial_potential_v:potential,potential_v:potential,prestep_s:0,duration_s:Number($('durationS').value),sens_period_code:Number($('sensPeriodCode').value),target_rate_hz:Number($('sampleRateHz').value),fit_window_s:Number($('fitWindowS').value),fsr_nA:Number($('fsrNA').value),offset_mode:$('offsetNA').value}}
+function readSettings(){const potential=Number($('potentialV').value),low=Number($('cvLowV').value),high=Number($('cvHighV').value),rate=Number($('cvScanRate').value),cycles=Number($('cvCycles').value),cv=state.method==='cv',duration=cv?2*(high-low)/rate*cycles:Number($('durationS').value);return {method:state.method,initial_potential_v:cv?low:potential,potential_v:cv?low:potential,prestep_s:cv?Number($('cvQuietS').value):0,duration_s:duration,sens_period_code:Number($('sensPeriodCode').value),target_rate_hz:Number($('sampleRateHz').value),fit_window_s:Number($('fitWindowS').value),fsr_nA:Number($('fsrNA').value),offset_mode:$('offsetNA').value,cv_low_v:low,cv_high_v:high,cv_scan_rate_v_s:rate,cv_cycles:cycles,cv_step_v:.001,cv_quiet_s:Number($('cvQuietS').value),cv_eis_fsr_uA:Number($('cvEisFsrUA').value)}}
 function renderOffsetLabels(fsr){$('offsetNA').querySelectorAll('option[data-pct]').forEach(option=>{const pct=Number(option.dataset.pct);option.textContent=`${pct}% FSR (${fsr*pct/100} nA)`})}
 function signedPotential(value){const number=Number(value);return `${number>0?'+':''}${number.toFixed(2)}`}
 function renderSettings(data){
-  state.settings=data; const s=data.settings, periods=[124,242,476,945,1882,3757], nativeRate=1000/periods[s.sens_period_code??0];
-  $('potentialV').value=s.potential_v; $('durationS').value=s.duration_s; $('sensPeriodCode').value=String(s.sens_period_code??0); $('sampleRateHz').value=s.target_rate_hz; $('fitWindowS').value=s.fit_window_s; $('fsrNA').value=String(s.fsr_nA);renderOffsetLabels(s.fsr_nA);$('offsetNA').value=s.offset_mode||`${s.offset_nA??19}nA`;
-  $('outputPoints').textContent=`${Math.round(s.duration_s*s.target_rate_hz)} 点 · 原生 ${fmt(nativeRate,2)} Hz`;
-  pages.measure[1]=`${s.duration_s} 秒 IT 检测与末 ${s.fit_window_s} 秒稳态分析`; if($('view-measure').classList.contains('active'))$('pageSubtitle').textContent=pages.measure[1]; $('validCount').nextElementSibling.textContent=`/ ${Math.round(s.duration_s*s.target_rate_hz)}`;
+  state.settings=data; const s=data.settings, periods=[124,242,476,945,1882,3757];
+  state.method=s.method||'it';const cv=state.method==='cv',wideIt=!cv&&s.fsr_nA>2000;
+  const nativeRate=cv?s.cv_scan_rate_v_s/s.cv_step_v:wideIt?s.target_rate_hz:1000/periods[s.sens_period_code??0];
+  if(!cv){$('potentialV').value=s.potential_v;$('durationS').value=s.duration_s} $('sensPeriodCode').value=String(s.sens_period_code??0); $('sampleRateHz').value=s.target_rate_hz; $('fitWindowS').value=s.fit_window_s; $('fsrNA').value=String(s.fsr_nA);renderOffsetLabels(s.fsr_nA);$('offsetNA').value=s.offset_mode||`${s.offset_nA??19}nA`;
+  $('cvLowV').value=s.cv_low_v;$('cvHighV').value=s.cv_high_v;$('cvScanRate').value=s.cv_scan_rate_v_s;$('cvCycles').value=s.cv_cycles;$('cvQuietS').value=s.cv_quiet_s;$('cvEisFsrUA').value=String(s.cv_eis_fsr_uA??20);
+  $('methodMode').querySelectorAll('button').forEach(button=>button.classList.toggle('active',button.dataset.method===state.method));$('itSettings').hidden=cv;$('cvSettings').hidden=!cv;$('sampleRoleBlock').hidden=cv;$('concentrationField').hidden=cv;$('dcSamplingField').hidden=cv||wideIt;$('dcRangeField').hidden=cv;$('dcOffsetField').hidden=cv||wideIt;
+  $('chartTitle').textContent=cv?'CV 循环伏安曲线':'I-T 计时电流曲线';$('settingsTitle').textContent=cv?'CV 条件':'I-T 条件';
+  $('itChart').setAttribute('aria-label',cv?'CV 电位电流曲线':'I-T 电流时间曲线');
+  $('metricPrimaryLabel').textContent=cv?'实时电位':'稳态电流';$('metricPrimaryUnit').textContent=cv?'V':'nA';$('metricSecondaryLabel').textContent=cv?'当前循环':'标准差';$('metricSecondaryUnit').textContent=cv?'圈':'nA';
+  const points=cv?Math.round(s.duration_s*nativeRate):Math.round(s.duration_s*s.target_rate_hz);
+  $('outputPoints').textContent=cv?`${s.cv_cycles} 圈 · ${s.cv_cycles*2} 段 · 约 ${points} 个原生电流点`:`${points} 点 · 原生 ${fmt(nativeRate,2)} Hz`;
+  $('outputPoints').nextElementSibling.textContent=cv?'波形按 1 mV 步进；每个 EIS ADC 原生电流点实时显示并保存':wideIt?'宽量程 I-T 使用 EIS ADC；单次电位扰动小于 0.4 mV':`MAX30131 原生约 ${fmt(nativeRate,2)} Hz；更高输出频率由时间戳重采样生成`;
+  pages.measure[1]=cv?`${signedPotential(s.cv_low_v)} 至 ${signedPotential(s.cv_high_v)} V · ${s.cv_scan_rate_v_s} V/s · ${s.cv_cycles} 圈`: `${s.duration_s} 秒 I-T 检测与末 ${s.fit_window_s} 秒稳态分析`; if($('view-measure').classList.contains('active'))$('pageSubtitle').textContent=pages.measure[1]; $('validCount').nextElementSibling.textContent=`/ ≈ ${Math.round(s.duration_s*nativeRate)}`;
   $('settingsMessage').textContent=data.message; $('settingsBadge').textContent=data.state==='applying'?'应用中':data.applied?'已应用':'未应用'; $('settingsBadge').className=`live-badge ${data.applied?'running':data.state==='error'?'error':''}`;
-  $('firmwareNote').textContent=`${signedPotential(s.potential_v)} V 恒电位 · ${s.fsr_nA} nA FSR`; $('scheduleMethodLabel').textContent=`恒电位 IT · ${s.duration_s} 秒 · ${signedPotential(s.potential_v)} V`;
-  const minInterval=(s.duration_s+10)/60; $('intervalMinutes').min=minInterval.toFixed(2); if(Number($('intervalMinutes').value)<minInterval)$('intervalMinutes').value=Math.ceil(minInterval*4)/4;
+  $('firmwareNote').textContent=cv?`CV ${signedPotential(s.cv_low_v)}–${signedPotential(s.cv_high_v)} V · EIS ADC ${s.cv_eis_fsr_uA} µA`:wideIt?`${signedPotential(s.potential_v)} V 恒电位 · EIS ADC ${s.fsr_nA/1000} µA`:`${signedPotential(s.potential_v)} V 恒电位 · ${s.fsr_nA} nA FSR`; $('scheduleMethodLabel').textContent=cv?`CV · ${s.cv_cycles} 圈 · ${Math.round(s.duration_s/60)} 分钟`:`恒电位 I-T · ${s.duration_s} 秒 · ${signedPotential(s.potential_v)} V`;
+  $('chartWindow').querySelectorAll('button').forEach((button,index)=>{if(cv){const labels=['全程','5 圈','1 圈'];const values=['all','5','1'];button.textContent=labels[index];button.dataset.window=values[index]}else{const labels=['全程','20 s','5 s'];const values=['all','20','5'];button.textContent=labels[index];button.dataset.window=values[index]}});
+  state.chartWindowS=cv?1:5;$('chartWindow').querySelectorAll('button').forEach((button,index)=>button.classList.toggle('active',index===2));
+  const minInterval=(s.prestep_s+s.duration_s+10)/60; $('intervalMinutes').min=minInterval.toFixed(2); if(Number($('intervalMinutes').value)<minInterval)$('intervalMinutes').value=Math.ceil(minInterval*4)/4;
+  renderWorkflow(state.workflow||{save_dir:'',stage:'collect',calibration_ready:false,points_count:0,selected_points_count:0,settings_match:true});renderScheduleMode();drawAll();
   updateStartState(); $('startSchedule').disabled=state.schedule?.active||!data.applied;
 }
 function settingsChanged(){if(!state.settings)return;state.settings.applied=false;state.settings.state='not_applied';state.settings.message='参数已修改，请重新应用';const s=readSettings();state.settings.settings=s;renderSettings(state.settings)}
-['potentialV','durationS','sensPeriodCode','sampleRateHz','fitWindowS','fsrNA','offsetNA'].forEach(id=>$(id).addEventListener('change',settingsChanged));
-$('applySettings').onclick=async()=>{try{$('applySettings').disabled=true;$('applySettings').textContent='正在编译并烧录…';renderSettings({...state.settings,settings:readSettings(),state:'applying',message:'正在编译并写入硬件参数',applied:false});const data=await post('/api/settings/apply',readSettings());renderSettings(data);renderWorkflow(await api('/api/workflow'));toast('IT 条件已应用到硬件')}catch(e){errorBox('measureError',e);try{renderSettings(await api('/api/settings'))}catch{}}finally{$('applySettings').disabled=false;$('applySettings').textContent='应用条件并烧录硬件'}};
+['potentialV','durationS','sensPeriodCode','sampleRateHz','fitWindowS','fsrNA','offsetNA','cvLowV','cvHighV','cvScanRate','cvCycles','cvQuietS','cvEisFsrUA'].forEach(id=>$(id).addEventListener('change',settingsChanged));
+$('methodMode').addEventListener('click',event=>{const button=event.target.closest('button[data-method]');if(!button||button.dataset.method===state.method)return;state.method=button.dataset.method;settingsChanged()});
+$('applySettings').onclick=async()=>{try{$('applySettings').disabled=true;$('applySettings').textContent='正在编译并烧录…';renderSettings({...state.settings,settings:readSettings(),state:'applying',message:'正在编译并写入硬件参数',applied:false});const data=await post('/api/settings/apply',readSettings());renderSettings(data);renderWorkflow(await api('/api/workflow'));toast(`${state.method.toUpperCase()} 条件已应用到硬件`)}catch(e){errorBox('measureError',e);try{renderSettings(await api('/api/settings'))}catch{}}finally{$('applySettings').disabled=false;$('applySettings').textContent='应用条件并烧录硬件'}};
 
 function makeCell(tr,content){const td=document.createElement('td');if(content instanceof Node)td.appendChild(content);else td.textContent=content;tr.appendChild(td);return td}
 function pointInput(key,value,type='text'){const input=document.createElement('input');input.dataset.k=key;input.type=type;input.value=value??'';if(type==='number')input.step='0.001';return input}
@@ -224,8 +256,8 @@ function renderDrift(data){state.drift=data;const records=data.records||[],oldSt
 $('calculateDrift').onclick=async()=>{try{const data=await post('/api/drift/calculate',{solution_name:$('driftSolution').value,known_concentration_um:$('driftConcentration').value===''?null:$('driftConcentration').value,start_run_id:$('driftStart').value,end_run_id:$('driftEnd').value,enabled:$('applyDrift').checked});renderDrift(data);state.calibration=await api('/api/calibration');renderCalibration();toast('漂移 bias 已计算')}catch(e){toast(e.message)}};
 $('applyDrift').addEventListener('change',async()=>{try{renderDrift(await post('/api/drift/toggle',{enabled:$('applyDrift').checked}));state.calibration=await api('/api/calibration');renderCalibration();toast($('applyDrift').checked?'漂移校正已启用':'漂移校正已停用')}catch(e){$('applyDrift').checked=!$('applyDrift').checked;toast(e.message)}});
 
-function renderScheduleMode(){const role=$('scheduleRole').value,note={stabilization:'连续运行稳定化 IT；全部数据自动保存，当前测试曲线保持锁定。',test:'每轮 IT 完成后使用已锁定曲线自动预测，不更新标定。',calibration:'每轮结果只加入候选标定点；完成后仍需手动选择范围并生成曲线。'};$('scheduleModeNote').textContent=note[role];if(role==='stabilization'&&$('schedulePrefix').value==='自动样品')$('schedulePrefix').value='稳定化IT'}
-function updateSchedule(data){state.schedule=data;$('scheduleBadge').textContent=data.active?'运行中':'未运行';$('scheduleBadge').className=`live-badge ${data.active?'running':''}`;$('scheduleMessage').textContent=data.message;$('completedRuns').textContent=data.completed_runs;$('startSchedule').disabled=data.active||!state.settings?.applied;$('stopSchedule').disabled=!data.active;const next=data.next_run_at?new Date(data.next_run_at*1000):null,stop=data.stop_at?new Date(data.stop_at*1000):null;$('nextRun').textContent=next?`下次 ${next.toLocaleTimeString('zh-CN',{hour12:false})}${stop?` · 结束 ${stop.toLocaleTimeString('zh-CN',{hour12:false})}`:''}`:'--';const list=$('historyList');list.innerHTML=data.history?.length?'':'<div class="empty-history">暂无自动测量记录</div>';(data.history||[]).forEach(h=>{const el=document.createElement('div');el.className='history-item';const c=h.summary?.steady_current_nA,role={calibration:'候选标定',stabilization:'稳定化',test:'测试'}[h.metadata?.sample_role]||'';el.innerHTML=`<strong>${h.metadata?.sample_name||h.run_id}</strong><span class="history-current">${fmt(c)} nA</span><small>${h.finished_at?new Date(h.finished_at*1000).toLocaleString('zh-CN'):''}</small><span>${role} · ${h.state==='completed'?'完成':'异常'}</span>`;list.appendChild(el)})}
+function renderScheduleMode(){const cv=state.method==='cv',role=$('scheduleRole').value,note={stabilization:'连续运行稳定化 I-T；全部数据自动保存，当前测试曲线保持锁定。',test:'每轮 I-T 完成后使用已锁定曲线自动预测，不更新标定。',calibration:'每轮结果只加入候选标定点；完成后仍需手动选择范围并生成曲线。'};$('scheduleRole').disabled=cv;$('scheduleModeNote').textContent=cv?'按当前 CV 条件完整扫描并逐轮保存；计划间隔必须长于单次扫描时长。':note[role];if(!cv&&role==='stabilization'&&$('schedulePrefix').value==='自动样品')$('schedulePrefix').value='稳定化IT'}
+function updateSchedule(data){state.schedule=data;$('scheduleBadge').textContent=data.active?'运行中':'未运行';$('scheduleBadge').className=`live-badge ${data.active?'running':''}`;$('scheduleMessage').textContent=data.message;$('completedRuns').textContent=data.completed_runs;$('startSchedule').disabled=data.active||!state.settings?.applied;$('stopSchedule').disabled=!data.active;const next=data.next_run_at?new Date(data.next_run_at*1000):null,stop=data.stop_at?new Date(data.stop_at*1000):null;$('nextRun').textContent=next?`下次 ${next.toLocaleTimeString('zh-CN',{hour12:false})}${stop?` · 结束 ${stop.toLocaleTimeString('zh-CN',{hour12:false})}`:''}`:'--';const list=$('historyList');list.innerHTML=data.history?.length?'':'<div class="empty-history">暂无自动测量记录</div>';(data.history||[]).forEach(h=>{const el=document.createElement('div');el.className='history-item';const c=h.summary?.steady_current_nA,role={calibration:'候选标定',stabilization:'稳定化',test:'测试',cv:'CV'}[h.metadata?.sample_role]||'';el.innerHTML=`<strong>${h.metadata?.sample_name||h.run_id}</strong><span class="history-current">${c==null?(h.summary?.cycles_observed?`${h.summary.cycles_observed} 圈`:'--'):fmt(c)+' nA'}</span><small>${h.finished_at?new Date(h.finished_at*1000).toLocaleString('zh-CN'):''}</small><span>${role} · ${h.state==='completed'?'完成':'异常'}</span>`;list.appendChild(el)})}
 $('scheduleRole').addEventListener('change',renderScheduleMode);
 $('startSchedule').onclick=async()=>{try{$('scheduleError').hidden=true;updateSchedule(await post('/api/schedule/start',{interval_minutes:$('intervalMinutes').value,max_runs:$('maxRuns').value,total_minutes:$('totalMinutes').value,sample_prefix:$('schedulePrefix').value,known_concentration_um:$('scheduleConcentration').value===''?null:$('scheduleConcentration').value,sample_role:$('scheduleRole').value,start_now:$('startNow').checked}))}catch(e){errorBox('scheduleError',e)}};
 $('stopSchedule').onclick=async()=>{try{updateSchedule(await post('/api/schedule/stop'))}catch(e){errorBox('scheduleError',e)}};

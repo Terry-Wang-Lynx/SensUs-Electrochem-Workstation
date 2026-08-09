@@ -70,6 +70,20 @@ bool max30131_fsr_uses_fast_clock(max30131_fsr_t fsr);
  * 50nA 档 → 763 fA。⚠️ LSB 是量化步长,不是检测能力。 */
 int32_t max30131_lsb_fa(max30131_fsr_t fsr);
 
+/* EIS ADC range used by CV/SWV (0x7D). */
+typedef enum {
+	MAX30131_EIS_FSR_4UA = 0,
+	MAX30131_EIS_FSR_8UA = 1,
+	MAX30131_EIS_FSR_20UA = 2,
+	MAX30131_EIS_FSR_40UA = 3,
+} max30131_eis_fsr_t;
+
+int32_t max30131_eis_fsr_ua(max30131_eis_fsr_t fsr);
+
+/* Datasheet CV/SWV equation, returned as signed current in fA. */
+int64_t max30131_cv_counts_to_iwe_fa(uint16_t counts, max30131_eis_fsr_t fsr,
+				      uint8_t eis_offset);
+
 /* ================================================================== */
 /* offset 电流档(Sn_OFFSET_SEL[2:0],0x23 bit[2:0])                   */
 /* ================================================================== */

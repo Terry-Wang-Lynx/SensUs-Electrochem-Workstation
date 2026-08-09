@@ -42,6 +42,13 @@ from .it import (
     summarize_run,
 )
 from .collect import find_rtt_address
+from .cv import (
+    export_cv_csv,
+    load_cv_run,
+    plot_cv,
+    save_cv_summary,
+    summarize_cv,
+)
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -80,6 +87,18 @@ FSR_OPTIONS = {
     1000: "MAX30131_FSR_1000NA",
     2000: "MAX30131_FSR_2000NA",
 }
+CV_EIS_FSR_OPTIONS = {
+    4: "MAX30131_EIS_FSR_4UA",
+    8: "MAX30131_EIS_FSR_8UA",
+    20: "MAX30131_EIS_FSR_20UA",
+    40: "MAX30131_EIS_FSR_40UA",
+}
+IT_WIDE_FSR_OPTIONS = {
+    4000: "MAX30131_EIS_FSR_4UA",
+    8000: "MAX30131_EIS_FSR_8UA",
+    20000: "MAX30131_EIS_FSR_20UA",
+    40000: "MAX30131_EIS_FSR_40UA",
+}
 OFFSET_OPTIONS = {
     "9nA": ("MAX30131_OFFSET_SEL4_9NA", 9),
     "19nA": ("MAX30131_OFFSET_SEL5_19NA", 19),
@@ -90,6 +109,31 @@ OFFSET_OPTIONS = {
     "50pct": ("MAX30131_OFFSET_50PCT_FSR", 0.50),
 }
 SENS_PERIOD_MS = {0: 124, 1: 242, 2: 476, 3: 945, 4: 1882, 5: 3757}
+
+
+def _port_accepts_connections(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _release_stale_measurement_bridge() -> None:
+    """Gracefully release an orphaned workstation OpenOCD RTT bridge."""
+    if not _port_accepts_connections(19021):
+        return
+    try:
+        with socket.create_connection(("127.0.0.1", 4444), timeout=1) as connection:
+            connection.sendall(b"shutdown\n")
+    except OSError as exc:
+        raise RuntimeError("检测到残留硬件连接，但无法释放 J-Link") from exc
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        if not _port_accepts_connections(19021):
+            return
+        time.sleep(0.1)
+    raise RuntimeError("残留 J-Link 连接未能在 4 秒内退出")
 
 
 def _json_safe(value: Any) -> Any:
@@ -112,9 +156,10 @@ def _now_id(prefix: str) -> str:
 
 
 class SettingsController:
-    """Validate IT parameters and build/flash matching firmware when needed."""
+    """Validate method parameters and build/flash matching firmware."""
 
     DEFAULTS = {
+        "method": "it",
         "initial_potential_v": 0.2,
         "potential_v": 0.2,
         "prestep_s": 0.0,
@@ -122,9 +167,16 @@ class SettingsController:
         "target_rate_hz": 10.0,
         "sens_period_code": 0,
         "fit_window_s": 20.0,
-        "fsr_nA": 500,
-        "offset_nA": 19,
-        "offset_mode": "19nA",
+        "fsr_nA": 40000,
+        "offset_nA": 20000,
+        "offset_mode": "50pct",
+        "cv_low_v": -0.6,
+        "cv_high_v": 0.6,
+        "cv_scan_rate_v_s": 0.05,
+        "cv_cycles": 30,
+        "cv_step_v": 0.001,
+        "cv_quiet_s": 2.0,
+        "cv_eis_fsr_uA": 40,
     }
 
     def __init__(self) -> None:
@@ -170,7 +222,12 @@ class SettingsController:
         traceability but do not invalidate a curve whose sampled potential,
         duration, rate, fit window and current range are unchanged.
         """
-        ignored = {"initial_potential_v", "prestep_s"}
+        if first.get("method", "it") != second.get("method", "it"):
+            return False
+        ignored = {
+            "initial_potential_v", "prestep_s", "cv_low_v", "cv_high_v",
+            "cv_scan_rate_v_s", "cv_cycles", "cv_step_v", "cv_quiet_s",
+        }
         return (
             {key: value for key, value in first.items() if key not in ignored}
             == {key: value for key, value in second.items() if key not in ignored}
@@ -179,6 +236,7 @@ class SettingsController:
     @classmethod
     def validate(cls, payload: dict[str, Any]) -> dict[str, Any]:
         merged = {**cls.DEFAULTS, **payload}
+        method = str(merged["method"]).lower()
         initial_potential_v = float(merged["initial_potential_v"])
         potential_v = float(merged["potential_v"])
         prestep_s = float(merged["prestep_s"])
@@ -186,28 +244,58 @@ class SettingsController:
         target_rate_hz = float(merged["target_rate_hz"])
         sens_period_code = int(merged["sens_period_code"])
         fit_window_s = float(merged["fit_window_s"])
+        cv_low_v = float(merged["cv_low_v"])
+        cv_high_v = float(merged["cv_high_v"])
+        cv_scan_rate_v_s = float(merged["cv_scan_rate_v_s"])
+        cv_cycles = int(merged["cv_cycles"])
+        cv_step_v = float(merged["cv_step_v"])
+        cv_quiet_s = float(merged["cv_quiet_s"])
+        cv_eis_fsr_uA = int(merged["cv_eis_fsr_uA"])
         fsr_nA = int(merged["fsr_nA"])
         raw_offset_mode = payload.get("offset_mode")
         if raw_offset_mode in (None, ""):
-            raw_offset_mode = f"{int(payload.get('offset_nA', cls.DEFAULTS['offset_nA']))}nA"
+            raw_offset_mode = (
+                f"{int(payload['offset_nA'])}nA"
+                if "offset_nA" in payload else cls.DEFAULTS["offset_mode"]
+            )
         offset_mode = str(raw_offset_mode)
-        if not -0.4 <= initial_potential_v <= 0.39:
-            raise ValueError("IT 起始电位必须在 -0.4 至 +0.39 V 之间")
-        if not -0.4 <= potential_v <= 0.39:
-            raise ValueError("IT 测试电位必须在 -0.4 至 +0.39 V 之间")
-        if not 0 <= prestep_s <= 300:
-            raise ValueError("阶跃前保持时间必须在 0 至 300 秒之间")
-        if not 10 <= duration_s <= 3600:
-            raise ValueError("IT 时长必须在 10 至 3600 秒之间")
+        if method not in {"it", "cv"}:
+            raise ValueError("检测方法必须是 I-T 或 CV")
+        if method == "it":
+            if not -0.4 <= initial_potential_v <= 0.4:
+                raise ValueError("I-T 起始电位必须在 -0.4 至 +0.4 V 之间")
+            if not -0.4 <= potential_v <= 0.4:
+                raise ValueError("I-T 测试电位必须在 -0.4 至 +0.4 V 之间")
+            if not 0 <= prestep_s <= 300:
+                raise ValueError("阶跃前保持时间必须在 0 至 300 秒之间")
+            if not 10 <= duration_s <= 3600:
+                raise ValueError("I-T 时长必须在 10 至 3600 秒之间")
+        else:
+            if not -0.6 <= cv_low_v < cv_high_v <= 0.6:
+                raise ValueError("CV 电位范围必须在 -0.6 至 +0.6 V 内，且下限小于上限")
+            if not 0.01 <= cv_scan_rate_v_s <= 0.1:
+                raise ValueError("CV 扫描速度必须在 0.01 至 0.10 V/s 之间")
+            if not 1 <= cv_cycles <= 100:
+                raise ValueError("CV 循环圈数必须在 1 至 100 之间")
+            if abs(cv_step_v - 0.001) > 1e-9:
+                raise ValueError("当前硬件 CV 电位步长固定为 1 mV")
+            if not 0 <= cv_quiet_s <= 300:
+                raise ValueError("CV 静置时间必须在 0 至 300 秒之间")
+            if cv_eis_fsr_uA not in CV_EIS_FSR_OPTIONS:
+                raise ValueError("CV EIS ADC 量程必须为 4、8、20 或 40 µA")
+            duration_s = 2 * (cv_high_v - cv_low_v) / cv_scan_rate_v_s * cv_cycles
+            initial_potential_v = cv_low_v
+            potential_v = cv_low_v
+            prestep_s = cv_quiet_s
         if not 0.5 <= target_rate_hz <= 10:
             raise ValueError("输出采样频率必须在 0.5 至 10 Hz 之间")
         if sens_period_code not in SENS_PERIOD_MS:
             raise ValueError("不支持该硬件采样周期")
-        if not 1 <= fit_window_s <= duration_s:
+        if method == "it" and not 1 <= fit_window_s <= duration_s:
             raise ValueError("拟合窗口必须在 1 秒与测量时长之间")
-        if fit_window_s * target_rate_hz < 3:
+        if method == "it" and fit_window_s * target_rate_hz < 3:
             raise ValueError("拟合窗口内至少需要 3 个输出采样点")
-        if fsr_nA not in FSR_OPTIONS:
+        if fsr_nA not in FSR_OPTIONS and fsr_nA not in IT_WIDE_FSR_OPTIONS:
             raise ValueError("不支持该电流量程")
         if offset_mode not in OFFSET_OPTIONS:
             raise ValueError("不支持该偏置电流档位")
@@ -219,6 +307,7 @@ class SettingsController:
         if offset_nA >= fsr_nA:
             raise ValueError("偏置电流必须小于电流满量程")
         return {
+            "method": method,
             "initial_potential_v": round(initial_potential_v, 4),
             "potential_v": round(potential_v, 4),
             "prestep_s": round(prestep_s, 3),
@@ -229,7 +318,25 @@ class SettingsController:
             "fsr_nA": fsr_nA,
             "offset_nA": offset_nA,
             "offset_mode": offset_mode,
+            "cv_low_v": round(cv_low_v, 4),
+            "cv_high_v": round(cv_high_v, 4),
+            "cv_scan_rate_v_s": round(cv_scan_rate_v_s, 4),
+            "cv_cycles": cv_cycles,
+            "cv_step_v": round(cv_step_v, 4),
+            "cv_quiet_s": round(cv_quiet_s, 3),
+            "cv_eis_fsr_uA": cv_eis_fsr_uA,
         }
+
+    @staticmethod
+    def working_electrode_mv(settings: dict[str, Any]) -> int:
+        """Keep legacy I-T common mode unless a positive rail margin is needed."""
+        if settings["method"] == "cv":
+            return 800
+        highest_potential_mv = max(
+            int(round(settings["initial_potential_v"] * 1000)),
+            int(round(settings["potential_v"] * 1000)),
+        )
+        return 800 if highest_potential_mv > 390 else 400
 
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         settings = self.validate(payload)
@@ -241,23 +348,42 @@ class SettingsController:
         initial_potential_mv = int(round(settings["initial_potential_v"] * 1000))
         prestep_ms = int(round(settings["prestep_s"] * 1000))
         duration_ms = int(round(settings["duration_s"] * 1000))
+        cv_step_interval_ms = int(round(
+            settings["cv_step_v"] / settings["cv_scan_rate_v_s"] * 1000
+        ))
+        it_sample_interval_ms = int(round(1000 / settings["target_rate_hz"]))
         sens_code = settings["sens_period_code"]
         sens_ms = SENS_PERIOD_MS[sens_code]
+        working_electrode_mv = self.working_electrode_mv(settings)
         header = (
             "#ifndef SENSUS_MEASUREMENT_CONFIG_H\n"
             "#define SENSUS_MEASUREMENT_CONFIG_H\n\n"
             "/* Generated by the local electrochemistry workstation. */\n"
-            f"#define GUI_WP_FSR {FSR_OPTIONS[settings['fsr_nA']]}\n"
+            f"#define GUI_MEASUREMENT_MODE_CV {1 if settings['method'] == 'cv' else 0}\n"
+            f"#define GUI_WP_V_WE_MV {working_electrode_mv}\n"
+            f"#define GUI_WP_FSR {FSR_OPTIONS.get(settings['fsr_nA'], 'MAX30131_FSR_2000NA')}\n"
             f"#define GUI_WP_OFFSET_SEL {OFFSET_OPTIONS[settings['offset_mode']][0]}\n"
+            f"#define GUI_IT_USE_EIS {1 if settings['fsr_nA'] in IT_WIDE_FSR_OPTIONS else 0}\n"
+            f"#define GUI_IT_EIS_FSR {IT_WIDE_FSR_OPTIONS.get(settings['fsr_nA'], 'MAX30131_EIS_FSR_40UA')}\n"
+            f"#define GUI_IT_SAMPLE_INTERVAL_MS {it_sample_interval_ms}U\n"
             f"#define GUI_WP_START_E_MV {initial_potential_mv}\n"
             f"#define GUI_WP_E_MV {potential_mv}\n"
             f"#define GUI_PRESTEP_DURATION_MS {prestep_ms}U\n"
             f"#define GUI_MEASUREMENT_DURATION_MS {duration_ms}U\n\n"
+            f"#define GUI_CV_LOW_E_MV {int(round(settings['cv_low_v'] * 1000))}\n"
+            f"#define GUI_CV_HIGH_E_MV {int(round(settings['cv_high_v'] * 1000))}\n"
+            f"#define GUI_CV_SCAN_RATE_MV_S {int(round(settings['cv_scan_rate_v_s'] * 1000))}U\n"
+            f"#define GUI_CV_CYCLES {settings['cv_cycles']}U\n"
+            f"#define GUI_CV_STEP_MV {int(round(settings['cv_step_v'] * 1000))}U\n"
+            f"#define GUI_CV_STEP_INTERVAL_MS {cv_step_interval_ms}U\n"
+            f"#define GUI_CV_QUIET_DURATION_MS {int(round(settings['cv_quiet_s'] * 1000))}U\n\n"
+            f"#define GUI_CV_EIS_FSR {CV_EIS_FSR_OPTIONS[settings['cv_eis_fsr_uA']]}\n\n"
             f"#define GUI_SENS_PERIOD_CODE 0x{sens_code:X}U\n"
             f"#define GUI_SENS_PERIOD_MS {sens_ms}U\n\n"
             "#endif\n"
         )
         try:
+            _release_stale_measurement_bridge()
             FIRMWARE_CONFIG.write_text(header)
             build = (
                 "source ~/ncs/zephyr/zephyr-env.sh && "
@@ -304,10 +430,24 @@ class SettingsController:
                 "state": self.state,
                 "message": self.message,
                 "error": self.error,
-                "native_rate_hz": 1000 / SENS_PERIOD_MS[self.settings["sens_period_code"]],
-                "output_points": int(round(
-                    self.settings["duration_s"] * self.settings["target_rate_hz"]
-                )),
+                "native_rate_hz": (
+                    self.settings["cv_scan_rate_v_s"] / self.settings["cv_step_v"]
+                    if self.settings["method"] == "cv"
+                    else (
+                        self.settings["target_rate_hz"]
+                        if self.settings["fsr_nA"] in IT_WIDE_FSR_OPTIONS
+                        else 1000 / SENS_PERIOD_MS[self.settings["sens_period_code"]]
+                    )
+                ),
+                "output_points": (
+                    int(round(self.settings["duration_s"]
+                              * self.settings["cv_scan_rate_v_s"]
+                              / self.settings["cv_step_v"]))
+                    if self.settings["method"] == "cv"
+                    else int(round(self.settings["duration_s"]
+                                   * self.settings["target_rate_hz"]))
+                ),
+                "cv_segments": self.settings["cv_cycles"] * 2,
             })
 
 
@@ -339,6 +479,17 @@ class MeasurementController:
         self.bridge_process: subprocess.Popen[str] | None = None
         self.bridge_log_handle: Any = None
         self.user_stop_requested = False
+        self._reset_data_cache()
+
+    def _reset_data_cache(self) -> None:
+        self._data_cache_path: Path | None = None
+        self._data_cache_position = 0
+        self._data_cache_pending = ""
+        self._data_cache_header: list[str] | None = None
+        self._data_cache_first_dev_ms: float | None = None
+        self._data_cache: dict[str, list[Any]] = {
+            "time_s": [], "current_nA": [], "valid": [],
+        }
 
     def start(self, metadata: dict[str, Any] | None = None,
               on_complete: Any = None,
@@ -346,8 +497,10 @@ class MeasurementController:
         with self.lock:
             if self.state == "running":
                 raise RuntimeError("已有测量正在运行")
+            self.settings = SettingsController.validate(settings or self.settings)
+            method = self.settings["method"]
             RUNS_DIR.mkdir(parents=True, exist_ok=True)
-            self.run_id = _now_id("it")
+            self.run_id = _now_id(method)
             self.run_dir = RUNS_DIR / self.run_id
             self.run_dir.mkdir(parents=True, exist_ok=False)
             self.metadata = dict(metadata or {})
@@ -355,19 +508,23 @@ class MeasurementController:
             self.raw_path = Path(live_raw_path) if live_raw_path else self.run_dir / "raw.csv"
             self.raw_path.parent.mkdir(parents=True, exist_ok=True)
             self.raw_log = self.run_dir / "rtt.log"
-            self.resampled_path = self.run_dir / "resampled_10hz.csv"
+            self.resampled_path = self.run_dir / (
+                "cv.csv" if method == "cv" else "resampled_10hz.csv"
+            )
             self.summary_path = self.run_dir / "summary.json"
-            self.plot_path = self.run_dir / "it_curve.png"
+            self.plot_path = self.run_dir / (
+                "cv_curve.png" if method == "cv" else "it_curve.png"
+            )
             self.started_at = time.time()
             self.finished_at = None
             self.summary = None
             self.workflow_result = None
             self.error = ""
             self.user_stop_requested = False
+            self._reset_data_cache()
             self.state = "running"
-            self.message = "已启动硬件测量，等待 RTT 数据"
+            self.message = f"已启动硬件 {method.upper()} 测量，等待 RTT 数据"
             self.on_complete = on_complete
-            self.settings = SettingsController.validate(settings or self.settings)
 
             env = os.environ.copy()
             host_dir = str(PROJECT_DIR / "software" / "host")
@@ -384,12 +541,14 @@ class MeasurementController:
                 "--raw-log",
                 str(self.raw_log),
                 "--trigger",
-                "START",
+                "FRESH_START",
                 "--duration",
                 str(self.settings["prestep_s"] + self.settings["duration_s"] + 5),
                 "--idle-timeout",
                 "25",
             ]
+            if method == "cv":
+                command.append("--cv")
             log_handle = (self.run_dir / "collector.log").open("w", buffering=1)
             try:
                 self._start_bridge()
@@ -523,18 +682,26 @@ class MeasurementController:
                 return
             try:
                 assert self.raw_path and self.resampled_path and self.summary_path
-                resample_run_10hz(
-                    self.raw_path, self.resampled_path,
-                    duration_s=self.settings["duration_s"],
-                    target_rate_hz=self.settings["target_rate_hz"],
-                )
-                summary = summarize_run(
-                    self.resampled_path, window_s=self.settings["fit_window_s"]
-                )
-                save_summary(summary, self.summary_path)
+                if self.settings["method"] == "cv":
+                    export_cv_csv(self.raw_path, self.resampled_path, self.settings)
+                    summary = summarize_cv(self.raw_path, self.settings)
+                    save_cv_summary(summary, self.summary_path)
+                    if self.plot_path is not None:
+                        plot_cv(self.raw_path, self.plot_path)
+                    self.message = "CV 完成，全部原生电流点已保存"
+                else:
+                    resample_run_10hz(
+                        self.raw_path, self.resampled_path,
+                        duration_s=self.settings["duration_s"],
+                        target_rate_hz=self.settings["target_rate_hz"],
+                    )
+                    summary = summarize_run(
+                        self.resampled_path, window_s=self.settings["fit_window_s"]
+                    )
+                    save_summary(summary, self.summary_path)
+                    self.message = "测量完成，已生成 10 Hz 数据和末段汇总"
                 self.summary = _json_safe(asdict(summary))
                 self.state = "completed"
-                self.message = "测量完成，已生成 10 Hz 数据和末 20 s 汇总"
             except Exception as exc:  # keep the raw run even if analysis fails
                 self.state = "error"
                 self.error = f"测量已落盘，但分析失败：{exc}"
@@ -559,27 +726,76 @@ class MeasurementController:
                 self.message = f"测量完成并已自动保存：{saved}"
 
     def _progress_message(self) -> str:
-        count = 0
-        if self.raw_path and self.raw_path.exists():
-            try:
-                t, _, _ = load_run_csv(self.raw_path)
-                count = len(t)
-            except (OSError, ValueError):
-                pass
-        return f"正在采集：已收到约 {count} 个原生点"
+        count = len(self._data()["time_s"])
+        return f"正在采集：已收到 {count} 个原生点"
 
     def _data(self) -> dict[str, Any]:
         if not self.raw_path or not self.raw_path.exists():
             return {"time_s": [], "current_nA": [], "valid": []}
+        if self._data_cache_path != self.raw_path:
+            self._reset_data_cache()
+            self._data_cache_path = self.raw_path
+            if self.settings["method"] == "cv":
+                self._data_cache.update({
+                    "potential_v": [], "cycle": [], "direction": [],
+                })
         try:
-            t, current, valid = load_run_csv(self.raw_path)
-        except (OSError, ValueError):
-            return {"time_s": [], "current_nA": [], "valid": []}
-        return {
-            "time_s": [float(x) for x in t],
-            "current_nA": [float(x) for x in current],
-            "valid": [bool(x) for x in valid],
-        }
+            if self.raw_path.stat().st_size < self._data_cache_position:
+                self._reset_data_cache()
+                self._data_cache_path = self.raw_path
+                if self.settings["method"] == "cv":
+                    self._data_cache.update({
+                        "potential_v": [], "cycle": [], "direction": [],
+                    })
+            with self.raw_path.open(newline="") as handle:
+                handle.seek(self._data_cache_position)
+                chunk = handle.read()
+                self._data_cache_position = handle.tell()
+        except OSError:
+            return self._data_cache
+
+        text = self._data_cache_pending + chunk
+        lines = text.splitlines(keepends=True)
+        self._data_cache_pending = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._data_cache_pending = lines.pop()
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            try:
+                values = next(csv.reader([stripped]))
+                if self._data_cache_header is None:
+                    self._data_cache_header = values
+                    continue
+                row = dict(zip(self._data_cache_header, values, strict=False))
+                dev_ms = float(row["dev_ms"])
+                first_dev_ms = (
+                    dev_ms if self._data_cache_first_dev_ms is None
+                    else self._data_cache_first_dev_ms
+                )
+                current_nA = float(row["fa_fw"]) / 1_000_000
+                valid = (
+                    int(row.get("sat") or 0) == 0
+                    and int(row.get("ovf") or 0) == 0
+                )
+                if self.settings["method"] == "cv":
+                    potential_v = float(row["potential_mv"]) / 1000
+                    cycle = int(row["cycle"])
+                    direction = int(row["direction"])
+                self._data_cache_first_dev_ms = first_dev_ms
+                self._data_cache["time_s"].append(
+                    (dev_ms - first_dev_ms) / 1000
+                )
+                self._data_cache["current_nA"].append(current_nA)
+                self._data_cache["valid"].append(valid)
+                if self.settings["method"] == "cv":
+                    self._data_cache["potential_v"].append(potential_v)
+                    self._data_cache["cycle"].append(cycle)
+                    self._data_cache["direction"].append(direction)
+            except (KeyError, TypeError, ValueError, csv.Error):
+                continue
+        return self._data_cache
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -593,6 +809,12 @@ class MeasurementController:
                     "current_nA": data["current_nA"][index],
                     "valid": data["valid"][index],
                 }
+                if self.settings["method"] == "cv":
+                    latest_sample.update({
+                        "potential_v": data["potential_v"][index],
+                        "cycle": data["cycle"][index],
+                        "direction": data["direction"][index],
+                    })
             payload = {
                 "state": self.state,
                 "message": self.message,
@@ -612,7 +834,15 @@ class MeasurementController:
                 "latest_sample": latest_sample,
                 "settings": {
                     **self.settings,
-                    "native_rate_note": "MAX30131 原生约 8.06 Hz；高于原生的输出频率由主机重采样",
+                    "native_rate_note": (
+                        "CV 使用 EIS ADC，按 1 mV 步进；每个原生电流点实时显示并保存"
+                        if self.settings["method"] == "cv"
+                        else (
+                            "宽量程 I-T 使用 EIS ADC；单次电位扰动小于 0.4 mV"
+                            if self.settings["fsr_nA"] in IT_WIDE_FSR_OPTIONS
+                            else "MAX30131 原生约 8.06 Hz；高于原生的输出频率由主机重采样"
+                        )
+                    ),
                 },
             }
             return _json_safe(payload)
@@ -645,19 +875,22 @@ class ScheduleController:
     def start(self, payload: dict[str, Any]) -> dict[str, Any]:
         interval_minutes = float(payload.get("interval_minutes", 5))
         settings = SettingsController.validate(payload.get("settings", {}))
-        sample_role = str(payload.get("sample_role") or "test")
+        sample_role = (
+            "cv" if settings["method"] == "cv"
+            else str(payload.get("sample_role") or "test")
+        )
         raw_concentration = payload.get("known_concentration_um")
         known_concentration = (
             None if raw_concentration in (None, "") else float(raw_concentration)
         )
-        if sample_role not in {"calibration", "stabilization", "test"}:
-            raise ValueError("自动任务类型必须是标定、稳定化或测试")
+        if sample_role not in {"calibration", "stabilization", "test", "cv"}:
+            raise ValueError("自动任务类型必须是标定、稳定化、测试或 CV")
         if sample_role == "calibration" and known_concentration is None:
             raise ValueError("自动标定任务必须填写已知浓度")
         minimum_interval_s = settings["prestep_s"] + settings["duration_s"] + 10
         if interval_minutes * 60 < minimum_interval_s:
             raise ValueError(
-                f"当前 IT 条件要求间隔至少 {minimum_interval_s / 60:.2f} 分钟"
+                f"当前测量条件要求间隔至少 {minimum_interval_s / 60:.2f} 分钟"
             )
         with self.lock:
             if self.active:
@@ -983,6 +1216,7 @@ class AppState:
 
     def workflow_snapshot(self) -> dict[str, Any]:
         current_settings = self.settings.snapshot()["settings"]
+        is_it = current_settings.get("method", "it") == "it"
         settings_match = (
             self.calibration_settings is None
             or SettingsController.same_analysis_protocol(
@@ -990,7 +1224,8 @@ class AppState:
             )
         )
         calibration_ready = (
-            self.model is not None
+            is_it
+            and self.model is not None
             and self.model_settings is not None
             and SettingsController.same_analysis_protocol(
                 self.model_settings, current_settings
@@ -1026,9 +1261,13 @@ class AppState:
         sample_name = str(payload.get("sample_name", "")).strip()
         if not sample_name:
             raise ValueError("请填写样品名称")
-        role = str(payload.get("sample_role", "calibration"))
-        if role not in {"calibration", "stabilization", "test"}:
-            raise ValueError("样品类型必须是标定、稳定化或测试")
+        current_settings = self.settings.snapshot()["settings"]
+        role = (
+            "cv" if current_settings.get("method") == "cv"
+            else str(payload.get("sample_role", "calibration"))
+        )
+        if role not in {"calibration", "stabilization", "test", "cv"}:
+            raise ValueError("样品类型必须是标定、稳定化、测试或 CV")
         raw_concentration = payload.get("known_concentration_um")
         concentration = (
             None if raw_concentration in (None, "") else float(raw_concentration)
@@ -1037,7 +1276,6 @@ class AppState:
             raise ValueError("浓度不能为负数")
         if role == "calibration" and concentration is None:
             raise ValueError("标定样品必须填写已知浓度")
-        current_settings = self.settings.snapshot()["settings"]
         if (role == "calibration" and self.points and self.calibration_settings is not None
                 and not SettingsController.same_analysis_protocol(
                     self.calibration_settings, current_settings
@@ -1258,9 +1496,16 @@ class AppState:
                     shutil.copy2(data_source, data_target)
                     result["data_path"] = str(data_target)
                     try:
-                        from .it_tool import _plot_run
-                        _plot_run(data_source, plot_target,
-                                  float(run["settings"]["fit_window_s"]))
+                        if run["settings"].get("method") == "cv":
+                            plot_source = Path(str(run.get("plot_path") or ""))
+                            if plot_source.exists():
+                                shutil.copy2(plot_source, plot_target)
+                            else:
+                                plot_cv(raw_source, plot_target)
+                        else:
+                            from .it_tool import _plot_run
+                            _plot_run(data_source, plot_target,
+                                      float(run["settings"]["fit_window_s"]))
                         result["plot_path"] = str(plot_target)
                     except Exception:
                         result["plot_path"] = ""
@@ -1578,6 +1823,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self._send_bytes((GUI_DIR / "index.html").read_bytes(), "text/html; charset=utf-8")
             return
+        if parsed.path == "/compact":
+            self._send_bytes(
+                (GUI_DIR / "compact.html").read_bytes(), "text/html; charset=utf-8"
+            )
+            return
         if parsed.path == "/api/status":
             self._send_json(APP.measurement.snapshot())
             return
@@ -1615,7 +1865,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if APP.schedule.snapshot()["active"]:
                     raise RuntimeError("自动测量运行期间不能插入手动测量")
                 if not APP.settings.snapshot()["applied"]:
-                    raise RuntimeError("请先将当前 IT 条件应用到硬件")
+                    raise RuntimeError("请先将当前检测条件应用到硬件")
                 result = APP.start_measurement(payload)
             elif self.path == "/api/measurement/stop":
                 result = APP.measurement.stop()
@@ -1631,10 +1881,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = APP.predict(payload)
             elif self.path == "/api/schedule/start":
                 if not APP.settings.snapshot()["applied"]:
-                    raise RuntimeError("请先将当前 IT 条件应用到硬件")
+                    raise RuntimeError("请先将当前检测条件应用到硬件")
                 role = str(payload.get("sample_role") or "test")
                 workflow = APP.workflow_snapshot()
-                if role in {"stabilization", "test"} and not workflow["calibration_ready"]:
+                is_it = APP.settings.snapshot()["settings"].get("method") == "it"
+                if is_it and role in {"stabilization", "test"} and not workflow["calibration_ready"]:
                     raise RuntimeError("请先选择标定点并生成测试曲线")
                 if (role == "calibration" and workflow["points_count"]
                         and not workflow["settings_match"]):

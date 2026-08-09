@@ -49,7 +49,9 @@ LINE_RE = re.compile(
     #    这样 2026-07-31 那批(还没有 sat)的 RTT 日志/CSV 仍然能解析。
     #    缺失时按 0(无饱和)处理 —— 对旧数据是正确的默认(当时用 SEL4,
     #    但那时电极是开路的,没有真信号,不会饱和)。
-    r"(?:\s+sat=(?P<sat>\d+))?\s*$"
+    r"(?:\s+sat=(?P<sat>\d+))?"
+    # CV 扫描追加逐点电位与圈数；IT 与历史日志没有这些字段。
+    r"(?:\s+mv=(?P<mv>-?\d+)\s+cycle=(?P<cycle>\d+)\s+dir=(?P<direction>[+-]1))?\s*$"
 )
 
 
@@ -77,6 +79,9 @@ class Sample:
     auto: bool
     ovf: int
     sat: int = 0
+    potential_mv: int | None = None
+    cycle: int | None = None
+    direction: int | None = None
 
 
 CSV_COLUMNS = [
@@ -89,6 +94,9 @@ CSV_COLUMNS = [
     "auto",
     "ovf",
     "sat",  # 饱和标志位(bit0=LOW/还原吃光 offset, bit1=HIGH/氧化超量程)
+    "potential_mv",  # CV 实际阶梯电位；IT 为空
+    "cycle",  # CV 圈数，从 1 开始；IT 为空
+    "direction",  # CV 扫描方向：+1 正扫，-1 反扫；IT 为空
 ]
 
 assert len(CSV_COLUMNS) == len(fields(Sample)) + 1  # host_unix_s 是多出来那列
@@ -108,6 +116,9 @@ def parse_line(line: str) -> Sample | None:
         auto=m["auto"] == "1",
         ovf=int(m["ovf"]),
         sat=int(m["sat"]) if m["sat"] is not None else 0,
+        potential_mv=int(m["mv"]) if m["mv"] is not None else None,
+        cycle=int(m["cycle"]) if m["cycle"] is not None else None,
+        direction=int(m["direction"]) if m["direction"] is not None else None,
     )
 
 
@@ -123,14 +134,21 @@ def sample_to_row(s: Sample, host_unix_s: float) -> list[str]:
         "1" if s.auto else "0",
         str(s.ovf),
         str(s.sat),
+        "" if s.potential_mv is None else str(s.potential_mv),
+        "" if s.cycle is None else str(s.cycle),
+        "" if s.direction is None else str(s.direction),
     ]
 
 
 def format_sample_line(s: Sample) -> str:
     """反向生成行文本 —— 供测试与合成数据用,保证解析器与格式互为逆运算."""
+    cv_fields = (
+        "" if s.potential_mv is None else
+        f" mv={s.potential_mv} cycle={s.cycle} dir={s.direction:+d}"
+    )
     return (
         f"S seq={s.seq} ms={s.ms} counts={s.counts} fa={s.fa} "
-        f"tag={s.tag} auto={1 if s.auto else 0} ovf={s.ovf} sat={s.sat}"
+        f"tag={s.tag} auto={1 if s.auto else 0} ovf={s.ovf} sat={s.sat}{cv_fields}"
     )
 
 

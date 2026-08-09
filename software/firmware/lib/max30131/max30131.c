@@ -60,6 +60,34 @@ int32_t max30131_lsb_fa(max30131_fsr_t fsr)
 	return (int32_t)div_round((int64_t)fsr_pa * 1000, 65536);
 }
 
+int32_t max30131_eis_fsr_ua(max30131_eis_fsr_t fsr)
+{
+	switch (fsr) {
+	case MAX30131_EIS_FSR_4UA:
+		return 4;
+	case MAX30131_EIS_FSR_8UA:
+		return 8;
+	case MAX30131_EIS_FSR_20UA:
+		return 20;
+	case MAX30131_EIS_FSR_40UA:
+		return 40;
+	default:
+		return 0;
+	}
+}
+
+int64_t max30131_cv_counts_to_iwe_fa(uint16_t counts, max30131_eis_fsr_t fsr,
+				      uint8_t eis_offset)
+{
+	int32_t fsr_ua = max30131_eis_fsr_ua(fsr);
+	if (fsr_ua == 0 || eis_offset > 6u) {
+		return 0;
+	}
+	/* I = 3/2 * IFSR * (codes/2^16 - (8-offset)/16). */
+	int64_t centered_counts = (int64_t)counts - (int64_t)(8u - eis_offset) * 4096;
+	return div_round(3LL * fsr_ua * 1000000000LL * centered_counts, 2LL * 65536LL);
+}
+
 /* ------------------------------------------------------------------ */
 /* offset                                                             */
 /* ------------------------------------------------------------------ */

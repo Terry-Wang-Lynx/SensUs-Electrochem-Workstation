@@ -1,0 +1,271 @@
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+  background: #f5f7f7;
+  color: #18272b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body { background: #f5f7f7; }
+
+main {
+  height: 100%;
+  min-height: 410px;
+  display: grid;
+  grid-template-rows: auto auto minmax(112px, 1fr) auto auto auto 44px;
+  gap: 8px;
+  padding: 12px;
+}
+
+header, .status-line, .live, .progress-row, .field-row {
+  display: flex;
+  align-items: center;
+}
+
+header {
+  justify-content: space-between;
+  min-width: 0;
+  font-size: 11px;
+  color: #67767a;
+}
+
+header > span {
+  max-width: 58%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.status-line {
+  min-width: 0;
+  gap: 7px;
+  color: #233438;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #9aa5a7;
+  box-shadow: 0 0 0 4px rgb(154 165 167 / 14%);
+}
+
+.status-dot.running {
+  background: #16866f;
+  box-shadow: 0 0 0 4px rgb(22 134 111 / 14%);
+}
+
+.status-dot.error {
+  background: #c14a45;
+  box-shadow: 0 0 0 4px rgb(193 74 69 / 14%);
+}
+
+.live {
+  justify-content: space-between;
+  gap: 12px;
+  padding: 1px 2px 0;
+}
+
+.live > div {
+  white-space: nowrap;
+  line-height: 1;
+}
+
+#liveCurrent {
+  font-size: 34px;
+  font-weight: 720;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+#liveUnit {
+  margin-left: 4px;
+  color: #617075;
+  font-size: 13px;
+}
+
+#liveMeta {
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  color: #66767a;
+  font-size: 10px;
+  line-height: 1.45;
+  text-align: right;
+}
+
+.chart-shell {
+  position: relative;
+  min-height: 112px;
+  overflow: hidden;
+  border: 1px solid #d8e0e1;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+#liveChart {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+#chartEmpty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #8a9699;
+  font-size: 11px;
+  pointer-events: none;
+}
+
+#chartEmpty[hidden] { display: none; }
+
+.progress-row { gap: 8px; }
+
+.progress {
+  height: 5px;
+  flex: 1;
+  overflow: hidden;
+  border-radius: 3px;
+  background: #dfe6e6;
+}
+
+.progress i {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: #16866f;
+  transition: width 120ms linear;
+}
+
+#progressText {
+  width: 34px;
+  color: #66767a;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.controls {
+  display: grid;
+  gap: 7px;
+}
+
+.controls[hidden] { display: none; }
+
+.segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  height: 28px;
+  padding: 2px;
+  border: 1px solid #d4dddd;
+  border-radius: 6px;
+  background: #e9eeee;
+}
+
+.segmented button {
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #617075;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.segmented button.active {
+  background: #ffffff;
+  color: #126f60;
+  font-weight: 650;
+  box-shadow: 0 1px 3px rgb(26 47 50 / 12%);
+}
+
+.segmented button:disabled {
+  cursor: not-allowed;
+  opacity: .38;
+}
+
+.field-row { gap: 7px; }
+
+label {
+  min-width: 0;
+  flex: 1;
+}
+
+label span {
+  display: block;
+  margin: 0 0 3px 2px;
+  color: #66767a;
+  font-size: 9px;
+}
+
+input {
+  width: 100%;
+  height: 31px;
+  border: 1px solid #ccd7d8;
+  border-radius: 5px;
+  padding: 0 8px;
+  outline: none;
+  background: #ffffff;
+  color: #1d3034;
+  font: inherit;
+  font-size: 11px;
+}
+
+input:focus {
+  border-color: #16866f;
+  box-shadow: 0 0 0 2px rgb(22 134 111 / 12%);
+}
+
+#message {
+  min-height: 14px;
+  margin: 0;
+  overflow: hidden;
+  color: #66767a;
+  font-size: 10px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#message.error { color: #b7423a; }
+
+.measure {
+  width: 100%;
+  height: 44px;
+  border: 0;
+  border-radius: 6px;
+  background: #16866f;
+  color: #ffffff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.measure.stop { background: #b94c47; }
+
+.measure:disabled {
+  cursor: not-allowed;
+  opacity: .42;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root, body { background: #172326; color: #edf4f3; }
+  header, #liveMeta, #progressText, label span, #message { color: #9aabad; }
+  .status-line { color: #e7efee; }
+  .chart-shell, input, .segmented button.active { background: #213033; color: #ecf3f2; }
+  .chart-shell, input, .segmented { border-color: #3b4a4d; }
+  .segmented, .progress { background: #2b393c; }
+}

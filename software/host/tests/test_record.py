@@ -21,6 +21,9 @@ from pa_host.record import (  # noqa: E402
     sample_to_row,
 )
 from pa_host.collect import (  # noqa: E402
+    parse_cv_aborted,
+    parse_cv_done,
+    parse_cv_start,
     parse_it_aborted,
     parse_it_done,
     parse_it_start,
@@ -48,6 +51,9 @@ def main() -> int:
     s3 = Sample(seq=9, ms=9999, counts=65000, fa=-30000000, tag=0, auto=True, ovf=2,
                 sat=2)
     chk(parse_line(format_sample_line(s3)) == s3, "sat=2(HIGH 饱和)+ ovf 往返")
+    cv = Sample(seq=10, ms=10123, counts=32000, fa=-250000, tag=0, auto=True,
+                ovf=0, potential_mv=-537, cycle=4, direction=1)
+    chk(parse_line(format_sample_line(cv)) == cv, "CV 电位、圈数、方向往返")
 
     print("\n=== 🔴 向后兼容:旧格式(无 sat 字段)必须仍能解析 ===")
     # 2026-07-31 那批 RTT 日志就是这个格式;sat 是 08-01 追加的可选字段
@@ -66,7 +72,8 @@ def main() -> int:
     print("\n=== CSV 列数一致 ===")
     chk(len(sample_to_row(s, 1.0)) == len(CSV_COLUMNS),
         f"行宽 {len(CSV_COLUMNS)} 列对齐")
-    chk(CSV_COLUMNS[-1] == "sat", "sat 在最后一列(追加不破坏旧列序)")
+    chk(CSV_COLUMNS[-3:] == ["potential_mv", "cycle", "direction"],
+        "CV 元数据追加在历史 IT 列之后")
 
     print("\n=== 完整性检查统计饱和 ===")
     r = check_integrity([s, s2, s3])
@@ -91,6 +98,12 @@ def main() -> int:
         == ("restart", 741, 92001), "识别运行中重新开始标记")
     chk(parse_it_aborted("IT_ABORTED reason=stop native=12 elapsed_ms=1510")
         == ("stop", 12, 1510), "识别硬件停止标记")
+    chk(parse_cv_start("CV_START run=2 low_mv=-600 high_mv=600 rate_mv_s=50 cycles=30")
+        == (2, -600, 600, 50, 30), "识别 CV 开始标记")
+    chk(parse_cv_done("CV_DONE native=11613 expected=11613 elapsed_ms=1440020 cycles=30")
+        == (11613, 11613, 1440020, 30), "识别 CV 完成标记")
+    chk(parse_cv_aborted("CV_ABORTED reason=stop native=42 elapsed_ms=5200")
+        == ("stop", 42, 5200), "识别 CV 停止标记")
 
     print("\n=== 电位审计故障标记 ===")
     fault = ("POTENTIAL_FAULT sample=80 target_mv=200 expected_daca=1067 "

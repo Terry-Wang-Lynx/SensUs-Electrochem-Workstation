@@ -8,7 +8,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from pa_host.gui_server import AppState, SettingsController
+from pa_host.gui_server import AppState, MeasurementController, SettingsController
 
 
 def _point(point_id: str, concentration: float, current: float) -> dict[str, object]:
@@ -115,6 +115,49 @@ def test_it_step_settings_keep_initial_and_target_potentials_distinct() -> None:
         "prestep_s": 0,
     })
     assert SettingsController.same_analysis_protocol(settings, continuously_held)
+
+
+def test_it_positive_400mv_uses_high_common_mode_without_changing_legacy_conditions() -> None:
+    legacy = SettingsController.validate({
+        "initial_potential_v": 0.2,
+        "potential_v": 0.2,
+    })
+    near_rail = SettingsController.validate({
+        "initial_potential_v": 0.4,
+        "potential_v": 0.4,
+    })
+
+    assert SettingsController.working_electrode_mv(legacy) == 400
+    assert SettingsController.working_electrode_mv(near_rail) == 800
+
+
+def test_live_cv_data_reader_only_appends_new_complete_rows() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = Path(tmp) / "live.csv"
+        raw.write_text(
+            "# live CV\n"
+            "host_unix_s,seq,dev_ms,counts,fa_fw,tag,auto,ovf,sat,potential_mv,cycle,direction\n"
+            "1,0,1000,1,2500000,4,0,0,0,-600,1,1\n"
+            "1,1,1020,2,"
+        )
+        controller = MeasurementController()
+        controller.settings = SettingsController.validate({"method": "cv", "cv_cycles": 1})
+        controller.raw_path = raw
+
+        first = controller._data()
+        assert first["time_s"] == [0.0]
+        assert first["current_nA"] == [2.5]
+
+        with raw.open("a") as handle:
+            handle.write(
+                "3000000,4,0,0,0,-599,1,1\n"
+                "1,2,1040,3,3500000,4,0,0,1,-598,1,1\n"
+            )
+        second = controller._data()
+        assert second["time_s"] == [0.0, 0.02, 0.04]
+        assert second["current_nA"] == [2.5, 3.0, 3.5]
+        assert second["potential_v"] == [-0.6, -0.599, -0.598]
+        assert second["valid"] == [True, True, False]
 
 
 def test_drift_bias_shifts_curve_and_prediction_only_when_enabled() -> None:

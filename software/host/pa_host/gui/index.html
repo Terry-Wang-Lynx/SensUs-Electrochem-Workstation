@@ -32,45 +32,52 @@
           <div class="workflow-heading"><div><h2>数据流程</h2><p id="workflowMessage">设置保存目录后，先标定再测试</p></div><div class="live-badge" id="workflowBadge">待配置</div></div>
           <div class="workflow-body">
             <div class="workflow-steps"><span class="active" id="calibrationStep"><b>1</b> 采集标定点</span><i></i><span id="selectionStep"><b>2</b> 选择范围</span><i></i><span id="testStep"><b>3</b> 稳定化 / 测试</span></div>
-            <label class="save-directory">自动保存目录<div class="directory-row"><input id="saveDirectory" placeholder="例如：/Users/lynx/Documents/实验数据"><button class="secondary" id="applySaveDirectory">应用目录</button></div></label>
+            <label class="save-directory">自动保存目录<div class="directory-row"><input id="saveDirectory" placeholder="请选择实验数据文件夹"><button class="secondary" id="applySaveDirectory">应用目录</button></div></label>
             <button class="text-button reset-calibration" id="resetCalibration">新建标定批次</button>
           </div>
         </section>
         <div class="workspace-grid">
           <section class="panel chart-panel">
-            <div class="panel-head"><div><h2>IT 曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small>nA</small><em id="liveCurrentTime">尚无数据</em></div><div class="segmented" id="chartWindow"><button data-window="all">全程</button><button data-window="20">20 s</button><button class="active" data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
+            <div class="panel-head"><div><h2 id="chartTitle">I-T 曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small id="liveCurrentUnit">nA</small><em id="liveCurrentTime">尚无数据</em></div><div class="segmented" id="chartWindow"><button data-window="all">全程</button><button data-window="20">20 s</button><button class="active" data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
             <div class="chart-wrap"><canvas id="itChart" aria-label="IT 电流时间曲线"></canvas><div class="chart-legend"><span><i class="valid-point"></i>有效点</span><span><i class="invalid-point"></i>异常点</span></div><div class="empty-chart" id="chartEmpty">开始测量后显示实时电流</div></div>
             <div class="metric-strip">
-              <div><span>稳态电流</span><strong id="steadyCurrent">--</strong><small>nA</small></div>
-              <div><span>标准差</span><strong id="steadySd">--</strong><small>nA</small></div>
-              <div><span>显示原生点</span><strong id="validCount">--</strong><small>/ ≈ 1452</small></div>
+              <div><span id="metricPrimaryLabel">稳态电流</span><strong id="steadyCurrent">--</strong><small id="metricPrimaryUnit">nA</small></div>
+              <div><span id="metricSecondaryLabel">标准差</span><strong id="steadySd">--</strong><small id="metricSecondaryUnit">nA</small></div>
+              <div><span>原生电流点</span><strong id="validCount">--</strong><small>/ ≈ 1452</small></div>
               <div><span>进度</span><strong id="progressValue">0</strong><small>%</small></div>
             </div>
           </section>
 
           <aside class="panel control-panel">
-            <div class="panel-head"><div><h2>IT 条件</h2><p id="settingsMessage">参数尚未应用到硬件</p></div><div class="live-badge" id="settingsBadge">未应用</div></div>
+            <div class="panel-head"><div><h2 id="settingsTitle">检测条件</h2><p id="settingsMessage">参数尚未应用到硬件</p></div><div class="live-badge" id="settingsBadge">未应用</div></div>
             <div class="it-settings">
-              <label>测量方法<select disabled><option>恒电位 IT</option></select></label>
-              <div class="field-pair">
-                <label>测试电位<div class="input-unit"><input id="potentialV" type="number" min="-0.4" max="0.39" step="0.01" value="0.2"><span>V</span></div></label>
+              <div class="method-switch"><span>检测方法</span><div class="segmented" id="methodMode"><button class="active" data-method="it">I-T</button><button data-method="cv">CV</button></div></div>
+              <div id="itSettings">
+              <div class="field-pair compact-fields">
+                <label>测试电位<div class="input-unit"><input id="potentialV" type="number" min="-0.4" max="0.4" step="0.01" value="0.2"><span>V</span></div></label>
                 <label>测量时长<div class="input-unit"><input id="durationS" type="number" min="10" max="3600" step="1" value="180"><span>s</span></div></label>
               </div>
-              <div class="field-pair">
-                <label>硬件采样频率<select id="sensPeriodCode"><option value="0">8.06 Hz</option><option value="1">4.13 Hz</option><option value="2">2.10 Hz</option><option value="3">1.06 Hz</option><option value="4">0.53 Hz</option><option value="5">0.27 Hz</option></select></label>
+              <div class="field-pair compact-fields">
                 <label>输出采样频率<div class="input-unit"><input id="sampleRateHz" type="number" min="0.5" max="10" step="0.5" value="10"><span>Hz</span></div></label>
+                <label>末段拟合<div class="input-unit"><input id="fitWindowS" type="number" min="1" step="1" value="20"><span>s</span></div></label>
               </div>
-              <label>末段拟合窗口<div class="input-unit"><input id="fitWindowS" type="number" min="1" step="1" value="20"><span>s</span></div></label>
-              <div class="field-pair">
-                <label>电流量程<select id="fsrNA"><option value="50">50 nA</option><option value="100">100 nA</option><option value="250">250 nA</option><option value="500" selected>500 nA</option><option value="1000">1 µA</option><option value="2000">2 µA</option></select></label>
-                <label>偏置电流<select id="offsetNA"><option value="9nA">9 nA</option><option value="19nA" selected>19 nA</option><option value="40nA">40 nA</option><option value="80nA">80 nA</option><option value="10pct" data-pct="10">10% FSR</option><option value="20pct" data-pct="20">20% FSR</option><option value="50pct" data-pct="50">50% FSR</option></select></label>
               </div>
+              <div id="cvSettings" hidden>
+                <div class="field-pair compact-fields"><label>电位下限<div class="input-unit"><input id="cvLowV" type="number" min="-0.6" max="0.59" step="0.01" value="-0.6"><span>V</span></div></label><label>电位上限<div class="input-unit"><input id="cvHighV" type="number" min="-0.59" max="0.6" step="0.01" value="0.6"><span>V</span></div></label></div>
+                <div class="field-pair compact-fields"><label>扫描速度<div class="input-unit"><input id="cvScanRate" type="number" min="0.01" max="0.1" step="0.01" value="0.05"><span>V/s</span></div></label><label>循环圈数<div class="input-unit"><input id="cvCycles" type="number" min="1" max="100" step="1" value="30"><span>圈</span></div></label></div>
+                <div class="field-pair compact-fields"><label>扫描前静置<div class="input-unit"><input id="cvQuietS" type="number" min="0" max="300" step="1" value="2"><span>s</span></div></label><label>CV 电流量程<select id="cvEisFsrUA"><option value="4">4 µA</option><option value="8">8 µA</option><option value="20">20 µA</option><option value="40" selected>40 µA</option></select></label></div>
+              </div>
+              <div class="field-pair compact-fields shared-settings">
+                <label id="dcSamplingField">硬件采样<select id="sensPeriodCode"><option value="0">8.06 Hz</option><option value="1">4.13 Hz</option><option value="2">2.10 Hz</option><option value="3">1.06 Hz</option><option value="4">0.53 Hz</option><option value="5">0.27 Hz</option></select></label>
+                <label id="dcRangeField">电流量程<select id="fsrNA"><optgroup label="DC ADC"><option value="50">50 nA</option><option value="100">100 nA</option><option value="250">250 nA</option><option value="500">500 nA</option><option value="1000">1 µA</option><option value="2000">2 µA</option></optgroup><optgroup label="宽量程 EIS ADC"><option value="4000">4 µA</option><option value="8000">8 µA</option><option value="20000">20 µA</option><option value="40000" selected>40 µA</option></optgroup></select></label>
+              </div>
+              <label id="dcOffsetField">偏置电流<select id="offsetNA"><option value="9nA">9 nA</option><option value="19nA" selected>19 nA</option><option value="40nA">40 nA</option><option value="80nA">80 nA</option><option value="10pct" data-pct="10">10% FSR</option><option value="20pct" data-pct="20">20% FSR</option><option value="50pct" data-pct="50">50% FSR</option></select></label>
               <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
               <button class="secondary full apply-settings" id="applySettings">应用条件并烧录硬件</button>
             </div>
-            <div class="sample-role-block"><span>本轮用途</span><div class="segmented role-segmented" id="sampleRole"><button class="active" data-role="calibration">标定</button><button data-role="test">测试</button></div></div>
+            <div class="sample-role-block" id="sampleRoleBlock"><span>本轮用途</span><div class="segmented role-segmented" id="sampleRole"><button class="active" data-role="calibration">标定</button><button data-role="test">测试</button></div></div>
             <label>样品名称<input id="sampleName" placeholder="例如：未知样品 01"></label>
-            <label><span id="concentrationLabel">已知浓度（标定必填）</span><div class="input-unit"><input id="knownConcentration" type="number" min="0" step="0.001" placeholder="请输入标定浓度"><span>µM</span></div></label>
+            <label id="concentrationField"><span id="concentrationLabel">已知浓度（标定必填）</span><div class="input-unit"><input id="knownConcentration" type="number" min="0" step="0.001" placeholder="请输入标定浓度"><span>µM</span></div></label>
             <div class="auto-save-preview"><span>自动保存</span><strong id="autoSaveName">样品名称-浓度.csv</strong></div>
             <div class="action-row"><button class="primary" id="startMeasure">开始标定测量</button><button class="icon-button" id="stopMeasure" title="停止当前测量" disabled>■</button></div>
             <button class="secondary full" id="useForCalibration" hidden disabled>将结果加入标定</button>
@@ -124,7 +131,7 @@
       <section class="view" id="view-schedule">
         <div class="schedule-layout">
           <section class="panel scheduler-control">
-            <div class="panel-head"><div><h2>定时连续测量</h2><p>按固定起始间隔自动运行 IT</p></div><div class="live-badge" id="scheduleBadge">未运行</div></div>
+            <div class="panel-head"><div><h2>定时连续测量</h2><p>按固定起始间隔自动运行当前方法</p></div><div class="live-badge" id="scheduleBadge">未运行</div></div>
             <div class="form-grid">
               <label>测量方法<select disabled><option id="scheduleMethodLabel">恒电位 IT · 当前条件</option></select></label>
               <label>任务类型<select id="scheduleRole"><option value="stabilization">稳定化 IT（不改曲线）</option><option value="test">测试并自动预测</option><option value="calibration">收集候选标定点</option></select></label>
