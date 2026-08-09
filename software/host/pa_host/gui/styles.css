@@ -25,6 +25,8 @@
 .range-live .full{width:100%;margin:10px 0 0;padding:8px 12px;font-size:12px}
 .range-live .notice{margin:9px 0 0;padding:8px}
 .range-live.switching{border-left-color:var(--amber);background:#fdf8f0}
+/* 重烧会丢运行时档位的告警。用 amber 而非 red:这不是错误,是一个后果提示。 */
+.notice.warn{background:#fdf7ee;color:#8a5a12;border:1px solid #e8d4ae}
 /* 错误详情顶到 .panel-head 的副标题上:变红、允许断词换行,最多 3 行后截断
    (`command not found: west` 这类还好,编译报错可能是一长串路径,不截断会把
    panel-head 撑开、把徽章挤走)。完整文本挂在 title 上,悬停可看。 */

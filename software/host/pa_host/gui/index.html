@@ -66,6 +66,7 @@
                 <label>偏置电流<select id="offsetNA"><option value="9nA">9 nA</option><option value="19nA" selected>19 nA</option><option value="40nA">40 nA</option><option value="80nA">80 nA</option><option value="10pct" data-pct="10">10% FSR</option><option value="20pct" data-pct="20">20% FSR</option><option value="50pct" data-pct="50">50% FSR</option></select></label>
               </div>
               <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
+              <div class="notice warn" id="reflashWarn" hidden></div>
               <button class="secondary full apply-settings" id="applySettings">应用条件并烧录硬件</button>
               <div class="range-live" id="rangeLive">
                 <div class="range-live-head"><span>运行档位<em>(硬件真值)</em></span><div class="live-badge" id="rangeBadge">未知</div></div>

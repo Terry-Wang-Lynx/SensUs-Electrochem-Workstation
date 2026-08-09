@@ -167,6 +167,21 @@ function renderRange(data){
     : '—';
   // 只有测量进行中才能切:命令要经采集器的 RTT socket 转发,采集器不在就没人转发
   $('applyRange').disabled=!running;
+  renderReflashWarn(a);
+}
+// 🔴 运行时档位 ≠ 已烧录 settings 时告警。点「应用条件并烧录硬件」会重编译+烧录+
+//    **复位 MCU**,复位中断极化 ⇒ 档位回退到编译期默认,并重新引入初始瞬态
+//    (实测撞轨 7~91s,期间恒电位环开环)。这个后果在点之前必须可见。
+function renderReflashWarn(applied){
+  const node=$('reflashWarn'), s=state.settings?.settings;
+  if(!applied||!s){ node.hidden=true; return }
+  const liveFsr=Math.round(applied.fsr_pa/1000), liveOff=Math.round(applied.off_pa/1000);
+  const same = liveFsr===Number(s.fsr_nA) && Math.abs(liveOff-Number(s.offset_nA))<=1;
+  node.hidden=same;
+  if(!same) node.textContent=
+    `⚠️ 硬件当前跑的是 ${liveFsr} nA / offset ${liveOff} nA(在线切档结果),`+
+    `而上面这组条件是 ${s.fsr_nA} nA / offset ${s.offset_nA} nA。`+
+    `点「应用条件并烧录硬件」会复位 MCU ⇒ 丢掉在线切档结果、并重新引入初始瞬态。`;
 }
 $('applyRange').onclick=async()=>{
   try{
