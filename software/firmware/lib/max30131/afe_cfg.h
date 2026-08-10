@@ -138,6 +138,13 @@ typedef struct {
 	bool forced;        /* 行尾 FORCE */
 	afe_cfg_t cfg;      /* SET/RANGE:打过补丁的候选配置 */
 	uint8_t n_keys;
+	/*
+	 * 本行是遗留的 `RANGE <fsr> <off>` 而非 `SET`。语义上二者等价(verb 都是
+	 * SET),但**上报行不同**:上位机 gui_server._scan_range_events() 逐字依赖
+	 * `RANGE_APPLIED` / `RANGE_REJECT`。留这个标记,让"协议统一"不必以打断
+	 * 现有 GUI 为代价。
+	 */
+	bool legacy_range;
 	/* PEEK/POKE/OCP 的裸参数 */
 	int32_t arg0, arg1;
 } afe_cmd_t;

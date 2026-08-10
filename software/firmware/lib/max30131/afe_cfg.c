@@ -371,6 +371,7 @@ bool afe_cfg_parse(const char *line, const afe_cfg_t *base, afe_cmd_t *out,
 		apply_key(&out->cfg, K_FSR, bare[0], false);
 		apply_key(&out->cfg, K_OFF, bare[1], false);
 		n_keys += 2;
+		out->legacy_range = true;
 	} else {
 		out->arg0 = bare[0];
 		out->arg1 = bare[1];

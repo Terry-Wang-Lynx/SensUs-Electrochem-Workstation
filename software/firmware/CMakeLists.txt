@@ -20,6 +20,7 @@ target_sources(app PRIVATE
   src/max30131_spi.c
   src/board_guards.c
   lib/max30131/max30131.c        # 纯逻辑层,与单测同源
+  lib/max30131/afe_cfg.c         # 命令解析/校验/写序/审计格式化,同源单测
 )
 
 zephyr_include_directories(
