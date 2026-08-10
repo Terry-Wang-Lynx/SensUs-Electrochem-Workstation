@@ -321,6 +321,26 @@ IT_ABORTED_RE = re.compile(
     r"^IT_ABORTED\s+reason=(restart|stop)\s+native=(\d+)\s+elapsed_ms=(\d+)\s*$"
 )
 POTENTIAL_FAULT_RE = re.compile(r"^POTENTIAL_FAULT\s+.+$")
+# 电极电压连采行(固件 CELL_V)。System ADC 与 Sensor ADC 在 AUTO 下并行,
+# 速率由 SYS_PERIOD 决定(≈1Hz),与电流样本(8Hz)**不同步** ⇒ 必须落到独立 CSV,
+# 塞进电流 CSV 会错行。
+CELL_V_RE = re.compile(
+    r"^CELL_V\s+ms=(-?\d+)\s+idle=(-?\d+)\s+we_mv=(-?\d+)\s+re_mv=(-?\d+)\s+"
+    r"ce_mv=(-?\d+)\s+wo_mv=(-?\d+)\s+e_mv=(-?\d+)\s+we_code=(\d+)\s+"
+    r"re_code=(\d+)\s+ce_code=(\d+)\s+wo_code=(\d+)\s*$"
+)
+CELL_V_COLUMNS = (
+    "host_unix_s", "dev_ms", "idle_mode", "we_mv", "re_mv", "ce_mv", "wo_mv",
+    "e_mv", "we_code", "re_code", "ce_code", "wo_code",
+)
+
+
+def parse_cell_v(line: str) -> list[str] | None:
+    """把一行 CELL_V 解析成 CSV 字段;不是该行则返回 None。"""
+    match = CELL_V_RE.match(ANSI_RE.sub("", line).strip())
+    if match is None:
+        return None
+    return [f"{time.time():.3f}", *match.groups()]
 
 
 def parse_it_done(line: str) -> tuple[int, int, int] | None:
@@ -360,6 +380,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", required=True, type=Path, help="输出 CSV 路径")
     ap.add_argument("--raw-log", type=Path,
                     help="可选:同时保存未解析的 RTT 原始行(含启动/标定日志)")
+    ap.add_argument("--cell-v", type=Path,
+                    help="电极电压连采 CSV(默认 <out 的 stem>-cellv.csv)。"
+                         "速率由固件 SYS_PERIOD 定(≈1Hz),与电流样本不同步,"
+                         "所以必须独立成文件")
 
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--start-jlink", action="store_true",
@@ -431,6 +455,15 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _on_sigint)
 
     raw_out = args.raw_log.open("w", buffering=1) if args.raw_log else None
+    # 电极电压独立 CSV,默认放在电流 CSV 旁边(<stem>-cellv.csv)。
+    cell_v_path = args.cell_v or args.out.with_name(args.out.stem + "-cellv.csv")
+    cell_v_new = not cell_v_path.exists() or cell_v_path.stat().st_size == 0
+    cell_v_out = cell_v_path.open("a", buffering=1)
+    cell_v_rows = 0
+    if cell_v_new:
+        cell_v_out.write("# pA-Converter V4.0 电极电压连采(System ADC,与电流并行)\n")
+        cell_v_out.write("# e_mv = we_mv - re_mv;code 撞 0 或 4095 = 超量程削顶\n")
+        cell_v_out.write(",".join(CELL_V_COLUMNS) + "\n")
     try:
         with args.out.open("a", buffering=1) as out:
             if new_file:
@@ -472,6 +505,14 @@ def main(argv: list[str] | None = None) -> int:
                     potential_fault = fault
                     print(f"[collect] 电位寄存器审计失败:{fault}", file=sys.stderr)
                     continue
+                cellv = parse_cell_v(clean_line)
+                if cellv is not None:
+                    # 🔴 刻意**不受 acquisition_started 门禁**:idle 期间的电极电位
+                    #    正是我们要看的东西(断开时电解池停在哪个电位),不能等 START。
+                    if cell_v_out is not None:
+                        cell_v_out.write(",".join(cellv) + "\n")
+                    cell_v_rows += 1
+                    continue
                 done = parse_it_done(clean_line) if args.it_10hz else None
                 if done is not None:
                     if not acquisition_started:
@@ -502,6 +543,12 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if raw_out is not None:
             raw_out.close()
+        cell_v_out.close()
+        if cell_v_rows:
+            print(f"[collect] 电极电压 {cell_v_rows} 组 → {cell_v_path}", file=sys.stderr)
+        else:
+            print("[collect] ⚠️ 未收到任何 CELL_V 行 —— 若固件 WP_CELLV_ENABLE=true,"
+                  "首查 0x55 的 SYS_SELECT 位号假设", file=sys.stderr)
         if proc is not None:
             # 🔴 用 terminate,别用 pkill —— pkill 会把这支克隆探头打掉线
             try:

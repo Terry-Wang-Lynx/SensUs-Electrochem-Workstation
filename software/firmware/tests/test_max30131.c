@@ -677,6 +677,86 @@ TEST(test_manual_gain_calibration)
 }
 
 /* ================================================================== */
+/*
+ * System ADC(量电极引脚电压)。这条链路是回答「不测量时电极被放在哪个电位」的
+ * 唯一可信手段(从框图推过两次都被实验否),所以换算与编码都要锁住。
+ */
+static void test_sys_adc_setup_and_voltage(void)
+{
+	/* 🔴 OPA_BYPASS_EN 必须恒为 0:置 1 后输入需驱动 14MΩ,等于在 RE 上挂
+	 * ~29nA 漏电路径,会把参比电极极化掉。编码器不给调用方留出错机会。 */
+	for (uint8_t g = 0; g < 4; g++) {
+		uint8_t b = max30131_enc_sys_adc_setup(g);
+
+		CHECK_EQ(b & (1u << MAX30131_SYSADC_OPA_BYPASS_EN_Pos), 0);
+		CHECK_EQ((b >> MAX30131_SYSADC_SENSV_GAIN_Pos) & 0x3u, g);
+	}
+	/* 0.5× 增益:满量程 = VREF/0.5 = 3.072V,盖住电极浮到 VDD 的情况 */
+	CHECK_EQ(max30131_enc_sys_adc_setup(MAX30131_SYSADC_GAIN_0P5X), 0x08);
+
+	/* V = code/4096 × VREF / gain。1536mV 基准下逐档校核。 */
+	/* 满码是 4095 而非 4096 ⇒ 满量程读数差一个 LSB(3072×4095/4096 = 3071.25) */
+	CHECK_EQ(max30131_sys_adc_mv(4095, 1536, MAX30131_SYSADC_GAIN_1X), 1536);
+	CHECK_EQ(max30131_sys_adc_mv(4095, 1536, MAX30131_SYSADC_GAIN_0P5X), 3071);
+	CHECK_EQ(max30131_sys_adc_mv(4095, 1536, MAX30131_SYSADC_GAIN_2X), 768);
+	CHECK_EQ(max30131_sys_adc_mv(0, 1536, MAX30131_SYSADC_GAIN_0P5X), 0);
+	/* WE 静态 0.4V:0.4/3.072×4096 = 533 code ⇒ 回算应得 400mV 附近 */
+	CHECK_EQ(max30131_sys_adc_mv(533, 1536, MAX30131_SYSADC_GAIN_0P5X), 400);
+	/* 高 12 位以上被忽略(数据只有 bits[11:0]) */
+	CHECK_EQ(max30131_sys_adc_mv(0xF000u | 533u, 1536, MAX30131_SYSADC_GAIN_0P5X),
+		 400);
+	CHECK_EQ(max30131_sys_adc_mv(533, 0, MAX30131_SYSADC_GAIN_0P5X), 0);
+}
+
+/*
+ * E = V_WE − V_RE 必须由**两路**电压相减得到。只测 WE 拿不到 E ——
+ * 断开放大器时 RE 同样在浮,WE 对芯片 GND 的电压没有电化学意义。
+ */
+static void test_cell_potential_needs_both_we_and_re(void)
+{
+	const int32_t ref = 1536;
+	/* 正常受控:WE=0.4V(code 533)、RE=0.2V(code 267)⇒ E=+200mV */
+	int32_t we = max30131_sys_adc_mv(533, ref, MAX30131_SYSADC_GAIN_0P5X);
+	int32_t re = max30131_sys_adc_mv(267, ref, MAX30131_SYSADC_GAIN_0P5X);
+
+	CHECK_EQ(we - re, 200);
+	/*
+	 * 整个电解池共模上浮 0.5V:两路都涨,E 不变 —— 这正是必须测 RE 的原因。
+	 * 容差 1mV:两路各自独立舍入,差值会带 ±1 LSB(0.75mV)的舍入残差。
+	 */
+	we = max30131_sys_adc_mv(533 + 667, ref, MAX30131_SYSADC_GAIN_0P5X);
+	re = max30131_sys_adc_mv(267 + 667, ref, MAX30131_SYSADC_GAIN_0P5X);
+	CHECK_NEAR(we - re, 200, 1);
+	/* 四个电极 tag 互不相同,且都落在 8-bit tag 分支(>0xC) */
+	CHECK_EQ(MAX30131_FIFO_TAG_S1_WE_V, 0xD1);
+	CHECK_EQ(MAX30131_FIFO_TAG_S1_RE_V, 0xD2);
+	CHECK_TRUE(MAX30131_FIFO_TAG_S1_WO_V > MAX30131_FIFO_TAG4_THRESHOLD);
+	CHECK_TRUE(MAX30131_FIFO_TAG_S1_CE_V > MAX30131_FIFO_TAG4_THRESHOLD);
+}
+
+/* 关放大器 = 真开路;0x20 的固定位(DAC mux/CHOP)在开关过程中不能被改掉。 */
+static void test_amp_enable_toggle_preserves_other_bits(void)
+{
+	max30131_s1_config1_t c = {
+		.we_amp_en = true, .ce_amp_en = true,
+		.we_dac_mx = MAX30131_DAC_MX_A, .ce_dac_mx = MAX30131_DAC_MX_B,
+		.cp_en = false, .chop_en = true,
+	};
+	uint8_t on = max30131_enc_s1_config1(&c);
+
+	c.we_amp_en = false;                 /* 断开第一步:先关 WE(照 CHI 的次序) */
+	uint8_t we_off = max30131_enc_s1_config1(&c);
+	c.ce_amp_en = false;                 /* 第二步:再关 CE */
+	uint8_t both_off = max30131_enc_s1_config1(&c);
+
+	CHECK_EQ(on, 0xC5);
+	/* 只有两个 AMP_EN 位变化,低位(DAC mux + CHOP)必须原样保留 */
+	CHECK_EQ(on & 0x3Fu, we_off & 0x3Fu);
+	CHECK_EQ(on & 0x3Fu, both_off & 0x3Fu);
+	CHECK_EQ(we_off, 0x45);
+	CHECK_EQ(both_off, 0x05);
+}
+
 int main(void)
 {
 	printf("=== MAX30131 纯逻辑层单测 ===\n");
@@ -702,5 +782,8 @@ int main(void)
 	RUN(test_period_must_be_ge_conv_time);
 	RUN(test_diff_conversion_cancels_adc_offset_and_offset_tolerance);
 	RUN(test_manual_gain_calibration);
+	RUN(test_sys_adc_setup_and_voltage);
+	RUN(test_cell_potential_needs_both_we_and_re);
+	RUN(test_amp_enable_toggle_preserves_other_bits);
 	return mt_report();
 }

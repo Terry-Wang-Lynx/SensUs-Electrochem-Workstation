@@ -187,6 +187,26 @@ function renderReflashWarn(applied){
 // 但复位放生电极后的**起始瞬态是还原方向**(实测起点 ≥500nA),而还原侧上限就是
 // offset。所以:瞬态期要大 offset(否则撞轨、电极根本不在 +200mV),测量期要小
 // offset(它只白占量程+白加容差)。两者靠 RANGE 在线切档分开在时间上满足。
+// 电极电位连采。E = V_WE − V_RE 必须由两路相减 —— 断开放大器时 RE 同样在浮,
+// 只看 WE 对芯片 GND 的电压没有电化学意义。code 撞 0/4095 = 超 System ADC 量程。
+function renderCellV(data){
+  const c=data.cell_v, box=$('cellvLive');
+  if(!c){
+    $('cellvBadge').textContent='无数据'; $('cellvBadge').className='live-badge';
+    $('cellvE').textContent='—';
+    $('cellvDetail').textContent='固件按 SYS_PERIOD(≈1Hz)与电流并行采样;idle 与测量期间都采';
+    box.classList.remove('clipped'); return;
+  }
+  const clipped=Boolean(c.clipped);
+  box.classList.toggle('clipped',clipped);
+  $('cellvBadge').textContent=clipped?'超量程削顶':`${c.rows} 组`;
+  $('cellvBadge').className=`live-badge ${clipped?'error':'running'}`;
+  $('cellvE').textContent=`E = ${fmt(c.e_mv,0)} mV`;
+  $('cellvDetail').textContent=
+    `WE ${fmt(c.we_mv,0)} · RE ${fmt(c.re_mv,0)} · CE ${fmt(c.ce_mv,0)} · WO ${fmt(c.wo_mv,0)} mV`+
+    `  |  code WE ${c.we_code} / RE ${c.re_code}`+
+    (clipped?'  ⚠️ 有 code 撞 0 或 4095,电位已超出 0~3.07V 可测范围':'');
+}
 function renderTransient(data){
   const p=data.transient||{}, auto=data.auto_switch||{}, box=$('phaseLive');
   const running=data.state==='running', atTarget=isMeasRange(data.range_runtime?.applied);
@@ -250,7 +270,7 @@ $('applyRange').onclick=async()=>{
 
 function updateMeasurement(data){
   state.measurement=data; const running=data.state==='running', complete=data.state==='completed';
-  renderRange(data); renderTransient(data);
+  renderRange(data); renderTransient(data); renderCellV(data);
   $('measureMessage').textContent=data.message||''; $('liveBadge').textContent=running?'采集中':complete?'已完成':data.state==='error'?'错误':'待机'; $('liveBadge').className=`live-badge ${running?'running':data.state==='error'?'error':''}`;
   $('stopMeasure').disabled=!running; $('useForCalibration').disabled=!complete||data.summary?.steady_current_nA==null; $('predictConcentration').disabled=!complete||data.summary?.steady_current_nA==null;
   const s=data.summary||{}; $('steadyCurrent').textContent=fmt(s.steady_current_nA); $('steadySd').textContent=fmt(s.steady_sd_nA);

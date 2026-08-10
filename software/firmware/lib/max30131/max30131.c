@@ -581,6 +581,32 @@ uint8_t max30131_enc_s1_config5(uint8_t conv_time_code, bool select)
 	       BIT_IF(select, MAX30131_S1C5_SELECT_Pos);
 }
 
+uint8_t max30131_enc_sys_adc_setup(uint8_t sensv_gain_code)
+{
+	/*
+	 * AIN/PWR 增益本设计不用,留复位默认 00;OPA_BYPASS_EN 强制 0 ——
+	 * 置 1 会旁路输入缓冲,datasheet 要求信号能驱动 14MΩ,等于在 WE/RE 上
+	 * 挂一条 ~29nA 的漏电路径,会破坏被测对象本身(尤其 RE 绝不能带载)。
+	 */
+	return (uint8_t)((sensv_gain_code & 0x3u)
+			 << MAX30131_SYSADC_SENSV_GAIN_Pos);
+}
+
+int32_t max30131_sys_adc_mv(uint16_t code, int32_t vref_mv, uint8_t gain_code)
+{
+	/* V = code/4096 × VREF / gain。gain = 2 / 1 / 0.5 / 0.25 ⇒ 用整数比避免浮点。 */
+	static const int32_t num[4] = { 1, 1, 2, 4 }; /* 1/gain 的分子 */
+	static const int32_t den[4] = { 2, 1, 1, 1 }; /* 1/gain 的分母 */
+
+	if (vref_mv <= 0) {
+		return 0;
+	}
+	gain_code &= 0x3u;
+	return (int32_t)div_round((int64_t)(code & 0x0FFFu) * vref_mv
+					  * num[gain_code],
+				  (int64_t)4096 * den[gain_code]);
+}
+
 uint8_t max30131_enc_reference_control(max30131_ref_val_t ref, bool ref_en,
 				       bool external)
 {

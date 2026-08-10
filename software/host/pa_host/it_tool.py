@@ -115,6 +115,8 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         cmd += ["--socket", args.socket or "127.0.0.1:19021"]
     if getattr(args, "cmd_file", None):
         cmd += ["--cmd-file", str(args.cmd_file)]
+    if getattr(args, "cell_v", None):
+        cmd += ["--cell-v", str(args.cell_v)]
     if args.raw_log:
         cmd += ["--raw-log", str(args.raw_log)]
     if args.trigger:
@@ -141,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="连接 RTT 后触发一轮测量；默认 START")
     measure.add_argument("--out", type=Path, required=True)
     measure.add_argument("--raw-log", type=Path)
+    measure.add_argument("--cell-v", type=Path,
+                         help="电极电压连采 CSV(默认 <out stem>-cellv.csv)")
     measure.add_argument("--cmd-file", type=Path,
                          help="命令文件:采集器会把新增行经自己的 RTT socket 转发给固件")
     measure.add_argument("--duration", type=float, default=205.0)

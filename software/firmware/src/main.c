@@ -124,8 +124,93 @@ static int apply_range(int fsr_code, int off_code);
  *   A(原)= 0x08(IOS_MODE=1)   B(本次)= 0x00(IOS_MODE=0)
  *   判据:① 运行第一个样本的 counts/fa;② **无复位**轮次边界的跳变幅度。
  *   这一位同时判定 datasheet 哪一边对 —— 无论结果如何都要回灌 05 文档 §7。
+ *
+ * ❌ **A/B 结果:阴性(2026-08-09 实测)。** 组 B(0x00)的边界跳变照旧、照旧撞轨:
+ *   A(0x08):间隔 33.8s,+25.88nA → **+499.88nA**(counts 8, sat=1),跳 +474nA
+ *   B(0x00):间隔 32.1s,+97.29nA → **+482.79nA**(counts 1128, sat=1),跳 +385nA
+ *   根因:我漏读了 p40 那句是**无条件**的 ——「When the ADC is not converting, S1.n is
+ *   switched to VDD, S2.n is closed, and the fixed 50nA bias current is used to bias the
+ *   WEn pin」。`IOS_MODE` 只管**编程 offset 在不转换时是否还在**,管不了 S1.n 的
+ *   VDD/ADC 切换、也管不了那个固定 50nA 源 ⇒ 只要"停转换"发生,通路就要变一次。
+ *   ⚠️ 这次 A/B 因此**也没能判定 datasheet 的极性矛盾**(我把机制假设与极性判定塞进了
+ *   同一个实验,只有前者得到回答)。极性仍以寄存器图为准 ⇒ 恢复 0x08。
  */
-#define WP_S1_CONFIG3 0x00U   /* A/B 组 B;原值 0x08 */
+#define WP_S1_CONFIG3 0x08U   /* IOS_MODE=1=常在(寄存器图 p96,唯一自洽);A/B 组 B 的 0x00 已阴性 */
+
+/*
+ * 🔬 A/B 实验二(2026-08-09):**轮次之间不要停转换。**
+ *
+ * 上一个实验把嫌疑人缩小到了"停转换"这个动作本身(而不是它的某个副作用):收尾会写
+ * `CONVERT_START=(AUTO=0,CONVERT=0)`,于是两轮之间有 **~32s AFE 完全不转换**,
+ * 那段时间 WE 只由 p40 的"不转换"通路(S1.n→VDD + 固定 50nA)偏置。重开转换时要恢复,
+ * 观测到的两个时间尺度与此相符:
+ *   - <1s 的快速恢复(B 第2轮 counts 1128→9112→13192→15328,0.5s 内爬到 +266nA)
+ *     ——更像**重启后第一次转换是残缺积分**(积分不足 ⇒ counts 偏低 ⇒ 读成大还原电流),测量伪影
+ *   - ~100s 的慢尾(+266nA 爬回零)——真实,疑为那段偏置通路改变留下的电化学债
+ *
+ * ✅ **A/B 二结果:阳性。** 不停转换后,轮次边界跳变 +474/+385nA → **−1.7nA**。
+ *   而且 gap 长度已被独立排除:停转换的最短 gap(15.5s)瞬态最大(999nA 顶轨),
+ *   不停转换的最长 gap(172.5s,长 11 倍)瞬态最小(~20nA)。若 gap 长度是驱动量,
+ *   这张表必须是反的。⇒ **"停转换"这个动作是原因。**
+ *   (该对照来自用户 2026-08-09 深夜自跑的 10 轮,不是我排的 C_run3 —— 那轮因溶液
+ *    干掉被我中止,归因当时并不成立,是后来用他的数据补上的。)
+ *
+ * 🔻 本开关已被 WP_IDLE_MODE 取代(两个旋钮管同一件事是陷阱),不再单独存在。
+ *   等价关系:原 true  ≡ IDLE_KEEP_BIASED
+ *             原 false ≡ IDLE_STOP_CONV
+ *   现默认走第三种 IDLE_DISCONNECT —— 见下。
+ */
+
+/*
+ * ══════════════════════════════════════════════════════════════════════
+ * 轮次之间(idle)对电解池怎么处置 —— 三态,含实测代价
+ * ══════════════════════════════════════════════════════════════════════
+ * IDLE_STOP_CONV(旧行为,仅作对照):只写 CONVERT=0。放大器仍开,但芯片按 p40
+ *   把 WE 切到"不转换"偏置通路(S1.n→VDD + 固定 50nA)。**实测这是最坏的中间态**:
+ *   既不是恒电位保持,也不是开路;下一轮开跑必有 +385~474nA 还原冲击、~100s 恢复。
+ *   (gap 长度已被排除:15.5s gap 反而给出最大瞬态,172.5s gap 的 C 模式最小)
+ * IDLE_KEEP_BIASED:转换不停,电解池始终被钳在设定电位。轮次边界跳变实测 −1.7nA。
+ *   代价:待机 3.5→7.3µA。这是 datasheet p1 "continuous biasing" 的原意。
+ * IDLE_DISCONNECT(默认,2026-08-10 用户+生物负责人拍板):写 0x20 令
+ *   WE/CE_AMP_EN=0 ⇒ **真开路**(p11 Output Off Leakage ±10pA typ/±100max)。
+ *   与 CHI660 对齐:两次实验之间不驱动电解池,下次测量重新充双电层。
+ *   🔴 代价必须承认:每轮开头必有完整双电层充电瞬态。实测 τ≈26–50s ⇒ 5τ≈130–250s。
+ *      ⇒ **必须配 Quiet Time**(GUI 的 prestep_s 设 180~300s),先极化再记录,
+ *         否则前 100s+ 数据是瞬态、不是稳态。CHI660 也是靠 Quiet Time,行为一致。
+ */
+#define IDLE_STOP_CONV   0
+#define IDLE_KEEP_BIASED 1
+#define IDLE_DISCONNECT  2
+#define WP_IDLE_MODE IDLE_DISCONNECT
+
+/*
+ * idle 期间用 System ADC 直接量电极引脚电压,回答「不测量时电极被放在哪个电位」。
+ * 这个问题我从框图推过两次、两次都被实验打脸(见上面两处 A/B 说明)⇒ 不再推,直接测。
+ *
+ * 🔴 必须同时量 WE 和 RE:E = V_WE − V_RE,而断开时 **RE 也在浮**,只测 WE 得不到 E。
+ *    另加 CE(诊断:若被拉到地说明进了 sensor-detect 类状态)与 WO(放大器输出停靠点)。
+ * 四路 tag:0xD0=WO1 / 0xD1=WE1 / 0xD2=RE1 / 0xD3=CE1(Table 9)。
+ *
+ * ⚠️ 仅在"转换已停"的两种 idle 模式下工作:手动单次转换与 IDLE_KEEP_BIASED
+ *    "永不停转换"的定义直接冲突,那个模式下不探测(否则就破坏了它本身)。
+ * ⚠️ 全断开时整个电解池对芯片 GND 浮动,电压可能跌破 0 或超量程 ⇒ 会削顶。
+ *    所以日志里**同时打印原始 12-bit code**,只看 mV 看不出削顶。
+ */
+#define WP_CELLV_ENABLE true
+#define WP_SYSADC_SENSV_GAIN MAX30131_SYSADC_GAIN_0P5X /* 0.5× ⇒ 可测 0~3.07V,盖住浮到 VDD */
+/*
+ * SYS_PERIOD(0x81 低半字节),与 SENS_PERIOD 同一张码表:
+ *   0x0=124ms 0x1=242ms 0x2=476ms 0x3=945ms 0x4=1882ms …
+ * 🔴 硬约束(p143):**四路的总转换时间必须 ≤ SYS_PERIOD**,否则置 INVALID_CFG,
+ *   且"the conversion cycle abruptly restarts before completing all selected
+ *   channels. Data saved in the FIFO is invalid for the interrupted channel."
+ *   System ADC 单次 8.5ms(EC 表),SYS_CONV_TYPE=0 时每路要 offset+signal 两次
+ *   ⇒ 4 路 × 2 × 8.5 ≈ 68ms。取 0x3(945ms)⇒ 占空比仅 ~7%,余量 13 倍。
+ * ⚠️ 已知风险:System ADC 每 945ms 活动 68ms,可能给 pA 级电流测量注入扰动。
+ *   若电流谱里出现 1/0.945 ≈ 1.06Hz 的谱线,就是它。把 WP_CELLV_ENABLE 置 false
+ *   跑一轮即可 A/B 判定(那条路径下 idle 行为退回纯原始版本)。
+ */
+#define WP_SYS_PERIOD_CODE 0x3U
 
 /*
  * 🔴 2026-08-09:0x0(31ms/12bit)→ 0x1(60ms/13bit)。
@@ -360,6 +445,28 @@ static int afe_configure(void)
 		  "S1_CONFIG1: WE/CE_AMP_EN=1, WE_DAC_MX=00→DACA, "
 		  "🔴CE_DAC_MX=01→DACB(不写则两放大器共用 DACA、E=0), CHOP_EN=1" },
 		{ 0x21U, 0x90U, "S1_CONFIG2: 3 端电极 + WE drive" },
+		/*
+		 * 电极电压连采(System ADC)。常开 —— idle 与测量期间一视同仁,
+		 * 靠 AUTO 模式与 Sensor ADC 并行(p143),共用 FIFO 靠 tag 区分。
+		 * 次序:先配增益与通道,最后开 SYS_SELECT。
+		 */
+		{ MAX30131_REG_SYS_ADC_SETUP,
+		  WP_CELLV_ENABLE ? max30131_enc_sys_adc_setup(WP_SYSADC_SENSV_GAIN) : 0x00U,
+		  "SYS ADC SETUP: SENSV 增益 0.5×(可测 0~3.07V), 🔴OPA_BYPASS_EN=0" },
+		{ MAX30131_REG_CONVERT_SETUP2,
+		  WP_CELLV_ENABLE ? (uint8_t)(WP_SYS_PERIOD_CODE << MAX30131_CS2_SYS_PERIOD_Pos)
+				  : 0x00U,
+		  "CONVERT SETUP2: SYS_PERIOD(四路总转换时间须 ≤ 该周期)" },
+		{ MAX30131_REG_SYS_ADC_IN_SEL2,
+		  WP_CELLV_ENABLE ? (uint8_t)(BIT(MAX30131_SYSADC_S1_WE_SEL_Pos) |
+					      BIT(MAX30131_SYSADC_S1_RE_SEL_Pos) |
+					      BIT(MAX30131_SYSADC_S1_CE_SEL_Pos) |
+					      BIT(MAX30131_SYSADC_S1_WO_SEL_Pos))
+				  : 0x00U,
+		  "SYS ADC IN SEL2: WE1+RE1+CE1+WO1(E=V_WE−V_RE 必须两路都有)" },
+		{ MAX30131_REG_SYS_ADC_IN_SEL1,
+		  WP_CELLV_ENABLE ? (uint8_t)BIT(MAX30131_SYSADC_SYS_SELECT_Pos) : 0x00U,
+		  "SYS ADC IN SEL1: SYS_SELECT(⚠️ 位号未从 datasheet 文本层确认,见 regs.h)" },
 		{ 0x22U, WP_S1_CONFIG3, "S1_CONFIG3:IOS_MODE(见文件头 A/B 说明)" },
 		{ 0x23U, max30131_enc_s1_config4(WP_FSR, WP_OFFSET_SEL),
 		  "S1_CONFIG4: configured FSR/offset" },
@@ -751,13 +858,260 @@ static enum control_command poll_control_command(void)
 	return CONTROL_NONE;
 }
 
+/* ================================================================== */
+/* idle(轮次之间)对电解池的处置 + 电极电压自监视                       */
+/* ================================================================== */
+
+/* 本设计 0x20 的固定部分:WE_DAC_MX=DACA、CE_DAC_MX=DACB、CP_EN=0、CHOP_EN=1。 */
+static uint8_t s1_config1_byte(bool we_amp_en, bool ce_amp_en)
+{
+	const max30131_s1_config1_t c = {
+		.we_amp_en = we_amp_en,
+		.ce_amp_en = ce_amp_en,
+		.we_dac_mx = MAX30131_DAC_MX_A,
+		.ce_dac_mx = MAX30131_DAC_MX_B,
+		.cp_en = false,
+		.chop_en = true,
+	};
+	return max30131_enc_s1_config1(&c);
+}
+
+/*
+ * 开/关恒电位放大器。**分两步写,次序照 CH Instruments 手册的电极接线告诫**:
+ *   "You should connect the reference and counter electrodes first.
+ *    When disconnecting, disconnect the working electrode first."
+ * 断开:先关 WE、再关 CE。接通:先开 CE、再开 WE。
+ * 我们是片内开关而非插拔,但同一道理 —— 不让 WE 在没有 CE 回路时单独带电。
+ */
+static int set_potentiostat_amps(bool on)
+{
+	int rc;
+
+	if (on) {
+		rc = max30131_spi_write_reg(MAX30131_REG_S1_CONFIG1,
+					   s1_config1_byte(false, true));
+		if (rc) {
+			return rc;
+		}
+		return max30131_spi_write_reg(MAX30131_REG_S1_CONFIG1,
+					      s1_config1_byte(true, true));
+	}
+	rc = max30131_spi_write_reg(MAX30131_REG_S1_CONFIG1,
+				   s1_config1_byte(false, true));
+	if (rc) {
+		return rc;
+	}
+	return max30131_spi_write_reg(MAX30131_REG_S1_CONFIG1,
+				      s1_config1_byte(false, false));
+}
+
+/* 选/不选 Sensor 1 参与转换(0x24 bit0)。idle 探测期间必须**不选**——见下。 */
+static int set_sensor_selected(bool selected)
+{
+	return max30131_spi_write_reg(MAX30131_REG_S1_CONFIG5,
+				      max30131_enc_s1_config5(WP_CONV_TIME_CODE,
+							      selected));
+}
+
+/*
+ * ══════════════════════════════════════════════════════════════════════
+ * 电极电压的**连续**采集(idle 与测量期间一视同仁)
+ * ══════════════════════════════════════════════════════════════════════
+ * 由 System ADC 在 AUTO 模式下按 SYS_PERIOD 自主转换,与 Sensor ADC 的电流转换
+ * **并行**,共用同一个 FIFO、靠 tag 区分(p143 明文)。所以不需要手动单次转换,
+ * 也不需要在 idle/测量之间切换采集方式 —— 一条路径全覆盖。
+ *
+ * 🔴 为什么必须四路而不是只测 WE:E = V_WE − V_RE,而断开时 **RE 也在浮**,
+ *    只有 WE 对芯片 GND 的电压推不出任何电化学量。CE 用于诊断(被拉到地 ⇒ 进了
+ *    sensor-detect 类状态),WO 给出放大器输出的停靠点。
+ * 🔴 为什么必须上报原始 12-bit code:整个电解池对芯片 GND 浮动时,电压可能跌破 0
+ *    或超量程被削顶;只看 mV 看不出削顶,看 code 撞 0/4095 才看得出。
+ */
+static struct {
+	int32_t mv[4];
+	uint16_t code[4];
+	bool got[4];
+	bool ever_got;
+	int64_t warned_at;
+} cellv;
+
+#define CELLV_WE 0
+#define CELLV_RE 1
+#define CELLV_CE 2
+#define CELLV_WO 3
+
+/*
+ * 如果这个 FIFO 词是电极电压,收进 cellv 并返回 true(调用方应 continue);
+ * 否则返回 false 交给电流路径。四路凑齐 WE+RE 就打一行。
+ */
+static bool collect_voltage_word(const max30131_fifo_word_t *w)
+{
+	int idx;
+
+	if (!w->tag_is_8bit) {
+		return false;
+	}
+	switch (w->tag) {
+	case MAX30131_FIFO_TAG_S1_WE_V: idx = CELLV_WE; break;
+	case MAX30131_FIFO_TAG_S1_RE_V: idx = CELLV_RE; break;
+	case MAX30131_FIFO_TAG_S1_CE_V: idx = CELLV_CE; break;
+	case MAX30131_FIFO_TAG_S1_WO_V: idx = CELLV_WO; break;
+	default: return false;
+	}
+
+	cellv.code[idx] = w->counts;
+	cellv.mv[idx] = max30131_sys_adc_mv(w->counts, max30131_ref_mv(WP_REF),
+					    WP_SYSADC_SENSV_GAIN);
+	cellv.got[idx] = true;
+	cellv.ever_got = true;
+
+	/* WE 与 RE 都到手才算一组 —— 少任何一个都算不出 E。 */
+	if (!cellv.got[CELLV_WE] || !cellv.got[CELLV_RE]) {
+		return true;
+	}
+	printk("CELL_V ms=%lld idle=%d we_mv=%d re_mv=%d ce_mv=%d wo_mv=%d "
+	       "e_mv=%d we_code=%u re_code=%u ce_code=%u wo_code=%u\n",
+	       (long long)k_uptime_get(), WP_IDLE_MODE,
+	       cellv.mv[CELLV_WE], cellv.mv[CELLV_RE],
+	       cellv.got[CELLV_CE] ? cellv.mv[CELLV_CE] : -1,
+	       cellv.got[CELLV_WO] ? cellv.mv[CELLV_WO] : -1,
+	       cellv.mv[CELLV_WE] - cellv.mv[CELLV_RE],
+	       cellv.code[CELLV_WE], cellv.code[CELLV_RE],
+	       cellv.code[CELLV_CE], cellv.code[CELLV_WO]);
+	for (int i = 0; i < 4; i++) {
+		cellv.got[i] = false;
+	}
+	return true;
+}
+
+/*
+ * idle 期间排空 FIFO —— 此时没有采集循环在跑,得有人来读,否则电压词只会
+ * 在 FIFO 里滚掉(ro=1),上位机什么也看不到。
+ */
+static void drain_fifo_for_voltages(void)
+{
+	for (int n = 0; n < 12; n++) {
+		uint8_t raw[3];
+		max30131_fifo_word_t w;
+		uint8_t st = 0;
+
+		if (max30131_spi_read_reg(MAX30131_REG_STATUS1, &st) != 0) {
+			return;
+		}
+		if (!(st & BIT(MAX30131_STATUS1_FIFO_DATA_RDY_Pos))) {
+			return;
+		}
+		if (max30131_spi_read_burst(MAX30131_REG_FIFO_DATA, raw,
+					    sizeof(raw)) != 0) {
+			return;
+		}
+		if (max30131_fifo_unpack(raw, &w) != MAX30131_OK) {
+			continue;
+		}
+		if (w.tag_is_8bit && w.tag == MAX30131_FIFO_TAG_EMPTY) {
+			return;
+		}
+		(void)collect_voltage_word(&w);
+	}
+}
+
+/*
+ * 长时间一个电压词都没收到,最可能是 0x55 的 SYS_SELECT 位号猜错了
+ * (datasheet 表格未能从文本层确认,按惯例取了 bit0)。大声报一次,不静默 ——
+ * 这是个可检测、无损的假设。
+ */
+static void warn_if_no_voltages(void)
+{
+	int64_t now = k_uptime_get();
+
+	if (cellv.ever_got || !WP_CELLV_ENABLE) {
+		return;
+	}
+	if (cellv.warned_at != 0 && now - cellv.warned_at < 30000) {
+		return;
+	}
+	cellv.warned_at = now;
+	LOG_WRN("🔴 至今未收到任何电极电压词(tag 0xD1/0xD2)。"
+		"首查 0x55 的 SYS_SELECT 位号假设(现取 bit%u,共 8 种可能);"
+		"其次查 0x56=0x0F 与 SYS_PERIOD 是否够长",
+		MAX30131_SYSADC_SYS_SELECT_Pos);
+}
+
+/*
+ * 进入 idle。三种模式的差别收敛成两个正交开关:**sensor 选不选** 和 **放大器开不开**。
+ *
+ * 🔴 开了电极电压连采(WP_CELLV_ENABLE)时,**AUTO 必须保持运行** ——
+ *    System ADC 的自主转换靠的就是它。所以此时 idle **不写 CONVERT=0**,
+ *    改用「不选 sensor」来达到"电流不转换"的效果:
+ *      STOP_CONV   : sensor 不选 + 放大器**开**  ⇒ 复现旧的那个坏中间态
+ *      KEEP_BIASED : sensor 选   + 放大器开      ⇒ 转换从不停
+ *      DISCONNECT  : sensor 不选 + 放大器**关**  ⇒ 真开路
+ *    关掉连采时(A/B 用)才退回"直接写 CONVERT=0"的纯原始行为。
+ */
+static void enter_idle_state(void)
+{
+	if (!WP_CELLV_ENABLE && WP_IDLE_MODE != IDLE_KEEP_BIASED) {
+		(void)max30131_spi_write_reg(MAX30131_REG_CONVERT_START,
+					     max30131_enc_convert_start(false, false));
+	} else if (WP_IDLE_MODE != IDLE_KEEP_BIASED) {
+		(void)set_sensor_selected(false);
+	}
+
+	switch (WP_IDLE_MODE) {
+	case IDLE_KEEP_BIASED:
+		LOG_INF("idle=KEEP_BIASED:转换不停、电解池持续钳在 E=%d mV"
+			"(边界跳变实测 −1.7nA;待机 7.3µA)", WP_STARTUP_E_MV);
+		break;
+	case IDLE_DISCONNECT:
+		if (set_potentiostat_amps(false) != 0) {
+			LOG_ERR("idle=DISCONNECT:关放大器失败");
+		} else {
+			LOG_INF("idle=DISCONNECT:WE/CE 放大器已关 ⇒ 真开路"
+				"(残余仅引脚漏电 ±10pA typ)。与 CHI660 默认行为一致:"
+				"实验结束即 cell off,下轮靠 Quiet Time 重新极化");
+		}
+		break;
+	default:
+		LOG_WRN("idle=STOP_CONV(仅作对照):电极会落到 p40 的固定 50nA 偏置通路,"
+			"实测下一轮开头有 +385~474nA 还原冲击、~100s 恢复");
+		break;
+	}
+}
+
+/* 退出 idle:恢复放大器与 sensor 选择。电位与 Quiet Time 由调用方负责。 */
+static void exit_idle_state(void)
+{
+	if (WP_IDLE_MODE == IDLE_DISCONNECT) {
+		if (set_potentiostat_amps(true) != 0) {
+			LOG_ERR("退出 idle:开放大器失败");
+		}
+		/* 放大器上电建立;DAC/REF 一直使能,不需要 12ms REF settle。 */
+		k_msleep(20);
+		LOG_INF("退出 idle:放大器已开(先 CE 后 WE)");
+	}
+	if (WP_IDLE_MODE != IDLE_KEEP_BIASED) {
+		(void)set_sensor_selected(true);
+		if (!WP_CELLV_ENABLE) {
+			/* 纯原始路径下 idle 停过转换,这里要重新起 AUTO。 */
+			(void)max30131_spi_write_reg(MAX30131_REG_CONVERT_START,
+						     max30131_enc_convert_start(true, true));
+		}
+	}
+}
+
 static void wait_for_start_command(void)
 {
-	printk("IT_READY target_mv=%d\n", WP_E_MV);
+	printk("IT_READY target_mv=%d idle_mode=%d cellv=%d\n", WP_E_MV,
+	       WP_IDLE_MODE, (int)WP_CELLV_ENABLE);
 	while (1) {
 		board_guards_feed();
 		if (poll_control_command() == CONTROL_START) {
 			return;
+		}
+		if (WP_CELLV_ENABLE) {
+			/* idle 期间没有采集循环在读 FIFO,得有人来排 —— 否则电压词滚掉。 */
+			drain_fifo_for_voltages();
+			warn_if_no_voltages();
 		}
 		k_msleep(20);
 	}
@@ -1129,6 +1483,17 @@ static uint16_t drain_fifo(uint16_t max_emit)
 			return emitted;
 		}
 
+		/*
+		 * 电极电压词(tag 0xD0–0xD3)走电压路径。它们由 System ADC 在
+		 * AUTO 模式下按 SYS_PERIOD 自主转换,与 Sensor ADC 的电流转换**并行**
+		 * (p143:"all selected channels are continuously converted at the rate
+		 * determined by each channels period setting in SENS_PERIOD[3:0],
+		 * TEMP_PERIOD[3:0], and SYS_PERIOD[3:0]"),共用同一个 FIFO、靠 tag 区分。
+		 */
+		if (collect_voltage_word(&s)) {
+			continue;
+		}
+
 		/* 只上报「Sensor 1 DC 电流」样本;其它 tag(如 EIS)本版不处理 */
 		if (s.tag != MAX30131_FIFO_TAG_S1_DC) {
 			LOG_DBG("跳过非 S1-DC 样本 tag=0x%02x", s.tag);
@@ -1227,9 +1592,33 @@ int main(void)
 		last_sat = 0U;
 		printk("IT_START run=%u target_mv=%d\n", run_number, WP_E_MV);
 
+	/*
+	 * 🔴 次序:先退出 idle(开放大器)→ 再加 Quiet Time 电位 → 才能静置。
+	 * 原来的 prestep 只是 sleep,它**默认电位已经加着**;在 IDLE_DISCONNECT 下
+	 * 放大器是关的,不先做这两步就是干等,双电层根本没在充。
+	 */
+	exit_idle_state();
+	if (set_polarization(WP_STARTUP_E_MV) != 0) {
+		LOG_ERR("施加静置电位 E=%d mV 失败,停在此处", WP_STARTUP_E_MV);
+		while (1) {
+			board_guards_feed();
+			k_msleep(1000);
+		}
+	}
+	if (WP_IDLE_MODE == IDLE_DISCONNECT && WP_PRESTEP_DURATION_MS == 0U) {
+		/*
+		 * 断开模式 + 零 Quiet Time = 每轮都在录双电层充电瞬态,不是稳态。
+		 * 实测 τ≈26–50s ⇒ 需要 130–250s。CHI 手册示例是 2s,但那是宏电极;
+		 * 我们的界面是 CPE,慢两个数量级,照抄 2s 会全废。
+		 */
+		LOG_ERR("🔴 IDLE_DISCONNECT 但 Quiet Time = 0!每轮开头都是双电层充电瞬态。"
+			"请在上位机把 prestep_s 设为 180~300s(实测 τ≈26–50s ⇒ 5τ≈130~250s)");
+	}
+
 	if (WP_PRESTEP_DURATION_MS > 0U) {
-		LOG_INF("IT 阶跃前保持:E=%d mV,hold=%u ms", WP_STARTUP_E_MV,
-			WP_PRESTEP_DURATION_MS);
+		LOG_INF("Quiet Time(静置):E=%d mV 保持 %u ms 后才开始记录"
+			"(对应 CHI 的 Quiet Time = quiescent time before potential scan)",
+			WP_STARTUP_E_MV, WP_PRESTEP_DURATION_MS);
 		uint32_t waited_ms = 0U;
 		while (waited_ms < WP_PRESTEP_DURATION_MS) {
 			uint32_t chunk_ms = MIN(1000U, WP_PRESTEP_DURATION_MS - waited_ms);
@@ -1322,10 +1711,17 @@ int main(void)
 		k_msleep(POLL_INTERVAL_MS);
 	}
 
-	/* 停止任何残留转换并把电位恢复为用户配置的起始值。 */
-	(void)max30131_spi_write_reg(MAX30131_REG_CONVERT_START,
-					 max30131_enc_convert_start(false, false));
+	/*
+	 * 先把电位写回起始值,再按 WP_IDLE_MODE 处置电解池 —— 次序不能反:
+	 * DISCONNECT 会关掉放大器,关掉之后再写 DAC 就是空动作。
+	 *
+	 * ⚠️ 注:在 DISCONNECT 模式下这次 set_polarization 本身**不保持任何电位**
+	 * (放大器随后就关了),它只是让寄存器状态回到已知值。对应 CH Instruments 的
+	 * "Return to Initial E after Run" 选项 —— 手册明说该选项
+	 * "only makes sense to enable ... if Cell On Between Runs is also checked"。
+	 */
 	(void)set_polarization(WP_STARTUP_E_MV);
+	enter_idle_state();
 	LOG_INF("i-t 测量结束:elapsed=%lld ms,native=%u/%u,empty polls=%u,E 已恢复为 %d mV",
 		(long long)(k_uptime_get() - measurement_start_ms), native_samples,
 		WP_EXPECTED_SAMPLE_COUNT, conversion_errors, WP_STARTUP_E_MV);

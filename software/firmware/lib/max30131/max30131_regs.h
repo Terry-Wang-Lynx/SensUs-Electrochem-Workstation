@@ -116,6 +116,52 @@
 #define MAX30131_REG_S1_IOFFSET_L 0x2Cu /* S1_IOFFSET[7:0]  */
 
 /* ------------------------------------------------------------------ */
+/* System ADC(12-bit,22 路输入;本设计只用它量 WE1 引脚电压)          */
+/* ------------------------------------------------------------------ */
+/*
+ * 用途:直接数字化 WE1 **引脚**电压,用来回答「不测量时芯片把电极放在哪个电位」——
+ * 这个问题从框图推过两次都被实验打脸(见 main.c 的两处 A/B 说明),必须实测。
+ * 依据:datasheet System ADC p64-65、寄存器 0x54-0x56 p117-119、FIFO tag Table 9 p72。
+ */
+#define MAX30131_REG_SYS_ADC_SETUP 0x54u
+#define MAX30131_SYSADC_AIN_GAIN_Pos 6u    /* [7:6] */
+#define MAX30131_SYSADC_PWR_GAIN_Pos 4u    /* [5:4] */
+#define MAX30131_SYSADC_SENSV_GAIN_Pos 2u  /* [3:2] 管 WOn/WEn/REn/CEn */
+/*
+ * 🔴 OPA_BYPASS_EN 必须保持 0。置 1 会旁路输入缓冲,datasheet 明说此时
+ * 「the signal must be able to drive a 14MΩ load」⇒ 在 WE 上等于挂了条
+ * 0.4V/14MΩ ≈ 29nA 的漏电路径,足以把我们要测的东西本身破坏掉。
+ * 缓冲使能时「the input signal loading is negligible」。
+ */
+#define MAX30131_SYSADC_OPA_BYPASS_EN_Pos 1u
+/* 增益码:00=2.0 / 01=1.0 / 10=0.5 / 11=0.25(V/V) */
+#define MAX30131_SYSADC_GAIN_2X 0x0u
+#define MAX30131_SYSADC_GAIN_1X 0x1u
+#define MAX30131_SYSADC_GAIN_0P5X 0x2u
+#define MAX30131_SYSADC_GAIN_0P25X 0x3u
+
+#define MAX30131_REG_SYS_ADC_IN_SEL1 0x55u
+/*
+ * ⚠️ SYS_SELECT 的位号未能从 datasheet 文本层确认(表格被提取工具打散)。
+ * 按本 datasheet 的排版惯例(字段说明的最后一项 = LSB,与 0x56 的
+ * S1_CE_SYS_SEL=bit0 一致)取 bit0。假设若错,后果只是拿不到 0xD1 数据 ——
+ * 可检测、无损;固件会在 bring-up 时明确报出来,不会静默。
+ */
+#define MAX30131_SYSADC_SYS_SELECT_Pos 0u
+
+#define MAX30131_REG_SYS_ADC_IN_SEL2 0x56u
+#define MAX30131_SYSADC_S1_CE_SEL_Pos 0u
+#define MAX30131_SYSADC_S1_RE_SEL_Pos 1u
+#define MAX30131_SYSADC_S1_WE_SEL_Pos 2u /* ← 我们要的那一位 */
+#define MAX30131_SYSADC_S1_WO_SEL_Pos 3u
+
+/* FIFO tag(Table 9,8-bit tag 分支,数据在 bits[11:0]) */
+#define MAX30131_FIFO_TAG_S1_WO_V 0xD0u
+#define MAX30131_FIFO_TAG_S1_WE_V 0xD1u
+#define MAX30131_FIFO_TAG_S1_RE_V 0xD2u
+#define MAX30131_FIFO_TAG_S1_CE_V 0xD3u
+
+/* ------------------------------------------------------------------ */
 /* 极化 DAC(单通道版只有 DACA/DACB)                                    */
 /* ------------------------------------------------------------------ */
 /*
@@ -146,6 +192,15 @@
 /* 转换控制                                                            */
 /* ------------------------------------------------------------------ */
 #define MAX30131_REG_CONVERT_SETUP1 0x80u
+
+/*
+ * 0x81 CONVERT SETUP2:TEMP_PERIOD[7:4] + SYS_PERIOD[3:0](p142)。
+ * 码表与 SENS_PERIOD 同一张:0x0=124ms / 0x1=242 / 0x2=476 / 0x3=945 / 0x4=1882 …
+ * TEMP_SELECT(0x60)本设计不开,所以 TEMP_PERIOD 取什么都无所谓,留 0。
+ */
+#define MAX30131_REG_CONVERT_SETUP2 0x81u
+#define MAX30131_CS2_SYS_PERIOD_Pos 0u  /* [3:0] */
+#define MAX30131_CS2_TEMP_PERIOD_Pos 4u /* [7:4] */
 #define MAX30131_CS1_SENS_PERIOD_Pos 0u   /* [3:0] */
 #define MAX30131_CS1_SYS_CONV_TYPE_Pos 4u
 #define MAX30131_CS1_IOFFSET_CONV_Pos 5u  /* [6:5] */

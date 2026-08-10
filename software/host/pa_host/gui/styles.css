@@ -28,6 +28,9 @@
 /* 两相测量的相位区块。刻意放在「运行档位」上方 —— 相位决定该不该切档,
    而不是反过来。琥珀=还原瞬态(此时切小 offset 必撞轨),绿=已过零并稳定。 */
 .phase-live{background:#f7f9f7;border-left-color:#9aa7ab}
+/* 电极电位连采。红色边框留给"超量程削顶"—— 那意味着读数不可信,不是小事。 */
+.cellv-live{background:#f6f8fa;border-left-color:var(--blue)}
+.cellv-live.clipped{border-left-color:var(--red);background:#fff5f5}
 .phase-live.reduction{border-left-color:var(--amber);background:#fdf8f0}
 .phase-live.ready{border-left-color:var(--green);background:#f2f7f5}
 .phase-live .phase-auto{margin:9px 0 0;font-size:10px;color:var(--muted)}

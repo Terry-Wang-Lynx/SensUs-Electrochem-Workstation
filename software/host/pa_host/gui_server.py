@@ -469,6 +469,7 @@ class MeasurementController:
         self.finished_at: float | None = None
         self.process: subprocess.Popen[str] | None = None
         self.cmd_path: Path | None = None   # 方案 C:在线切档命令文件
+        self.cell_v_path: Path | None = None  # 电极电压连采 CSV(与电流不同速率)
         # 方案 C:运行时档位真值。**不能用 SettingsController 的值代替** ——
         # 那是"最后一次烧录进去的编译期默认",而 RANGE 命令会在运行中改掉它,
         # 两者可以不一致。唯一权威来源是固件回的 RANGE_APPLIED 行。
@@ -507,6 +508,7 @@ class MeasurementController:
             self.raw_path.parent.mkdir(parents=True, exist_ok=True)
             self.raw_log = self.run_dir / "rtt.log"
             self.cmd_path = self.run_dir / "cmd.txt"
+            self.cell_v_path = self.run_dir / "cellv.csv"
             self.range_runtime = {"pending": None, "applied": None,
                                   "rejected": None, "at": None}
             self._rtt_pos = 0
@@ -546,6 +548,8 @@ class MeasurementController:
                 JLINK_SERIAL,
                 # 方案 C:命令文件。外部另开 telnet 连接写下行**无效**
                 # (JLinkExe 只转发采集器持有的那个连接)⇒ 必须走这个文件。
+                "--cell-v",
+                str(self.cell_v_path),
                 "--cmd-file",
                 str(self.cmd_path),
                 "--out",
@@ -846,6 +850,42 @@ class MeasurementController:
             "valid": [bool(x) for x in valid],
         }
 
+    def _cell_voltages(self) -> dict[str, Any] | None:
+        """读电极电压连采 CSV 的最后一行。
+
+        为什么单独一个文件而不是并进电流 CSV:System ADC 按 SYS_PERIOD(≈1Hz)走,
+        电流按 SENS_PERIOD(8Hz)走,两者**不同步**,塞一张表必然错行。
+        为什么只取最后一行:GUI 只需要"现在电极在哪个电位";全序列留给离线分析。
+        """
+        path = self.cell_v_path
+        if path is None or not path.exists():
+            return None
+        try:
+            rows = [
+                ln for ln in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if ln and not ln.startswith("#")
+            ]
+        except OSError:
+            return None
+        if len(rows) < 2:
+            return None
+        header = rows[0].split(",")
+        last = rows[-1].split(",")
+        if len(last) != len(header):
+            return None
+        out: dict[str, Any] = {}
+        for key, raw in zip(header, last):
+            try:
+                out[key] = float(raw) if "." in raw else int(raw)
+            except ValueError:
+                out[key] = raw
+        # 削顶标记:12-bit 单端,撞 0 或 4095 就说明超出了 System ADC 量程
+        out["clipped"] = any(
+            out.get(k) in (0, 4095) for k in ("we_code", "re_code", "ce_code", "wo_code")
+        )
+        out["rows"] = len(rows) - 1
+        return out
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             data = self._data()
@@ -865,6 +905,7 @@ class MeasurementController:
                 # 方案 C:运行时档位。**与 settings 里的 fsr_nA/offset_nA 不是一回事** ——
                 # 那是最后一次烧录的编译期默认值,RANGE 命令能在运行中改掉实际档位。
                 "range_runtime": self.range_runtime,
+                "cell_v": self._cell_voltages(),
                 "transient": _transient_phase(data["time_s"], data["current_nA"],
                                               data["valid"]),
                 "auto_switch": {

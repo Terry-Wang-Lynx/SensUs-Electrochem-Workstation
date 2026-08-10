@@ -68,6 +68,11 @@
               <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
               <div class="notice warn" id="reflashWarn" hidden></div>
               <button class="secondary full apply-settings" id="applySettings">应用条件并烧录硬件</button>
+              <div class="range-live cellv-live" id="cellvLive">
+                <div class="range-live-head"><span>电极电位<em>(System ADC 连采)</em></span><div class="live-badge" id="cellvBadge">无数据</div></div>
+                <strong id="cellvE">—</strong>
+                <small id="cellvDetail">固件按 SYS_PERIOD(≈1Hz)与电流并行采样；idle 与测量期间都采</small>
+              </div>
               <div class="range-live phase-live" id="phaseLive">
                 <div class="range-live-head"><span>测量相位<em>(E=+200 mV,信号为氧化)</em></span><div class="live-badge" id="phaseBadge">待机</div></div>
                 <strong id="phaseNow">—</strong>

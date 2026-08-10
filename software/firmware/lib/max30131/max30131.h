@@ -308,6 +308,15 @@ void max30131_switches_3term_we_drive(max30131_s1_config2_t *out);
 uint8_t max30131_enc_s1_config3(bool ios_mode, bool detector_en);
 uint8_t max30131_enc_s1_config4(max30131_fsr_t fsr, max30131_offset_sel_t off);
 uint8_t max30131_enc_s1_config5(uint8_t conv_time_code, bool select);
+
+/*
+ * System ADC(只用来量 WE1 引脚电压)。
+ * enc_sys_adc_setup 固定把 OPA_BYPASS_EN 写 0 —— 置 1 会引入 14MΩ 负载(≈29nA 漏电),
+ * 足以破坏被测对象本身,所以不给调用方留出错的机会。
+ */
+uint8_t max30131_enc_sys_adc_setup(uint8_t sensv_gain_code);
+/* 12-bit 单端:V = code/4096 × VREF / gain。gain_code 见 MAX30131_SYSADC_GAIN_*。 */
+int32_t max30131_sys_adc_mv(uint16_t code, int32_t vref_mv, uint8_t gain_code);
 uint8_t max30131_enc_reference_control(max30131_ref_val_t ref, bool ref_en,
 				       bool external);
 uint8_t max30131_enc_convert_setup1(bool eis, uint8_t ioffset_conv,
