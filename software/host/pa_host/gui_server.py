@@ -470,6 +470,19 @@ class MeasurementController:
         self.process: subprocess.Popen[str] | None = None
         self.cmd_path: Path | None = None   # 方案 C:在线切档命令文件
         self.cell_v_path: Path | None = None  # 电极电压连采 CSV(与电流不同速率)
+        self.audit_path: Path | None = None   # 配置变更审计 jsonl(每次改参数留痕)
+        # DEBUG 页的增量读状态。全部按"读位置 + 累积列表"做 ⇒ 1Hz 刷新不随
+        # 文件增长变慢(一轮 180s 就上千行,全量重读会明显卡)。
+        self._audit_pos = 0
+        self._audit_cache: list[dict[str, Any]] = []
+        self._cfg_live: dict[str, Any] = {}
+        self._afe_status: dict[str, Any] = {}
+        self._dbg_cur_pos = 0
+        self._dbg_cur: list[dict[str, Any]] = []
+        self._dbg_cur_hdr: list[str] | None = None
+        self._dbg_cv_pos = 0
+        self._dbg_cv: list[dict[str, Any]] = []
+        self._dbg_cv_hdr: list[str] | None = None
         # 方案 C:运行时档位真值。**不能用 SettingsController 的值代替** ——
         # 那是"最后一次烧录进去的编译期默认",而 RANGE 命令会在运行中改掉它,
         # 两者可以不一致。唯一权威来源是固件回的 RANGE_APPLIED 行。
@@ -509,6 +522,21 @@ class MeasurementController:
             self.raw_log = self.run_dir / "rtt.log"
             self.cmd_path = self.run_dir / "cmd.txt"
             self.cell_v_path = self.run_dir / "cellv.csv"
+            # 🔴 审计与 CSV **同目录同 run_id** —— 用户要的"每次测量都要出 csv 和
+            #    对应的操作审计日志"就是靠这个绑定,不靠时间戳事后猜。
+            self.audit_path = self.run_dir / "audit.jsonl"
+            # 🔴 新一轮必须清缓存与读位置 —— 不清会把上一轮的审计与曲线接在
+            #    这一轮后面(文件换了,读位置却没归零 ⇒ 直接读到文件尾之外)。
+            self._audit_pos = 0
+            self._audit_cache = []
+            self._cfg_live = {}
+            self._afe_status = {}
+            self._dbg_cur_pos = 0
+            self._dbg_cur = []
+            self._dbg_cur_hdr = None
+            self._dbg_cv_pos = 0
+            self._dbg_cv = []
+            self._dbg_cv_hdr = None
             self.range_runtime = {"pending": None, "applied": None,
                                   "rejected": None, "at": None}
             self._rtt_pos = 0
@@ -550,6 +578,8 @@ class MeasurementController:
                 # (JLinkExe 只转发采集器持有的那个连接)⇒ 必须走这个文件。
                 "--cell-v",
                 str(self.cell_v_path),
+                "--audit",
+                str(self.audit_path),
                 "--cmd-file",
                 str(self.cmd_path),
                 "--out",
@@ -650,6 +680,163 @@ class MeasurementController:
                                   "rejected": None, "at": time.time()}
             return _json_safe({"sent": line, "cmd_file": str(self.cmd_path),
                                "note": "固件会回 RANGE_APPLIED / RANGE_REJECT,见 rtt.log"})
+
+    # ------------------------------------------------------------------
+    # 硬件 DEBUG 模式
+    # ------------------------------------------------------------------
+    def send_command(self, line: str) -> dict[str, Any]:
+        """下发任意一行命令。send_range() 是它的一个特例。
+
+        🔴 同样必须经采集器的命令文件 —— JLinkExe 的 RTT telnet 只把**采集器持有
+        的那个连接**的输入送进下行通道,另开 telnet 写命令目标端收不到
+        (2026-08-09 实测)。所以"没有测量在跑"时无处可发,只能拒绝。
+        """
+        line = line.strip()
+        if not line:
+            raise ValueError("命令为空")
+        if "\n" in line or "\r" in line:
+            raise ValueError("一行一条命令,不许含换行")
+        if len(line) >= 128:
+            # 与固件 AFE_CFG_LINE_MAX 同口径:超长在固件侧只会被拒,不如在这里挡
+            raise ValueError(f"命令过长({len(line)} ≥ 128 字符)")
+        with self.lock:
+            if self.state != "running" or self.cmd_path is None:
+                raise RuntimeError("命令只能在测量进行中下发(RTT 下行通道由采集器持有)")
+            with self.cmd_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            if line.startswith(("RANGE ", "SET ")):
+                self.range_runtime = {**self.range_runtime, "pending": line,
+                                      "rejected": None, "at": time.time()}
+            return _json_safe({"sent": line, "cmd_file": str(self.cmd_path)})
+
+    def _audit_events(self, limit: int = 60) -> list[dict[str, Any]]:
+        """读 audit.jsonl 的尾部。增量读:只从上次位置往后追加,不全量重读。"""
+        path = self.audit_path
+        if path is None or not path.exists():
+            return []
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(self._audit_pos)
+                fresh = fh.read()
+                self._audit_pos = fh.tell()
+        except OSError:
+            return self._audit_cache[-limit:]
+        for raw in fresh.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            self._audit_cache.append(event)
+            kind = event.get("kind")
+            if kind in ("CFG_APPLIED", "CFG_DERIVED", "CFG_BOOT"):
+                self._cfg_live.update({k: v for k, v in event.items()
+                                       if k not in ("raw", "kind")})
+            elif kind == "CFG_CONFIRMED":
+                self._cfg_live.update({k: v for k, v in event.items()
+                                       if k not in ("raw", "kind")})
+                self._cfg_live["confirmed_ep"] = event.get("ep")
+            elif kind == "AFE_STATUS":
+                self._afe_status = {k: v for k, v in event.items() if k != "kind"}
+        # 只保留尾部,长跑不无限膨胀
+        if len(self._audit_cache) > 400:
+            del self._audit_cache[:-400]
+        return self._audit_cache[-limit:]
+
+    def _read_kv_csv(self, path: Path | None, pos_attr: str, cache_attr: str,
+                     wanted: tuple[str, ...]) -> list[dict[str, Any]]:
+        """增量读一个带表头的 CSV,只留 `wanted` 里的列。
+
+        为什么要增量:DEBUG 页 1Hz 刷新,一轮 180s 就是上千行;每次全量重读会
+        随时间线性变慢,长跑时界面明显卡顿。
+        """
+        cache: list[dict[str, Any]] = getattr(self, cache_attr)
+        if path is None or not path.exists():
+            return cache
+        pos = getattr(self, pos_attr)
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(pos)
+                fresh = fh.read()
+                setattr(self, pos_attr, fh.tell())
+        except OSError:
+            return cache
+        header = getattr(self, cache_attr + "_hdr", None)
+        for raw in fresh.splitlines():
+            raw = raw.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            parts = raw.split(",")
+            if header is None:
+                header = parts
+                setattr(self, cache_attr + "_hdr", header)
+                continue
+            if len(parts) != len(header):
+                continue
+            row: dict[str, Any] = {}
+            for key, value in zip(header, parts):
+                if key not in wanted:
+                    continue
+                try:
+                    row[key] = float(value) if "." in value else int(value)
+                except ValueError:
+                    row[key] = value
+            cache.append(row)
+        return cache
+
+    def _debug_series(self) -> dict[str, Any]:
+        """双轴图的两条流。
+
+        🔴 两条流必须都用**设备时钟 dev_ms** 对齐,不能一条用 load_run_csv 的
+        time_s、另一条用 host_unix_s:前者会裁掉静置段(t=0 的定义不同),后者含
+        轮询抖动。共用 dev_ms 后,t=0 = 两条流里最早的那个设备时刻,左右轴同轴。
+        ⚠️ dev_ms 来自 LFRC(±500ppm),作**相对量**可信,不当绝对时间用。
+        """
+        cur = self._read_kv_csv(self.raw_path, "_dbg_cur_pos", "_dbg_cur",
+                                ("dev_ms", "fa_fw", "sat", "epoch", "counts"))
+        cv = self._read_kv_csv(self.cell_v_path, "_dbg_cv_pos", "_dbg_cv",
+                               ("dev_ms", "e_mv", "we_mv", "re_mv", "epoch",
+                                "ocp", "we_code", "re_code"))
+        starts = [r["dev_ms"] for r in (cur[:1] + cv[:1]) if "dev_ms" in r]
+        t0 = min(starts) if starts else 0
+        return {
+            "t0_dev_ms": t0,
+            "current": {
+                "t": [(r.get("dev_ms", 0) - t0) / 1000.0 for r in cur],
+                "nA": [r.get("fa_fw", 0) / 1e6 for r in cur],
+                "valid": [not int(r.get("sat", 0) or 0) for r in cur],
+                "ep": [int(r.get("epoch", 0) or 0) for r in cur],
+            },
+            "cell_v": {
+                "t": [(r.get("dev_ms", 0) - t0) / 1000.0 for r in cv],
+                "e_mv": [r.get("e_mv", 0) for r in cv],
+                "clipped": [bool(r.get("we_code") in (0, 4095)
+                                 or r.get("re_code") in (0, 4095)) for r in cv],
+                "ocp": [int(r.get("ocp", 0) or 0) for r in cv],
+            },
+        }
+
+    def debug_snapshot(self) -> dict[str, Any]:
+        events = self._audit_events()
+        return _json_safe({
+            "state": self.state,
+            "message": self.message,
+            "error": self.error,
+            "run_id": self.run_id,
+            "run_dir": str(self.run_dir) if self.run_dir else "",
+            "raw_path": str(self.raw_path) if self.raw_path else "",
+            "audit_path": str(self.audit_path) if self.audit_path else "",
+            "cell_v_path": str(self.cell_v_path) if self.cell_v_path else "",
+            "cfg": self._cfg_live,
+            "afe_status": self._afe_status,
+            "cell_v": self._cell_voltages(),
+            "series": self._debug_series(),
+            # 只送尾部,并且倒序 —— 界面上最新的在最上面
+            "audit": list(reversed(events[-40:])),
+            "audit_total": len(self._audit_cache),
+        })
 
     def switch_to_measurement_range(self) -> dict[str, Any]:
         """切到测量档(FSR 250nA + offset SEL4=9nA)。
@@ -1373,6 +1560,32 @@ class AppState:
         metadata = self._prepare_export_metadata(metadata)
         return self.measurement.start(metadata=metadata, settings=current_settings)
 
+    def start_debug_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """硬件 DEBUG 模式的「一次 I-t 测量」。
+
+        与正式测量的差别只有三点,其余完全共用同一条已验证的 RTT/J-Link 路径:
+          ① metadata 打 `debug` 标记 ⇒ 收尾时不进标定工作区(见 _measurement_completed)
+          ② **不传 live_raw_path** ⇒ raw 留在 run_dir/raw.csv,不写进保存目录
+          ③ 不校验样品名/浓度/标定就绪 —— DEBUG 页刻意不暴露那套工作流
+
+        🔴 但两个门禁必须保留:自动测量运行期间不许插队(会抢探头),
+        已有测量在跑时不许再起(同上)。这两条与正式测量同口径。
+        """
+        if self.schedule.snapshot()["active"]:
+            raise RuntimeError("自动测量运行期间不能起硬件 DEBUG 轮(探头只有一支)")
+        if self.measurement.snapshot()["state"] == "running":
+            raise RuntimeError("已有测量正在运行")
+        if not self.settings.snapshot()["applied"]:
+            raise RuntimeError("请先将当前 IT 条件应用到硬件(固件里的开机默认值)")
+        metadata = {
+            "debug": True,
+            "sample_name": str(payload.get("note") or "hw-debug"),
+            "sample_role": "test",
+            "source": "debug_gui",
+        }
+        return self.measurement.start(
+            metadata=metadata, settings=self.settings.snapshot()["settings"])
+
     def _prepare_export_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
         prepared = dict(metadata)
         sample_name = str(prepared.get("sample_name") or "sample")
@@ -1537,6 +1750,21 @@ class AppState:
 
     def _measurement_completed(self, run: dict[str, Any]) -> None:
         metadata = dict(run.get("metadata") or {})
+        # 🔴 硬件 DEBUG 轮不进工作流:不导出、不进 measurement-index.csv、不触发
+        #    浓度预测。否则调参数时随手跑的几轮会污染标定工作区,而"污染"这件事
+        #    要到下次拟合曲线时才会暴露出来 —— 那时已经分不清哪几行是调试轮。
+        #    刻意**不新增第四个 sample_role**:那要串改 5 处调用点却买不到任何东西。
+        if metadata.get("debug"):
+            self.measurement.set_workflow_result({
+                "finished_at": run.get("finished_at"),
+                "run_id": run.get("run_id"),
+                "debug": True,
+                "state": run.get("state"),
+                "note": "硬件 DEBUG 轮:原始数据保留在 run_dir,不进标定工作区",
+                "run_dir": run.get("run_dir"),
+                "raw_path": run.get("raw_path"),
+            })
+            return
         sample_name = str(metadata.get("sample_name") or run.get("run_id") or "sample")
         concentration = metadata.get("known_concentration_um")
         role = str(metadata.get("sample_role") or "test")
@@ -1913,6 +2141,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/drift":
             self._send_json(APP.drift_payload())
             return
+        if parsed.path == "/api/debug":
+            self._send_json(APP.measurement.debug_snapshot())
+            return
         if parsed.path == "/api/health":
             self._send_json({"ok": True, "project": str(PROJECT_DIR)})
             return
@@ -1942,6 +2173,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = APP.measurement.set_auto_switch(payload)
             elif self.path == "/api/measurement/stop":
                 result = APP.measurement.stop()
+            # ── 硬件 DEBUG 模式 ───────────────────────────────────────────
+            # 复用 MeasurementController(它本来就是"一次 I-t 测量"这个抽象),
+            # 只是打上 debug 标记并**不传 live_raw_path** ⇒ raw 留在 run_dir。
+            elif self.path == "/api/debug/start":
+                result = APP.start_debug_run(payload)
+            elif self.path == "/api/debug/stop":
+                result = APP.measurement.stop()
+            elif self.path == "/api/debug/cmd":
+                result = APP.measurement.send_command(str(payload.get("line", "")))
             elif self.path == "/api/calibration/load":
                 result = APP.load_points(str(payload["path"]))
             elif self.path == "/api/calibration/fit":

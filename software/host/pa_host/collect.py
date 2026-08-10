@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -315,10 +316,18 @@ def tail_lines(path: Path, idle_timeout: float | None = None):
 
 # --------------------------------------------------------------------------
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-IT_DONE_RE = re.compile(r"^IT_DONE\s+native=(\d+)\s+expected=(\d+)\s+elapsed_ms=(\d+)\s*$")
-IT_START_RE = re.compile(r"^IT_START\s+run=(\d+)\s+target_mv=(-?\d+)\s*$")
+# 🔴 三条标记行的尾部在 2026-08-10 加了 `ep=` / `tainted=`。这些正则原来都是
+#    **严格锚定**(`\s*$`)的,不放开尾部会让新固件的完成/中止标记完全不被识别 ——
+#    后果不是少一个字段,而是采集器永远等不到收尾、按 idle timeout 超时退出。
+#    统一改成"尾部允许任意 key=value",既兼容旧日志也兼容以后再加字段。
+_TAIL = r"(?:\s+[a-z_]+=\S+)*\s*$"
+IT_DONE_RE = re.compile(
+    r"^IT_DONE\s+native=(\d+)\s+expected=(\d+)\s+elapsed_ms=(\d+)" + _TAIL)
+IT_START_RE = re.compile(r"^IT_START\s+run=(\d+)\s+target_mv=(-?\d+)" + _TAIL)
+# reason 域也扩了:除 restart/stop,现在还有 invalid_cfg / vdd_oor(STATUS1 升级)
 IT_ABORTED_RE = re.compile(
-    r"^IT_ABORTED\s+reason=(restart|stop)\s+native=(\d+)\s+elapsed_ms=(\d+)\s*$"
+    r"^IT_ABORTED\s+reason=(restart|stop|invalid_cfg|vdd_oor)\s+native=(\d+)"
+    r"\s+elapsed_ms=(\d+)" + _TAIL
 )
 POTENTIAL_FAULT_RE = re.compile(r"^POTENTIAL_FAULT\s+.+$")
 # 电极电压连采行(固件 CELL_V)。System ADC 与 Sensor ADC 在 AUTO 下并行,
@@ -327,11 +336,14 @@ POTENTIAL_FAULT_RE = re.compile(r"^POTENTIAL_FAULT\s+.+$")
 CELL_V_RE = re.compile(
     r"^CELL_V\s+ms=(-?\d+)\s+idle=(-?\d+)\s+we_mv=(-?\d+)\s+re_mv=(-?\d+)\s+"
     r"ce_mv=(-?\d+)\s+wo_mv=(-?\d+)\s+e_mv=(-?\d+)\s+we_code=(\d+)\s+"
-    r"re_code=(\d+)\s+ce_code=(\d+)\s+wo_code=(\d+)\s*$"
+    r"re_code=(\d+)\s+ce_code=(\d+)\s+wo_code=(\d+)"
+    # ep / ocp 是 2026-08-10 追加的可选尾组。⚠️ 这条正则原来严格锚定,
+    # 若不放开就会**直接打断 cellv.csv 落盘**(一行都匹配不上,静默产出空文件)。
+    r"(?:\s+ep=(\d+))?(?:\s+ocp=([01]))?\s*$"
 )
 CELL_V_COLUMNS = (
     "host_unix_s", "dev_ms", "idle_mode", "we_mv", "re_mv", "ce_mv", "wo_mv",
-    "e_mv", "we_code", "re_code", "ce_code", "wo_code",
+    "e_mv", "we_code", "re_code", "ce_code", "wo_code", "epoch", "ocp",
 )
 
 
@@ -340,7 +352,109 @@ def parse_cell_v(line: str) -> list[str] | None:
     match = CELL_V_RE.match(ANSI_RE.sub("", line).strip())
     if match is None:
         return None
-    return [f"{time.time():.3f}", *match.groups()]
+    groups = [g if g is not None else "0" for g in match.groups()]
+    return [f"{time.time():.3f}", *groups]
+
+
+# --------------------------------------------------------------------------
+# 配置变更审计
+# --------------------------------------------------------------------------
+# 固件把每次启动/改参数拆成多行上报,每行自带 `ep=`。**拆行而不是一大行**是因为
+# 上行 RTT 在 NO_BLOCK_SKIP 下丢的是整条写入 —— 拆开后丢一行 ≠ 丢全部,而且
+# `CFG_APPLIED.nregs` 与 `CFG_REG i=/n=` 让丢行**可检测**(检测到就发 GET 重放)。
+AUDIT_PREFIXES = (
+    "CFG_BOOT", "CFG_APPLIED", "CFG_DERIVED", "CFG_REG", "CFG_CONFIRMED",
+    "CFG_REJECT", "CFG_ROLLBACK", "CFG_FAULT", "CFG_NOOP",
+    "AFE_STATUS", "REG_PEEK", "REG_POKE",
+    "OCP_BEGIN", "OCP_DONE", "OCP_RESTORED", "OCP_REJECT",
+    "RANGE_APPLIED", "RANGE_REJECT", "IT_TAINTED",
+)
+_AUDIT_RE = re.compile(r"^(" + "|".join(AUDIT_PREFIXES) + r")(\s|$)")
+_KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\S*)")
+
+
+def _coerce(value: str) -> object:
+    """`0x1F` / `-12` / 其它 → int / int / 原样字符串。"""
+    if value.startswith(("0x", "0X")):
+        try:
+            return int(value, 16)
+        except ValueError:
+            return value
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def parse_audit(line: str) -> dict[str, object] | None:
+    """把一行审计输出解析成 dict;不是审计行则返回 None。
+
+    刻意保留 `raw`(原始整行):这些行是事后复盘"当时到底是什么配置"的唯一依据,
+    解析器有 bug 时至少原文还在。
+    """
+    cleaned = ANSI_RE.sub("", line).strip()
+    if _AUDIT_RE.match(cleaned) is None:
+        return None
+    kind = cleaned.split(None, 1)[0]
+    event: dict[str, object] = {
+        "host_unix_s": round(time.time(), 3),
+        "kind": kind,
+        "raw": cleaned,
+    }
+    for key, value in _KV_RE.findall(cleaned[len(kind):]):
+        event[key] = _coerce(value)
+    return event
+
+
+# `cfg_events.csv` 的列 = 每个 epoch 一行宽表(给分析脚本按 epoch join 电流 CSV 用)。
+# 只收 CFG_APPLIED + CFG_DERIVED 的字段,其余事件只进 audit.jsonl。
+CFG_EVENT_COLUMNS = (
+    "host_unix_s", "ep", "src", "nlines", "forced", "perturbs_cell", "nregs",
+    "skipped",
+    "fsr", "off", "conv", "conv_src", "period", "sysper", "clk40", "ioc",
+    "e_mv", "vwe_mv", "idle", "cellv", "chop", "rs", "ios", "sel", "amps",
+    "fsr_pa", "off_pa", "bits", "conv_ms", "period_ms", "idle_ppm",
+    "lsb_frame_fa", "lsb_eff_fa", "rej50_db_x10", "rej50_worst_db_x10",
+    "conv_alt", "red_max_pa", "ox_max_pa", "sat_margin", "sat_margin_pa",
+    "sysbudget_ms", "sysper_ms", "daca", "dacb",
+    "idle_warn", "headroom_warn", "sig_warn",
+    "status1", "invalid_cfg", "confirmed",
+)
+
+
+class CfgEventAccumulator:
+    """把同一个 epoch 的 APPLIED/DERIVED/CONFIRMED 三行合成一行宽表。
+
+    ⚠️ 只在 `CFG_CONFIRMED`(或该 epoch 结束)时才落盘 —— 未确认的 epoch 不该
+    出现在宽表里,否则分析脚本会把一个被回滚掉的配置当成生效过的配置。
+    未确认的行仍在 audit.jsonl 里,不丢信息。
+    """
+
+    def __init__(self) -> None:
+        self.pending: dict[int, dict[str, object]] = {}
+        self.rows: list[list[str]] = []
+
+    def feed(self, event: dict[str, object]) -> list[str] | None:
+        ep = event.get("ep")
+        if not isinstance(ep, int):
+            return None
+        kind = event["kind"]
+        if kind in ("CFG_APPLIED", "CFG_DERIVED"):
+            row = self.pending.setdefault(ep, {"ep": ep, "confirmed": 0})
+            row.update({k: v for k, v in event.items()
+                        if k not in ("kind", "raw")})
+            return None
+        if kind == "CFG_CONFIRMED":
+            row = self.pending.pop(ep, {"ep": ep})
+            row.update({k: v for k, v in event.items()
+                        if k not in ("kind", "raw")})
+            row["confirmed"] = 1
+            out = [str(row.get(c, "")) for c in CFG_EVENT_COLUMNS]
+            self.rows.append(out)
+            return out
+        if kind in ("CFG_ROLLBACK", "CFG_FAULT"):
+            self.pending.pop(ep, None)  # 回滚掉的 epoch 不进宽表
+        return None
 
 
 def parse_it_done(line: str) -> tuple[int, int, int] | None:
@@ -384,6 +498,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="电极电压连采 CSV(默认 <out 的 stem>-cellv.csv)。"
                          "速率由固件 SYS_PERIOD 定(≈1Hz),与电流样本不同步,"
                          "所以必须独立成文件")
+    ap.add_argument("--audit", type=Path,
+                    help="配置变更审计 jsonl(默认 <out 的 stem>-audit.jsonl)。"
+                         "同时在旁边写 <...>-audit-cfg.csv:每个**已确认**的 epoch "
+                         "一行宽表,便于按 epoch 分段解释电流 CSV")
 
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--start-jlink", action="store_true",
@@ -464,6 +582,18 @@ def main(argv: list[str] | None = None) -> int:
         cell_v_out.write("# pA-Converter V4.0 电极电压连采(System ADC,与电流并行)\n")
         cell_v_out.write("# e_mv = we_mv - re_mv;code 撞 0 或 4095 = 超量程削顶\n")
         cell_v_out.write(",".join(CELL_V_COLUMNS) + "\n")
+    # 配置变更审计。两份产物,用途不同:
+    #   audit.jsonl   每行一个事件(含原始行)—— 复盘"当时到底发生了什么"
+    #   cfg_events.csv 每 epoch 一行宽表 —— 给分析脚本按 epoch join 电流 CSV
+    audit_path = args.audit or args.out.with_name(args.out.stem + "-audit.jsonl")
+    cfg_csv_path = audit_path.with_name(audit_path.stem + "-cfg.csv")
+    audit_new = not cfg_csv_path.exists() or cfg_csv_path.stat().st_size == 0
+    audit_out = audit_path.open("a", buffering=1)
+    cfg_csv_out = cfg_csv_path.open("a", buffering=1)
+    audit_acc = CfgEventAccumulator()
+    audit_rows = 0
+    if audit_new:
+        cfg_csv_out.write(",".join(CFG_EVENT_COLUMNS) + "\n")
     try:
         with args.out.open("a", buffering=1) as out:
             if new_file:
@@ -505,6 +635,17 @@ def main(argv: list[str] | None = None) -> int:
                     potential_fault = fault
                     print(f"[collect] 电位寄存器审计失败:{fault}", file=sys.stderr)
                     continue
+                audit = parse_audit(clean_line)
+                if audit is not None:
+                    # 🔴 同样**不受 acquisition_started 门禁** —— 开机的
+                    #    CFG_BOOT/CFG_DERIVED 正是最该留下的两行,它们比 START 早。
+                    audit_out.write(json.dumps(audit, ensure_ascii=False) + "\n")
+                    audit_rows += 1
+                    if audit_acc.feed(audit) is not None:
+                        cfg_csv_out.write(",".join(audit_acc.rows[-1]) + "\n")
+                    if audit["kind"] in ("CFG_REJECT", "CFG_FAULT", "CFG_ROLLBACK"):
+                        print(f"[collect] 🔴 {audit['raw']}", file=sys.stderr)
+                    continue
                 cellv = parse_cell_v(clean_line)
                 if cellv is not None:
                     # 🔴 刻意**不受 acquisition_started 门禁**:idle 期间的电极电位
@@ -544,6 +685,15 @@ def main(argv: list[str] | None = None) -> int:
         if raw_out is not None:
             raw_out.close()
         cell_v_out.close()
+        audit_out.close()
+        cfg_csv_out.close()
+        if audit_rows:
+            print(f"[collect] 配置审计 {audit_rows} 条 → {audit_path}"
+                  f"({len(audit_acc.rows)} 个已确认 epoch → {cfg_csv_path})",
+                  file=sys.stderr)
+        else:
+            print("[collect] ⚠️ 未收到任何配置审计行 —— 固件版本可能早于 2026-08-10",
+                  file=sys.stderr)
         if cell_v_rows:
             print(f"[collect] 电极电压 {cell_v_rows} 组 → {cell_v_path}", file=sys.stderr)
         else:

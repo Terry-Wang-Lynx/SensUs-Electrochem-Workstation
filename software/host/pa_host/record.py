@@ -49,7 +49,13 @@ LINE_RE = re.compile(
     #    这样 2026-07-31 那批(还没有 sat)的 RTT 日志/CSV 仍然能解析。
     #    缺失时按 0(无饱和)处理 —— 对旧数据是正确的默认(当时用 SEL4,
     #    但那时电极是开路的,没有真信号,不会饱和)。
-    r"(?:\s+sat=(?P<sat>\d+))?\s*$"
+    r"(?:\s+sat=(?P<sat>\d+))?"
+    # 🔴 ep 是 2026-08-10 追加的**配置纪元**,同样做成可选尾组(旧日志继续可解析)。
+    #    为什么必须进样本行:`counts` 与 `sat` 的量纲本身随 epoch 变(sat 余量
+    #    依赖 FSR/offset),不带 epoch 的 counts 事后无法解释;而上行 RTT 是丢包
+    #    信道(NO_BLOCK_SKIP),靠"审计行 + 主机插值"会静默错归。
+    #    ⚠️ 缺失按 0 处理是**对旧数据**的正确默认;新数据里没有它 = 固件版本不对。
+    r"(?:\s+ep=(?P<ep>\d+))?\s*$"
 )
 
 
@@ -67,6 +73,8 @@ class Sample:
              **WE 已失恒电位控制**;bit1(2)=counts 逼近满量程:氧化方向超出 FSR−offset。
              ≠0 的样本**不是测量结果**(恒电位环开环),算 σ / 标定曲线前必须剔除。
              旧数据(2026-07-31 之前,协议无此字段)默认 0。
+    ep     : 配置纪元。同一 epoch 内的 counts 才可比;跨 epoch 只有 fa 可比。
+             只有固件打过 `CFG_CONFIRMED ep=n` 的 epoch 才可信。旧数据默认 0。
     """
 
     seq: int
@@ -77,6 +85,7 @@ class Sample:
     auto: bool
     ovf: int
     sat: int = 0
+    ep: int = 0
 
 
 CSV_COLUMNS = [
@@ -89,6 +98,7 @@ CSV_COLUMNS = [
     "auto",
     "ovf",
     "sat",  # 饱和标志位(bit0=LOW/还原吃光 offset, bit1=HIGH/氧化超量程)
+    "epoch",  # 配置纪元:该样本是在哪一版 AFE 配置下采的(见 audit.jsonl)
 ]
 
 assert len(CSV_COLUMNS) == len(fields(Sample)) + 1  # host_unix_s 是多出来那列
@@ -108,6 +118,7 @@ def parse_line(line: str) -> Sample | None:
         auto=m["auto"] == "1",
         ovf=int(m["ovf"]),
         sat=int(m["sat"]) if m["sat"] is not None else 0,
+        ep=int(m["ep"]) if m["ep"] is not None else 0,
     )
 
 
@@ -123,6 +134,7 @@ def sample_to_row(s: Sample, host_unix_s: float) -> list[str]:
         "1" if s.auto else "0",
         str(s.ovf),
         str(s.sat),
+        str(s.ep),
     ]
 
 
@@ -130,7 +142,8 @@ def format_sample_line(s: Sample) -> str:
     """反向生成行文本 —— 供测试与合成数据用,保证解析器与格式互为逆运算."""
     return (
         f"S seq={s.seq} ms={s.ms} counts={s.counts} fa={s.fa} "
-        f"tag={s.tag} auto={1 if s.auto else 0} ovf={s.ovf} sat={s.sat}"
+        f"tag={s.tag} auto={1 if s.auto else 0} ovf={s.ovf} sat={s.sat} "
+        f"ep={s.ep}"
     )
 
 

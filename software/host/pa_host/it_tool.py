@@ -117,6 +117,8 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         cmd += ["--cmd-file", str(args.cmd_file)]
     if getattr(args, "cell_v", None):
         cmd += ["--cell-v", str(args.cell_v)]
+    if getattr(args, "audit", None):
+        cmd += ["--audit", str(args.audit)]
     if args.raw_log:
         cmd += ["--raw-log", str(args.raw_log)]
     if args.trigger:
@@ -143,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="连接 RTT 后触发一轮测量；默认 START")
     measure.add_argument("--out", type=Path, required=True)
     measure.add_argument("--raw-log", type=Path)
+    measure.add_argument("--audit", type=Path,
+                         help="配置变更审计 jsonl(转给 collect.py)")
     measure.add_argument("--cell-v", type=Path,
                          help="电极电压连采 CSV(默认 <out stem>-cellv.csv)")
     measure.add_argument("--cmd-file", type=Path,
