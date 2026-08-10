@@ -783,6 +783,13 @@ class MeasurementController:
                     row[key] = float(value) if "." in value else int(value)
                 except ValueError:
                     row[key] = value
+            # 🔴 固件复位边界:dev_ms 回退 ⇒ 之前那些行属于上一次开机,丢掉。
+            #    不丢的话双轴图会把两次开机首尾相接:t0 取 min(dev_ms) 会落到
+            #    上一次开机的时刻,整条曲线的时间轴全错,而且看起来完全正常。
+            #    (2026-08-10 实测:RTT 上行缓冲在目标复位后不清空,残留几十行。)
+            if (cache and "dev_ms" in row and "dev_ms" in cache[-1]
+                    and row["dev_ms"] < cache[-1]["dev_ms"]):
+                cache.clear()
             cache.append(row)
         return cache
 

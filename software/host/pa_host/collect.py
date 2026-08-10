@@ -49,6 +49,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from .record import (
     CSV_COLUMNS,
@@ -173,7 +174,8 @@ def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
 def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                       idle_timeout: float | None = None,
                       trigger: str | None = None,
-                      cmd_file: Path | None = None):
+                      cmd_file: Path | None = None,
+                      trigger_state: dict[str, Any] | None = None):
     """连 RTT telnet 服务,按行 yield。"""
     deadline = time.monotonic() + connect_timeout
     sock = None
@@ -200,6 +202,11 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
     )
     trigger_pending = trigger_bytes is not None
     resends = 0
+    # 🔴 复位后必须能**重新武装** trigger。2026-08-10 实测的坑:残留缓冲里带着
+    #    上一次开机的 IT_START,重发循环见到它就停了;随后检测到复位、门禁被重置,
+    #    但 START 再也不会发出 ⇒ 固件停在 IT_READY,而上位机在等永远不来的样本。
+    if trigger_state is None:
+        trigger_state = {}
     warned_unacked = False
     if trigger_bytes:
         sock.sendall(trigger_bytes)
@@ -246,6 +253,12 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
             #    吐"恰恰就是需要重发的那个场景 —— 等于把重发放在了它唯一不可能触发
             #    的位置。现象:collector.log 只有最初那一条发送、没有「固件已确认」,
             #    rtt.log 里连 IT_START 都没有,界面「设备测量中」而曲线永远空。
+            if trigger_state.pop("rearm", False) and trigger_bytes is not None:
+                trigger_pending = True
+                resends = 0
+                warned_unacked = False
+                last_trigger_at = 0.0   # 立刻重发,不等下一个间隔
+                print("[collect] 复位后重新武装 START", file=sys.stderr)
             if trigger_pending and time.monotonic() - last_trigger_at >= TRIGGER_RESEND_INTERVAL_S:
                 if resends < TRIGGER_MAX_RESENDS:
                     try:
@@ -339,11 +352,12 @@ CELL_V_RE = re.compile(
     r"re_code=(\d+)\s+ce_code=(\d+)\s+wo_code=(\d+)"
     # ep / ocp 是 2026-08-10 追加的可选尾组。⚠️ 这条正则原来严格锚定,
     # 若不放开就会**直接打断 cellv.csv 落盘**(一行都匹配不上,静默产出空文件)。
-    r"(?:\s+ep=(\d+))?(?:\s+ocp=([01]))?\s*$"
+    r"(?:\s+ep=(\d+))?(?:\s+ocp=([01]))?(?:\s+dropped=(\d+))?\s*$"
 )
 CELL_V_COLUMNS = (
     "host_unix_s", "dev_ms", "idle_mode", "we_mv", "re_mv", "ce_mv", "wo_mv",
     "e_mv", "we_code", "re_code", "ce_code", "wo_code", "epoch", "ocp",
+    "dropped",
 )
 
 
@@ -520,6 +534,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=RTT_TELNET_PORT)
     ap.add_argument("--probe-serial", default=None,
                     help="多探头时指定 S/N(本机那支克隆板是 29734569)")
+    ap.add_argument("--no-reset-before-read", dest="reset_before_read",
+                    action="store_false", default=True,
+                    help="不要在开始读 RTT 前复位目标。"
+                         "🔴 默认是**复位**,因为 RTT 上行缓冲在目标复位前不会清空:"
+                         "设备无人看管跑了一阵后,缓冲里压满上一次开机的字节,"
+                         "collector 一连上就会把它们当本轮数据解析落盘 —— "
+                         "2026-08-10 实测因此得出过完全错误的硬件结论。"
+                         "复位会跑 SEGGER_RTT_Init(),缓冲指针归零 ⇒ 读到的一定是本轮的。"
+                         "代价:每次采集从固件编译期默认值起步(运行时 SET 不跨轮保留),"
+                         "且极化被打断 —— 但紧接着就是 Quiet Time 重新极化,与 CHI 流程一致。")
     ap.add_argument("--reset-before-read", action="store_true",
                     help="启动 J-Link RTT 后复位并运行目标;适合开始一轮新测量")
     ap.add_argument("--duration", type=float, default=None,
@@ -547,12 +571,58 @@ def main(argv: list[str] | None = None) -> int:
         lines = read_socket_lines(host or "127.0.0.1", int(port_s or args.port),
                                   cmd_file=args.cmd_file,
                                   idle_timeout=args.idle_timeout,
-                                  trigger=args.trigger)
+                                  trigger=args.trigger,
+                                  trigger_state=trigger_state)
     else:
         lines = tail_lines(args.tail, args.idle_timeout)
 
     samples: list[Sample] = []
     junk = 0
+    trigger_state: dict[str, Any] = {}
+    # ══════════════════════════════════════════════════════════════════
+    # 🔴 固件复位边界检测(2026-08-10 加,起因是它害我误诊了一整轮)
+    # ══════════════════════════════════════════════════════════════════
+    # RTT **上行缓冲在目标复位后不清空**:collector 一连上,JLinkExe 先 reset 目标,
+    # 但缓冲里还压着上一次开机没被读走的字节。这些字节会被照常解析、照常落盘,
+    # 于是一份"新采集"的 CSV 头部混着几十行**上一次开机**的数据。
+    # 实测后果:我据此得出"RE/CE 满量程乱摆、电极悬空"的结论,而同一轮的
+    # 原始词流其实干净得很(E = 200±1 mV)。**静默错归比缺数据坏得多。**
+    # 判据:dev_ms 回退(固件时基单调)或 CFG_BOOT 行。两者都不依赖上位机时钟。
+    last_dev_ms: int | None = None
+    boot_boundaries = 0
+
+    def note_boot_boundary(why: str) -> None:
+        """处置一次固件复位边界。
+
+        🔴 **必须分两种情况**,否则修 bug 会修出更坏的 bug(2026-08-10 亲历):
+          ① 还没收到任何本轮样本 ⇒ 这条边界分隔的是"残留缓冲 vs 本轮",
+             丢弃 + 重置门禁 + **重新武装 trigger** 都是对的。
+          ② 已经收到样本 ⇒ 这是一次**运行中复位**,本轮作废,但绝不能"丢弃后
+             继续跑" —— 那会让人以为还在采,实际数据已经断了。响铃并结束。
+        我第一版无条件走 ①:于是一轮完整的 536 样本采集(固件侧全对)被
+        collector 全部丢掉、trigger 又没重发,最后落成一个空 CSV。
+        **"防止错归"不能以"销毁正确数据"为代价。**
+        """
+        nonlocal boot_boundaries, last_dev_ms
+        boot_boundaries += 1
+        last_dev_ms = None
+        marker = f"# --- 固件复位({why}) ---"
+        for handle in (out_ref.get("cur"), cell_v_out):
+            if handle is not None:
+                handle.write(marker + "\n")
+        # 🔴 **只警告 + 标记,绝不销毁数据、绝不动门禁。**
+        #
+        # 我的第一版在这里 samples.clear() + 重置 acquisition_started + 重发 trigger。
+        # 结果:一轮固件侧完全正确的 536 样本采集被 collector 整段丢掉,落成空 CSV
+        # (残留缓冲里的 CELL_V 把 last_dev_ms 抬到 90s,本轮的 18s 一来就判"复位")。
+        # 教训:**在一个启发式判据上挂销毁性动作,比它要修的错归更坏。**
+        # 根因已经从源头解决 —— 默认 --reset-before-read 让 RTT 缓冲在开读前归零。
+        # 这里保留检测只为一件事:万一还是出现了,人必须看得到,而不是静默。
+        print(f"[collect] ⚠️ 检测到 dev_ms 不单调({why})。若你用了 --no-reset-before-read,"
+              f"这很可能是上一次开机的残留数据混进来了;CSV 里已插入标记行。"
+              f"**本轮数据未被丢弃**,请按标记行自行切分", file=sys.stderr)
+
+    out_ref: dict[str, Any] = {"cur": None}
     potential_fault: str | None = None
     aborted_reason: str | None = None
     acquisition_started = args.trigger is None
@@ -596,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg_csv_out.write(",".join(CFG_EVENT_COLUMNS) + "\n")
     try:
         with args.out.open("a", buffering=1) as out:
+            out_ref["cur"] = out
             if new_file:
                 out.write("# pA-Converter V4.0 实时采集\n")
                 out.write(f"# 起始 unix 时间: {time.time():.3f}\n")
@@ -637,6 +708,10 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 audit = parse_audit(clean_line)
                 if audit is not None:
+                    if audit["kind"] == "CFG_BOOT":
+                        # 默认已复位 ⇒ CFG_BOOT 就是**本轮**的第一行,不是边界。
+                        # 只把它作为"本轮固件从头开始了"的确认打出来。
+                        print(f"[collect] 固件启动确认:{audit['raw']}", file=sys.stderr)
                     # 🔴 同样**不受 acquisition_started 门禁** —— 开机的
                     #    CFG_BOOT/CFG_DERIVED 正是最该留下的两行,它们比 START 早。
                     audit_out.write(json.dumps(audit, ensure_ascii=False) + "\n")
@@ -648,6 +723,10 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 cellv = parse_cell_v(clean_line)
                 if cellv is not None:
+                    dev_ms = int(cellv[1])
+                    if last_dev_ms is not None and dev_ms < last_dev_ms:
+                        note_boot_boundary(f"dev_ms {last_dev_ms}→{dev_ms} 回退")
+                    last_dev_ms = dev_ms
                     # 🔴 刻意**不受 acquisition_started 门禁**:idle 期间的电极电位
                     #    正是我们要看的东西(断开时电解池停在哪个电位),不能等 START。
                     if cell_v_out is not None:
@@ -668,6 +747,10 @@ def main(argv: list[str] | None = None) -> int:
                         junk += 1
                     continue
 
+                if last_dev_ms is not None and s.ms < last_dev_ms:
+                    note_boot_boundary(f"样本 dev_ms {last_dev_ms}→{s.ms} 回退")
+                last_dev_ms = s.ms
+
                 if not acquisition_started:
                     continue
 
@@ -687,6 +770,9 @@ def main(argv: list[str] | None = None) -> int:
         cell_v_out.close()
         audit_out.close()
         cfg_csv_out.close()
+        if boot_boundaries:
+            print(f"[collect] ⚠️ 本次共检测到 {boot_boundaries} 次固件复位边界;"
+                  f"CSV 里已插入 `# --- 固件复位` 标记行", file=sys.stderr)
         if audit_rows:
             print(f"[collect] 配置审计 {audit_rows} 条 → {audit_path}"
                   f"({len(audit_acc.rows)} 个已确认 epoch → {cfg_csv_path})",

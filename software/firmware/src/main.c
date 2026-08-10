@@ -228,6 +228,8 @@ static void replay_state(const char *src);
  * ⚠️ 全断开时整个电解池对芯片 GND 浮动,电压可能跌破 0 或超量程 ⇒ 会削顶。
  *    所以日志里**同时打印原始 12-bit code**,只看 mV 看不出削顶。
  */
+/* 🔬 逐词 trace 开关。判死"间歇 0"之后应关掉(它把电位上报量翻 4 倍)。 */
+#define WP_CELLV_TRACE false
 #define WP_DEFAULT_CELLV_ENABLE true
 #define WP_CELLV_ENABLE cfg_live.cellv
 #define WP_SYSADC_SENSV_GAIN MAX30131_SYSADC_GAIN_0P5X /* 0.5× ⇒ 可测 0~3.07V,盖住浮到 VDD */
@@ -400,6 +402,46 @@ static void emit_sample(uint16_t counts, int32_t fa, uint8_t tag, bool auto_mode
 	       auto_mode ? 1U : 0U, ovf, sat, cfg_epoch);
 }
 
+/*
+ * ══════════════════════════════════════════════════════════════════════
+ * STATUS1 的**读清**位:必须走 sticky 累积器
+ * ══════════════════════════════════════════════════════════════════════
+ * 🔴 VDD_OOR 与 PWR_RDY 都是"读 0x00 即清"(datasheet p82)。而本固件里读 0x00 的
+ *    地方不止一处:drain_fifo_for_voltages() 在 idle 每 20ms 读一次、
+ *    manual_convert_once() 轮询读、afe_status_poll() 1Hz 读。
+ *    ⇒ 20ms 那条会在 1Hz 监视看到之前把故障位吃光,监视器永远报"一切正常"。
+ *    这正是"沉默即故障"公理要防的形态:**看不到 ≠ 没发生**。
+ * ⇒ 所有读 STATUS1 的地方一律走 status1_read();它把两个读清位 OR 进 sticky,
+ *   由 afe_status_poll() 统一消费并清零。
+ */
+/*
+ * 🔴 审计行的格式化缓冲**必须是静态的,不能放栈上**(2026-08-10 实测教训)。
+ * 曾经 afe_cfg_commit() 与 handle_command_line() 各持一个 char[512],两帧同时活着
+ * ⇒ 光缓冲就 1KB,加上 afe_cfg_t/afe_derived_t/afe_plan_t 约 500B,再叠 printk 自身
+ * 的格式化开销,直接把 CONFIG_MAIN_STACK_SIZE=2048 撑爆:
+ *   ZEPHYR FATAL ERROR 2: Stack overflow ⇒ Halting system(发一条 OCP 就整机死)
+ * 实测最长行 CFG_DERIVED = 430 字符 ⇒ 640 有 1.5× 余量。
+ * 安全性:四个格式化器都是"填缓冲 → 立刻 printk"顺序使用,同一线程、无嵌套、
+ * 无重入(ocp_run 期间不格式化审计行),所以共享一个缓冲是安全的。
+ */
+#define AUDIT_LINE_MAX 640
+static char audit_line[AUDIT_LINE_MAX];
+
+static uint8_t status1_sticky;
+
+#define STATUS1_STICKY_MASK \
+	(BIT(MAX30131_STATUS1_VDD_OOR_Pos) | BIT(MAX30131_STATUS1_PWR_RDY_Pos))
+
+static int status1_read(uint8_t *out)
+{
+	int rc = max30131_spi_read_reg(MAX30131_REG_STATUS1, out);
+
+	if (rc == 0) {
+		status1_sticky |= (uint8_t)(*out & STATUS1_STICKY_MASK);
+	}
+	return rc;
+}
+
 /* ------------------------------------------------------------------ */
 /* AFE 初始化                                                          */
 /* ------------------------------------------------------------------ */
@@ -536,6 +578,17 @@ static int afe_configure(void)
 		{ 0x24U, max30131_enc_s1_config5(WP_CONV_TIME_CODE, true),
 		  "S1_CONFIG5: CONV_TIME 随 FSR 分组(慢钟 0x0/12bit,快钟 0x1/13bit)" },
 		{ 0x68U, 0x01U, "REFERENCE CONTROL: 内部基准 1.536V + REF_EN=1" },
+		/*
+		 * 🔴 2026-08-10 补:不写这个寄存器,STATUS1.VDD_OOR **恒为 0**
+		 * (p82:"otherwise, VDD_OOR is always set to 0")⇒ 掉压监测是死的,
+		 * 而本固件此前一直没写它 ⇒ 之前所有 "VDD_OOR=0" 都不构成"供电正常"的证据。
+		 * REF_EN 已在上一行置 1,两个条件这才同时满足。
+		 * INTB_OCFG=00 开漏:本板 INTB 悬空,开漏保证它永不驱动。
+		 */
+		{ MAX30131_REG_INTB_SETUP,
+		  (uint8_t)(BIT(MAX30131_INTB_EN_VDD_OOR_Pos) |
+			    (MAX30131_INTB_OCFG_OPEN_DR << MAX30131_INTB_OCFG_Pos)),
+		  "INTB SETUP: EN_VDD_OOR=1(否则 VDD_OOR 恒 0)+ 开漏" },
 		/* 🔴 原为字面量 0x00,那默认了 SENS_PERIOD=0。period 现在可运行时改,
 		 * 写死会让开机那一刻的周期与 cfg_live 不符(而 cfg_live 决定换算与
 		 * 期望样本数)⇒ 必须走编码函数。 */
@@ -690,6 +743,37 @@ static int __attribute__((unused)) afe_start_auto(void)
 	return rc;
 }
 
+/*
+ * 🔴 **重起** AUTO(先 AUTO=0 再 AUTO=1)。
+ *
+ * 2026-08-10 实测答了一个我在 apply_range() 注释里标着「未知」的问题:
+ *   ⚠️「AUTO=1 运行中写 0x23/0x24 是否立即生效」
+ * ⇒ **0x24 的 SELECT 位不生效**:通道选择在一次 AUTO 序列启动时锁存,
+ *   运行中改它不会被重新采纳,而且**没有任何错误指示**。
+ *
+ * 实测证据:第 1 轮(开机后首次启 AUTO,SELECT 本来就是 1)拿到 536 个电流样本;
+ * 第 2 轮 idle 期间 set_sensor_selected(false) → 退出 idle 写回 true → 电流样本
+ * **0 个**,而电位词(System ADC)照常每秒一组。`POTENTIAL_AUDIT sample=0` 刷了
+ * 整轮,STATUS1 也一切正常 —— 这是个纯静默失败。
+ *
+ * ⇒ 凡是改过 SELECT,就必须重起 AUTO 让它重新锁存。
+ * ⚠️ 代价:重起那一瞬间转换会停一次,而"停转换"实测会扰动电解池
+ *   (p40 的固定 50nA 偏置通路,见文件头 A/B 二)。所以只在**退出 idle 时**做 ——
+ *   那时正要重新极化,一个瞬时扰动无所谓;IDLE_KEEP_BIASED 下从不改 SELECT,
+ *   也就从不走这条路径,它"转换从不停"的语义得以保持。
+ */
+static int afe_restart_auto(void)
+{
+	int rc = max30131_spi_write_reg(MAX30131_REG_CONVERT_START,
+					max30131_enc_convert_start(false, false));
+
+	if (rc) {
+		return rc;
+	}
+	k_msleep(2);
+	return afe_start_auto();
+}
+
 /* ================================================================== */
 /* 🔬 开机自检:判定「开路却读到 ~1.2nA」到底是什么                     */
 /* ================================================================== */
@@ -733,7 +817,7 @@ static int manual_convert_once(uint16_t *counts_out, uint8_t *tag_out)
 		k_msleep(5);
 		uint8_t st = 0;
 
-		if (max30131_spi_read_reg(MAX30131_REG_STATUS1, &st)) {
+		if (status1_read(&st)) {
 			return -EIO;
 		}
 		if (st & BIT(MAX30131_STATUS1_FIFO_DATA_RDY_Pos)) {
@@ -760,7 +844,7 @@ static void log_status1(const char *when)
 {
 	uint8_t st = 0;
 
-	if (max30131_spi_read_reg(MAX30131_REG_STATUS1, &st)) {
+	if (status1_read(&st)) {
 		LOG_ERR("STATUS1 读失败");
 		return;
 	}
@@ -1024,6 +1108,7 @@ static struct {
 	uint16_t code[4];
 	bool got[4];
 	bool ever_got;
+	uint32_t dropped;    /* 因缺词被丢弃的组数(累计) */
 	int64_t warned_at;
 } cellv;
 
@@ -1048,6 +1133,7 @@ static struct {
 } ocp;
 
 static void ocp_observe(int32_t e_mv, uint16_t we_code, uint16_t re_code);
+static void cellv_flush(void);
 
 /*
  * 如果这个 FIFO 词是电极电压,收进 cellv 并返回 true(调用方应 continue);
@@ -1068,26 +1154,80 @@ static bool collect_voltage_word(const max30131_fifo_word_t *w)
 	default: return false;
 	}
 
+	/*
+	 * 🔬 逐词 trace。加它的原因:2026-08-10 实测四路电位里**间歇性出现 0**,
+	 * 连片内跟随器驱动的 WE 也会一采样 400mV、下一采样 0 —— 物理上不可能,
+	 * 所以问题在数据通路而不在电极。而只看聚合后的 CELL_V 行永远看不出
+	 * "哪个词是 0、来的顺序是什么、一个周期到底几个词"。
+	 * 一个周期 4 路 ≈ 4 行/s,代价可接受;判死之后可关。
+	 */
+	if (WP_CELLV_TRACE) {
+		printk("CELL_W ms=%lld tag=0x%02x code=%u auto=%d\n",
+		       (long long)k_uptime_get(), w->tag, w->counts,
+		       w->auto_mode ? 1 : 0);
+	}
+	/*
+	 * 🔴 何时算"一组齐了"—— 原判据是"WE+RE 都到就打",错在**打得太早**:
+	 * 实测到达次序是 CE → RE → WE → WO(0xD3/0xD2/0xD1/0xD0),
+	 * 在 WE 到达时就打 ⇒ 本周期的 WO 还没来 ⇒ 打出的 WO 永远是**上一周期**的
+	 * (或 -1)。而这一行的全部用途正是"同一时刻的四电极电位"。
+	 *
+	 * 改成**周期末 flush**,两个触发条件,与到达次序无关:
+	 *   ① 某个 tag 重复出现 ⇒ 上一周期有词丢了、新周期已开始 ⇒ 先结算旧的
+	 *   ② 四路到齐 ⇒ 正常结算
+	 *
+	 * 🔴 顺序纪律:条件①**必须在写入之前判**。我第一版把它写在
+	 * `got[idx] = true` 之后 ⇒ `got[idx]` 恒为真 ⇒ 每个词都触发一次 flush,
+	 * 于是每组永远缺 WO(实测 100% 的行 wo=-1)。写入前判、写入后结算。
+	 */
+	if (cellv.got[idx]) {
+		cellv_flush();   /* 条件①:本词属于新周期,先把上一周期结算掉 */
+	}
+
 	cellv.code[idx] = w->counts;
 	cellv.mv[idx] = max30131_sys_adc_mv(w->counts, max30131_ref_mv(WP_REF),
 					    WP_SYSADC_SENSV_GAIN);
 	cellv.got[idx] = true;
 	cellv.ever_got = true;
 
-	/* WE 与 RE 都到手才算一组 —— 少任何一个都算不出 E。 */
-	if (!cellv.got[CELLV_WE] || !cellv.got[CELLV_RE]) {
-		return true;
+	if (cellv.got[CELLV_WE] && cellv.got[CELLV_RE] &&
+	    cellv.got[CELLV_CE] && cellv.got[CELLV_WO]) {
+		cellv_flush();   /* 条件②:四路到齐 */
+	}
+	return true;
+}
+
+/* 把当前累积的一组四电极电位打成一行并清空。WE/RE 缺任一则只清不打(算不出 E)。 */
+static void cellv_flush(void)
+{
+	/*
+	 * 🔴 **只打完整的组**。缺任何一路就丢弃并计数,绝不用 -1 或残留值凑一行:
+	 * 一行不完整的"四电极电位"在界面和 CSV 里跟真值长得一模一样,
+	 * 而它会被当成真的电位去解释(2026-08-10 我自己就被 wo=-1 和 we=0 误导过)。
+	 * 丢了多少必须可见 ⇒ 每行带 dropped= 累计值(公理 A3:沉默即故障)。
+	 */
+	if (!(cellv.got[CELLV_WE] && cellv.got[CELLV_RE] &&
+	      cellv.got[CELLV_CE] && cellv.got[CELLV_WO])) {
+		bool any = cellv.got[0] || cellv.got[1] || cellv.got[2] || cellv.got[3];
+
+		if (any) {
+			cellv.dropped++;
+		}
+		for (int i = 0; i < 4; i++) {
+			cellv.got[i] = false;
+		}
+		return;
 	}
 	printk("CELL_V ms=%lld idle=%d we_mv=%d re_mv=%d ce_mv=%d wo_mv=%d "
-	       "e_mv=%d we_code=%u re_code=%u ce_code=%u wo_code=%u ep=%u ocp=%d\n",
+	       "e_mv=%d we_code=%u re_code=%u ce_code=%u wo_code=%u ep=%u ocp=%d "
+	       "dropped=%u\n",
 	       (long long)k_uptime_get(), (int)WP_IDLE_MODE,
 	       cellv.mv[CELLV_WE], cellv.mv[CELLV_RE],
-	       cellv.got[CELLV_CE] ? cellv.mv[CELLV_CE] : -1,
-	       cellv.got[CELLV_WO] ? cellv.mv[CELLV_WO] : -1,
+	       cellv.mv[CELLV_CE], cellv.mv[CELLV_WO],
 	       cellv.mv[CELLV_WE] - cellv.mv[CELLV_RE],
 	       cellv.code[CELLV_WE], cellv.code[CELLV_RE],
 	       cellv.code[CELLV_CE], cellv.code[CELLV_WO],
-	       cfg_epoch, ocp_active ? 1 : 0);
+	       cfg_epoch, ocp_active ? 1 : 0, cellv.dropped);
 	if (ocp_active) {
 		ocp_observe(cellv.mv[CELLV_WE] - cellv.mv[CELLV_RE],
 			    cellv.code[CELLV_WE], cellv.code[CELLV_RE]);
@@ -1095,7 +1235,6 @@ static bool collect_voltage_word(const max30131_fifo_word_t *w)
 	for (int i = 0; i < 4; i++) {
 		cellv.got[i] = false;
 	}
-	return true;
 }
 
 /*
@@ -1109,7 +1248,7 @@ static void drain_fifo_for_voltages(void)
 		max30131_fifo_word_t w;
 		uint8_t st = 0;
 
-		if (max30131_spi_read_reg(MAX30131_REG_STATUS1, &st) != 0) {
+		if (status1_read(&st) != 0) {
 			return;
 		}
 		if (!(st & BIT(MAX30131_STATUS1_FIFO_DATA_RDY_Pos))) {
@@ -1139,6 +1278,15 @@ static void warn_if_no_voltages(void)
 	int64_t now = k_uptime_get();
 
 	if (cellv.ever_got || !WP_CELLV_ENABLE) {
+		return;
+	}
+	/*
+	 * 🔴 首次警告必须等够几个 SYS_PERIOD。原实现 warned_at==0 时立即喊,
+	 * 于是开机 269ms 就报"至今未收到任何电极电压词"—— 那时 SYS_PERIOD(945ms)
+	 * 连一个周期都没走完,**这条警告由构造决定必然误报**。
+	 * 一个可检测的假设被自己的告警时机做成了永远为真的噪声,比不报更坏。
+	 */
+	if (now < 4 * (int64_t)drv_live.sysper_ms) {
 		return;
 	}
 	if (cellv.warned_at != 0 && now - cellv.warned_at < 30000) {
@@ -1204,11 +1352,25 @@ static void exit_idle_state(void)
 		LOG_INF("退出 idle:放大器已开(先 CE 后 WE)");
 	}
 	if (WP_IDLE_MODE != IDLE_KEEP_BIASED) {
+		uint8_t s1c5 = 0U;
+
 		(void)set_sensor_selected(true);
-		if (!WP_CELLV_ENABLE) {
-			/* 纯原始路径下 idle 停过转换,这里要重新起 AUTO。 */
-			(void)max30131_spi_write_reg(MAX30131_REG_CONVERT_START,
-						     max30131_enc_convert_start(true, true));
+		/*
+		 * 🔴 必须**重起** AUTO —— 光写 SELECT 位不生效(见 afe_restart_auto 注释)。
+		 * 不重起的话第二轮及以后一个电流样本都拿不到,而且没有任何错误提示。
+		 */
+		if (afe_restart_auto() != 0) {
+			LOG_ERR("退出 idle:重起 AUTO 失败 —— 本轮可能拿不到电流样本");
+		}
+		/* 回读确认 SELECT 真的是 1(器件是权威) */
+		if (max30131_spi_read_reg(MAX30131_REG_S1_CONFIG5, &s1c5) == 0) {
+			if ((s1c5 & 0x1U) == 0U) {
+				LOG_ERR("🔴 退出 idle 后 0x24 SELECT 仍为 0(0x%02x)—— "
+					"电流通道未选中,本轮不会有样本", s1c5);
+			} else {
+				LOG_INF("退出 idle:sensor 已选中并重起 AUTO(0x24=0x%02x)",
+					s1c5);
+			}
 		}
 	}
 }
@@ -1319,13 +1481,23 @@ static void afe_status_poll(const char *why, bool force)
 	int64_t now = k_uptime_get();
 	bool invalid, vdd_oor;
 
-	if (max30131_spi_read_reg(MAX30131_REG_STATUS1, &st) != 0) {
+	if (status1_read(&st) != 0) {
 		printk("AFE_STATUS ep=%u ms=%lld status1=read_fail why=%s\n",
 		       cfg_epoch, (long long)now, why);
 		return;
 	}
 	invalid = (st & BIT(MAX30131_STATUS1_INVALID_CFG_Pos)) != 0U;
-	vdd_oor = (st & BIT(MAX30131_STATUS1_VDD_OOR_Pos)) != 0U;
+	/*
+	 * 🔴 两个物理事件位都**读清**,而且可能已被 20ms 的 FIFO 轮询吃掉
+	 * ⇒ 判据取「本次读到的 | sticky 累积的」,报完再清 sticky。
+	 * 🔴 PWR_RDY 的语义与名字相反:1 = VDD 曾掉到 1.55V UVLO 以下(掉压),
+	 *    0 = 正常。首次实测 STATUS1=0x00 时我按字面把它当"电源未就绪"报了故障,
+	 *    是**读反了 datasheet**(p82 已核,regs.h 头部记了原文)。
+	 */
+	uint8_t sticky = status1_sticky;
+
+	vdd_oor = ((st | sticky) & BIT(MAX30131_STATUS1_VDD_OOR_Pos)) != 0U;
+	bool brownout = ((st | sticky) & BIT(MAX30131_STATUS1_PWR_RDY_Pos)) != 0U;
 
 	/*
 	 * ⚠️ INVALID_CFG 是 latched 还是 live **未定**(datasheet 未明说)。
@@ -1345,20 +1517,37 @@ static void afe_status_poll(const char *why, bool force)
 	if (vdd_oor && acquiring) {
 		afe_fault_vdd = true;
 	}
+	/*
+	 * 掉压不中止本轮(器件已恢复,后续读数仍是测量),但**必须打 tainted**:
+	 * 掉压跨越的那段时间里基准与 offset 源都不在规格内,那些点不能进标定曲线。
+	 */
+	if (brownout) {
+		if (acquiring) {
+			run_tainted = true;
+			printk("IT_TAINTED ep=%u reason=brownout\n", cfg_epoch);
+		}
+		LOG_ERR("🔴 PWR_RDY 置位 —— VDD 曾跌破 1.55V UVLO 掉压"
+			"(不是「电源未就绪」,名字与语义相反,见 regs.h)。"
+			"查 CR2032 内阻/接触与去耦");
+	}
 
-	if (!force && st == status1_last &&
+	if (!force && st == status1_last && sticky == 0U &&
 	    now - status1_reported_ms < AFE_STATUS_HEARTBEAT_MS) {
 		return;
 	}
 	status1_last = st;
 	status1_reported_ms = now;
-	printk("AFE_STATUS ep=%u ms=%lld status1=0x%02x invalid_cfg=%d vdd_oor=%d "
-	       "pwr_rdy=%d a_full=%d data_rdy=%d streak=%u acquiring=%d why=%s\n",
-	       cfg_epoch, (long long)now, st, invalid ? 1 : 0, vdd_oor ? 1 : 0,
-	       (st >> MAX30131_STATUS1_PWR_RDY_Pos) & 1,
+	/* `brownout=` 取代原来那个会读反的 `pwr_rdy=`;sticky 一并上报,便于事后区分
+	 * "这一刻置位"与"这一秒里发生过" */
+	printk("AFE_STATUS ep=%u ms=%lld status1=0x%02x sticky=0x%02x invalid_cfg=%d "
+	       "vdd_oor=%d brownout=%d a_full=%d data_rdy=%d streak=%u acquiring=%d "
+	       "why=%s\n",
+	       cfg_epoch, (long long)now, st, sticky, invalid ? 1 : 0, vdd_oor ? 1 : 0,
+	       brownout ? 1 : 0,
 	       (st >> MAX30131_STATUS1_A_FULL_Pos) & 1,
 	       (st >> MAX30131_STATUS1_FIFO_DATA_RDY_Pos) & 1,
 	       invalid_cfg_streak, acquiring ? 1 : 0, why);
+	status1_sticky = 0U;
 }
 
 /* ================================================================== */
@@ -1378,7 +1567,6 @@ static int exec_plan(const afe_plan_t *plan, uint32_t ep, const char *tag)
 
 	for (uint8_t i = 0; i < plan->n; i++) {
 		uint8_t before = 0U, after = 0U;
-		char line[128];
 
 		(void)max30131_spi_read_reg(plan->w[i].addr, &before);
 		if (max30131_spi_write_reg(plan->w[i].addr, plan->w[i].val) != 0) {
@@ -1392,9 +1580,9 @@ static int exec_plan(const afe_plan_t *plan, uint32_t ep, const char *tag)
 			return -EIO;
 		}
 		if (afe_cfg_fmt_reg(ep, (uint8_t)(i + 1U), plan->n, plan->w[i].addr,
-				    before, plan->w[i].val, after, line,
-				    sizeof(line)) > 0) {
-			printk("%s\n", line);
+				    before, plan->w[i].val, after, audit_line,
+				    sizeof(audit_line)) > 0) {
+			printk("%s\n", audit_line);
 		}
 		if (after != plan->w[i].val) {
 			bad++;
@@ -1416,7 +1604,6 @@ static int afe_cfg_commit(const afe_cmd_t *cmd, const char *src)
 	afe_derived_t dprev = drv_live;
 	afe_plan_t plan;
 	afe_reject_t why;
-	char line[512];
 	uint32_t ep;
 	bool need_dac, range_changed, idle_changed;
 
@@ -1426,9 +1613,9 @@ static int afe_cfg_commit(const afe_cmd_t *cmd, const char *src)
 
 	afe_cfg_derive(&cand, &dcand);
 	if (!afe_cfg_validate(&cand, &dcand, acquiring, cmd->forced, &why)) {
-		if (afe_cfg_fmt_reject(cfg_epoch, k_uptime_get(), &why, src, line,
-				       sizeof(line)) > 0) {
-			printk("%s\n", line);
+		if (afe_cfg_fmt_reject(cfg_epoch, k_uptime_get(), &why, src,
+				       audit_line, sizeof(audit_line)) > 0) {
+			printk("%s\n", audit_line);
 		}
 		if (cmd->legacy_range) {
 			printk("RANGE_REJECT reason=%s\n", afe_rej_name(why.code));
@@ -1446,9 +1633,9 @@ static int afe_cfg_commit(const afe_cmd_t *cmd, const char *src)
 		afe_reject_t p = { .code = AFE_REJ_PERTURB_DURING_RUN,
 				   .key = "", .a = 0, .b = 0 };
 
-		if (afe_cfg_fmt_reject(cfg_epoch, k_uptime_get(), &p, src, line,
-				       sizeof(line)) > 0) {
-			printk("%s\n", line);
+		if (afe_cfg_fmt_reject(cfg_epoch, k_uptime_get(), &p, src,
+				       audit_line, sizeof(audit_line)) > 0) {
+			printk("%s\n", audit_line);
 		}
 		return -EBUSY;
 	}
@@ -1466,11 +1653,11 @@ static int afe_cfg_commit(const afe_cmd_t *cmd, const char *src)
 
 	ep = ++cfg_epoch;
 	if (afe_cfg_fmt_applied(ep, k_uptime_get(), src, cmd->n_keys, cmd->forced,
-				&plan, &prev, &cand, line, sizeof(line)) > 0) {
-		printk("%s\n", line);
+				&plan, &prev, &cand, audit_line, sizeof(audit_line)) > 0) {
+		printk("%s\n", audit_line);
 	}
-	if (afe_cfg_fmt_derived(ep, &cand, &dcand, line, sizeof(line)) > 0) {
-		printk("%s\n", line);
+	if (afe_cfg_fmt_derived(ep, &cand, &dcand, audit_line, sizeof(audit_line)) > 0) {
+		printk("%s\n", audit_line);
 	}
 
 	/* System ADC 增益寄存器不在 plan 里(它是常量),开启连采时补写一次 */
@@ -1709,15 +1896,14 @@ static void ocp_run(int32_t window_ms, bool forced)
 static void replay_state(const char *src)
 {
 	afe_plan_t empty = { 0 };
-	char line[512];
 
 	if (afe_cfg_fmt_applied(cfg_epoch, k_uptime_get(), src, 0, false, &empty,
-				&cfg_live, &cfg_live, line, sizeof(line)) > 0) {
-		printk("%s\n", line);
+				&cfg_live, &cfg_live, audit_line, sizeof(audit_line)) > 0) {
+		printk("%s\n", audit_line);
 	}
-	if (afe_cfg_fmt_derived(cfg_epoch, &cfg_live, &drv_live, line,
-				sizeof(line)) > 0) {
-		printk("%s\n", line);
+	if (afe_cfg_fmt_derived(cfg_epoch, &cfg_live, &drv_live, audit_line,
+				sizeof(audit_line)) > 0) {
+		printk("%s\n", audit_line);
 	}
 	afe_status_poll(src, true);
 }
@@ -1726,12 +1912,11 @@ static void handle_command_line(const char *line)
 {
 	afe_cmd_t cmd;
 	afe_reject_t why;
-	char out[512];
 
 	if (!afe_cfg_parse(line, &cfg_live, &cmd, &why)) {
-		if (afe_cfg_fmt_reject(cfg_epoch, k_uptime_get(), &why, line, out,
-				       sizeof(out)) > 0) {
-			printk("%s\n", out);
+		if (afe_cfg_fmt_reject(cfg_epoch, k_uptime_get(), &why, line,
+				       audit_line, sizeof(audit_line)) > 0) {
+			printk("%s\n", audit_line);
 		}
 		/* 遗留兼容:RANGE 的拒因也走老行,GUI 才看得见 */
 		if (strncmp(line, "RANGE", 5) == 0) {
@@ -2202,6 +2387,23 @@ int main(void)
 			k_msleep(1000);
 		}
 	}
+	/*
+	 * 🔴 2026-08-10 实测发现的缺口:电位连采号称"常开",但 System ADC 的自主转换
+	 * 靠的是 AUTO=1,而 afe_configure() **刻意不写 0x83**(为了让开机自检能用手动
+	 * 转换),AUTO 直到首轮 afe_start_auto() 才起来。
+	 * ⇒ 开机到第一轮之间(以及 Quiet Time 期间)一个 CELL_V 都不会有。
+	 *   首烧日志里 11.6s 的 wait_for_start_command 期间零电压词,就是这个原因,
+	 *   **不是** 0x55 的 SYS_SELECT 位号猜错。
+	 * 自检/标定两条路径都已关(WP_RUN_* 皆 false),所以这里直接起 AUTO 无冲突;
+	 * 将来若重开自检,必须把 AUTO 挪到自检之后。
+	 */
+	if (WP_CELLV_ENABLE && !WP_RUN_STARTUP_DIAGNOSTIC &&
+	    !WP_RUN_AFE_GAIN_CALIBRATION) {
+		if (afe_start_auto() == 0) {
+			LOG_INF("电位连采:开机即起 AUTO(System ADC 与电流转换并行,"
+				"idle 期间也在采)");
+		}
+	}
 	/* 配置已落到器件上 ⇒ 立即把「设备自己认为的状态」整套打出来 */
 	replay_state("boot");
 
@@ -2259,8 +2461,20 @@ int main(void)
 			WP_STARTUP_E_MV, WP_PRESTEP_DURATION_MS);
 		uint32_t waited_ms = 0U;
 		while (waited_ms < WP_PRESTEP_DURATION_MS) {
-			uint32_t chunk_ms = MIN(1000U, WP_PRESTEP_DURATION_MS - waited_ms);
+			/*
+			 * 🔴 静置期不能只 sleep:此时 AUTO 在跑、System ADC 每 SYS_PERIOD
+			 * 产一组电压词,没人读就会在 FIFO 里滚掉(ro=1)。而静置期恰恰是
+			 * 最该看电位的一段(双电层在充,E 应当从 OCP 收敛到设定值)。
+			 * chunk 从 1000ms 缩到 POLL_INTERVAL_MS,顺带让 STATUS1 心跳也活着。
+			 */
+			uint32_t chunk_ms = MIN((uint32_t)POLL_INTERVAL_MS,
+						WP_PRESTEP_DURATION_MS - waited_ms);
 			board_guards_feed();
+			if (WP_CELLV_ENABLE) {
+				drain_fifo_for_voltages();
+			}
+			afe_status_poll("quiet", false);
+			(void)poll_control_command();   /* 静置期也要能收 STOP / SET */
 			k_msleep(chunk_ms);
 			waited_ms += chunk_ms;
 		}

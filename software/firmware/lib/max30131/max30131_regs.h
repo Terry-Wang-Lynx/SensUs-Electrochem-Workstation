@@ -27,6 +27,15 @@
 #define MAX30131_STATUS1_EIS_CAL_DONE_Pos 3u
 #define MAX30131_STATUS1_INVALID_CFG_Pos 2u
 #define MAX30131_STATUS1_VDD_OOR_Pos 1u
+/*
+ * 🔴 PWR_RDY 的语义与名字相反(datasheet p82 原文):
+ *   "PWR_RDY is a read-only bit, and it indicates that VDD **had gone below the
+ *    UVLO Threshold (1.55V)**. This bit is not triggered by a soft reset.
+ *    This bit is cleared when STATUS 1 (register 0x00) is read or by setting SHDN."
+ * ⇒ **1 = 发生过掉压(坏),0 = 正常**。名字读起来像"电源就绪",按字面理解会把
+ *   每一次正常开机都报成故障。2026-08-10 首次实测 STATUS1=0x00 时我按字面读错过一次。
+ * ⇒ 而且它**读清**:任何读 0x00 的地方都会把它吃掉 ⇒ 必须用 sticky 累积器接。
+ */
 #define MAX30131_STATUS1_PWR_RDY_Pos 0u
 
 #define MAX30131_REG_INT_ENABLE1 0x05u
@@ -210,7 +219,18 @@
 #define MAX30131_CSTART_CONVERT_Pos 0u
 #define MAX30131_CSTART_AUTO_Pos 1u
 
+/*
+ * INTB SETUP(p149):bit2 = EN_VDD_OOR,bit[1:0] = INTB_OCFG。**复位值 EN_VDD_OOR=0**。
+ * 🔴 p82:"To enable VDD_OOR functionality, both EN_VDD_OOR (0x95) and REF_EN (0x68)
+ *   must be set to 1 (enabled); **otherwise, VDD_OOR is always set to 0**."
+ * ⇒ 不写这个寄存器,STATUS1.VDD_OOR 恒为 0 —— 那个"掉压监测"是**死的**。
+ *   本项目 2026-08-10 之前一直没写它,所以之前所有"VDD_OOR=0"都不构成证据。
+ * INTB_OCFG 取 0x0(open-drain)—— 本板 INTB 悬空,选开漏保证它永不驱动。
+ */
 #define MAX30131_REG_INTB_SETUP 0x95u
+#define MAX30131_INTB_EN_VDD_OOR_Pos 2u
+#define MAX30131_INTB_OCFG_Pos 0u
+#define MAX30131_INTB_OCFG_OPEN_DR 0u
 
 /* ------------------------------------------------------------------ */
 /* ID                                                                  */
