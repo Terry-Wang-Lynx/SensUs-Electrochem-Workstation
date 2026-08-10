@@ -443,10 +443,13 @@ function renderDebug(d) {
   //    把故障灯的"未置位"画成绿色会让人读成"这个故障是 ON 的"—— 与 2026-08-09
   //    那次 sat 阈值不可见导致误报难辨是同一类可读性坑。
   const faultLamp = (id, set) => { $(id).className = `lamp ${set ? 'bad' : ''}`; };
-  const readyLamp = (id, ok, known) => { $(id).className = `lamp ${!known ? '' : ok ? 'ok' : 'bad'}`; };
   faultLamp('dbgLampInvalid', Boolean(st.invalid_cfg));
   faultLamp('dbgLampVdd', Boolean(st.vdd_oor));
-  readyLamp('dbgLampPwr', Boolean(st.pwr_rdy), st.status1 != null);
+  // 🔴 四个灯**全是故障灯**:置位=红,未置位=灰。
+  //    这一位原来叫 PWR_RDY,而 datasheet p82 说它表示"VDD 曾跌破 1.55V UVLO"
+  //    ⇒ 1=掉压(坏)、0=正常,名字与语义相反。固件已改名上报 `brownout=`;
+  //    前端一度还在读旧字段 `pwr_rdy` 并按"就绪灯"画 ⇒ 真机上一切正常时亮红。
+  faultLamp('dbgLampPwr', Boolean(st.brownout));
   faultLamp('dbgLampClip', Boolean(c.clipped));
 
   $('dbgWe').textContent = fmt(c.we_mv, 0); $('dbgRe').textContent = fmt(c.re_mv, 0);

@@ -1906,6 +1906,17 @@ static void replay_state(const char *src)
 		printk("%s\n", audit_line);
 	}
 	afe_status_poll(src, true);
+	/*
+	 * 🔴 重放也要给确认行。GET 确实读了 STATUS1 —— 那就是一次真的"器件同意"。
+	 * 不给的话界面对**开机 epoch** 永远显示"未确认"(而 afe_configure 明明已经
+	 * 逐个寄存器写完并回读过 DAC),这是误报;而"未确认"这个提示一旦开始误报,
+	 * 真正未确认的那次就没人会当真了。
+	 */
+	printk("CFG_CONFIRMED ep=%u status1=0x%02x invalid_cfg=%d vdd_oor=%d "
+	       "brownout=%d nregs=0 skipped=0 src=%s\n", cfg_epoch, status1_last,
+	       (status1_last >> MAX30131_STATUS1_INVALID_CFG_Pos) & 1,
+	       (status1_last >> MAX30131_STATUS1_VDD_OOR_Pos) & 1,
+	       (status1_last >> MAX30131_STATUS1_PWR_RDY_Pos) & 1, src);
 }
 
 static void handle_command_line(const char *line)
@@ -2521,15 +2532,26 @@ int main(void)
 	bool stop_requested = false;
 	bool afe_fault = false;
 
+	/*
+	 * 🔴 本轮期望样本数**在开始时定死**,不再每次循环重算。
+	 * 2026-08-10 实测的意外:中途 `SET period=4` 把速率从 8.06 降到 0.53 SPS,
+	 * 于是 expected 从 363 掉到 24,而 native_samples 已经 82 > 24
+	 * ⇒ 循环条件立刻不成立、**本轮当场结束**,看起来像"改个参数把测量搞没了"。
+	 * 轮次长度应当在开跑那一刻就确定;之后改采样率只影响点密度,不影响轮次边界。
+	 * 周期真变了就明确报出来(见下面的 period 变更告警),而不是悄悄改变收尾条件。
+	 */
+	uint32_t expected_samples = expected_sample_count();
+	uint8_t  run_period_code = cfg_live.period;
+
 	acquiring = true;
 	run_tainted = false;
 	afe_fault_invalid = false;
 	afe_fault_vdd = false;
 	invalid_cfg_streak = 0U;
 	LOG_INF("进入 AUTO i-t 采集: %u native samples (约8Hz; host重采样10Hz), E=%d mV",
-		expected_sample_count(), WP_E_MV);
+		expected_samples, WP_E_MV);
 
-	while (native_samples < expected_sample_count()) {
+	while (native_samples < expected_samples) {
 		board_guards_feed();
 		enum control_command command = poll_control_command();
 		if (command == CONTROL_START) {
@@ -2540,7 +2562,7 @@ int main(void)
 			stop_requested = true;
 			break;
 		}
-		uint16_t left = (uint16_t)(expected_sample_count() - native_samples);
+		uint16_t left = (uint16_t)(expected_samples - native_samples);
 		uint16_t n = drain_fifo(left);
 		native_samples += n;
 		int64_t now_ms = k_uptime_get();
@@ -2568,13 +2590,20 @@ int main(void)
 		if (n == 0U) {
 			conversion_errors++;
 		}
-		if (native_samples >= expected_sample_count()) {
+		if (cfg_live.period != run_period_code) {
+			/* 采样率被中途改了 ⇒ 点密度变了但轮次边界不变,必须说清楚 */
+			LOG_WRN("⚠️ 本轮采样周期被改(码 %u→%u):期望样本数仍按开跑时的 %u 计,"
+				"本轮实际时长会随之变化", run_period_code, cfg_live.period,
+				expected_samples);
+			run_period_code = cfg_live.period;
+		}
+		if (native_samples >= expected_samples) {
 			break;
 		}
 		if (k_uptime_get() - measurement_start_ms >
 			WP_MEASUREMENT_DURATION_MS + 10000) {
 			LOG_ERR("AUTO i-t 超过时限:仅获得 %u/%u 个原生样本",
-				native_samples, expected_sample_count());
+				native_samples, expected_samples);
 			break;
 		}
 		k_msleep(POLL_INTERVAL_MS);
@@ -2594,7 +2623,7 @@ int main(void)
 	enter_idle_state();
 	LOG_INF("i-t 测量结束:elapsed=%lld ms,native=%u/%u,empty polls=%u,E 已恢复为 %d mV",
 		(long long)(k_uptime_get() - measurement_start_ms), native_samples,
-		expected_sample_count(), conversion_errors, WP_STARTUP_E_MV);
+		expected_samples, conversion_errors, WP_STARTUP_E_MV);
 	if (restart_requested || stop_requested || afe_fault) {
 		const char *reason = afe_fault
 					     ? (afe_fault_invalid ? "invalid_cfg"
@@ -2618,7 +2647,7 @@ int main(void)
 	}
 	/* 机器可读完成标记:上位机收到后立即收尾,不再等待 duration/idle timeout。 */
 	printk("IT_DONE native=%u expected=%u elapsed_ms=%lld ep=%u tainted=%d\n",
-	       native_samples, expected_sample_count(),
+	       native_samples, expected_samples,
 	       (long long)(k_uptime_get() - measurement_start_ms), cfg_epoch,
 	       run_tainted ? 1 : 0);
 	}

@@ -474,6 +474,7 @@ class MeasurementController:
         # DEBUG 页的增量读状态。全部按"读位置 + 累积列表"做 ⇒ 1Hz 刷新不随
         # 文件增长变慢(一轮 180s 就上千行,全量重读会明显卡)。
         self._audit_pos = 0
+        self._auto_get_at = 0.0
         self._audit_cache: list[dict[str, Any]] = []
         self._cfg_live: dict[str, Any] = {}
         self._afe_status: dict[str, Any] = {}
@@ -528,6 +529,7 @@ class MeasurementController:
             # 🔴 新一轮必须清缓存与读位置 —— 不清会把上一轮的审计与曲线接在
             #    这一轮后面(文件换了,读位置却没归零 ⇒ 直接读到文件尾之外)。
             self._audit_pos = 0
+            self._auto_get_at = 0.0
             self._audit_cache = []
             self._cfg_live = {}
             self._afe_status = {}
@@ -827,6 +829,21 @@ class MeasurementController:
 
     def debug_snapshot(self) -> dict[str, Any]:
         events = self._audit_events()
+        # 🔴 自愈:开机那几行 CFG_BOOT/CFG_APPLIED/CFG_DERIVED 常常收不到 ——
+        #   JLinkExe 的 `rtt start` 会把读指针对到当前写指针,**跳过缓冲里已有的
+        #   字节**,而那几行在 rtt start 之前(复位后 ~300ms)就写完了。
+        #   这正是 GET 幂等重放的用途:它不 ep++、不写任何寄存器,只把设备当前
+        #   认知整套重打一遍。检测到"在跑但一条 CFG_* 都没有"就自动补一次。
+        # 判据必须用**只有 CFG_DERIVED 才带**的字段(bits)。用 `not self._cfg_live`
+        # 不行:CFG_BOOT 只带 ep/ms/fw/reason,一到就让字典非空,GET 反而不发了
+        # ——"有几个键"和"有没有派生量"是两件事。
+        if (self.state == "running" and self._cfg_live.get("bits") is None
+                and time.time() - self._auto_get_at > 3.0):
+            self._auto_get_at = time.time()
+            try:
+                self.send_command("GET")
+            except (RuntimeError, ValueError):
+                pass
         return _json_safe({
             "state": self.state,
             "message": self.message,
@@ -1582,8 +1599,13 @@ class AppState:
             raise RuntimeError("自动测量运行期间不能起硬件 DEBUG 轮(探头只有一支)")
         if self.measurement.snapshot()["state"] == "running":
             raise RuntimeError("已有测量正在运行")
-        if not self.settings.snapshot()["applied"]:
-            raise RuntimeError("请先将当前 IT 条件应用到硬件(固件里的开机默认值)")
+        # 🔴 刻意**不**要求 settings.applied。
+        #   正式测量要求它,是因为标定/拟合假设固件的 E 与时长跟 settings 一致;
+        #   debug 轮什么都不导出、不拟合,这个耦合不存在。
+        #   反过来,"固件与 GUI 设置不一致"恰恰是硬件调试时的常态 —— 要求先
+        #   重编译+烧录才能看一眼硬件,等于取消了这个页面的用途。
+        #   而且现在固件开机就打 CFG_BOOT/CFG_DERIVED 给出**真实生效**的配置,
+        #   那比 applied 这个上位机侧的标志是更硬的证据。不一致由 UI 提示,不拦。
         metadata = {
             "debug": True,
             "sample_name": str(payload.get("note") or "hw-debug"),
@@ -2149,7 +2171,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(APP.drift_payload())
             return
         if parsed.path == "/api/debug":
-            self._send_json(APP.measurement.debug_snapshot())
+            payload = APP.measurement.debug_snapshot()
+            # 只作提示:不一致时 UI 提醒"固件里跑的可能不是 GUI 这套参数",
+            # 但**不阻止**调试轮(理由见 start_debug_run)。
+            payload["settings_applied"] = bool(
+                APP.settings.snapshot().get("applied"))
+            self._send_json(payload)
             return
         if parsed.path == "/api/health":
             self._send_json({"ok": True, "project": str(PROJECT_DIR)})

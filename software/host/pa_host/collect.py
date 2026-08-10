@@ -447,6 +447,7 @@ class CfgEventAccumulator:
     def __init__(self) -> None:
         self.pending: dict[int, dict[str, object]] = {}
         self.rows: list[list[str]] = []
+        self._done: set[int] = set()
 
     def feed(self, event: dict[str, object]) -> list[str] | None:
         ep = event.get("ep")
@@ -463,6 +464,15 @@ class CfgEventAccumulator:
             row.update({k: v for k, v in event.items()
                         if k not in ("kind", "raw")})
             row["confirmed"] = 1
+            # 🔴 两道去重,否则宽表违反"每 epoch 一行"的契约:
+            #   ① 没有 CFG_DERIVED(没有 bits)的行是**空壳**——开机时
+            #      CFG_BOOT+CFG_CONFIRMED 会先到,派生量还没来,落进去就是一行全空
+            #   ② 同一 epoch 只留第一条完整的(GET 重放会对同一 epoch 再报一次)
+            if row.get("bits") in (None, ""):
+                return None
+            if ep in self._done:
+                return None
+            self._done.add(ep)
             out = [str(row.get(c, "")) for c in CFG_EVENT_COLUMNS]
             self.rows.append(out)
             return out
