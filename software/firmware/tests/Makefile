@@ -13,7 +13,7 @@ CFLAGS   = -std=c99 -O1 -g \
            -Wconversion -Wsign-conversion -Wshadow -Wpointer-arith \
            -Wstrict-prototypes -Wmissing-prototypes \
            -I$(LIB_DIR)
-SRCS     = test_max30131.c $(LIB_DIR)/max30131.c
+SRCS     = test_max30131.c $(LIB_DIR)/max30131.c $(LIB_DIR)/afe_cfg.c
 BIN      = build/test_max30131
 BIN_ASAN = build/test_max30131_asan
 
@@ -27,11 +27,11 @@ asan: $(BIN_ASAN)
 
 all: test asan
 
-$(BIN): $(SRCS) $(LIB_DIR)/max30131.h $(LIB_DIR)/max30131_regs.h minitest.h
+$(BIN): $(SRCS) $(LIB_DIR)/max30131.h $(LIB_DIR)/max30131_regs.h $(LIB_DIR)/afe_cfg.h minitest.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $(SRCS)
 
-$(BIN_ASAN): $(SRCS) $(LIB_DIR)/max30131.h $(LIB_DIR)/max30131_regs.h minitest.h
+$(BIN_ASAN): $(SRCS) $(LIB_DIR)/max30131.h $(LIB_DIR)/max30131_regs.h $(LIB_DIR)/afe_cfg.h minitest.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer \
 		-o $@ $(SRCS)

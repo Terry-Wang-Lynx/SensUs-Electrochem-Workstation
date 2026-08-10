@@ -286,6 +286,79 @@ max30131_err_t max30131_check_period_vs_conv(uint8_t conv_time_code,
 					     max30131_fsr_t fsr);
 
 /* ================================================================== */
+/* 时钟数口径(取代 ms 相除)                                          */
+/* ================================================================== */
+/*
+ * 🔴 为什么必须有这一组:ms 表在同码时会**掩盖真值**。
+ * conv 0x0 = 124.20ms、period 0x0 = 124.49ms,两者都四舍五入成 124,
+ * `124 ≤ 124` 靠舍入方向侥幸通过;而 idle 窗口用 ms 相除会算出 0,
+ * 真值其实是 10 个时钟。校验与占比一律用时钟数,ms 只用于显示。
+ *
+ * 逐码验证过的恒等式(11 个码全对,见单测 test_conv_clocks_match_ms_tables):
+ *   N(code)            = 2^(12+code) − 1        ← 计数器深度,**不**等于 2^bits−1
+ *                                                 (code>4 时输出被 decimate 到 16 位,
+ *                                                  但计数器继续翻倍,所以时间继续涨)
+ *   conv_clocks(code)  = N + 246                ← 246 = precharge(p98 正文)
+ *   period_clocks(code)= conv_clocks(code) + 10 ← 同码时 idle 窗口恒为 10 个时钟
+ * 计数器上限 8,388,607 = 2^23 − 1 ⇒ 码 ≥0xB 全部夹在该值。
+ */
+uint32_t max30131_conv_time_clocks(uint8_t conv_time_code);
+uint32_t max30131_period_clocks(uint8_t sens_period_code);
+/*
+ * 一个采样周期里 ADC **没在转换**的时间占比(ppm)。
+ * 🔴 这不是"浪费的时间"那么简单:p40 说不转换时 WE 被切到固定 50nA 粗偏置通路
+ * (S1.n→VDD、S2.n 闭),而轮次间几十秒的该状态实测会把电极推正、造成下一轮
+ * +385~474nA 还原冲击。周期内的几十 ms 是否同样有害尚未实测,但**必须可见**。
+ * ⚠️ 两个时钟基不同:conv 随 FSR 分组(快钟组 ×4),period 恒用基频。
+ * 实例:FSR 1µA + conv 0x1 + period 0x0 ⇒ 515000 ppm(51.5%),而**同码**只有 2298 ppm。
+ */
+int32_t max30131_idle_window_ppm(uint8_t conv_time_code, uint8_t sens_period_code,
+				 max30131_fsr_t fsr);
+
+/*
+ * 积分窗对 50Hz 的抑制(dB×10,负值)。积分窗就是抗混叠滤波器,抑制 = |sinc(f·T)|,
+ * 零点在 T = k/f。
+ *   *_db_x10       标称时钟下的值
+ *   *_worst_db_x10 在 datasheet 给的采样时钟 ±2%(EC 表 f_SLOW)内取最坏
+ * 🔴 必须看最坏值:60.35ms 恰在 sinc 零点上(3.018 个工频周期),标称 −44.7dB,
+ * 但 ±2% 一偏就塌到 −32dB;而 119ms 靠 sinc 包络,最坏 −31.1dB。
+ * ⇒ 标称差 3dB、最坏几乎相同 ⇒ 选码不能只看标称。
+ */
+int16_t max30131_rej50_db_x10(uint8_t conv_time_code, bool clk_sel_40k,
+			      bool fast_clock_group);
+int16_t max30131_rej50_worst_db_x10(uint8_t conv_time_code, bool clk_sel_40k,
+				    bool fast_clock_group);
+
+/*
+ * 给定 FSR/period/时钟源,自动选最优 CONV_TIME 码。
+ * 排序键(字典序):① 最坏 50Hz 抑制 ② 位数 ③ idle 窗口小。
+ * 🔴 这是对 2026-08-09「写死 CONV_TIME=0x1」那次回归的**结构性**修复:
+ * 把耦合关系从宏变成可单测、可打印、可给出备选的决策。
+ * 返回选中的码;`alt_out` 非 NULL 时给次优码(审计行用,让"为什么选它"可查)。
+ * 无可用码(period 比最短转换还短)返回 -1。
+ */
+int max30131_auto_conv_code(max30131_fsr_t fsr, uint8_t sens_period_code,
+			    bool clk_sel_40k, int *alt_out);
+
+/*
+ * System ADC 采完所选通道需要的总时间(ms)。
+ * 🔴 p143 硬约束:总时间 > SYS_PERIOD ⇒ 置 INVALID_CFG,且
+ * "the conversion cycle abruptly restarts before completing all selected channels.
+ *  Data saved in the FIFO is invalid for the interrupted channel."
+ * sys_conv_type=false(0x80 bit4=0)⇒ 每通道 offset+signal 两次转换;true ⇒ 每类别共享一次 offset。
+ */
+int32_t max30131_sysadc_budget_ms(uint8_t n_channels, bool sys_conv_type);
+
+/*
+ * 改 E 要写 DACA+DACB 两对寄存器,中间态是"一新一旧"的组合,可能违反
+ * headroom(WEn ≤ VDD−1.1V)。返回安全的写序:0=先 A,1=先 B,
+ * -1=两个中间态都不安全(此时应分两步经过一个中间电位)。
+ */
+int max30131_polarization_write_order(const max30131_polarization_t *old_p,
+				      const max30131_polarization_t *new_p,
+				      int32_t vdd_mv, int32_t vref_mv);
+
+/* ================================================================== */
 /* 寄存器字节编码器(让 05 文档里的 hex 变成可断言的表达式)             */
 /* ================================================================== */
 typedef struct {

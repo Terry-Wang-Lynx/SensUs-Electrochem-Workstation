@@ -502,17 +502,66 @@ max30131_err_t max30131_check_period_vs_conv(uint8_t conv_time_code,
 					     bool clk_sel_40k,
 					     max30131_fsr_t fsr)
 {
-	int32_t conv = max30131_conv_time_ms(
-		conv_time_code, clk_sel_40k, max30131_fsr_uses_fast_clock(fsr));
-	int32_t period = max30131_sens_period_ms(sens_period_code, clk_sel_40k);
+	/*
+	 * 🔴 用**时钟数**比较,不用 ms 表。ms 表在同码时掩盖真值:
+	 * conv 0x0 = 124.20ms、period 0x0 = 124.49ms,两者都舍入成 124,
+	 * `124 ≤ 124` 是靠舍入方向侥幸通过的 —— 换个舍入实现就会误判。
+	 *
+	 * 两个时钟基不同(conv 随 FSR 分组、period 恒用基频),这里不做除法
+	 * (整数除会截断),改为把 period 乘上分组倍数,等价且无截断:
+	 *   慢钟组:conv_clk ≤ period_clk
+	 *   快钟组:conv_clk ≤ period_clk × 4
+	 * 溢出安全:period_clk 最大 8388863,×4 = 33555452 < 2^32。
+	 */
+	uint32_t conv_clk, budget_clk;
 
-	if (conv < 0 || period < 0) {
+	if (conv_time_code > 0x0Fu || sens_period_code > 0x0Fu) {
 		return MAX30131_ERR_ARG;
 	}
-	if (conv > period) {
+	(void)clk_sel_40k; /* 两侧同基频 ⇒ CLK_SEL 在比较中约掉 */
+	conv_clk = max30131_conv_time_clocks(conv_time_code);
+	budget_clk = max30131_period_clocks(sens_period_code);
+	if (max30131_fsr_uses_fast_clock(fsr)) {
+		budget_clk *= 4u;
+	}
+	if (conv_clk > budget_clk) {
 		return MAX30131_ERR_CFG; /* 会置 STATUS1.INVALID_CFG */
 	}
 	return MAX30131_OK;
+}
+
+int max30131_polarization_write_order(const max30131_polarization_t *old_p,
+				      const max30131_polarization_t *new_p,
+				      int32_t vdd_mv, int32_t vref_mv)
+{
+	/*
+	 * 改 E 要写 DACA + DACB 两对寄存器,物理上必然有中间态(<1ms)。
+	 * 中间态的 V_WE/V_RE 是"一个新一个旧"的组合,可能违反 headroom
+	 * (WE ≤ VDD−1.1V)。枚举两种次序,返回安全的那个。
+	 * 返回 0 = 先写 A,1 = 先写 B,-1 = 两个中间态都不安全(需分两步走中间电位)。
+	 */
+	int32_t lim_mv;
+
+	if (old_p == NULL || new_p == NULL || vref_mv <= 0) {
+		return -1;
+	}
+	lim_mv = vdd_mv - 1100; /* CP_EN=0 时 WEn 上限 */
+	/* 中间态 A:DACA 已新、DACB 仍旧 */
+	int32_t we_a = max30131_dac_mv_from_code(new_p->code_a, vref_mv);
+	int32_t re_a = max30131_dac_mv_from_code(old_p->code_b, vref_mv);
+	/* 中间态 B:DACB 已新、DACA 仍旧 */
+	int32_t we_b = max30131_dac_mv_from_code(old_p->code_a, vref_mv);
+	int32_t re_b = max30131_dac_mv_from_code(new_p->code_b, vref_mv);
+	bool ok_a = we_a <= lim_mv && re_a <= lim_mv && we_a >= 0 && re_a >= 0;
+	bool ok_b = we_b <= lim_mv && re_b <= lim_mv && we_b >= 0 && re_b >= 0;
+
+	if (ok_a) {
+		return 0;
+	}
+	if (ok_b) {
+		return 1;
+	}
+	return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -579,6 +628,175 @@ uint8_t max30131_enc_s1_config5(uint8_t conv_time_code, bool select)
 	return (uint8_t)((conv_time_code & 0x0Fu)
 			 << MAX30131_S1C5_CONV_TIME_Pos) |
 	       BIT_IF(select, MAX30131_S1C5_SELECT_Pos);
+}
+
+/* ================================================================== */
+/* 时钟数口径                                                          */
+/* ================================================================== */
+/*
+ * 计数器深度 N = 2^(12+code) − 1(**不是** 2^bits − 1:码 >4 时输出被 decimate
+ * 到 16 位,但计数器继续翻倍,所以转换时间继续涨)。上限 8,388,607 = 2^23 − 1
+ * ⇒ 码 ≥0xB 全部夹在该值。11 个码逐一与两张 ms 表吻合,见单测。
+ */
+#define MAX30131_CONV_PRECHARGE_CLOCKS 246u
+#define MAX30131_CONV_MAX_CODE 11u
+
+static uint32_t conv_counter_clocks(uint8_t conv_time_code)
+{
+	uint8_t c = conv_time_code > MAX30131_CONV_MAX_CODE
+			    ? (uint8_t)MAX30131_CONV_MAX_CODE
+			    : conv_time_code;
+
+	return ((uint32_t)1u << (12u + c)) - 1u;
+}
+
+uint32_t max30131_conv_time_clocks(uint8_t conv_time_code)
+{
+	return conv_counter_clocks(conv_time_code) + MAX30131_CONV_PRECHARGE_CLOCKS;
+}
+
+uint32_t max30131_period_clocks(uint8_t sens_period_code)
+{
+	/* 同码时 period 比 conv 多 10 个时钟 —— 这就是"背靠背"的 0.2% 的来处。 */
+	return max30131_conv_time_clocks(sens_period_code) + 10u;
+}
+
+int32_t max30131_idle_window_ppm(uint8_t conv_time_code, uint8_t sens_period_code,
+				 max30131_fsr_t fsr)
+{
+	/*
+	 * 🔴 两个时钟基不同,必须换算到同一基准:
+	 *   conv   随 FSR 分组 —— 快钟组(FSR 码 ≥4)时钟是基频的 4 倍
+	 *   period 恒用基频
+	 * 折算成基频时钟数:快钟组的 conv 只占基频的 1/4。
+	 */
+	uint32_t conv = max30131_conv_time_clocks(conv_time_code);
+	uint32_t period = max30131_period_clocks(sens_period_code);
+
+	if (max30131_fsr_uses_fast_clock(fsr)) {
+		conv = (conv + 3u) / 4u; /* 向上取整:宁可高估占用、低估 idle */
+	}
+	if (period == 0u) {
+		return -1;
+	}
+	if (conv >= period) {
+		return 0; /* 装不下(配置非法),idle 无意义 */
+	}
+	return (int32_t)(((uint64_t)(period - conv) * 1000000u) / period);
+}
+
+/* ================================================================== */
+/* 50Hz 抑制表(dB×10,负值)                                          */
+/* ================================================================== */
+/*
+ * 索引 [conv_code][clk40*2 + fast]。离线用 |sinc(50·T_int)| 算好,运行时纯查表 ——
+ * prj.conf 已 CBPRINTF_FP_SUPPORT=n,固件里不做 sin/log。
+ *
+ * 🔴 T 用**积分时间** N/f,不含 246 个 precharge 时钟。判据是我们自己的实测:
+ * CONV 0x0→0x1 实测 2.29Hz 谱峰降 23.0dB;积分口径预测 19.1dB、
+ * 转换口径预测 30.9dB ⇒ 积分口径才对得上。物理上也只有积分窗做抗混叠。
+ *
+ * 🔴 WORST 是在 datasheet 给的采样时钟 ±2%(EC 表 f_SLOW)内取最坏。
+ * 看 [0][2](慢钟/40kHz/码0):标称 −72.2dB(积分 99.98ms ≈ 4.999 个工频周期,
+ * 几乎完美零点)但最坏塌到 −33.8dB。**±2% 的片内振荡器上,靠 sinc 零点压工频
+ * 是不成立的**;真正单调改善最坏值的只有加长积分时间(包络 1/(πfT))。
+ * 所以选码一律看 WORST,NOM 只用于显示。
+ */
+static const int16_t rej50_nom_db_x10[11][4] = {
+	{  -326,  -133,  -722,  -149 },
+	{  -335,  -324,  -783,  -179 },
+	{  -375,  -327,  -843,  -843 },
+	{  -517,  -336,  -903,  -903 },
+	{  -524,  -375,  -963,  -963 },
+	{  -554,  -517, -1024, -1024 },
+	{  -988,  -524, -1084, -1084 },
+	{  -975,  -554, -1144, -1144 },
+	{  -969,  -969, -1204, -1204 },
+	{  -966,  -966, -1264, -1264 },
+	{  -966,  -965, -1325, -1325 },
+};
+static const int16_t rej50_worst_db_x10[11][4] = {
+	{  -279,  -133,  -338,  -144 },
+	{  -312,  -272,  -343,  -178 },
+	{  -374,  -279,  -362,  -339 },
+	{  -433,  -312,  -419,  -344 },
+	{  -493,  -374,  -478,  -362 },
+	{  -553,  -433,  -539,  -419 },
+	{  -612,  -493,  -599,  -478 },
+	{  -673,  -553,  -659,  -539 },
+	{  -733,  -612,  -719,  -599 },
+	{  -793,  -673,  -779,  -659 },
+	{  -853,  -733,  -840,  -719 },
+};
+
+static int16_t rej50_lookup(const int16_t tbl[11][4], uint8_t conv_time_code,
+			    bool clk_sel_40k, bool fast_clock_group)
+{
+	uint8_t c = conv_time_code > 10u ? 10u : conv_time_code;
+	uint8_t col = (uint8_t)((clk_sel_40k ? 2u : 0u) + (fast_clock_group ? 1u : 0u));
+
+	return tbl[c][col];
+}
+
+int16_t max30131_rej50_db_x10(uint8_t conv_time_code, bool clk_sel_40k,
+			      bool fast_clock_group)
+{
+	return rej50_lookup(rej50_nom_db_x10, conv_time_code, clk_sel_40k,
+			    fast_clock_group);
+}
+
+int16_t max30131_rej50_worst_db_x10(uint8_t conv_time_code, bool clk_sel_40k,
+				    bool fast_clock_group)
+{
+	return rej50_lookup(rej50_worst_db_x10, conv_time_code, clk_sel_40k,
+			    fast_clock_group);
+}
+
+int max30131_auto_conv_code(max30131_fsr_t fsr, uint8_t sens_period_code,
+			    bool clk_sel_40k, int *alt_out)
+{
+	int best = -1, alt = -1;
+
+	if (alt_out != NULL) {
+		*alt_out = -1;
+	}
+	/*
+	 * 策略 = **取能装下的最大码**。
+	 * 这不是偷懒:最坏 50Hz 抑制、位数、idle 窗口三个排序键在本器件上**同向单调**
+	 * (最坏抑制随码单调改善,已在单测里对全部 4 个时钟组合 × 11 码枚举验证),
+	 * 所以"字典序三键排序"与"最大码"给出同一个答案,而后者少一个排序循环、
+	 * 且不可能因表写错而选出坏码。单测 test_auto_conv_equals_three_key_sort 钉死等价性。
+	 */
+	for (uint8_t c = 0; c <= MAX30131_CONV_MAX_CODE; c++) {
+		if (max30131_check_period_vs_conv(c, sens_period_code, clk_sel_40k,
+						  fsr) != MAX30131_OK) {
+			continue;
+		}
+		alt = best;
+		best = (int)c;
+	}
+	if (alt_out != NULL) {
+		*alt_out = alt;
+	}
+	return best;
+}
+
+int32_t max30131_sysadc_budget_ms(uint8_t n_channels, bool sys_conv_type)
+{
+	/*
+	 * System ADC 单次转换 8.5ms(EC 表)。SYS_CONV_TYPE=0 ⇒ 每通道 offset+signal
+	 * 两次;=1 ⇒ 每**类别**共享一次 offset(本设计四路同属 sensor 类)。
+	 * 结果向上取整到 ms,宁可高估预算。
+	 */
+	const int32_t conv_x10 = 85; /* 8.5ms ×10 */
+	int32_t n = n_channels;
+	int32_t convs;
+
+	if (n <= 0) {
+		return 0;
+	}
+	convs = sys_conv_type ? (n + 1) : (n * 2);
+	return (convs * conv_x10 + 9) / 10;
 }
 
 uint8_t max30131_enc_sys_adc_setup(uint8_t sensv_gain_code)
