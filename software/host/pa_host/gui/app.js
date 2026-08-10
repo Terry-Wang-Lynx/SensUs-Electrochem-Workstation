@@ -3,7 +3,9 @@ const state = { measurement: null, calibration: {points: [], model: null, curve:
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
   calibrate: ['标定与漂移', '选择标定范围并管理过渡期 bias'],
-  schedule: ['稳定化 / 自动', '无人值守的定时连续 IT 检测']
+  schedule: ['稳定化 / 自动', '无人值守的定时连续 IT 检测'],
+  // 🔴 缺这一条会让整个切页 handler TypeError —— pages[view][0] 直接取下标
+  debug: ['硬件 DEBUG', '运行时改采样参数 · 每次变更留审计 · 电流与电位同图']
 };
 
 async function api(path, options = {}) {
@@ -69,7 +71,7 @@ document.querySelectorAll('.nav-item').forEach(button => button.addEventListener
   $(`view-${button.dataset.view}`).classList.add('active');
   $('pageTitle').textContent = pages[button.dataset.view][0];
   $('pageSubtitle').textContent = pages[button.dataset.view][1];
-  requestAnimationFrame(drawAll);
+  requestAnimationFrame(() => {drawAll(); drawDebug();});
 }));
 
 function setupCanvas(canvas) {
@@ -77,37 +79,68 @@ function setupCanvas(canvas) {
   canvas.width = Math.max(1, rect.width * ratio); canvas.height = Math.max(1, rect.height * ratio);
   const ctx = canvas.getContext('2d'); ctx.setTransform(ratio, 0, 0, ratio, 0, 0); return {ctx, w: rect.width, h: rect.height};
 }
+/* 双轴是 **opt-in 扩展**:series 里带 `axis:'right'` 的走右轴,
+ * options 可给 y2label / y2Digits / yDigits。不传 `axis` 时行为与改动前**像素级相同**
+ * ⇒ 现有两个调用点(itChart / calibrationChart)一个字都不用改。
+ * 左右轴共用同一组分数网格位置(6 条线),否则两侧刻度视觉上对不齐,
+ * 人会误读成"两条线在同一个值上交叉"。 */
 function drawChart(canvas, series, options = {}) {
   const {ctx, w, h} = setupCanvas(canvas); ctx.clearRect(0, 0, w, h);
-  const all = series.flatMap(s => s.points).filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1])); if (!all.length) return;
+  const left = series.filter(s => s.axis !== 'right'), right = series.filter(s => s.axis === 'right');
+  const hasRight = right.length > 0;
+  const pts = list => list.flatMap(s => s.points).filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+  const allL = pts(left), allR = pts(right), all = allL.concat(allR);
+  if (!all.length) return;
   let xmin = options.xmin ?? Math.min(...all.map(p => p[0])), xmax = options.xmax ?? Math.max(...all.map(p => p[0]));
-  let ymin = Math.min(...all.map(p => p[1])), ymax = Math.max(...all.map(p => p[1]));
-  if (xmax === xmin) xmax = xmin + 1; if (ymax === ymin) {ymin -= 1; ymax += 1;} const padY = (ymax-ymin)*.12; ymin -= padY; ymax += padY;
-  const m = {l:56,r:18,t:18,b:38}, px = x => m.l+(x-xmin)/(xmax-xmin)*(w-m.l-m.r), py = y => m.t+(ymax-y)/(ymax-ymin)*(h-m.t-m.b);
+  const span = list => {
+    if (!list.length) return [0, 1];
+    let lo = Math.min(...list.map(p => p[1])), hi = Math.max(...list.map(p => p[1]));
+    if (hi === lo) {lo -= 1; hi += 1;}
+    const pad = (hi - lo) * .12; return [lo - pad, hi + pad];
+  };
+  let [ymin, ymax] = span(allL.length ? allL : all);
+  const [y2min, y2max] = span(allR);
+  if (xmax === xmin) xmax = xmin + 1;
+  const m = {l:56, r: hasRight ? 56 : 18, t:18, b:38};
+  const px = x => m.l+(x-xmin)/(xmax-xmin)*(w-m.l-m.r);
+  const py = y => m.t+(ymax-y)/(ymax-ymin)*(h-m.t-m.b);
+  const py2 = y => m.t+(y2max-y)/(y2max-y2min)*(h-m.t-m.b);
+  const yd = options.yDigits ?? 1, y2d = options.y2Digits ?? 0;
   ctx.font = '10px system-ui'; ctx.fillStyle='#718086'; ctx.strokeStyle='#e2e7e8'; ctx.lineWidth=1;
-  for(let i=0;i<=5;i++){const y=ymin+(ymax-ymin)*i/5, yy=py(y);ctx.beginPath();ctx.moveTo(m.l,yy);ctx.lineTo(w-m.r,yy);ctx.stroke();ctx.fillText(y.toFixed(1),6,yy+3)}
+  for(let i=0;i<=5;i++){
+    const f=i/5, yy=m.t+(1-f)*(h-m.t-m.b);
+    ctx.beginPath();ctx.moveTo(m.l,yy);ctx.lineTo(w-m.r,yy);ctx.stroke();
+    ctx.fillStyle='#718086';ctx.fillText((ymin+(ymax-ymin)*f).toFixed(yd),6,yy+3);
+    if(hasRight){ctx.fillStyle='#8a6fb0';ctx.fillText((y2min+(y2max-y2min)*f).toFixed(y2d),w-m.r+6,yy+3)}
+  }
+  ctx.fillStyle='#718086';
   for(let i=0;i<=6;i++){const x=xmin+(xmax-xmin)*i/6, xx=px(x);ctx.beginPath();ctx.moveTo(xx,m.t);ctx.lineTo(xx,h-m.b);ctx.stroke();ctx.fillText(x.toFixed(xmax<=60?1:0),xx-8,h-15)}
   series.forEach(s => {
     const points = s.points.filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+    const yf = s.axis === 'right' ? py2 : py;
     const width = s.width ?? 1.6;
     if (width > 0 && points.length) {
       ctx.strokeStyle = s.color;
       ctx.lineWidth = width;
+      if (s.dash) ctx.setLineDash(s.dash);
       ctx.beginPath();
-      points.forEach((p, i) => i ? ctx.lineTo(px(p[0]), py(p[1])) : ctx.moveTo(px(p[0]), py(p[1])));
+      points.forEach((p, i) => i ? ctx.lineTo(px(p[0]), yf(p[1])) : ctx.moveTo(px(p[0]), yf(p[1])));
       ctx.stroke();
+      ctx.setLineDash([]);
     }
     if (s.dots) {
       ctx.fillStyle = s.color;
       const radius = s.pointRadius ?? 4;
       points.forEach(p => {
         ctx.beginPath();
-        ctx.arc(px(p[0]), py(p[1]), radius, 0, Math.PI * 2);
+        ctx.arc(px(p[0]), yf(p[1]), radius, 0, Math.PI * 2);
         ctx.fill();
       });
     }
   });
-  ctx.fillStyle='#68767b';ctx.fillText(options.xlabel||'Time (s)',w/2-22,h-2);ctx.save();ctx.translate(12,h/2+25);ctx.rotate(-Math.PI/2);ctx.fillText(options.ylabel||'Current (nA)',0,0);ctx.restore();
+  ctx.fillStyle='#68767b';ctx.fillText(options.xlabel||'Time (s)',w/2-22,h-2);
+  ctx.save();ctx.translate(12,h/2+25);ctx.rotate(-Math.PI/2);ctx.fillText(options.ylabel||'Current (nA)',0,0);ctx.restore();
+  if(hasRight){ctx.fillStyle='#8a6fb0';ctx.save();ctx.translate(w-10,h/2-25);ctx.rotate(Math.PI/2);ctx.fillText(options.y2label||'',0,0);ctx.restore()}
 }
 function drawAll(){
   const d = state.measurement?.data || {};
@@ -372,4 +405,190 @@ $('startSchedule').onclick=async()=>{try{$('scheduleError').hidden=true;updateSc
 $('stopSchedule').onclick=async()=>{try{updateSchedule(await post('/api/schedule/stop'))}catch(e){errorBox('scheduleError',e)}};
 
 async function init(){setInterval(()=>$('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);try{renderSettings(await api('/api/settings'))}catch{}try{renderWorkflow(await api('/api/workflow'))}catch{}try{state.calibration=await api('/api/calibration');renderCalibration()}catch{}try{renderDrift(await api('/api/drift'))}catch{}try{updateSchedule(await api('/api/schedule'))}catch{}setSampleRole(state.workflow?.calibration_ready?'test':'calibration',true);previewFilename();measurementRefreshLoop();setInterval(async()=>{try{updateSchedule(await api('/api/schedule'))}catch{}},1000)}
-window.addEventListener('resize',drawAll);init();
+
+// ══════════════════════════════════════════════════════════════════════════
+// 硬件 DEBUG 模式
+// ══════════════════════════════════════════════════════════════════════════
+// 🔴 与前三页刻意**不共用任何 id 与刷新循环**:这一页 1Hz 拉 /api/debug,
+//    前三页 100ms 拉 /api/status。合到一起会让调试页把采集循环的刷新率拖慢。
+state.debug = null;
+state.dbgChartWindowS = null;   // null = 全程
+
+const DBG_FSR_NA = [50, 100, 250, 500, 1000, 2000];
+const DBG_IDLE_NAME = ['停转换(仅对照)', '持续钳位', '断开(CHI 默认)'];
+
+function dbgRow(label, value, hint) {
+  return `<tr><th>${label}</th><td>${value}</td><td class="dbg-hint">${hint || ''}</td></tr>`;
+}
+function renderDebug(d) {
+  state.debug = d;
+  const cfg = d.cfg || {}, st = d.afe_status || {}, running = d.state === 'running';
+  $('dbgBadge').textContent = running ? '采集中' : d.state === 'completed' ? '已完成' : d.state === 'error' ? '错误' : '待机';
+  $('dbgBadge').className = `live-badge ${running ? 'running' : d.state === 'error' ? 'error' : ''}`;
+  $('dbgStart').disabled = running;
+  $('dbgStop').disabled = !running;
+  // 🔴 命令只能在测量进行中下发(RTT 下行通道由采集器持有)⇒ 不跑就禁用
+  ['dbgGet', 'dbgOcp', 'dbgPresetQuiet'].forEach(id => { $(id).disabled = !running; });
+  $('dbgEpochMsg').textContent = cfg.ep == null ? 'epoch --（尚未收到 CFG_* 行）'
+    : `epoch ${cfg.ep}${cfg.confirmed_ep === cfg.ep ? ' · 已确认' : ' · ⚠️ 未确认'}`
+      + (cfg.conv_src ? ` · conv=${cfg.conv_src}` : '');
+  $('dbgStatusBadge').textContent = st.status1 == null ? '未连接'
+    : `STATUS1 0x${Number(st.status1).toString(16).toUpperCase().padStart(2, '0')}`;
+  $('dbgStatusBadge').className = `live-badge ${st.invalid_cfg || st.vdd_oor ? 'error' : running ? 'running' : ''}`;
+
+  const c = d.cell_v || {};
+  // 🔴 两种灯语义相反,不能共用一个"亮=好"的规则:
+  //    故障灯(INVALID_CFG / VDD_OOR / 削顶)= 置位才亮红,未置位保持灰;
+  //    就绪灯(PWR_RDY)= 置位亮绿,清零亮红。
+  //    把故障灯的"未置位"画成绿色会让人读成"这个故障是 ON 的"—— 与 2026-08-09
+  //    那次 sat 阈值不可见导致误报难辨是同一类可读性坑。
+  const faultLamp = (id, set) => { $(id).className = `lamp ${set ? 'bad' : ''}`; };
+  const readyLamp = (id, ok, known) => { $(id).className = `lamp ${!known ? '' : ok ? 'ok' : 'bad'}`; };
+  faultLamp('dbgLampInvalid', Boolean(st.invalid_cfg));
+  faultLamp('dbgLampVdd', Boolean(st.vdd_oor));
+  readyLamp('dbgLampPwr', Boolean(st.pwr_rdy), st.status1 != null);
+  faultLamp('dbgLampClip', Boolean(c.clipped));
+
+  $('dbgWe').textContent = fmt(c.we_mv, 0); $('dbgRe').textContent = fmt(c.re_mv, 0);
+  $('dbgCe').textContent = fmt(c.ce_mv, 0); $('dbgWo').textContent = fmt(c.wo_mv, 0);
+  $('dbgLiveE').textContent = c.e_mv == null ? '--' : fmt(c.e_mv, 0);
+  $('dbgLiveEAt').textContent = c.rows ? `${c.rows} 组 · dev ${fmt(c.dev_ms / 1000, 1)} s` : '尚无数据';
+  $('dbgLiveBox').classList.toggle('invalid', Boolean(c.clipped));
+  // 🔴 原始 code 必须显示:整池对芯片 GND 浮动时电压会撞 0/4095,只看 mV 看不出削顶
+  $('dbgCodes').textContent = c.we_code == null ? '原始 12-bit code:等待数据'
+    : `原始 12-bit code — WE ${c.we_code} · RE ${c.re_code} · CE ${c.ce_code} · WO ${c.wo_code}`
+      + (c.clipped ? '　⚠️ 有 code 撞 0 或 4095,该电位读数不可信' : '');
+
+  const rows = [];
+  if (cfg.fsr != null) rows.push(dbgRow('FSR', `${DBG_FSR_NA[cfg.fsr]} nA`, `码 ${cfg.fsr} · ${cfg.fsr <= 3 ? '慢钟组' : '快钟组 ×4'}`));
+  if (cfg.off_pa != null) rows.push(dbgRow('offset', `${fmt(cfg.off_pa / 1000, 2)} nA`, `档 ${cfg.off} · 容差 ${fmt(cfg.off_min_pa / 1000, 1)}–${fmt(cfg.off_max_pa / 1000, 1)} nA`));
+  if (cfg.bits != null) rows.push(dbgRow('分辨率', `${cfg.bits} bit`, `有效 LSB ${fmt(cfg.lsb_eff_fa / 1000, 3)} pA（帧 ${fmt(cfg.lsb_frame_fa / 1000, 3)}）`));
+  if (cfg.conv_ms != null) {
+    // 积分时间 ≠ 转换时间:差 246 个 precharge 时钟。50Hz 抑制只由**积分时间**决定。
+    rows.push(dbgRow('转换 / 周期', `${cfg.conv_ms} / ${cfg.period_ms} ms`, `≈${fmt(1000 / cfg.period_ms, 2)} SPS`));
+    rows.push(dbgRow('idle 窗口', `${fmt(cfg.idle_ppm / 10000, 3)} %`, cfg.idle_warn ? '⚠️ >10%,ADC 大量时间在空转' : 'ADC 未在转换的时间占比'));
+  }
+  if (cfg.rej50_worst_db_x10 != null) rows.push(dbgRow('50 Hz 抑制', `${fmt(cfg.rej50_worst_db_x10 / 10, 1)} dB`, `标称 ${fmt(cfg.rej50_db_x10 / 10, 1)} dB（±2% 时钟下的最坏值才是判据）`));
+  if (cfg.conv_alt != null && cfg.conv_alt >= 0) rows.push(dbgRow('conv 次优码', `0x${Number(cfg.conv_alt).toString(16)}`, `${fmt(cfg.conv_alt_db_x10 / 10, 1)} dB`));
+  if (cfg.red_max_pa != null) rows.push(dbgRow('可测上限', `还原 ${fmt(cfg.red_max_pa / 1000, 2)} / 氧化 ${fmt(cfg.ox_max_pa / 1000, 1)} nA`, cfg.sig_warn ? '⚠️ offset 盖不住已知信号峰 12.8 nA' : '还原上限 = offset（p41）'));
+  if (cfg.sat_margin != null) rows.push(dbgRow('sat 余量', `${cfg.sat_margin} counts`, `= ${fmt(cfg.sat_margin_pa / 1000, 2)} nA`));
+  if (cfg.e_mv != null) rows.push(dbgRow('电位', `E ${cfg.e_mv} mV`, `V_WE ${cfg.vwe_mv} · DACA ${cfg.daca} / DACB ${cfg.dacb}${cfg.headroom_warn ? ' ⚠️ EOL 余量不足' : ''}`));
+  if (cfg.idle != null) rows.push(dbgRow('idle 处置', DBG_IDLE_NAME[cfg.idle] || cfg.idle, `连采 ${cfg.cellv ? '开' : '关'} · SYS_PERIOD ${cfg.sysper_ms} ms（预算 ${cfg.sysbudget_ms} ms）`));
+  if (cfg.ios != null) rows.push(dbgRow('开关位', `chop ${cfg.chop} · rs ${cfg.rs} · ios ${cfg.ios}`, `sel ${cfg.sel} · amps ${cfg.amps} · ioc ${cfg.ioc}`));
+  $('dbgParams').querySelector('tbody').innerHTML = rows.join('') ||
+    '<tr><td colspan="3" class="dbg-hint">尚未收到 CFG_DERIVED —— 开始一次测量,固件会在开机与每次变更时打出全部派生量</td></tr>';
+
+  $('dbgAuditPath').textContent = d.audit_path || '尚无';
+  const events = d.audit || [];
+  $('dbgAudit').innerHTML = events.length ? events.map(e => {
+    const bad = ['CFG_REJECT', 'CFG_FAULT', 'CFG_ROLLBACK', 'OCP_REJECT'].includes(e.kind);
+    const warn = ['IT_TAINTED', 'RANGE_REJECT'].includes(e.kind);
+    return `<div class="dbg-event ${bad ? 'bad' : warn ? 'warn' : ''}"><b>${e.kind}</b><code>${
+      String(e.raw || '').slice(e.kind.length).trim().replace(/[<>&]/g, ch => ({'<': '&lt;', '>': '&gt;', '&': '&amp;'}[ch]))
+    }</code></div>`;
+  }).join('') : '<div class="empty-history">开始测量后显示审计事件</div>';
+
+  // 🔴 必须在最后:dbgSend 的可点性同时取决于 running 与"这条 SET 是否为空",
+  //    只有 dbgPreviewSet 知道后者。放前面会被每秒刷新覆盖成"可点但点了没反应"。
+  dbgPreviewSet();
+  drawDebug();
+}
+
+function drawDebug() {
+  const s = state.debug?.series || {};
+  const cur = s.current || {t: [], nA: [], valid: []}, cv = s.cell_v || {t: [], e_mv: [], clipped: []};
+  const curPts = [], curBad = [], ePts = [], eBad = [];
+  (cur.t || []).forEach((t, i) => {
+    curPts.push([t, cur.nA[i]]);
+    if (cur.valid?.[i] === false) curBad.push([t, cur.nA[i]]);
+  });
+  (cv.t || []).forEach((t, i) => {
+    ePts.push([t, cv.e_mv[i]]);
+    if (cv.clipped?.[i]) eBad.push([t, cv.e_mv[i]]);
+  });
+  const latest = Math.max(curPts.at(-1)?.[0] || 0, ePts.at(-1)?.[0] || 0);
+  const win = state.dbgChartWindowS;
+  const xmin = win === null ? 0 : Math.max(0, latest - win);
+  const xmax = win === null ? Math.max(1, latest) : Math.max(win, latest);
+  const vis = pts => pts.filter(p => p[0] >= xmin && p[0] <= xmax);
+  $('dbgChartEmpty').hidden = curPts.length > 0 || ePts.length > 0;
+  drawChart($('dbgChart'), [
+    {points: vis(curPts), color: '#167b74', width: 1.4},
+    {points: vis(curBad), color: '#c33c54', width: 0, dots: true, pointRadius: 1.8},
+    {points: vis(ePts), color: '#8a6fb0', width: 1.4, axis: 'right'},
+    {points: vis(eBad), color: '#c33c54', width: 0, dots: true, pointRadius: 2.4, axis: 'right'},
+  ], {xmin, xmax, xlabel: '时间 (s，设备时钟)', ylabel: '电流 (nA)',
+      y2label: 'E = V_WE − V_RE (mV)', yDigits: 2, y2Digits: 0});
+}
+
+// 组装一条 SET —— 只带用户真正改过的键(补丁语义:未列出的键保持原值)
+function dbgComposeSet() {
+  const keys = [
+    ['fsr', 'dbgFsr'], ['off', 'dbgOff'], ['conv', 'dbgConv'], ['period', 'dbgPeriod'],
+    ['sysper', 'dbgSysper'], ['ioc', 'dbgIoc'], ['e', 'dbgE'], ['vwe', 'dbgVwe'],
+    ['idle', 'dbgIdle'], ['cellv', 'dbgCellv'],
+  ];
+  const parts = keys.filter(([, id]) => String($(id).value).trim() !== '')
+                    .map(([key, id]) => `${key}=${String($(id).value).trim()}`);
+  if (!parts.length) return '';
+  return `SET ${parts.join(' ')}${$('dbgForce').checked ? ' FORCE' : ''}`;
+}
+function dbgPreviewSet() {
+  const line = dbgComposeSet();
+  $('dbgCmdPreview').textContent = line || 'SET　（尚未选择任何要改的参数）';
+  $('dbgSend').disabled = !line || state.debug?.state !== 'running';
+}
+async function dbgSend(line) {
+  try {
+    $('dbgError').hidden = true;
+    await post('/api/debug/cmd', {line});
+    toast(`已下发：${line}`);
+    setTimeout(refreshDebug, 400);   // 固件回读+确认要几十 ms,等一拍再拉
+  } catch (e) { errorBox('dbgError', e); }
+}
+async function refreshDebug() {
+  try { renderDebug(await api('/api/debug')); }
+  catch { $('dbgStatusBadge').textContent = '服务未连接'; }
+}
+
+$('dbgChartWindow').addEventListener('click', event => {
+  const button = event.target.closest('button'); if (!button) return;
+  $('dbgChartWindow').querySelectorAll('button').forEach(x => x.classList.toggle('active', x === button));
+  state.dbgChartWindowS = button.dataset.window === 'all' ? null : Number(button.dataset.window);
+  drawDebug();
+});
+['dbgFsr', 'dbgOff', 'dbgConv', 'dbgPeriod', 'dbgSysper', 'dbgIoc', 'dbgIdle', 'dbgCellv', 'dbgE', 'dbgVwe', 'dbgForce']
+  .forEach(id => $(id).addEventListener('input', dbgPreviewSet));
+$('dbgSend').addEventListener('click', () => { const line = dbgComposeSet(); if (line) void dbgSend(line); });
+$('dbgGet').addEventListener('click', () => void dbgSend('GET'));
+$('dbgOcp').addEventListener('click', () => void dbgSend('OCP 10000'));
+// 预设:慢钟 500nA + conv 0x4。SENS_PERIOD 必须一起给到 0x4(1882ms) ——
+// 1875ms 的积分塞不进 124ms 的周期,分两条发必然经过 INVALID_CFG。
+// 🔴 预设必须**先清空所有其它字段**,否则编辑器里的残留(比如上次填的 e=-200、
+//    勾着的 FORCE)会留在预览里,而真正下发的是写死的那条 ⇒ 预览与实发不一致。
+//    "显示的和发出去的是两回事"正是这套审计机制要消灭的东西,不能自己先犯。
+//    改成:清空 → 填预设 → 由 dbgComposeSet() 生成 → 发它。预览即实发。
+$('dbgPresetQuiet').addEventListener('click', () => {
+  ['dbgFsr','dbgOff','dbgConv','dbgPeriod','dbgSysper','dbgIoc','dbgE','dbgVwe','dbgIdle','dbgCellv']
+    .forEach(id => { $(id).value = ''; });
+  $('dbgForce').checked = false;
+  $('dbgFsr').value = '3';     // 500 nA ⇒ 慢钟组
+  $('dbgConv').value = '4';    // 积分 1875 ms / 16 bit / 最坏 50Hz −49.3 dB
+  $('dbgPeriod').value = '4';  // 1882 ms —— 1875ms 的积分塞不进 124ms,必须同时给
+  dbgPreviewSet();
+  const line = dbgComposeSet();
+  if (line) void dbgSend(line);
+});
+$('dbgStart').addEventListener('click', async () => {
+  try { $('dbgError').hidden = true; await post('/api/debug/start', {note: 'hw-debug'}); await refreshDebug(); }
+  catch (e) { errorBox('dbgError', e); }
+});
+$('dbgStop').addEventListener('click', async () => {
+  try { await post('/api/debug/stop'); await refreshDebug(); }
+  catch (e) { errorBox('dbgError', e); }
+});
+
+setInterval(refreshDebug,1000);
+window.addEventListener('resize',()=>{drawAll();drawDebug()});
+dbgPreviewSet();
+init();
