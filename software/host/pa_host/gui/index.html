@@ -182,6 +182,7 @@
             <div class="panel-head">
               <div><h2>电流 / 电位 双轴</h2><p id="dbgChartMsg">左轴电流 nA · 右轴 E = V_WE − V_RE (mV)</p></div>
               <div class="chart-actions">
+                <div class="live-current" id="dbgLiveIBox"><span>实时电流</span><strong id="dbgLiveI">--</strong><small>nA</small><em id="dbgLiveIAt">尚无数据</em></div>
                 <div class="live-current" id="dbgLiveBox"><span>E (V_WE−V_RE)</span><strong id="dbgLiveE">--</strong><small>mV</small><em id="dbgLiveEAt">尚无数据</em></div>
                 <div class="segmented" id="dbgChartWindow"><button class="active" data-window="all">全程</button><button data-window="20">20 s</button><button data-window="5">5 s</button></div>
                 <div class="live-badge" id="dbgBadge">待机</div>
@@ -190,6 +191,12 @@
             <div class="chart-wrap"><canvas id="dbgChart" aria-label="电流与电极电位双轴曲线"></canvas>
               <div class="chart-legend"><span><i class="valid-point"></i>电流(左轴)</span><span><i class="dbg-e-point"></i>E(右轴)</span><span><i class="invalid-point"></i>饱和/削顶</span></div>
               <div class="empty-chart" id="dbgChartEmpty">开始一次 I-t 测量后显示</div>
+            </div>
+            <div class="metric-strip">
+              <div><span>末 20 点中位</span><strong id="dbgIMed">--</strong><small>nA</small></div>
+              <div><span>末 20 点 σ</span><strong id="dbgISd">--</strong><small>nA</small></div>
+              <div><span>counts</span><strong id="dbgCounts">--</strong><small id="dbgCountsNote">原始码</small></div>
+              <div><span>点数 / 饱和</span><strong id="dbgN">--</strong><small id="dbgSat">sat 0</small></div>
             </div>
             <div class="metric-strip">
               <div><span>V_WE</span><strong id="dbgWe">--</strong><small>mV</small></div>
@@ -253,6 +260,7 @@
             <div class="dbg-cmd-preview" id="dbgCmdPreview">SET</div>
             <button class="secondary full" id="dbgSend">下发这条 SET</button>
             <div class="notice error" id="dbgError" hidden></div>
+            <div class="notice error" id="dbgReject" hidden></div>
 
             <h3 class="dbg-h3">变更审计</h3>
             <p class="dbg-audit-path" id="dbgAuditPath">尚无</p>

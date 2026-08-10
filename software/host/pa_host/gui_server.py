@@ -478,6 +478,7 @@ class MeasurementController:
         self._audit_cache: list[dict[str, Any]] = []
         self._cfg_live: dict[str, Any] = {}
         self._afe_status: dict[str, Any] = {}
+        self._last_reject: dict[str, Any] = {}
         self._dbg_cur_pos = 0
         self._dbg_cur: list[dict[str, Any]] = []
         self._dbg_cur_hdr: list[str] | None = None
@@ -533,6 +534,7 @@ class MeasurementController:
             self._audit_cache = []
             self._cfg_live = {}
             self._afe_status = {}
+            self._last_reject = {}
             self._dbg_cur_pos = 0
             self._dbg_cur = []
             self._dbg_cur_hdr = None
@@ -742,6 +744,12 @@ class MeasurementController:
                 self._cfg_live["confirmed_ep"] = event.get("ep")
             elif kind == "AFE_STATUS":
                 self._afe_status = {k: v for k, v in event.items() if k != "kind"}
+            elif kind in ("CFG_REJECT", "CFG_FAULT", "CFG_ROLLBACK", "OCP_REJECT",
+                          "RANGE_REJECT"):
+                # 🔴 拒因必须摆到显眼处。埋在滚动日志尾部时,用户看到的是
+                #    "我点了下发,然后什么都没发生" —— 那和命令没送达同形。
+                self._last_reject = {k: v for k, v in event.items() if k != "kind"}
+                self._last_reject["kind"] = kind
         # 只保留尾部,长跑不无限膨胀
         if len(self._audit_cache) > 400:
             del self._audit_cache[:-400]
@@ -855,6 +863,7 @@ class MeasurementController:
             "cell_v_path": str(self.cell_v_path) if self.cell_v_path else "",
             "cfg": self._cfg_live,
             "afe_status": self._afe_status,
+            "last_reject": self._last_reject or None,
             "cell_v": self._cell_voltages(),
             "series": self._debug_series(),
             # 只送尾部,并且倒序 —— 界面上最新的在最上面
@@ -2268,14 +2277,37 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
     print(f"i-t GUI: {url}", flush=True)
     if open_browser:
         threading.Timer(0.35, lambda: webbrowser.open(url)).start()
+    # 🔴 必须接 SIGTERM。Python 对 SIGTERM 的默认动作是**立刻退出、不跑 finally**
+    #    ⇒ `pkill -f gui_server` 之后,它起的 collector 与 JLinkExe 会活下来、
+    #    继续占着探头和 telnet 19021,下一次启动的 run 连不上就带 traceback 死。
+    #    2026-08-10 实测踩到:一个孤儿 collector 让新 run 直接
+    #    ConnectionResetError,而现场看起来像"探头坏了"。
+    def _graceful(_sig, _frm):
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _graceful)
+        except ValueError:
+            pass   # 非主线程时不给注册,忽略
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         APP.schedule.stop()
+        # 🔴 同步收干净,不能只靠 stop() 里那个 1.5s 延迟线程 —— 进程一退它就没了。
         APP.measurement.stop()
+        proc = APP.measurement.process
+        if proc is not None and proc.poll() is None:
+            MeasurementController._terminate_tree(proc)
+            try:
+                proc.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                pass
         server.server_close()
+        print("i-t GUI 已退出(采集子进程与 J-Link 已收回)", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -70,3 +70,9 @@
 .dbg-event.bad{background:#fff5f5}.dbg-event.bad b{color:var(--red)}
 .dbg-event.warn{background:#fffaf0}.dbg-event.warn b{color:#9a6a12}
 #view-debug .chart-panel{align-self:start}
+#dbgLiveIBox,#dbgLiveBox{min-width:118px}
+#dbgLiveIBox strong{color:var(--green-dark)}
+#dbgLiveBox strong{color:#8a6fb0}
+.live-current.invalid strong{color:var(--red)}
+#dbgReject b{display:block;margin-bottom:4px}
+#dbgReject code{display:block;margin-top:4px;font-size:10px;word-break:break-all}

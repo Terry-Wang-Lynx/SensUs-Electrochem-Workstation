@@ -420,6 +420,42 @@ const DBG_IDLE_NAME = ['停转换(仅对照)', '持续钳位', '断开(CHI 默�
 function dbgRow(label, value, hint) {
   return `<tr><th>${label}</th><td>${value}</td><td class="dbg-hint">${hint || ''}</td></tr>`;
 }
+
+// 拒因 → 人能照着做的下一步。🔴 刻意不在 JS 里复算 conv/period 时序:
+// 那会变成与 lib/afe_cfg 并列的第二个真值源,而两个真值源必然分叉(本项目已栽过)。
+// 这里只把固件给的拒因与数字翻译成动作。
+const DBG_REJECT_HINT = {
+  period_lt_conv: (r) => `积分时间(${r.a} 个时钟)长于采样周期(${r.b} 个时钟)。`
+    + `慢钟组(FSR ≤500 nA)同一个 CONV_TIME 码的积分是快钟组的 4 倍 —— `
+    + `所以从 1 µA/2 µA 切到 ≤500 nA 时,原来的 conv 码往往就装不进去了。`
+    + `办法:CONV_TIME 选 auto(它会自己挑能装下的最大码),或把 SENS_PERIOD 一起放大。`,
+  offset_gt_fsr: () => 'offset 档超过了满量程 ⇒ 还原侧上限无意义、氧化侧为 0。换小 offset 或大 FSR。',
+  sysper_short: () => 'SYS_PERIOD 装不下四路电位的总转换时间(约 68 ms)⇒ 会被中途打断。把 SYS_PERIOD 放大。',
+  dac: () => '这个 E / V_WE 组合算出的 DAC 电位超出可表达范围(单极性 DAC 取不了负)。调 V_WE 或减小 |E|。',
+  dac_mid: () => '改电位的中间态会越过 headroom 限制。分两步走到目标电位。',
+  perturb_during_run: () => '这条命令会扰动电解池,而本轮正在采集 ⇒ 默认拒绝。'
+    + '确实要改就勾 FORCE(本轮会被标 tainted,数据不得用于标定)。',
+  too_long: () => '命令超过 127 字符,整行被丢弃。',
+  unknown_key: (r) => `不认识的键 \`${r.key}\`。`,
+  dup_key: () => '同一个键写了两次 —— 按笔误处理,整行拒绝。',
+  value: () => '值解析不出来。',
+  arg: (r) => `参数越界(给的 ${r.a},上限 ${r.b})。`,
+  verb: () => '不认识的命令动词。',
+  busy: () => '正在采集中 ⇒ OCP 会毁掉本轮,默认拒绝。先「停止」,或带 FORCE。',
+  cellv_off: () => 'OCP 要靠电位连采读开路电位,而连采是关的。先 SET cellv=1。',
+  idle_keep_biased: () => 'idle=持续钳位 与 OCP(开路)定义冲突。先把 idle 改成 2(断开)。',
+};
+function renderDbgReject(r) {
+  const box = $('dbgReject');
+  if (!r) { box.hidden = true; return; }
+  const reason = String(r.reason || r.kind || '');
+  const hint = DBG_REJECT_HINT[reason];
+  box.hidden = false;
+  box.innerHTML = `<b>${r.kind} · ${reason || '未给拒因'}</b>`
+    + (hint ? `<br>${hint(r)}` : '')
+    + `<br><code style="opacity:.7">${String(r.raw || '').replace(/[<>&]/g, ch => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[ch]))}</code>`;
+}
+
 function renderDebug(d) {
   state.debug = d;
   const cfg = d.cfg || {}, st = d.afe_status || {}, running = d.state === 'running';
@@ -451,6 +487,36 @@ function renderDebug(d) {
   //    前端一度还在读旧字段 `pwr_rdy` 并按"就绪灯"画 ⇒ 真机上一切正常时亮红。
   faultLamp('dbgLampPwr', Boolean(st.brownout));
   faultLamp('dbgLampClip', Boolean(c.clipped));
+
+  // ── 实时电流(用户明确要的:界面上必须有电流值,不能只有图)──────────────
+  const cur = d.series?.current || {t: [], nA: [], valid: [], ep: []};
+  const n = cur.nA.length;
+  if (n) {
+    const last = cur.nA[n - 1], lastOk = cur.valid[n - 1] !== false;
+    $('dbgLiveI').textContent = fmt(last, 3);
+    $('dbgLiveIAt').textContent = `t = ${fmt(cur.t[n - 1], 2)} s · ep ${cur.ep[n - 1] ?? '?'}`
+      + (lastOk ? '' : ' · 🔴 饱和,该点不是测量');
+    $('dbgLiveIBox').classList.toggle('invalid', !lastOk);
+    const win = cur.nA.slice(-20).filter(Number.isFinite);
+    const sorted = [...win].sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)];
+    const mean = win.reduce((a, b) => a + b, 0) / win.length;
+    const sd = Math.sqrt(win.reduce((a, b) => a + (b - mean) ** 2, 0) / win.length);
+    $('dbgIMed').textContent = fmt(med, 3);
+    $('dbgISd').textContent = fmt(sd, 3);
+    const nsat = cur.valid.filter(v => v === false).length;
+    $('dbgN').textContent = String(n);
+    $('dbgSat').textContent = nsat ? `🔴 sat ${nsat}` : 'sat 0';
+    $('dbgSat').style.color = nsat ? 'var(--red)' : '';
+  } else {
+    ['dbgLiveI','dbgIMed','dbgISd','dbgN'].forEach(i => { $(i).textContent = '--'; });
+    $('dbgLiveIAt').textContent = '尚无数据';
+    $('dbgSat').textContent = 'sat 0';
+  }
+  $('dbgCounts').textContent = cfg.lsb_eff_fa
+    ? `${fmt(cfg.lsb_eff_fa / 1000, 3)} pA/码` : '--';
+  $('dbgCountsNote').textContent = cfg.bits ? `${cfg.bits} bit 有效台阶` : '原始码';
+  renderDbgReject(d.last_reject);
 
   $('dbgWe').textContent = fmt(c.we_mv, 0); $('dbgRe').textContent = fmt(c.re_mv, 0);
   $('dbgCe').textContent = fmt(c.ce_mv, 0); $('dbgWo').textContent = fmt(c.wo_mv, 0);
