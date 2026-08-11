@@ -232,7 +232,32 @@ static void replay_state(const char *src);
 #define WP_CELLV_TRACE false
 #define WP_DEFAULT_CELLV_ENABLE true
 #define WP_CELLV_ENABLE cfg_live.cellv
-#define WP_SYSADC_SENSV_GAIN MAX30131_SYSADC_GAIN_0P5X /* 0.5× ⇒ 可测 0~3.07V,盖住浮到 VDD */
+/*
+ * ══════════════════════════════════════════════════════════════════════
+ * System ADC 的 PGA 增益 —— **跟随放大器状态,不做独立旋钮**(公理 A1)
+ * ══════════════════════════════════════════════════════════════════════
+ * 12-bit、内部基准 1.536V ⇒ LSB = 1536/(4096×GAIN):
+ *      GAIN    LSB        满量程     放大器开时(WE400/RE200/CE71/WO935)
+ *      0.5×    0.750 mV   3071 mV    够,但格子粗
+ *      1.0×    0.375 mV   1536 mV    够(WO 935,余量 1.6×)   ← 测量期用这个
+ *      2.0×    0.188 mV    768 mV    ✗ WO 935 削顶
+ *
+ * 🔴 为什么以前一直用 0.5×:**放大器关掉时四个引脚都在浮**,可能漂到 VDD≈3.0V,
+ *    1.0× 的 1536mV 顶不住 ⇒ OCP / idle 断开态会削顶,而 OCP 正是要靠它读开路电位。
+ * ⇒ 两个状态要的增益本来就不同,这不是"选一个折中",而是**跟着状态切**:
+ *      放大器开(电位有界)   → 1.0×,分辨率翻倍
+ *      放大器关(引脚在浮)   → 0.5×,保住不削顶
+ *    切换点就在 set_potentiostat_amps() 里,与放大器同一次动作,不可能脱钩。
+ *
+ * 实测背景:E 的 σ=0.55 mV 已经贴在量化地板上(纯量化 RMS 0.31 mV)⇒ 曲线只能
+ * 长成台阶。剩下的静态误差里 INL(±1.5 LSB=±1.1 mV/路,差值最坏 ±2.2 mV)才是大头,
+ * 而增益/基准/offset 误差在 E=V_WE−V_RE 里基本共模抵消(同 mux/同 PGA/同 ADC/同基准)。
+ */
+#define WP_SYSADC_GAIN_BIASED   MAX30131_SYSADC_GAIN_1X    /* 放大器开:0.375 mV/码 */
+#define WP_SYSADC_GAIN_FLOATING MAX30131_SYSADC_GAIN_0P5X  /* 放大器关:0.75 mV/码,不削顶 */
+/* 当前生效增益。换算(max30131_sys_adc_mv)必须用它,不能用编译期常量。 */
+static uint8_t sysadc_gain = WP_SYSADC_GAIN_FLOATING;
+#define WP_SYSADC_SENSV_GAIN sysadc_gain
 /*
  * SYS_PERIOD(0x81 低半字节),与 SENS_PERIOD 同一张码表:
  *   0x0=124ms 0x1=242ms 0x2=476ms 0x3=945ms 0x4=1882ms …
@@ -1050,6 +1075,20 @@ static int set_potentiostat_amps(bool on)
 {
 	int rc;
 
+	/*
+	 * 🔴 增益必须与放大器状态**同一次动作**内切换,否则中间会有若干个 SYS_PERIOD
+	 * 用错增益换算(读数凭空差 2 倍,而 code 看着完全正常)。
+	 * 次序:先把增益切到**两种状态都安全**的那一侧,再动放大器,最后收紧。
+	 *   开放大器:先 0.5×(此刻引脚还在浮)→ 开 → 再切 1.0×
+	 *   关放大器:先 0.5×(马上要浮了)   → 关
+	 * 这样任何时刻的增益都覆盖得住当时引脚可能的电位,不会削顶。
+	 */
+	sysadc_gain = WP_SYSADC_GAIN_FLOATING;
+	if (WP_CELLV_ENABLE) {
+		(void)max30131_spi_write_reg(MAX30131_REG_SYS_ADC_SETUP,
+			max30131_enc_sys_adc_setup(sysadc_gain));
+	}
+
 	if (on) {
 		rc = max30131_spi_write_reg(MAX30131_REG_S1_CONFIG1,
 					   s1_config1_byte(false, true));
@@ -1069,6 +1108,18 @@ static int set_potentiostat_amps(bool on)
 	}
 	if (rc == 0) {
 		cfg_live.amps_on = on;
+		if (on) {
+			/* 电位现在有界了 ⇒ 收紧到 1.0×,量化台阶 0.75→0.375 mV */
+			sysadc_gain = WP_SYSADC_GAIN_BIASED;
+			if (WP_CELLV_ENABLE) {
+				(void)max30131_spi_write_reg(
+					MAX30131_REG_SYS_ADC_SETUP,
+					max30131_enc_sys_adc_setup(sysadc_gain));
+			}
+		}
+		LOG_INF("电位量化台阶:%s mV/码(放大器%s)",
+			sysadc_gain == MAX30131_SYSADC_GAIN_1X ? "0.375" : "0.75",
+			on ? "开" : "关");
 	}
 	return rc;
 }
@@ -1220,14 +1271,14 @@ static void cellv_flush(void)
 	}
 	printk("CELL_V ms=%lld idle=%d we_mv=%d re_mv=%d ce_mv=%d wo_mv=%d "
 	       "e_mv=%d we_code=%u re_code=%u ce_code=%u wo_code=%u ep=%u ocp=%d "
-	       "dropped=%u\n",
+	       "dropped=%u vgain=%u\n",
 	       (long long)k_uptime_get(), (int)WP_IDLE_MODE,
 	       cellv.mv[CELLV_WE], cellv.mv[CELLV_RE],
 	       cellv.mv[CELLV_CE], cellv.mv[CELLV_WO],
 	       cellv.mv[CELLV_WE] - cellv.mv[CELLV_RE],
 	       cellv.code[CELLV_WE], cellv.code[CELLV_RE],
 	       cellv.code[CELLV_CE], cellv.code[CELLV_WO],
-	       cfg_epoch, ocp_active ? 1 : 0, cellv.dropped);
+	       cfg_epoch, ocp_active ? 1 : 0, cellv.dropped, sysadc_gain);
 	if (ocp_active) {
 		ocp_observe(cellv.mv[CELLV_WE] - cellv.mv[CELLV_RE],
 			    cellv.code[CELLV_WE], cellv.code[CELLV_RE]);

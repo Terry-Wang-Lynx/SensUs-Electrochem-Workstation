@@ -346,18 +346,25 @@ POTENTIAL_FAULT_RE = re.compile(r"^POTENTIAL_FAULT\s+.+$")
 # 电极电压连采行(固件 CELL_V)。System ADC 与 Sensor ADC 在 AUTO 下并行,
 # 速率由 SYS_PERIOD 决定(≈1Hz),与电流样本(8Hz)**不同步** ⇒ 必须落到独立 CSV,
 # 塞进电流 CSV 会错行。
+# System ADC PGA 增益码(与固件 max30131_regs.h 同值):0=2x 1=1x 2=0.5x 3=0.25x
+SYSADC_GAIN_0P5X = 2
+
 CELL_V_RE = re.compile(
     r"^CELL_V\s+ms=(-?\d+)\s+idle=(-?\d+)\s+we_mv=(-?\d+)\s+re_mv=(-?\d+)\s+"
     r"ce_mv=(-?\d+)\s+wo_mv=(-?\d+)\s+e_mv=(-?\d+)\s+we_code=(\d+)\s+"
     r"re_code=(\d+)\s+ce_code=(\d+)\s+wo_code=(\d+)"
     # ep / ocp 是 2026-08-10 追加的可选尾组。⚠️ 这条正则原来严格锚定,
     # 若不放开就会**直接打断 cellv.csv 落盘**(一行都匹配不上,静默产出空文件)。
-    r"(?:\s+ep=(\d+))?(?:\s+ocp=([01]))?(?:\s+dropped=(\d+))?\s*$"
+    r"(?:\s+ep=(\d+))?(?:\s+ocp=([01]))?(?:\s+dropped=(\d+))?(?:\s+vgain=(\d+))?\s*$"
 )
 CELL_V_COLUMNS = (
     "host_unix_s", "dev_ms", "idle_mode", "we_mv", "re_mv", "ce_mv", "wo_mv",
     "e_mv", "we_code", "re_code", "ce_code", "wo_code", "epoch", "ocp",
     "dropped",
+    # System ADC 的 PGA 增益码(0=2x 1=1x 2=0.5x 3=0.25x)。
+    # 🔴 必须落盘:它决定 code→mV 的换算系数,而增益会随放大器状态切换
+    # ⇒ 事后光有 code 没有 vgain 是解释不了的。
+    "vgain",
 )
 
 
@@ -366,7 +373,13 @@ def parse_cell_v(line: str) -> list[str] | None:
     match = CELL_V_RE.match(ANSI_RE.sub("", line).strip())
     if match is None:
         return None
-    groups = [g if g is not None else "0" for g in match.groups()]
+    # 🔴 缺失字段的默认值**逐个**给,不能一律 0:
+    #    `vgain` 缺失代表"2026-08-11 之前的固件",而那些版本固定用 0.5×(码 2)。
+    #    给 0 会被解释成 2×、把旧日志里的电位读数放大 4 倍 —— mV 列本来是对的,
+    #    只有拿 code 复算的人会中招,属于典型的静默错算。
+    defaults = ("0",) * 11 + ("0", "0", "0", str(SYSADC_GAIN_0P5X))
+    groups = [g if g is not None else d
+              for g, d in zip(match.groups(), defaults)]
     return [f"{time.time():.3f}", *groups]
 
 
