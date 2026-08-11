@@ -199,7 +199,7 @@
             <div><span>点数 / 饱和</span><strong id="dbgN">--</strong><small id="dbgSat">sat 0</small></div>
             <div><span>V_WE</span><strong id="dbgWe">--</strong><small>mV</small></div>
             <div><span>V_RE</span><strong id="dbgRe">--</strong><small>mV</small></div>
-            <div><span>V_CE</span><strong id="dbgCe">--</strong><small>mV</small></div>
+            <div><span>V_CE（驱动/余量）</span><strong id="dbgCe">--</strong><small id="dbgCeNote">mV</small></div>
             <div><span>V_WO</span><strong id="dbgWo">--</strong><small>mV</small></div>
           </div>
           <div class="dbg-codes" id="dbgCodes">原始 12-bit code:等待数据</div>
@@ -245,6 +245,7 @@
               <button class="danger" id="dbgStop" disabled>中止</button>
             </div>
           </div>
+          <div class="notice error" id="dbgLoopWarn" hidden></div>
           <div class="notice error" id="dbgError" hidden></div>
           <div class="notice error" id="dbgReject" hidden></div>
 

@@ -543,10 +543,35 @@ function renderDebug(d) {
   $('dbgCounts').textContent = cfg.lsb_eff_fa
     ? `${fmt(cfg.lsb_eff_fa / 1000, 3)} pA/码` : '--';
   $('dbgCountsNote').textContent = cfg.bits ? `${cfg.bits} bit 有效台阶` : '原始码';
+  // ── 环路饱和的**可行动**诊断 ──────────────────────────────────────────
+  // 用户实测:CE 顶在 0 轨、E 死活到不了设定值,手动调 V_WE 又好了。那不是巧合 ——
+  // V_WE 只是共模位置(只有 E 有物理意义),抬高它就给 CE 让出了下行空间。
+  // 仪器应当自己把这句话说出来,而不是让人从四个电位里去推。
+  const setE = Number(cfg.e_mv), gotE = Number(c.e_mv);
+  const eErr = (Number.isFinite(setE) && Number.isFinite(gotE)) ? gotE - setE : null;
+  const satur = Boolean(c.railed) && eErr !== null && Math.abs(eErr) > 5;
+  const warnBox = $('dbgLoopWarn');
+  if (satur) {
+    const vwe = Number(cfg.vwe_mv) || 400;
+    const need = Math.max(0, Math.round(Number(c.ce_drive_mv || 0)));
+    const suggest = Math.min(1000, Math.round((vwe + Math.abs(eErr) + 300) / 50) * 50);
+    warnBox.hidden = false;
+    warnBox.innerHTML =
+      `<b>恒电位环饱和：E 实测 ${gotE} mV / 设定 ${setE} mV（差 ${eErr.toFixed(0)} mV）</b>`
+      + `<br>CE 已顶在 0 轨（它需要比 RE 低 ${need} mV,健康态实测只需约 60 mV）。`
+      + `此刻电解池<b>不在设定电位上</b>,这段数据不能用于标定或预测。`
+      + `<br>立刻可做：把 <b>V_WE 抬到 ${suggest} mV</b> —— V_WE 只是共模位置,`
+      + `只有 E 有物理意义,抬高它就给 CE 让出下行空间。`
+      + `<br>但那只是绕过去：根因是 CE 支路需要的驱动变大了（气泡 / 局部干涸 / `
+      + `CE 引线接触）。WE 侧可另行核对：WO − WE 正常约 530 mV。`;
+  } else { warnBox.hidden = true; }
+
   renderDbgReject(d.last_reject);
 
   $('dbgWe').textContent = fmt(c.we_mv, 0); $('dbgRe').textContent = fmt(c.re_mv, 0);
   $('dbgCe').textContent = fmt(c.ce_mv, 0); $('dbgWo').textContent = fmt(c.wo_mv, 0);
+  $('dbgCeNote').textContent = c.ce_drive_mv == null ? 'mV'
+    : `mV · 驱动 ${fmt(c.ce_drive_mv, 0)} / 余量 ${fmt(c.ce_headroom_mv, 0)}`;
   $('dbgLiveE').textContent = c.e_mv == null ? '--' : fmt(c.e_mv, 0);
   $('dbgLiveEAt').textContent = c.rows ? `${c.rows} 组 · dev ${fmt(c.dev_ms / 1000, 1)} s` : '尚无数据';
   $('dbgLiveBox').classList.toggle('invalid', Boolean(c.clipped));

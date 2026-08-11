@@ -1113,6 +1113,13 @@ class MeasurementController:
         #           E 可能仍读得出来但电解池已不在设定电位上(此时 e_mv 会偏离设定值)
         out["clipped"] = any(out.get(k) in (0, 4095) for k in ("we_code", "re_code"))
         out["railed"] = any(out.get(k) in (0, 4095) for k in ("ce_code", "wo_code"))
+        # 🔴 恒电位环用了多少驱动、还剩多少 —— 这两个数把"环路快饱和了"变成可读数字。
+        #   ce_drive_mv:C 放大器为了把电流推过电解池,需要把 CE 压到 RE 之下多少。
+        #                健康态实测只需 ~60 mV(v1:CE 140 / RE 201)。
+        #   ce_headroom_mv:CE 距 0 轨还有多少。它见底 ⇒ 环路钳不住设定电位。
+        if isinstance(out.get("ce_mv"), (int, float)) and isinstance(out.get("re_mv"), (int, float)):
+            out["ce_drive_mv"] = out["re_mv"] - out["ce_mv"]
+            out["ce_headroom_mv"] = out["ce_mv"]
         out["rows"] = len(rows) - 1
         return out
 

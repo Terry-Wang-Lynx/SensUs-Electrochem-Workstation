@@ -108,3 +108,5 @@
   .dbg-actions{flex-direction:column;align-items:stretch}}
 /* 静置期用琥珀色徽标:它既不是"待机"也不是"在采",而是"刻意在等" */
 .live-badge.warn{color:#8a5d0f;border-color:#e2c48a;background:#fff8ec}
+#dbgLoopWarn b{display:inline}
+#dbgLoopWarn{line-height:1.7}
