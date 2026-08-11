@@ -75,7 +75,10 @@
 /* ── DEBUG 页:上下布局 ────────────────────────────────────────────────── */
 /* 参数面板需要横向空间。原来塞在 292px 的右栏里,10 个控件只能一列两列地挤,
    派生量表更是每行都换行 —— 上下布局把整幅宽度让给它。 */
-#view-debug{display:grid;gap:18px}
+/* 🔴 必须写成 `.active` 限定。`#view-debug{display:grid}` 是 id 选择器(特异性 100),
+   压过 `.view{display:none}`(10)⇒ DEBUG 页**永远显示**,叠在任何一页下面,
+   看起来像"两套 UI 并存"。只在 .active 时才给 grid,不 active 时由 .view 隐藏。 */
+#view-debug.active{display:grid;gap:18px}
 .dbg-chart .chart-wrap{height:400px}
 .dbg-chart .metric-strip{grid-template-columns:repeat(8,1fr)}
 .dbg-chart .metric-strip>div{padding:12px 14px}
