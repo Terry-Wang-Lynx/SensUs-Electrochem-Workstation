@@ -552,9 +552,11 @@ function renderDebug(d) {
   const satur = Boolean(c.railed) && eErr !== null && Math.abs(eErr) > 5;
   const warnBox = $('dbgLoopWarn');
   if (satur) {
-    const vwe = Number(cfg.vwe_mv) || 400;
+    const vwe = Number(cfg.vwe_mv) || 1200;
     const need = Math.max(0, Math.round(Number(c.ce_drive_mv || 0)));
-    const suggest = Math.min(1000, Math.round((vwe + Math.abs(eErr) + 300) / 50) * 50);
+    // 上限用**实测 VDD** 算(VDD−1.1V,见 datasheet p11);拿不到才退回旧的 1000 硬顶。
+    const ceil = Number.isFinite(Number(c.we_max_mv)) ? Number(c.we_max_mv) : 1000;
+    const suggest = Math.min(ceil, Math.round((vwe + Math.abs(eErr) + 300) / 50) * 50);
     warnBox.hidden = false;
     warnBox.innerHTML =
       `<b>恒电位环饱和：E 实测 ${gotE} mV / 设定 ${setE} mV（差 ${eErr.toFixed(0)} mV）</b>`
@@ -571,7 +573,23 @@ function renderDebug(d) {
   $('dbgWe').textContent = fmt(c.we_mv, 0); $('dbgRe').textContent = fmt(c.re_mv, 0);
   $('dbgCe').textContent = fmt(c.ce_mv, 0); $('dbgWo').textContent = fmt(c.wo_mv, 0);
   $('dbgCeNote').textContent = c.ce_drive_mv == null ? 'mV'
-    : `mV · 驱动 ${fmt(c.ce_drive_mv, 0)} / 余量 ${fmt(c.ce_headroom_mv, 0)}`;
+    : `mV · 驱动 ${fmt(c.ce_drive_mv, 0)} / 到 0.1V 余量 ${fmt(c.ce_headroom_mv, 0)}`;
+  // WO 在 V_WE=1200 下必然出量程(WO≈V_WE+540≈1745 > 1.0× 满量程 1536)。
+  // 说清是"看不见"而不是"坏了",否则会被当成故障追。
+  $('dbgWoNote').textContent = c.wo_offscale
+    ? 'mV · ⚠️ 出量程(>1536),V_WE 高时必然如此' : 'mV';
+  // VDD 与 V_WE 合法窗口。vdd_mv<=0 ⇒ 固件没报 ⇒ 只说"未上报",不拿假定值冒充。
+  const vdd = Number(c.vdd_mv);
+  if (Number.isFinite(vdd) && vdd > 0) {
+    $('dbgVdd').textContent = fmt(vdd, 0);
+    const lo = c.we_min_mv, hi = c.we_max_mv;
+    $('dbgVddNote').textContent =
+      `mV · V_WE 窗口 ${lo == null ? '?' : fmt(lo, 0)}~${fmt(hi, 0)}`
+      + (c.we_headroom_mv == null ? '' : ` · 余量 ${fmt(c.we_headroom_mv, 0)}`);
+  } else {
+    $('dbgVdd').textContent = '--';
+    $('dbgVddNote').textContent = 'mV · 固件未上报(旧版本)';
+  }
   $('dbgLiveE').textContent = c.e_mv == null ? '--' : fmt(c.e_mv, 0);
   $('dbgLiveEAt').textContent = c.rows ? `${c.rows} 组 · dev ${fmt(c.dev_ms / 1000, 1)} s` : '尚无数据';
   $('dbgLiveBox').classList.toggle('invalid', Boolean(c.clipped));

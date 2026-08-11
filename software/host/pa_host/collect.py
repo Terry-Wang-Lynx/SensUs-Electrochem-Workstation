@@ -355,7 +355,10 @@ CELL_V_RE = re.compile(
     r"re_code=(\d+)\s+ce_code=(\d+)\s+wo_code=(\d+)"
     # ep / ocp 是 2026-08-10 追加的可选尾组。⚠️ 这条正则原来严格锚定,
     # 若不放开就会**直接打断 cellv.csv 落盘**(一行都匹配不上,静默产出空文件)。
-    r"(?:\s+ep=(\d+))?(?:\s+ocp=([01]))?(?:\s+dropped=(\d+))?(?:\s+vgain=(\d+))?\s*$"
+    r"(?:\s+ep=(\d+))?(?:\s+ocp=([01]))?(?:\s+dropped=(\d+))?(?:\s+vgain=(\d+))?"
+    # vdd_mv / vdd_code 是 2026-08-11 追加的可选尾组(tag 0xE0)。**都可能是 -1**
+    # ⇒ 必须允许负号:-1 表示"一次都没收到过 VDD 词",与"读到 0V"是两件事。
+    r"(?:\s+vdd_mv=(-?\d+))?(?:\s+vdd_code=(-?\d+))?\s*$"
 )
 CELL_V_COLUMNS = (
     "host_unix_s", "dev_ms", "idle_mode", "we_mv", "re_mv", "ce_mv", "wo_mv",
@@ -365,6 +368,10 @@ CELL_V_COLUMNS = (
     # 🔴 必须落盘:它决定 code→mV 的换算系数,而增益会随放大器状态切换
     # ⇒ 事后光有 code 没有 vgain 是解释不了的。
     "vgain",
+    # VDD 实测(tag 0xE0,走 SYS_PWR_GAIN=0.25× ⇒ LSB 1.5mV,满量程 6144mV)。
+    # 🔴 -1 = 没收到过,不是 0V。它决定 headroom 上限 VDD−1.1V,是判断
+    # 「V_WE 会不会超共模上限」的唯一实测依据,不能只靠编译期假定的 3000。
+    "vdd_mv", "vdd_code",
 )
 
 
@@ -377,7 +384,9 @@ def parse_cell_v(line: str) -> list[str] | None:
     #    `vgain` 缺失代表"2026-08-11 之前的固件",而那些版本固定用 0.5×(码 2)。
     #    给 0 会被解释成 2×、把旧日志里的电位读数放大 4 倍 —— mV 列本来是对的,
     #    只有拿 code 复算的人会中招,属于典型的静默错算。
-    defaults = ("0",) * 11 + ("0", "0", "0", str(SYSADC_GAIN_0P5X))
+    #    `vdd_mv`/`vdd_code` 缺失代表"2026-08-11 之前的固件,根本没选 VDD 通道"
+    #    ⇒ 默认给 **-1**(= 无此数据),给 0 会被读成"VDD 测到 0V"即掉电。
+    defaults = ("0",) * 11 + ("0", "0", "0", str(SYSADC_GAIN_0P5X), "-1", "-1")
     groups = [g if g is not None else d
               for g, d in zip(match.groups(), defaults)]
     return [f"{time.time():.3f}", *groups]

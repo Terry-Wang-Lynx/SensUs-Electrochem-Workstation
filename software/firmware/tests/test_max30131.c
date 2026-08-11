@@ -687,13 +687,38 @@ static void test_sys_adc_setup_and_voltage(void)
 	/* 🔴 OPA_BYPASS_EN 必须恒为 0:置 1 后输入需驱动 14MΩ,等于在 RE 上挂
 	 * ~29nA 漏电路径,会把参比电极极化掉。编码器不给调用方留出错机会。 */
 	for (uint8_t g = 0; g < 4; g++) {
-		uint8_t b = max30131_enc_sys_adc_setup(g);
+		uint8_t b = max30131_enc_sys_adc_setup(g, 0);
 
 		CHECK_EQ(b & (1u << MAX30131_SYSADC_OPA_BYPASS_EN_Pos), 0);
 		CHECK_EQ((b >> MAX30131_SYSADC_SENSV_GAIN_Pos) & 0x3u, g);
 	}
 	/* 0.5× 增益:满量程 = VREF/0.5 = 3.072V,盖住电极浮到 VDD 的情况 */
-	CHECK_EQ(max30131_enc_sys_adc_setup(MAX30131_SYSADC_GAIN_0P5X), 0x08);
+	CHECK_EQ(max30131_enc_sys_adc_setup(MAX30131_SYSADC_GAIN_0P5X, 0), 0x08);
+
+	/*
+	 * 🔴 PWR 增益(管 VDD/GND)与 SENSV 是**两路独立**字段,必须各自落在自己的
+	 * 位段上、互不串扰。混用会让 VDD 读数偏 4 倍(p65 Figure 23)。
+	 */
+	for (uint8_t sg = 0; sg < 4; sg++) {
+		for (uint8_t pg = 0; pg < 4; pg++) {
+			uint8_t b = max30131_enc_sys_adc_setup(sg, pg);
+
+			CHECK_EQ((b >> MAX30131_SYSADC_SENSV_GAIN_Pos) & 0x3u, sg);
+			CHECK_EQ((b >> MAX30131_SYSADC_PWR_GAIN_Pos) & 0x3u, pg);
+			CHECK_EQ(b & (1u << MAX30131_SYSADC_OPA_BYPASS_EN_Pos), 0);
+			/* AIN 增益本设计不用,必须留 00 */
+			CHECK_EQ((b >> MAX30131_SYSADC_AIN_GAIN_Pos) & 0x3u, 0);
+		}
+	}
+	/* 现行组合:SENSV 1.0×(码 1)+ PWR 0.25×(码 3)⇒ 0b00_11_01_00 = 0x34 */
+	CHECK_EQ(max30131_enc_sys_adc_setup(MAX30131_SYSADC_GAIN_1X,
+					   MAX30131_SYSADC_GAIN_0P25X), 0x34);
+	/* VDD 通道换算:0.25× ⇒ 满量程 6144mV、LSB 1.5mV。3.3V 应落在码 2200 附近 */
+	CHECK_EQ(max30131_sys_adc_mv(2200, 1536, MAX30131_SYSADC_GAIN_0P25X), 3300);
+	/* 满码 4095 × LSB 1.5mV = 6142.5 ⇒ div_round 进位到 6143 */
+	CHECK_EQ(max30131_sys_adc_mv(4095, 1536, MAX30131_SYSADC_GAIN_0P25X), 6143);
+	/* 🔴 用错增益的后果要钉住:同一个码在 1.0× 下只报 825mV(偏 4 倍) */
+	CHECK_EQ(max30131_sys_adc_mv(2200, 1536, MAX30131_SYSADC_GAIN_1X), 825);
 
 	/* V = code/4096 × VREF / gain。1536mV 基准下逐档校核。 */
 	/* 满码是 4095 而非 4096 ⇒ 满量程读数差一个 LSB(3072×4095/4096 = 3071.25) */

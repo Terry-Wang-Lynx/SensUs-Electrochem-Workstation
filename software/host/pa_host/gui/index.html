@@ -200,7 +200,10 @@
             <div><span>V_WE</span><strong id="dbgWe">--</strong><small>mV</small></div>
             <div><span>V_RE</span><strong id="dbgRe">--</strong><small>mV</small></div>
             <div><span>V_CE（驱动/余量）</span><strong id="dbgCe">--</strong><small id="dbgCeNote">mV</small></div>
-            <div><span>V_WO</span><strong id="dbgWo">--</strong><small>mV</small></div>
+            <div><span>V_WO</span><strong id="dbgWo">--</strong><small id="dbgWoNote">mV</small></div>
+            <!-- VDD 实测(tag 0xE0)。它给出 V_WE 窗口的上限 VDD−1.1V ——
+                 在此之前上限只能靠编译期假定的 3000mV。 -->
+            <div><span>VDD（V_WE 窗口）</span><strong id="dbgVdd">--</strong><small id="dbgVddNote">mV</small></div>
           </div>
           <div class="dbg-codes" id="dbgCodes">原始 12-bit code:等待数据</div>
         </section>

@@ -151,12 +151,18 @@
 
 #define MAX30131_REG_SYS_ADC_IN_SEL1 0x55u
 /*
- * ⚠️ SYS_SELECT 的位号未能从 datasheet 文本层确认(表格被提取工具打散)。
- * 按本 datasheet 的排版惯例(字段说明的最后一项 = LSB,与 0x56 的
- * S1_CE_SYS_SEL=bit0 一致)取 bit0。假设若错,后果只是拿不到 0xD1 数据 ——
- * 可检测、无损;固件会在 bring-up 时明确报出来,不会静默。
+ * ✅ 2026-08-11:位号已从 datasheet **位表本身**读到(p118「SYSTEM ADC IN SEL1
+ * (0x55)」的 BIT/Field 行),不再是按排版惯例推断:
+ *
+ *   BIT   7      6      5      4      3        2        1     0
+ *   Field AIN4  AIN3   AIN2   AIN1   VDD_SEL  GND_SEL   –    SYS_SELECT
+ *
+ * 🔴 **bit1 是保留位**。按"字段说明末项=LSB"顺序数会把 VDD 算成 bit2(=GND),
+ *    读回 0V 还会以为是别的毛病 —— 这是查表而非推断救回来的一次。
  */
 #define MAX30131_SYSADC_SYS_SELECT_Pos 0u
+#define MAX30131_SYSADC_GND_SEL_Pos 2u
+#define MAX30131_SYSADC_VDD_SEL_Pos 3u
 
 #define MAX30131_REG_SYS_ADC_IN_SEL2 0x56u
 #define MAX30131_SYSADC_S1_CE_SEL_Pos 0u
@@ -164,11 +170,22 @@
 #define MAX30131_SYSADC_S1_WE_SEL_Pos 2u /* ← 我们要的那一位 */
 #define MAX30131_SYSADC_S1_WO_SEL_Pos 3u
 
-/* FIFO tag(Table 9,8-bit tag 分支,数据在 bits[11:0]) */
+/* FIFO tag(Table 9 p72–73,8-bit tag 分支,数据在 bits[11:0]) */
 #define MAX30131_FIFO_TAG_S1_WO_V 0xD0u
 #define MAX30131_FIFO_TAG_S1_WE_V 0xD1u
 #define MAX30131_FIFO_TAG_S1_RE_V 0xD2u
 #define MAX30131_FIFO_TAG_S1_CE_V 0xD3u
+/*
+ * 0xE0 = VDD supply voltage(Table 9 p73 原文:"VDD supply voltage /
+ * AUTO, 8'hE0, VDD_ADC_DATA[11:0]")。0xE1 = Ground reference。
+ *
+ * 🔴 VDD 走的是 **SYS_PWR_GAIN**(0x54 [5:4]),与 WE/RE/CE/WO 的
+ *    SYS_SENSV_GAIN 是**两路独立增益**(p65 Figure 23)。VDD≈3.3V 远超
+ *    VREF=1.536V,必须用 0.25× 才在量程内(满量程 6.144V,LSB 1.5mV);
+ *    拿 SENSV 的增益去换算 VDD 会得到一个偏 4 倍的假数字。
+ */
+#define MAX30131_FIFO_TAG_VDD 0xE0u
+#define MAX30131_FIFO_TAG_GND 0xE1u
 
 /* ------------------------------------------------------------------ */
 /* 极化 DAC(单通道版只有 DACA/DACB)                                    */

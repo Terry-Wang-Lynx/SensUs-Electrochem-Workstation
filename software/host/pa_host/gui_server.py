@@ -1112,14 +1112,40 @@ class MeasurementController:
         #   railed :CE 或 WO 撞轨 ⇒ 放大器用尽驱动范围、**环路饱和**,
         #           E 可能仍读得出来但电解池已不在设定电位上(此时 e_mv 会偏离设定值)
         out["clipped"] = any(out.get(k) in (0, 4095) for k in ("we_code", "re_code"))
-        out["railed"] = any(out.get(k) in (0, 4095) for k in ("ce_code", "wo_code"))
+        # 🔴 2026-08-11 拆分。原来把 ce_code 与 wo_code 一起算 railed,现在不成立:
+        #   ① **CE 的规格下限是 0.1V,不是 0**(datasheet p11「CE Output Voltage Range」
+        #      CP_EN=0 ⇒ 0.1V ~ VDD−1.1V)。CE 掉到 80mV 时环路已经出规格,
+        #      按 code==0 判会漏报。100mV / 0.375mV ≈ 267 码。
+        #   ② **WO 出量程现在是设计使然**:V_WE 默认改 1200 后 WO≈V_WE+540≈1745mV
+        #      > System ADC 在 1.0× 下的满量程 1536mV ⇒ wo_code 恒 4095。
+        #      继续把它算作"撞轨"会让告警灯常红,而常红的灯等于没有灯。
+        #      ⇒ 单独报 wo_offscale,措辞是"看不见"而不是"坏了"。
+        ce_code = out.get("ce_code")
+        out["ce_railed"] = isinstance(ce_code, int) and (ce_code <= 267 or ce_code >= 4095)
+        out["wo_offscale"] = out.get("wo_code") in (0, 4095)
+        out["railed"] = bool(out["ce_railed"])
         # 🔴 恒电位环用了多少驱动、还剩多少 —— 这两个数把"环路快饱和了"变成可读数字。
         #   ce_drive_mv:C 放大器为了把电流推过电解池,需要把 CE 压到 RE 之下多少。
         #                健康态实测只需 ~60 mV(v1:CE 140 / RE 201)。
         #   ce_headroom_mv:CE 距 0 轨还有多少。它见底 ⇒ 环路钳不住设定电位。
         if isinstance(out.get("ce_mv"), (int, float)) and isinstance(out.get("re_mv"), (int, float)):
             out["ce_drive_mv"] = out["re_mv"] - out["ce_mv"]
-            out["ce_headroom_mv"] = out["ce_mv"]
+            # 规格下限是 0.1V ⇒ 余量按到 100mV 算,不是到 0
+            out["ce_headroom_mv"] = out["ce_mv"] - 100
+        # 🔴 V_WE 的合法窗口 —— 现在两头都能给实测值,不再靠编译期假定的 VDD=3000:
+        #     E + drive + 0.1V  ≤  V_WE  ≤  VDD − 1.1V   (CP_EN=0;=1 时是 −0.7V)
+        #   上限来自实测 VDD(tag 0xE0);下限来自实测 drive=RE−CE。
+        #   vdd_mv == -1 ⇒ 固件没上报(旧版本或通道没选中)⇒ 这几项都不给,
+        #   宁可缺字段也不拿假定值冒充实测(公理 A4:器件是权威)。
+        vdd = out.get("vdd_mv")
+        if isinstance(vdd, (int, float)) and vdd > 0:
+            out["we_max_mv"] = int(vdd) - 1100
+            out["we_max_mv_cp"] = int(vdd) - 700   # 开 CP_EN 后的上限
+            if isinstance(out.get("we_mv"), (int, float)):
+                out["we_headroom_mv"] = out["we_max_mv"] - out["we_mv"]
+            if isinstance(out.get("ce_drive_mv"), (int, float)) and \
+                    isinstance(out.get("e_mv"), (int, float)):
+                out["we_min_mv"] = int(out["e_mv"] + out["ce_drive_mv"] + 100)
         out["rows"] = len(rows) - 1
         return out
 

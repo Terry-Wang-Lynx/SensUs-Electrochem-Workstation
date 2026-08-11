@@ -799,15 +799,20 @@ int32_t max30131_sysadc_budget_ms(uint8_t n_channels, bool sys_conv_type)
 	return (convs * conv_x10 + 9) / 10;
 }
 
-uint8_t max30131_enc_sys_adc_setup(uint8_t sensv_gain_code)
+uint8_t max30131_enc_sys_adc_setup(uint8_t sensv_gain_code, uint8_t pwr_gain_code)
 {
 	/*
-	 * AIN/PWR 增益本设计不用,留复位默认 00;OPA_BYPASS_EN 强制 0 ——
-	 * 置 1 会旁路输入缓冲,datasheet 要求信号能驱动 14MΩ,等于在 WE/RE 上
-	 * 挂一条 ~29nA 的漏电路径,会破坏被测对象本身(尤其 RE 绝不能带载)。
+	 * AIN 增益本设计不用(没接 GPIO 模拟输入),留复位默认 00。
+	 * PWR 增益管 VDD/GND 通道,与 SENSV 独立(p65 Figure 23)——
+	 * VDD≈3.3V 时必须 0.25×,否则恒在 4095 削顶。
+	 * OPA_BYPASS_EN 强制 0 —— 置 1 会旁路输入缓冲,datasheet 要求信号能驱动
+	 * 14MΩ,等于在 WE/RE 上挂一条 ~29nA 的漏电路径,会破坏被测对象本身
+	 * (尤其 RE 绝不能带载)。
 	 */
-	return (uint8_t)((sensv_gain_code & 0x3u)
-			 << MAX30131_SYSADC_SENSV_GAIN_Pos);
+	return (uint8_t)(((sensv_gain_code & 0x3u)
+			  << MAX30131_SYSADC_SENSV_GAIN_Pos)
+			 | ((pwr_gain_code & 0x3u)
+			    << MAX30131_SYSADC_PWR_GAIN_Pos));
 }
 
 int32_t max30131_sys_adc_mv(uint16_t code, int32_t vref_mv, uint8_t gain_code)

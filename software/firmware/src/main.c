@@ -96,7 +96,32 @@ static void afe_status_poll(const char *why, bool force);
 static void replay_state(const char *src);
 #define WP_REF        MAX30131_REF_1536MV      /* 内部 1.536V;CR2032 EOL 2.0V 只此档 */
 
-#define WP_DEFAULT_V_WE_MV 400                 /* WE 电位 0.4V(可 SET vwe= 改) */
+/*
+ * WE 静态电位。**它不是自由参数,是被两头夹住的**(datasheet p11 电气特性 +
+ * p33 电荷泵说明):
+ *
+ *     E + drive + 0.1V  ≤  V_WE  ≤  VDD − 1.1V     (CP_EN=0)
+ *                                    VDD − 0.7V     (CP_EN=1)
+ *
+ *   左边:CE/RE 的合法下限是 **0.1V**(不是 0)。CE = V_WE − E − drive,
+ *         其中 drive = RE−CE = CE→RE 段溶液 IR 降 + CE 界面过电位。
+ *   右边:WE/RE 输入范围上限。
+ *
+ * 🔴 2026-08-11 实测,drive 随电流剧变 —— 这就是原值 400 出问题的根因:
+ *     PBS 空白  i=0.66nA   ⇒ drive= 61mV ⇒ 下限 361mV(400 只余 39mV)
+ *     500µM LDOPA i>1µA    ⇒ drive=500mV ⇒ 下限 800mV(400 低了 400mV)
+ *   ⇒ 400 是**按空白负载标定的**,一上真实分析物 CE 就掉出 0.1V 下限并饱和到 0,
+ *     环路开环、E 塌到 ~100mV。实测把 V_WE 抬到 858–879mV 后 CE 回到 180–216mV、
+ *     E 爬回 178mV,机制确证。
+ *
+ * ⇒ 取 **1200mV** = datasheet 自己的标称测试条件(p11 表头 "WE = 1.2V"),
+ *   也是 VDD=3.3V 下窗口 [0.1, 2.2] 的正中间:距 LDOPA 下限 400mV、距上限 1000mV。
+ * ⚠️ CR2032 EOL(VDD=2.0V)时上限只有 900mV ⇒ 1200 **超限**,产品态必须
+ *   要么开 CP_EN=1(上限抬到 1300),要么降 V_WE。台面 3.0–3.3V 供电下 1200 合法。
+ *   headroom 校验按 WP_VDD_ASSUMED_MV=3000 判(上限 1900),现在 VDD 已能实测,
+ *   不符会打 VDD_MISMATCH。
+ */
+#define WP_DEFAULT_V_WE_MV 1200                /* 见上;可 SET vwe= 改 */
 #define WP_V_WE_MV    cfg_live.vwe_mv
 #define WP_E_MV       cfg_live.e_mv            /* E = V_WE - V_RE(测量电位) */
 #define WP_STARTUP_E_MV GUI_WP_START_E_MV      /* 用户可见的阶跃起始电位 */
@@ -262,6 +287,23 @@ static void replay_state(const char *src);
 /* 生效增益。仍留成变量:CELL_V 行要上报 vgain=,让主机能复算 code→mV。 */
 static uint8_t sysadc_gain = WP_SYSADC_GAIN_FIXED;
 #define WP_SYSADC_SENSV_GAIN sysadc_gain
+/*
+ * VDD/GND 通道走的是**另一路**增益 SYS_PWR_GAIN(0x54 [5:4]),与上面的 SENSV
+ * 完全独立(p65 Figure 23)。VDD 标称 3.0–3.3V 远超 VREF=1.536V:
+ *      GAIN    LSB        满量程     VDD=3.3V
+ *      1.0×    0.375 mV   1536 mV    ✗ 恒削顶
+ *      0.5×    0.750 mV   3071 mV    勉强,新电池/外供 3.3V 时贴边
+ *      0.25×   1.500 mV   6144 mV    ✓ 余量 1.9×   ← 用这个
+ * ⇒ 固定 0.25×。它只影响 VDD/GND 两路,不动电极四路的分辨率。
+ */
+#define WP_SYSADC_PWR_GAIN MAX30131_SYSADC_GAIN_0P25X
+/*
+ * headroom 校验用的 VDD 假定值(见 afe_configure() 里的 check_headroom)。
+ * 现在 VDD 已经能实测(tag 0xE0)⇒ 实测值与这个假定明显不符时必须报出来:
+ * 静默地拿错的 VDD 去判 WEn ≤ VDD−1.1V,等于校验形同虚设(公理 A3)。
+ */
+#define WP_VDD_ASSUMED_MV 3000
+#define WP_VDD_MISMATCH_MV 300
 /*
  * SYS_PERIOD(0x81 低半字节),与 SENS_PERIOD 同一张码表:
  *   0x0=124ms 0x1=242ms 0x2=476ms 0x3=945ms 0x4=1882ms …
@@ -582,8 +624,10 @@ static int afe_configure(void)
 		 * 次序:先配增益与通道,最后开 SYS_SELECT。
 		 */
 		{ MAX30131_REG_SYS_ADC_SETUP,
-		  WP_CELLV_ENABLE ? max30131_enc_sys_adc_setup(WP_SYSADC_SENSV_GAIN) : 0x00U,
-		  "SYS ADC SETUP: SENSV 增益 0.5×(可测 0~3.07V), 🔴OPA_BYPASS_EN=0" },
+		  WP_CELLV_ENABLE ? max30131_enc_sys_adc_setup(WP_SYSADC_SENSV_GAIN,
+							       WP_SYSADC_PWR_GAIN)
+				  : 0x00U,
+		  "SYS ADC SETUP: SENSV 1.0×(0~1536mV)+ PWR 0.25×(VDD 到 6144mV), 🔴OPA_BYPASS_EN=0" },
 		{ MAX30131_REG_CONVERT_SETUP2,
 		  WP_CELLV_ENABLE ? (uint8_t)(WP_SYS_PERIOD_CODE << MAX30131_CS2_SYS_PERIOD_Pos)
 				  : 0x00U,
@@ -596,8 +640,10 @@ static int afe_configure(void)
 				  : 0x00U,
 		  "SYS ADC IN SEL2: WE1+RE1+CE1+WO1(E=V_WE−V_RE 必须两路都有)" },
 		{ MAX30131_REG_SYS_ADC_IN_SEL1,
-		  WP_CELLV_ENABLE ? (uint8_t)BIT(MAX30131_SYSADC_SYS_SELECT_Pos) : 0x00U,
-		  "SYS ADC IN SEL1: SYS_SELECT(⚠️ 位号未从 datasheet 文本层确认,见 regs.h)" },
+		  WP_CELLV_ENABLE ? (uint8_t)(BIT(MAX30131_SYSADC_SYS_SELECT_Pos) |
+					      BIT(MAX30131_SYSADC_VDD_SEL_Pos))
+				  : 0x00U,
+		  "SYS ADC IN SEL1: SYS_SELECT(bit0)+ VDD_SYS_SEL(bit3,已从 p118 位表确认)" },
 		{ 0x22U, WP_S1_CONFIG3, "S1_CONFIG3:IOS_MODE(见文件头 A/B 说明)" },
 		{ 0x23U, max30131_enc_s1_config4(WP_FSR, WP_OFFSET_SEL),
 		  "S1_CONFIG4: configured FSR/offset" },
@@ -645,7 +691,8 @@ static int afe_configure(void)
 	sysadc_gain = WP_SYSADC_GAIN_FIXED;
 	if (WP_CELLV_ENABLE) {
 		rc = max30131_spi_write_reg(MAX30131_REG_SYS_ADC_SETUP,
-					   max30131_enc_sys_adc_setup(sysadc_gain));
+					   max30131_enc_sys_adc_setup(sysadc_gain,
+								      WP_SYSADC_PWR_GAIN));
 		if (rc) {
 			return rc;
 		}
@@ -1147,18 +1194,27 @@ static int set_sensor_selected(bool selected)
  *    或超量程被削顶;只看 mV 看不出削顶,看 code 撞 0/4095 才看得出。
  */
 static struct {
-	int32_t mv[4];
-	uint16_t code[4];
-	bool got[4];
+	int32_t mv[5];
+	uint16_t code[5];
+	bool got[5];
 	bool ever_got;
 	uint32_t dropped;    /* 因缺词被丢弃的组数(累计) */
 	int64_t warned_at;
+	bool vdd_warned;     /* VDD 实测与 WP_VDD_ASSUMED_MV 不符,只报一次 */
 } cellv;
 
 #define CELLV_WE 0
 #define CELLV_RE 1
 #define CELLV_CE 2
 #define CELLV_WO 3
+/*
+ * 🔴 VDD 刻意**不进**"成组到齐"判据(见 cellv_flush)。
+ *    理由:VDD_SYS_SEL 的位号一旦有误,把它并进 5 路到齐会让**每一组**都判不完整,
+ *    直接毁掉现在已经能用的四路电极数据 —— 用一个未经真机验证的假设去换销毁性后果,
+ *    正是 2026-08-11 早先在启发式判据上挂销毁动作那次的翻版。
+ *    VDD 作可选附加字段:没收到就报 -1,一眼看得出是"没来"而不是"是 0"。
+ */
+#define CELLV_VDD 4
 
 /*
  * OCP(开路电位)原语的状态。能力早就在跑了 —— IDLE_DISCONNECT + cellv 下
@@ -1194,6 +1250,7 @@ static bool collect_voltage_word(const max30131_fifo_word_t *w)
 	case MAX30131_FIFO_TAG_S1_RE_V: idx = CELLV_RE; break;
 	case MAX30131_FIFO_TAG_S1_CE_V: idx = CELLV_CE; break;
 	case MAX30131_FIFO_TAG_S1_WO_V: idx = CELLV_WO; break;
+	case MAX30131_FIFO_TAG_VDD: idx = CELLV_VDD; break;
 	default: return false;
 	}
 
@@ -1228,10 +1285,30 @@ static bool collect_voltage_word(const max30131_fifo_word_t *w)
 	}
 
 	cellv.code[idx] = w->counts;
-	cellv.mv[idx] = max30131_sys_adc_mv(w->counts, max30131_ref_mv(WP_REF),
-					    WP_SYSADC_SENSV_GAIN);
+	/* 🔴 VDD 走 PWR 增益,电极四路走 SENSV —— 两路独立(p65),混用会偏 4 倍 */
+	cellv.mv[idx] = max30131_sys_adc_mv(
+		w->counts, max30131_ref_mv(WP_REF),
+		(idx == CELLV_VDD) ? WP_SYSADC_PWR_GAIN : WP_SYSADC_SENSV_GAIN);
 	cellv.got[idx] = true;
 	cellv.ever_got = true;
+
+	/*
+	 * VDD 实测 vs headroom 校验所用的假定值。不符就报一次 ——
+	 * 静默地拿错的 VDD 判 `WEn ≤ VDD−1.1V`,校验等于没做(公理 A3)。
+	 * 只报不拦:VDD 读数本身也可能是新功能的 bug,不该让它有能力阻断测量。
+	 */
+	if (idx == CELLV_VDD && !cellv.vdd_warned) {
+		int32_t d = cellv.mv[CELLV_VDD] - WP_VDD_ASSUMED_MV;
+
+		if (d > WP_VDD_MISMATCH_MV || d < -WP_VDD_MISMATCH_MV) {
+			cellv.vdd_warned = true;
+			printk("VDD_MISMATCH measured_mv=%d assumed_mv=%d "
+			       "we_max_mv=%d code=%u pwr_gain=%u\n",
+			       cellv.mv[CELLV_VDD], WP_VDD_ASSUMED_MV,
+			       max30131_we_max_mv(cellv.mv[CELLV_VDD]),
+			       cellv.code[CELLV_VDD], WP_SYSADC_PWR_GAIN);
+		}
+	}
 
 	if (cellv.got[CELLV_WE] && cellv.got[CELLV_RE] &&
 	    cellv.got[CELLV_CE] && cellv.got[CELLV_WO]) {
@@ -1261,16 +1338,23 @@ static void cellv_flush(void)
 		}
 		return;
 	}
+	/*
+	 * vdd_mv/vdd_code:**可选**字段,-1 = 一次都没收到过(位号错或没选中),
+	 * 与"读到 0 V"截然不同。sticky 保留 ⇒ 若 VDD 排在 WO 之后到达,这里给的是
+	 * 上一周期的值,最多滞后一个 SYS_PERIOD(~945ms)—— 对电源轨无害。
+	 */
 	printk("CELL_V ms=%lld idle=%d we_mv=%d re_mv=%d ce_mv=%d wo_mv=%d "
 	       "e_mv=%d we_code=%u re_code=%u ce_code=%u wo_code=%u ep=%u ocp=%d "
-	       "dropped=%u vgain=%u\n",
+	       "dropped=%u vgain=%u vdd_mv=%d vdd_code=%d\n",
 	       (long long)k_uptime_get(), (int)WP_IDLE_MODE,
 	       cellv.mv[CELLV_WE], cellv.mv[CELLV_RE],
 	       cellv.mv[CELLV_CE], cellv.mv[CELLV_WO],
 	       cellv.mv[CELLV_WE] - cellv.mv[CELLV_RE],
 	       cellv.code[CELLV_WE], cellv.code[CELLV_RE],
 	       cellv.code[CELLV_CE], cellv.code[CELLV_WO],
-	       cfg_epoch, ocp_active ? 1 : 0, cellv.dropped, sysadc_gain);
+	       cfg_epoch, ocp_active ? 1 : 0, cellv.dropped, sysadc_gain,
+	       cellv.got[CELLV_VDD] ? cellv.mv[CELLV_VDD] : -1,
+	       cellv.got[CELLV_VDD] ? (int)cellv.code[CELLV_VDD] : -1);
 	if (ocp_active) {
 		ocp_observe(cellv.mv[CELLV_WE] - cellv.mv[CELLV_RE],
 			    cellv.code[CELLV_WE], cellv.code[CELLV_RE]);
@@ -1312,9 +1396,10 @@ static void drain_fifo_for_voltages(void)
 }
 
 /*
- * 长时间一个电压词都没收到,最可能是 0x55 的 SYS_SELECT 位号猜错了
- * (datasheet 表格未能从文本层确认,按惯例取了 bit0)。大声报一次,不静默 ——
- * 这是个可检测、无损的假设。
+ * 长时间一个电压词都没收到就大声报一次,不静默。
+ * ⚠️ 2026-08-11:**SYS_SELECT=bit0 已从 datasheet p118 位表本身确认**,不再是
+ *    按排版惯例的猜测 ⇒ 这条警告不该再把人引向"位号猜错"。真出现时先查
+ *    0x56(电极四路选择)与 SYS_PERIOD 是否够长。
  */
 static void warn_if_no_voltages(void)
 {
@@ -1337,9 +1422,9 @@ static void warn_if_no_voltages(void)
 	}
 	cellv.warned_at = now;
 	LOG_WRN("🔴 至今未收到任何电极电压词(tag 0xD1/0xD2)。"
-		"首查 0x55 的 SYS_SELECT 位号假设(现取 bit%u,共 8 种可能);"
-		"其次查 0x56=0x0F 与 SYS_PERIOD 是否够长",
-		MAX30131_SYSADC_SYS_SELECT_Pos);
+		"位号已由 p118 位表确认(SYS_SELECT=bit%u、VDD=bit%u),别再往那查;"
+		"查 0x56=0x0F 是否写进去了、SYS_PERIOD 是否够长、AUTO 是否在跑",
+		MAX30131_SYSADC_SYS_SELECT_Pos, MAX30131_SYSADC_VDD_SEL_Pos);
 }
 
 /*
@@ -1706,7 +1791,8 @@ static int afe_cfg_commit(const afe_cmd_t *cmd, const char *src)
 	/* System ADC 增益寄存器不在 plan 里(它是常量),开启连采时补写一次 */
 	if (cand.cellv && !prev.cellv) {
 		(void)max30131_spi_write_reg(MAX30131_REG_SYS_ADC_SETUP,
-			max30131_enc_sys_adc_setup(WP_SYSADC_SENSV_GAIN));
+			max30131_enc_sys_adc_setup(WP_SYSADC_SENSV_GAIN,
+						   WP_SYSADC_PWR_GAIN));
 	}
 
 	if (exec_plan(&plan, ep, "apply") != 0) {
