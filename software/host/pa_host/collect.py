@@ -395,6 +395,8 @@ AUDIT_PREFIXES = (
     "AFE_STATUS", "REG_PEEK", "REG_POKE",
     "OCP_BEGIN", "OCP_DONE", "OCP_RESTORED", "OCP_REJECT",
     "RANGE_APPLIED", "RANGE_REJECT", "IT_TAINTED",
+    # 阶段行:静置期没有电流样本,靠它上位机才知道"在静置"而不是"卡住了"
+    "IT_PHASE",
 )
 _AUDIT_RE = re.compile(r"^(" + "|".join(AUDIT_PREFIXES) + r")(\s|$)")
 _KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\S*)")

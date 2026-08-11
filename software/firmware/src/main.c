@@ -2517,11 +2517,18 @@ int main(void)
 			"请在上位机把 prestep_s 设为 180~300s(实测 τ≈26–50s ⇒ 5τ≈130~250s)");
 	}
 
+	if (WP_PRESTEP_DURATION_MS == 0U) {
+		/* 没有静置也要报,否则上位机分不清"没有静置"与"固件没报" */
+		printk("IT_PHASE ms=%lld phase=quiet elapsed_ms=0 total_ms=0 e_mv=%d ep=%u\n",
+		       (long long)k_uptime_get(), WP_STARTUP_E_MV, cfg_epoch);
+	}
 	if (WP_PRESTEP_DURATION_MS > 0U) {
 		LOG_INF("Quiet Time(静置):E=%d mV 保持 %u ms 后才开始记录"
 			"(对应 CHI 的 Quiet Time = quiescent time before potential scan)",
 			WP_STARTUP_E_MV, WP_PRESTEP_DURATION_MS);
 		uint32_t waited_ms = 0U;
+		uint32_t next_phase_ms = 0U;
+
 		while (waited_ms < WP_PRESTEP_DURATION_MS) {
 			/*
 			 * 🔴 静置期不能只 sleep:此时 AUTO 在跑、System ADC 每 SYS_PERIOD
@@ -2537,6 +2544,19 @@ int main(void)
 			}
 			afe_status_poll("quiet", false);
 			(void)poll_control_command();   /* 静置期也要能收 STOP / SET */
+			/*
+			 * 🔴 静置期必须**主动报进度**。用户反馈:"按一下要等一会儿才有图线,
+			 * 界面上完全没显示" —— 静置期没有电流样本,若固件不说话,上位机除了
+			 * 干等没有任何依据,和"卡死了"完全同形。
+			 * 每秒一行,带 elapsed/total ⇒ 上位机不必知道固件的编译期配置也能倒计时。
+			 */
+			if (waited_ms >= next_phase_ms) {
+				printk("IT_PHASE ms=%lld phase=quiet elapsed_ms=%u total_ms=%u "
+				       "e_mv=%d ep=%u\n", (long long)k_uptime_get(), waited_ms,
+				       (uint32_t)WP_PRESTEP_DURATION_MS, WP_STARTUP_E_MV,
+				       cfg_epoch);
+				next_phase_ms = waited_ms + 1000U;
+			}
 			k_msleep(chunk_ms);
 			waited_ms += chunk_ms;
 		}
@@ -2593,6 +2613,10 @@ int main(void)
 	 */
 	uint32_t expected_samples = expected_sample_count();
 	uint8_t  run_period_code = cfg_live.period;
+
+	printk("IT_PHASE ms=%lld phase=acquire elapsed_ms=0 total_ms=%u expected=%u "
+	       "e_mv=%d ep=%u\n", (long long)k_uptime_get(),
+	       (uint32_t)WP_MEASUREMENT_DURATION_MS, expected_samples, WP_E_MV, cfg_epoch);
 
 	acquiring = true;
 	run_tainted = false;
@@ -2672,6 +2696,8 @@ int main(void)
 	acquiring = false;
 	(void)set_polarization(WP_STARTUP_E_MV);
 	enter_idle_state();
+	printk("IT_PHASE ms=%lld phase=idle elapsed_ms=0 total_ms=0 e_mv=%d ep=%u\n",
+	       (long long)k_uptime_get(), WP_STARTUP_E_MV, cfg_epoch);
 	LOG_INF("i-t 测量结束:elapsed=%lld ms,native=%u/%u,empty polls=%u,E 已恢复为 %d mV",
 		(long long)(k_uptime_get() - measurement_start_ms), native_samples,
 		expected_samples, conversion_errors, WP_STARTUP_E_MV);

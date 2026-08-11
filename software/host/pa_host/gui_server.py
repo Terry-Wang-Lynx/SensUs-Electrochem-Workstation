@@ -479,6 +479,7 @@ class MeasurementController:
         self._cfg_live: dict[str, Any] = {}
         self._afe_status: dict[str, Any] = {}
         self._last_reject: dict[str, Any] = {}
+        self._phase: dict[str, Any] = {}
         self._dbg_cur_pos = 0
         self._dbg_cur: list[dict[str, Any]] = []
         self._dbg_cur_hdr: list[str] | None = None
@@ -537,6 +538,7 @@ class MeasurementController:
             #    退回 HTML 默认值(FSR 50nA、E 空)——而那时按「应用」就会把**猜的值**
             #    写进硬件。保留上次已知值,新一轮的 auto-GET 几秒内就会刷新它。
             self._last_reject = {}
+            self._phase = {}          # 阶段是**本轮**的属性,新一轮必须清
             self._dbg_cur_pos = 0
             self._dbg_cur = []
             self._dbg_cur_hdr = None
@@ -746,6 +748,8 @@ class MeasurementController:
                 self._cfg_live["confirmed_ep"] = event.get("ep")
             elif kind == "AFE_STATUS":
                 self._afe_status = {k: v for k, v in event.items() if k != "kind"}
+            elif kind == "IT_PHASE":
+                self._phase = {k: v for k, v in event.items() if k != "kind"}
             elif kind in ("CFG_REJECT", "CFG_FAULT", "CFG_ROLLBACK", "OCP_REJECT",
                           "RANGE_REJECT"):
                 # 🔴 拒因必须摆到显眼处。埋在滚动日志尾部时,用户看到的是
@@ -866,6 +870,7 @@ class MeasurementController:
             "cfg": self._cfg_live,
             "afe_status": self._afe_status,
             "last_reject": self._last_reject or None,
+            "phase": self._phase or None,
             "cell_v": self._cell_voltages(),
             "series": self._debug_series(),
             # 只送尾部,并且倒序 —— 界面上最新的在最上面

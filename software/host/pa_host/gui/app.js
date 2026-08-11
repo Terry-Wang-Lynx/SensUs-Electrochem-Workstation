@@ -465,8 +465,30 @@ function renderDbgReject(r) {
 function renderDebug(d) {
   state.debug = d;
   const cfg = d.cfg || {}, st = d.afe_status || {}, running = d.state === 'running';
-  $('dbgBadge').textContent = running ? '采集中' : d.state === 'completed' ? '已完成' : d.state === 'error' ? '错误' : '待机';
-  $('dbgBadge').className = `live-badge ${running ? 'running' : d.state === 'error' ? 'error' : ''}`;
+  // ── 阶段与静置倒计时 ────────────────────────────────────────────────────
+  // 🔴 静置期(Quiet Time)没有电流样本。不显式报阶段的话,界面上"按了没反应"
+  //    与"卡死了"完全同形 —— 用户第一反应就是"要等一会儿才有图线"。
+  //    固件每秒发一行 IT_PHASE(带 elapsed/total),这里直接渲染,不靠上位机猜配置。
+  const ph = d.phase || {};
+  const inQuiet = running && ph.phase === 'quiet' && Number(ph.total_ms) > 0;
+  const quietLeft = inQuiet
+    ? Math.max(0, Math.ceil((Number(ph.total_ms) - Number(ph.elapsed_ms)) / 1000)) : 0;
+  $('dbgBadge').textContent = !running
+    ? (d.state === 'completed' ? '已完成' : d.state === 'error' ? '错误' : '待机')
+    : inQuiet ? `静置 还剩 ${quietLeft} s`
+    : ph.phase === 'acquire' ? '采集中'
+    : ph.phase === 'idle' ? '本轮已收尾' : '采集中';
+  $('dbgBadge').className = `live-badge ${running ? (inQuiet ? 'warn' : 'running') : d.state === 'error' ? 'error' : ''}`;
+  $('dbgChartMsg').textContent = inQuiet
+    ? `静置中（Quiet Time）：E=${ph.e_mv} mV 已保持 ${Math.round(Number(ph.elapsed_ms) / 1000)}/`
+      + `${Math.round(Number(ph.total_ms) / 1000)} s —— 这段刻意不记录电流,`
+      + `等双电层充完再开始,否则录到的是瞬态不是稳态`
+    : ph.phase === 'acquire'
+      ? `采集中：E=${ph.e_mv} mV,目标 ${ph.expected} 个原生点 · 左轴电流 nA / 右轴 E (mV)`
+      : '左轴电流 nA · 右轴 E = V_WE − V_RE (mV)';
+  $('dbgChartEmpty').textContent = inQuiet
+    ? `静置中,还剩 ${quietLeft} s 才开始记录电流（电位曲线已在走）`
+    : running ? '等待第一个样本…' : '点「应用并开始一次 I-t」后显示';
   // 🔴 命令只能在测量进行中下发(RTT 下行通道由采集器持有)⇒ 不跑就禁用
   ['dbgGet', 'dbgOcp'].forEach(id => { $(id).disabled = !running; });
   $('dbgEpochMsg').textContent = cfg.ep == null ? 'epoch --（尚未收到 CFG_* 行）'
