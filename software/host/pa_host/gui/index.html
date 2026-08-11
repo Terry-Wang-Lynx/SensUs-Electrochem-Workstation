@@ -215,7 +215,8 @@
                 <span id="dbgLampInvalid" class="lamp">INVALID_CFG</span>
                 <span id="dbgLampVdd" class="lamp">VDD_OOR</span>
                 <span id="dbgLampPwr" class="lamp" title="STATUS1.PWR_RDY:1=VDD 曾跌破 1.55V UVLO(掉压),0=正常">掉压(PWR_RDY)</span>
-                <span id="dbgLampClip" class="lamp">削顶</span>
+                <span id="dbgLampClip" class="lamp" title="WE 或 RE 的 12-bit code 撞 0/4095 ⇒ E = V_WE − V_RE 这个数不可信">削顶(WE/RE)</span>
+                <span id="dbgLampRail" class="lamp" title="CE 或 WO 撞轨 ⇒ 放大器用尽驱动范围、恒电位环饱和,电解池未必在设定电位上">环路饱和(CE/WO)</span>
               </div>
               <div class="live-badge" id="dbgStatusBadge">未连接</div>
             </div>

@@ -1106,10 +1106,13 @@ class MeasurementController:
                 out[key] = float(raw) if "." in raw else int(raw)
             except ValueError:
                 out[key] = raw
-        # 削顶标记:12-bit 单端,撞 0 或 4095 就说明超出了 System ADC 量程
-        out["clipped"] = any(
-            out.get(k) in (0, 4095) for k in ("we_code", "re_code", "ce_code", "wo_code")
-        )
+        # 🔴 两类"撞轨"必须分开报,否则告警会互相淹没(2026-08-11 实测:CE 顶在
+        #    下轨让 65/66 行都亮 clipped,真正会让 E 失效的 WE/RE 削顶反而看不见了)。
+        #   clipped:WE 或 RE 出界 ⇒ **E 这个数不可信**(它就是这两路之差)
+        #   railed :CE 或 WO 撞轨 ⇒ 放大器用尽驱动范围、**环路饱和**,
+        #           E 可能仍读得出来但电解池已不在设定电位上(此时 e_mv 会偏离设定值)
+        out["clipped"] = any(out.get(k) in (0, 4095) for k in ("we_code", "re_code"))
+        out["railed"] = any(out.get(k) in (0, 4095) for k in ("ce_code", "wo_code"))
         out["rows"] = len(rows) - 1
         return out
 

@@ -242,21 +242,25 @@ static void replay_state(const char *src);
  *      1.0×    0.375 mV   1536 mV    够(WO 935,余量 1.6×)   ← 测量期用这个
  *      2.0×    0.188 mV    768 mV    ✗ WO 935 削顶
  *
- * 🔴 为什么以前一直用 0.5×:**放大器关掉时四个引脚都在浮**,可能漂到 VDD≈3.0V,
- *    1.0× 的 1536mV 顶不住 ⇒ OCP / idle 断开态会削顶,而 OCP 正是要靠它读开路电位。
- * ⇒ 两个状态要的增益本来就不同,这不是"选一个折中",而是**跟着状态切**:
- *      放大器开(电位有界)   → 1.0×,分辨率翻倍
- *      放大器关(引脚在浮)   → 0.5×,保住不削顶
- *    切换点就在 set_potentiostat_amps() 里,与放大器同一次动作,不可能脱钩。
+ * 🔴🔴 2026-08-11 实测教训:**增益只能在 AUTO 启动之前设定一次,不能运行中切。**
+ *    我先前做成"跟随放大器状态切换",真机上直接虚报 2 倍:
+ *      ms=15612 vg=1 we_code=1067 → 400 mV ✓
+ *      ms=22194 vg=2 we_code=1067 → 固件按 0.75 换算报 800 mV / E=399 mV ✗
+ *    **code 一个没变** ⇒ 写 0x54 在 AUTO 运行中不生效(与 0x24 SELECT 同一个锁存
+ *    问题),而固件的换算系数却变了 ⇒ 硬件与换算脱钩、静默虚报一倍。
+ *    这比"格子粗"坏得多:粗只是分辨率,错是错。
+ * ⇒ 固定 1.0×,在 afe_configure() 里(AUTO 尚未启动)写一次,此后永不改动。
+ *    代价:放大器关掉时引脚浮过 1536mV 会削顶 —— 由 `clipped` 标记如实报告,
+ *    而不是靠切增益去躲。反正 OCP 目前另有问题(见 07 文档),不值得为它牺牲
+ *    测量期的分辨率。
  *
  * 实测背景:E 的 σ=0.55 mV 已经贴在量化地板上(纯量化 RMS 0.31 mV)⇒ 曲线只能
  * 长成台阶。剩下的静态误差里 INL(±1.5 LSB=±1.1 mV/路,差值最坏 ±2.2 mV)才是大头,
  * 而增益/基准/offset 误差在 E=V_WE−V_RE 里基本共模抵消(同 mux/同 PGA/同 ADC/同基准)。
  */
-#define WP_SYSADC_GAIN_BIASED   MAX30131_SYSADC_GAIN_1X    /* 放大器开:0.375 mV/码 */
-#define WP_SYSADC_GAIN_FLOATING MAX30131_SYSADC_GAIN_0P5X  /* 放大器关:0.75 mV/码,不削顶 */
-/* 当前生效增益。换算(max30131_sys_adc_mv)必须用它,不能用编译期常量。 */
-static uint8_t sysadc_gain = WP_SYSADC_GAIN_FLOATING;
+#define WP_SYSADC_GAIN_FIXED MAX30131_SYSADC_GAIN_1X   /* 0.375 mV/码,全程固定 */
+/* 生效增益。仍留成变量:CELL_V 行要上报 vgain=,让主机能复算 code→mV。 */
+static uint8_t sysadc_gain = WP_SYSADC_GAIN_FIXED;
 #define WP_SYSADC_SENSV_GAIN sysadc_gain
 /*
  * SYS_PERIOD(0x81 低半字节),与 SENS_PERIOD 同一张码表:
@@ -632,6 +636,20 @@ static int afe_configure(void)
 
 	/* 🔴 基准建立需 ≥12ms(datasheet);抢跑会读到未稳定的值 */
 	k_msleep(20);
+
+	/*
+	 * 🔴 增益必须在**这里**写 —— 此刻 AUTO 尚未启动(0x83 刻意不在 cfg[] 表里),
+	 * 所以这次写入会被正常锁存。运行中再写就不生效了(实测,见 WP_SYSADC_GAIN_FIXED
+	 * 处的说明),所以全程只有这一次。
+	 */
+	sysadc_gain = WP_SYSADC_GAIN_FIXED;
+	if (WP_CELLV_ENABLE) {
+		rc = max30131_spi_write_reg(MAX30131_REG_SYS_ADC_SETUP,
+					   max30131_enc_sys_adc_setup(sysadc_gain));
+		if (rc) {
+			return rc;
+		}
+	}
 
 	/* --- 极化电位:E = V_DACA − V_DACB --- */
 	max30131_polarization_t pol;
@@ -1075,20 +1093,6 @@ static int set_potentiostat_amps(bool on)
 {
 	int rc;
 
-	/*
-	 * 🔴 增益必须与放大器状态**同一次动作**内切换,否则中间会有若干个 SYS_PERIOD
-	 * 用错增益换算(读数凭空差 2 倍,而 code 看着完全正常)。
-	 * 次序:先把增益切到**两种状态都安全**的那一侧,再动放大器,最后收紧。
-	 *   开放大器:先 0.5×(此刻引脚还在浮)→ 开 → 再切 1.0×
-	 *   关放大器:先 0.5×(马上要浮了)   → 关
-	 * 这样任何时刻的增益都覆盖得住当时引脚可能的电位,不会削顶。
-	 */
-	sysadc_gain = WP_SYSADC_GAIN_FLOATING;
-	if (WP_CELLV_ENABLE) {
-		(void)max30131_spi_write_reg(MAX30131_REG_SYS_ADC_SETUP,
-			max30131_enc_sys_adc_setup(sysadc_gain));
-	}
-
 	if (on) {
 		rc = max30131_spi_write_reg(MAX30131_REG_S1_CONFIG1,
 					   s1_config1_byte(false, true));
@@ -1108,18 +1112,6 @@ static int set_potentiostat_amps(bool on)
 	}
 	if (rc == 0) {
 		cfg_live.amps_on = on;
-		if (on) {
-			/* 电位现在有界了 ⇒ 收紧到 1.0×,量化台阶 0.75→0.375 mV */
-			sysadc_gain = WP_SYSADC_GAIN_BIASED;
-			if (WP_CELLV_ENABLE) {
-				(void)max30131_spi_write_reg(
-					MAX30131_REG_SYS_ADC_SETUP,
-					max30131_enc_sys_adc_setup(sysadc_gain));
-			}
-		}
-		LOG_INF("电位量化台阶:%s mV/码(放大器%s)",
-			sysadc_gain == MAX30131_SYSADC_GAIN_1X ? "0.375" : "0.75",
-			on ? "开" : "关");
 	}
 	return rc;
 }
@@ -1925,6 +1917,18 @@ static void ocp_run(int32_t window_ms, bool forced)
 		(void)set_polarization(cfg_live.e_mv);
 	}
 	(void)set_sensor_selected(sel_before);
+	/*
+	 * 🔴 必须重起 AUTO。2026-08-11 实测:OCP 期间改写过 0x54(增益)与 0x24(deselect),
+	 * 而**配置在 AUTO 序列启动时锁存**(今天早上在电流通道上已经踩过一次)。
+	 * 不重起的后果不是"OCP 读数不准",而是**OCP 之后 System ADC 整个坏掉**:
+	 * 恢复放大器、写回 E=200mV 之后,四路电位读数仍然全是 0(ms=46739 实测),
+	 * 电极不可能这样 ⇒ 是仪器侧的锁存没刷新。
+	 * 代价:重起会停一次转换、扰动电解池一下 —— 但 OCP 本来就已经把放大器关过了,
+	 * 这一轮的电化学状态无论如何都要重新建立,所以此处没有额外代价。
+	 */
+	if (afe_restart_auto() != 0) {
+		LOG_ERR("OCP 收尾:重起 AUTO 失败 —— 电位读数可能仍然无效");
+	}
 	{
 		uint8_t s1 = 0U, s5 = 0U;
 

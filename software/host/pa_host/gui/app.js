@@ -513,6 +513,7 @@ function renderDebug(d) {
   //    前端一度还在读旧字段 `pwr_rdy` 并按"就绪灯"画 ⇒ 真机上一切正常时亮红。
   faultLamp('dbgLampPwr', Boolean(st.brownout));
   faultLamp('dbgLampClip', Boolean(c.clipped));
+  faultLamp('dbgLampRail', Boolean(c.railed));
 
   // ── 实时电流(用户明确要的:界面上必须有电流值,不能只有图)──────────────
   const cur = d.series?.current || {t: [], nA: [], valid: [], ep: []};
@@ -552,7 +553,8 @@ function renderDebug(d) {
   // 🔴 原始 code 必须显示:整池对芯片 GND 浮动时电压会撞 0/4095,只看 mV 看不出削顶
   $('dbgCodes').textContent = c.we_code == null ? '原始 12-bit code:等待数据'
     : `原始 12-bit code — WE ${c.we_code} · RE ${c.re_code} · CE ${c.ce_code} · WO ${c.wo_code}`
-      + (c.clipped ? '　⚠️ 有 code 撞 0 或 4095,该电位读数不可信' : '');
+      + (c.clipped ? '　⚠️ WE/RE 出界 ⇒ E 不可信' : '')
+      + (c.railed ? '　⚠️ CE/WO 撞轨 ⇒ 放大器驱动用尽、环路饱和,电解池未必在设定电位上' : '');
 
   const rows = [];
   if (cfg.fsr != null) rows.push(dbgRow('FSR', `${DBG_FSR_NA[cfg.fsr]} nA`, `码 ${cfg.fsr} · ${cfg.fsr <= 3 ? '慢钟组' : '快钟组 ×4'}`));
