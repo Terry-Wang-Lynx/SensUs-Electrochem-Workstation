@@ -177,96 +177,88 @@
            所有 id 一律 dbg 前缀 —— app.js 全篇假定 id 全局唯一且在模块顶层
            直接 $('id').onclick,复用现有 id 会让第二个永远不画。 -->
       <section class="view" id="view-debug">
-        <div class="workspace-grid">
-          <section class="panel chart-panel">
-            <div class="panel-head">
-              <div><h2>电流 / 电位 双轴</h2><p id="dbgChartMsg">左轴电流 nA · 右轴 E = V_WE − V_RE (mV)</p></div>
-              <div class="chart-actions">
-                <div class="live-current" id="dbgLiveIBox"><span>实时电流</span><strong id="dbgLiveI">--</strong><small>nA</small><em id="dbgLiveIAt">尚无数据</em></div>
-                <div class="live-current" id="dbgLiveBox"><span>E (V_WE−V_RE)</span><strong id="dbgLiveE">--</strong><small>mV</small><em id="dbgLiveEAt">尚无数据</em></div>
-                <div class="segmented" id="dbgChartWindow"><button class="active" data-window="all">全程</button><button data-window="20">20 s</button><button data-window="5">5 s</button></div>
-                <div class="live-badge" id="dbgBadge">待机</div>
+        <!-- 上下布局:图在上、控制在下。参数面板需要横向空间,挤在右侧窄栏里读不动。 -->
+        <section class="panel chart-panel dbg-chart">
+          <div class="panel-head">
+            <div><h2>电流 / 电位 双轴</h2><p id="dbgChartMsg">左轴电流 nA · 右轴 E = V_WE − V_RE (mV)</p></div>
+            <div class="chart-actions">
+              <div class="live-current" id="dbgLiveIBox"><span>实时电流</span><strong id="dbgLiveI">--</strong><small>nA</small><em id="dbgLiveIAt">尚无数据</em></div>
+              <div class="live-current" id="dbgLiveBox"><span>E (V_WE−V_RE)</span><strong id="dbgLiveE">--</strong><small>mV</small><em id="dbgLiveEAt">尚无数据</em></div>
+              <div class="segmented" id="dbgChartWindow"><button class="active" data-window="all">全程</button><button data-window="20">20 s</button><button data-window="5">5 s</button></div>
+              <div class="live-badge" id="dbgBadge">待机</div>
+            </div>
+          </div>
+          <div class="chart-wrap"><canvas id="dbgChart" aria-label="电流与电极电位双轴曲线"></canvas>
+            <div class="chart-legend"><span><i class="valid-point"></i>电流(左轴)</span><span><i class="dbg-e-point"></i>E(右轴)</span><span><i class="invalid-point"></i>饱和/削顶</span></div>
+            <div class="empty-chart" id="dbgChartEmpty">点「应用并开始一次 I-t」后显示</div>
+          </div>
+          <div class="metric-strip">
+            <div><span>末 20 点中位</span><strong id="dbgIMed">--</strong><small>nA</small></div>
+            <div><span>末 20 点 σ</span><strong id="dbgISd">--</strong><small>nA</small></div>
+            <div><span>有效台阶</span><strong id="dbgCounts">--</strong><small id="dbgCountsNote">原始码</small></div>
+            <div><span>点数 / 饱和</span><strong id="dbgN">--</strong><small id="dbgSat">sat 0</small></div>
+            <div><span>V_WE</span><strong id="dbgWe">--</strong><small>mV</small></div>
+            <div><span>V_RE</span><strong id="dbgRe">--</strong><small>mV</small></div>
+            <div><span>V_CE</span><strong id="dbgCe">--</strong><small>mV</small></div>
+            <div><span>V_WO</span><strong id="dbgWo">--</strong><small>mV</small></div>
+          </div>
+          <div class="dbg-codes" id="dbgCodes">原始 12-bit code:等待数据</div>
+        </section>
+
+        <!-- 统一参数面板:每个下拉直接显示**设备当前生效值**,改哪个就是哪个,
+             不再有"不改"这种需要脑内做减法的选项。 -->
+        <section class="panel dbg-panel">
+          <div class="panel-head">
+            <div><h2>采样参数</h2><p id="dbgEpochMsg">epoch --</p></div>
+            <div class="chart-actions">
+              <div class="dbg-lamps" id="dbgLamps">
+                <span id="dbgLampInvalid" class="lamp">INVALID_CFG</span>
+                <span id="dbgLampVdd" class="lamp">VDD_OOR</span>
+                <span id="dbgLampPwr" class="lamp" title="STATUS1.PWR_RDY:1=VDD 曾跌破 1.55V UVLO(掉压),0=正常">掉压(PWR_RDY)</span>
+                <span id="dbgLampClip" class="lamp">削顶</span>
               </div>
+              <div class="live-badge" id="dbgStatusBadge">未连接</div>
             </div>
-            <div class="chart-wrap"><canvas id="dbgChart" aria-label="电流与电极电位双轴曲线"></canvas>
-              <div class="chart-legend"><span><i class="valid-point"></i>电流(左轴)</span><span><i class="dbg-e-point"></i>E(右轴)</span><span><i class="invalid-point"></i>饱和/削顶</span></div>
-              <div class="empty-chart" id="dbgChartEmpty">开始一次 I-t 测量后显示</div>
-            </div>
-            <div class="metric-strip">
-              <div><span>末 20 点中位</span><strong id="dbgIMed">--</strong><small>nA</small></div>
-              <div><span>末 20 点 σ</span><strong id="dbgISd">--</strong><small>nA</small></div>
-              <div><span>counts</span><strong id="dbgCounts">--</strong><small id="dbgCountsNote">原始码</small></div>
-              <div><span>点数 / 饱和</span><strong id="dbgN">--</strong><small id="dbgSat">sat 0</small></div>
-            </div>
-            <div class="metric-strip">
-              <div><span>V_WE</span><strong id="dbgWe">--</strong><small>mV</small></div>
-              <div><span>V_RE</span><strong id="dbgRe">--</strong><small>mV</small></div>
-              <div><span>V_CE</span><strong id="dbgCe">--</strong><small>mV</small></div>
-              <div><span>V_WO</span><strong id="dbgWo">--</strong><small>mV</small></div>
-            </div>
-            <div class="dbg-codes" id="dbgCodes">原始 12-bit code:等待数据</div>
-          </section>
+          </div>
 
-          <aside class="panel control-panel">
-            <div class="panel-head"><div><h2>硬件状态</h2><p id="dbgEpochMsg">epoch --</p></div><div class="live-badge" id="dbgStatusBadge">未连接</div></div>
-            <div class="dbg-lamps" id="dbgLamps">
-              <span id="dbgLampInvalid" class="lamp">INVALID_CFG</span>
-              <span id="dbgLampVdd" class="lamp">VDD_OOR</span>
-              <span id="dbgLampPwr" class="lamp" title="STATUS1.PWR_RDY:1=VDD 曾跌破 1.55V UVLO(掉压),0=正常">掉压(PWR_RDY)</span>
-              <span id="dbgLampClip" class="lamp">削顶</span>
-            </div>
+          <div class="dbg-form">
+            <label>电流量程 FSR<select id="dbgFsr"><option value="0">50 nA</option><option value="1">100 nA</option><option value="2">250 nA</option><option value="3">500 nA</option><option value="4">1 µA</option><option value="5">2 µA</option></select></label>
+            <label>偏置 offset<select id="dbgOff"><option value="0">0(不推荐)</option><option value="1">10% FS</option><option value="2">20% FS</option><option value="3">50% FS</option><option value="4">9 nA</option><option value="5">19 nA</option><option value="6">40 nA</option><option value="7">80 nA</option></select></label>
+            <label>CONV_TIME<select id="dbgConv"><option value="auto">auto（按周期自动取最优）</option><option value="0">0x0 · 12 bit</option><option value="1">0x1 · 13 bit</option><option value="2">0x2 · 14 bit</option><option value="3">0x3 · 15 bit</option><option value="4">0x4 · 16 bit</option><option value="5">0x5 · 16 bit</option><option value="6">0x6 · 16 bit</option></select></label>
+            <label>SENS_PERIOD<select id="dbgPeriod"><option value="0">0x0 · 124 ms</option><option value="1">0x1 · 242 ms</option><option value="2">0x2 · 476 ms</option><option value="3">0x3 · 945 ms</option><option value="4">0x4 · 1882 ms</option><option value="5">0x5 · 3757 ms</option></select></label>
+            <label>电位 E<div class="input-unit"><input id="dbgE" type="number" min="-800" max="800" step="1"><span>mV</span></div></label>
+            <label>V_WE<div class="input-unit"><input id="dbgVwe" type="number" min="100" max="2000" step="1"><span>mV</span></div></label>
+            <label>idle 处置<select id="dbgIdle"><option value="0">0 停转换（仅对照）</option><option value="1">1 持续钳位</option><option value="2">2 断开（CHI 默认）</option></select></label>
+            <label>SYS_PERIOD<select id="dbgSysper"><option value="0">0x0 · 124 ms</option><option value="1">0x1 · 242 ms</option><option value="2">0x2 · 476 ms</option><option value="3">0x3 · 945 ms</option><option value="4">0x4 · 1882 ms</option></select></label>
+            <label>电位连采<select id="dbgCellv"><option value="1">开</option><option value="0">关（A/B 用）</option></select></label>
+            <label>IOFFSET_CONV<select id="dbgIoc"><option value="0">0 信号+offset</option><option value="1">1 仅 offset</option></select></label>
+          </div>
 
-            <h3 class="dbg-h3">实时采样参数</h3>
-            <table class="dbg-table" id="dbgParams"><tbody></tbody></table>
-
-            <h3 class="dbg-h3">一次 I-t 测量</h3>
-            <div class="action-row">
-              <button class="primary" id="dbgStart">开始一次 I-t</button>
-              <button class="danger" id="dbgStop" disabled>停止</button>
-            </div>
-            <div class="action-row">
-              <button class="secondary" id="dbgGet">GET(重放状态)</button>
+          <div class="dbg-actions">
+            <div class="dbg-diff" id="dbgDiff">与设备当前配置一致</div>
+            <div class="dbg-buttons">
+              <button class="secondary" id="dbgPresetQuiet" title="慢钟 500nA + conv 0x4:积分 1875 ms · 16 bit · 50Hz 最坏 −49.3 dB · idle 0.015% · ≈0.53 SPS">预设：低噪声 500 nA / 16 bit</button>
+              <button class="secondary" id="dbgGet">重读设备状态</button>
               <button class="secondary" id="dbgOcp">测开路电位 OCP</button>
+              <button class="primary" id="dbgApply">应用并开始一次 I-t</button>
+              <button class="danger" id="dbgStop" disabled>中止</button>
             </div>
+          </div>
+          <div class="notice error" id="dbgError" hidden></div>
+          <div class="notice error" id="dbgReject" hidden></div>
 
-            <h3 class="dbg-h3">改采样参数(运行中可改)</h3>
-            <!-- 🔴 一行命令 = 一个事务。改 FSR 必须同时重算 CONV_TIME,分两条发
-                 必然经过 INVALID_CFG 中间态 —— 那正是 2026-08-09 回归的形态。 -->
-            <div class="dbg-preset">
-              <button class="secondary" id="dbgPresetQuiet">预设:慢钟 500nA + conv 0x4</button>
-              <small id="dbgPresetNote">积分 1875 ms · 16 bit · 50Hz 最坏 −49.3 dB · idle 0.015% · ≈0.53 SPS</small>
+          <div class="dbg-split">
+            <div>
+              <h3 class="dbg-h3">派生量（设备自报）</h3>
+              <table class="dbg-table" id="dbgParams"><tbody></tbody></table>
             </div>
-            <div class="field-pair">
-              <label>电流量程 FSR<select id="dbgFsr"><option value="">不改</option><option value="0">50 nA</option><option value="1">100 nA</option><option value="2">250 nA</option><option value="3">500 nA</option><option value="4">1 µA</option><option value="5">2 µA</option></select></label>
-              <label>偏置 offset<select id="dbgOff"><option value="">不改</option><option value="0">0(不推荐)</option><option value="1">10% FS</option><option value="2">20% FS</option><option value="3">50% FS</option><option value="4">9 nA</option><option value="5">19 nA</option><option value="6">40 nA</option><option value="7">80 nA</option></select></label>
+            <div>
+              <h3 class="dbg-h3">变更审计</h3>
+              <p class="dbg-audit-path" id="dbgAuditPath">尚无</p>
+              <div class="dbg-audit" id="dbgAudit"><div class="empty-history">开始测量后显示审计事件</div></div>
             </div>
-            <div class="field-pair">
-              <label>CONV_TIME<select id="dbgConv"><option value="">不改</option><option value="auto">auto(推荐)</option><option value="0">0x0 · 12bit</option><option value="1">0x1 · 13bit</option><option value="2">0x2 · 14bit</option><option value="3">0x3 · 15bit</option><option value="4">0x4 · 16bit</option><option value="5">0x5</option><option value="6">0x6</option></select></label>
-              <label>SENS_PERIOD<select id="dbgPeriod"><option value="">不改</option><option value="0">0x0 · 124 ms</option><option value="1">0x1 · 242 ms</option><option value="2">0x2 · 476 ms</option><option value="3">0x3 · 945 ms</option><option value="4">0x4 · 1882 ms</option><option value="5">0x5 · 3757 ms</option></select></label>
-            </div>
-            <div class="field-pair">
-              <label>电位 E<div class="input-unit"><input id="dbgE" type="number" min="-800" max="800" step="1" placeholder="不改"><span>mV</span></div></label>
-              <label>V_WE<div class="input-unit"><input id="dbgVwe" type="number" min="100" max="2000" step="1" placeholder="不改"><span>mV</span></div></label>
-            </div>
-            <div class="field-pair">
-              <label>idle 处置<select id="dbgIdle"><option value="">不改</option><option value="0">0 停转换(仅对照)</option><option value="1">1 持续钳位</option><option value="2">2 断开(CHI 默认)</option></select></label>
-              <label>SYS_PERIOD<select id="dbgSysper"><option value="">不改</option><option value="0">0x0 · 124 ms</option><option value="1">0x1 · 242 ms</option><option value="2">0x2 · 476 ms</option><option value="3">0x3 · 945 ms</option><option value="4">0x4 · 1882 ms</option></select></label>
-            </div>
-            <div class="field-pair">
-              <label>电位连采<select id="dbgCellv"><option value="">不改</option><option value="1">开</option><option value="0">关(A/B 用)</option></select></label>
-              <label>IOFFSET_CONV<select id="dbgIoc"><option value="">不改</option><option value="0">0 信号+offset</option><option value="1">1 仅 offset</option></select></label>
-            </div>
-            <label class="checkbox-row"><input id="dbgForce" type="checkbox"><span>FORCE(采集中允许扰动电解池,本轮会打 tainted)</span></label>
-            <div class="dbg-cmd-preview" id="dbgCmdPreview">SET</div>
-            <button class="secondary full" id="dbgSend">下发这条 SET</button>
-            <div class="notice error" id="dbgError" hidden></div>
-            <div class="notice error" id="dbgReject" hidden></div>
-
-            <h3 class="dbg-h3">变更审计</h3>
-            <p class="dbg-audit-path" id="dbgAuditPath">尚无</p>
-            <div class="dbg-audit" id="dbgAudit"><div class="empty-history">开始测量后显示审计事件</div></div>
-          </aside>
-        </div>
+          </div>
+        </section>
       </section>
     </main>
   </div>

@@ -448,11 +448,17 @@ const DBG_REJECT_HINT = {
 function renderDbgReject(r) {
   const box = $('dbgReject');
   if (!r) { box.hidden = true; return; }
-  const reason = String(r.reason || r.kind || '');
+  // 🔴 从原始整行兜底解析 reason:字段可能缺(旧固件、或别人写的 jsonl)。
+  //    缺了就退化成标题重复两遍 kind、且拿不到中文提示 —— 而原始行里明明写着。
+  //    原始行是唯一保证存在的东西,所以让它当最后依据。
+  const reason = String(r.reason || (/\breason=(\w+)/.exec(r.raw || '') || [])[1] || '');
   const hint = DBG_REJECT_HINT[reason];
   box.hidden = false;
-  box.innerHTML = `<b>${r.kind} · ${reason || '未给拒因'}</b>`
-    + (hint ? `<br>${hint(r)}` : '')
+  box.innerHTML = `<b>${r.kind}${reason ? ' · ' + reason : ' · 未给拒因'}</b>`
+    + (hint ? `<br>${hint({...r, reason,
+        a: r.a ?? (/\ba=(-?\d+)/.exec(r.raw || '') || [])[1],
+        b: r.b ?? (/\bb=(-?\d+)/.exec(r.raw || '') || [])[1],
+        key: r.key ?? (/\bkey=(\S+)/.exec(r.raw || '') || [])[1]})}` : '')
     + `<br><code style="opacity:.7">${String(r.raw || '').replace(/[<>&]/g, ch => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[ch]))}</code>`;
 }
 
@@ -461,10 +467,8 @@ function renderDebug(d) {
   const cfg = d.cfg || {}, st = d.afe_status || {}, running = d.state === 'running';
   $('dbgBadge').textContent = running ? '采集中' : d.state === 'completed' ? '已完成' : d.state === 'error' ? '错误' : '待机';
   $('dbgBadge').className = `live-badge ${running ? 'running' : d.state === 'error' ? 'error' : ''}`;
-  $('dbgStart').disabled = running;
-  $('dbgStop').disabled = !running;
   // 🔴 命令只能在测量进行中下发(RTT 下行通道由采集器持有)⇒ 不跑就禁用
-  ['dbgGet', 'dbgOcp', 'dbgPresetQuiet'].forEach(id => { $(id).disabled = !running; });
+  ['dbgGet', 'dbgOcp'].forEach(id => { $(id).disabled = !running; });
   $('dbgEpochMsg').textContent = cfg.ep == null ? 'epoch --（尚未收到 CFG_* 行）'
     : `epoch ${cfg.ep}${cfg.confirmed_ep === cfg.ep ? ' · 已确认' : ' · ⚠️ 未确认'}`
       + (cfg.conv_src ? ` · conv=${cfg.conv_src}` : '');
@@ -557,9 +561,9 @@ function renderDebug(d) {
     }</code></div>`;
   }).join('') : '<div class="empty-history">开始测量后显示审计事件</div>';
 
-  // 🔴 必须在最后:dbgSend 的可点性同时取决于 running 与"这条 SET 是否为空",
-  //    只有 dbgPreviewSet 知道后者。放前面会被每秒刷新覆盖成"可点但点了没反应"。
-  dbgPreviewSet();
+  // 🔴 顺序:先按设备值回填未 dirty 的控件,再渲染按钮与 diff
+  dbgSyncFields(cfg);
+  renderDbgApply(d);
   drawDebug();
 }
 
@@ -590,29 +594,85 @@ function drawDebug() {
       y2label: 'E = V_WE − V_RE (mV)', yDigits: 2, y2Digits: 0});
 }
 
-// 组装一条 SET —— 只带用户真正改过的键(补丁语义:未列出的键保持原值)
-function dbgComposeSet() {
-  const keys = [
-    ['fsr', 'dbgFsr'], ['off', 'dbgOff'], ['conv', 'dbgConv'], ['period', 'dbgPeriod'],
-    ['sysper', 'dbgSysper'], ['ioc', 'dbgIoc'], ['e', 'dbgE'], ['vwe', 'dbgVwe'],
-    ['idle', 'dbgIdle'], ['cellv', 'dbgCellv'],
-  ];
-  const parts = keys.filter(([, id]) => String($(id).value).trim() !== '')
-                    .map(([key, id]) => `${key}=${String($(id).value).trim()}`);
-  if (!parts.length) return '';
-  return `SET ${parts.join(' ')}${$('dbgForce').checked ? ' FORCE' : ''}`;
+// ── 统一参数面板 ───────────────────────────────────────────────────────────
+// 每个控件直接显示**设备当前生效值**;改哪个就是哪个。
+// 🔴 刻意取消"不改"这种选项:它要求用户在脑内对"设备现在是什么"做减法,
+//    而那个信息当时并不在同一个控件里。现在控件本身就是当前值。
+const DBG_FIELDS = [
+  {id: 'dbgFsr',    key: 'fsr',    from: c => String(c.fsr)},
+  {id: 'dbgOff',    key: 'off',    from: c => String(c.off)},
+  {id: 'dbgConv',   key: 'conv',   from: c => (c.conv_src === 'auto' ? 'auto' : String(c.conv))},
+  {id: 'dbgPeriod', key: 'period', from: c => String(c.period)},
+  {id: 'dbgE',      key: 'e',      from: c => String(c.e_mv)},
+  {id: 'dbgVwe',    key: 'vwe',    from: c => String(c.vwe_mv)},
+  {id: 'dbgIdle',   key: 'idle',   from: c => String(c.idle)},
+  {id: 'dbgSysper', key: 'sysper', from: c => String(c.sysper)},
+  {id: 'dbgCellv',  key: 'cellv',  from: c => String(c.cellv ? 1 : 0)},
+  {id: 'dbgIoc',    key: 'ioc',    from: c => String(c.ioc)},
+];
+// 用户动过但还没应用的控件。🔴 必须有它:1Hz 刷新会把控件写回设备值,
+// 正在选的东西会被抢掉。dirty 的字段不同步,应用成功后清空、让设备值回填 ——
+// 于是界面上看到的永远是"设备真的接受了什么",而不是"我打算改什么"。
+state.dbgDirty = new Set();
+state.dbgCfgSeen = null;
+
+function dbgSyncFields(cfg) {
+  if (cfg.fsr === undefined) return;
+  // epoch 变了 = 设备已换配置 ⇒ 丢掉全部 dirty,一切以设备为准
+  if (state.dbgCfgSeen !== cfg.ep) { state.dbgCfgSeen = cfg.ep; state.dbgDirty.clear(); }
+  DBG_FIELDS.forEach(f => {
+    if (state.dbgDirty.has(f.id)) return;
+    const want = f.from(cfg);
+    if ($(f.id).value !== want) $(f.id).value = want;
+  });
 }
-function dbgPreviewSet() {
-  const line = dbgComposeSet();
-  $('dbgCmdPreview').textContent = line || 'SET　（尚未选择任何要改的参数）';
-  $('dbgSend').disabled = !line || state.debug?.state !== 'running';
+function dbgFormCfg() {
+  const out = {};
+  DBG_FIELDS.forEach(f => { out[f.key] = String($(f.id).value).trim(); });
+  return out;
 }
+function dbgDiffKeys(cfg) {
+  if (cfg.fsr === undefined) return DBG_FIELDS.map(f => f.key);
+  return DBG_FIELDS.filter(f => String($(f.id).value).trim() !== f.from(cfg))
+                   .map(f => f.key);
+}
+// 一条 SET 带**全部**键。未变的键固件侧 plan 会自己 skip(审计行的 skipped= 就是它),
+// 所以"全带"既不会多写寄存器,也让这一行成为该 epoch 的完整快照。
+function dbgComposeSet(force) {
+  const c = dbgFormCfg();
+  const parts = DBG_FIELDS.map(f => `${f.key}=${c[f.key]}`);
+  return `SET ${parts.join(' ')}${force ? ' FORCE' : ''}`;
+}
+function renderDbgApply(d) {
+  const running = d?.state === 'running';
+  const cfg = d?.cfg || {};
+  // 🔴 还没读到设备配置时,控件里是 HTML 默认值而**不是**设备真值。
+  //    此时绝不能把表单当成"要应用的配置"下发 —— 那会把猜的值(FSR 50nA、E 空)
+  //    写进硬件。改成:这一按只起一轮,让 auto-GET 把真值读回来填表。
+  const known = cfg.fsr !== undefined;
+  const changed = known ? dbgDiffKeys(cfg) : [];
+  const btn = $('dbgApply');
+  btn.classList.toggle('warn-btn', running && changed.length > 0);
+  btn.textContent = !known ? '开始一次 I-t（先读回设备配置）'
+    : running ? (changed.length ? '应用（测量中强制改写）' : '重新下发（测量中）')
+    : '应用并开始一次 I-t';
+  btn.title = !known ? '尚未读到设备配置,本次只起一轮并读回真值,不会写任何参数'
+    : running ? '本轮正在采集:改这些参数会扰动电解池,本轮会被标 tainted,数据不得用于标定'
+    : '先把参数写进硬件,再立即开始一次 I-t 测量';
+  $('dbgStop').disabled = !running;
+  $('dbgDiff').textContent = !known
+    ? '尚未读到设备配置（控件里现在是页面默认值,不是硬件真值）'
+    : changed.length ? `将改动 ${changed.length} 项：${changed.join(' · ')}`
+    : '与设备当前配置一致';
+  $('dbgDiff').classList.toggle('changed', known && changed.length > 0);
+}
+
 async function dbgSend(line) {
   try {
     $('dbgError').hidden = true;
     await post('/api/debug/cmd', {line});
-    toast(`已下发：${line}`);
-    setTimeout(refreshDebug, 400);   // 固件回读+确认要几十 ms,等一拍再拉
+    toast(`已下发：${line.length > 60 ? line.slice(0, 60) + '…' : line}`);
+    setTimeout(refreshDebug, 500);
   } catch (e) { errorBox('dbgError', e); }
 }
 async function refreshDebug() {
@@ -626,38 +686,53 @@ $('dbgChartWindow').addEventListener('click', event => {
   state.dbgChartWindowS = button.dataset.window === 'all' ? null : Number(button.dataset.window);
   drawDebug();
 });
-['dbgFsr', 'dbgOff', 'dbgConv', 'dbgPeriod', 'dbgSysper', 'dbgIoc', 'dbgIdle', 'dbgCellv', 'dbgE', 'dbgVwe', 'dbgForce']
-  .forEach(id => $(id).addEventListener('input', dbgPreviewSet));
-$('dbgSend').addEventListener('click', () => { const line = dbgComposeSet(); if (line) void dbgSend(line); });
+DBG_FIELDS.forEach(f => $(f.id).addEventListener('input', () => {
+  state.dbgDirty.add(f.id);
+  renderDbgApply(state.debug);
+}));
 $('dbgGet').addEventListener('click', () => void dbgSend('GET'));
 $('dbgOcp').addEventListener('click', () => void dbgSend('OCP 10000'));
-// 预设:慢钟 500nA + conv 0x4。SENS_PERIOD 必须一起给到 0x4(1882ms) ——
-// 1875ms 的积分塞不进 124ms 的周期,分两条发必然经过 INVALID_CFG。
-// 🔴 预设必须**先清空所有其它字段**,否则编辑器里的残留(比如上次填的 e=-200、
-//    勾着的 FORCE)会留在预览里,而真正下发的是写死的那条 ⇒ 预览与实发不一致。
-//    "显示的和发出去的是两回事"正是这套审计机制要消灭的东西,不能自己先犯。
-//    改成:清空 → 填预设 → 由 dbgComposeSet() 生成 → 发它。预览即实发。
+// 预设:慢钟 500nA + conv 0x4。SENS_PERIOD 必须一起给到 0x4(1882ms)——
+// 1875ms 的积分塞不进 124ms,分两条发必然经过 INVALID_CFG。
+// 只填表单、不自动下发:填完让人看一眼 diff 再按「应用」。
 $('dbgPresetQuiet').addEventListener('click', () => {
-  ['dbgFsr','dbgOff','dbgConv','dbgPeriod','dbgSysper','dbgIoc','dbgE','dbgVwe','dbgIdle','dbgCellv']
-    .forEach(id => { $(id).value = ''; });
-  $('dbgForce').checked = false;
-  $('dbgFsr').value = '3';     // 500 nA ⇒ 慢钟组
-  $('dbgConv').value = '4';    // 积分 1875 ms / 16 bit / 最坏 50Hz −49.3 dB
-  $('dbgPeriod').value = '4';  // 1882 ms —— 1875ms 的积分塞不进 124ms,必须同时给
-  dbgPreviewSet();
-  const line = dbgComposeSet();
-  if (line) void dbgSend(line);
+  [['dbgFsr','3'],['dbgConv','4'],['dbgPeriod','4']].forEach(([id, v]) => {
+    $(id).value = v; state.dbgDirty.add(id);
+  });
+  renderDbgApply(state.debug);
+  toast('预设已填入表单,确认 diff 后按「应用」');
 });
-$('dbgStart').addEventListener('click', async () => {
-  try { $('dbgError').hidden = true; await post('/api/debug/start', {note: 'hw-debug'}); await refreshDebug(); }
-  catch (e) { errorBox('dbgError', e); }
+
+$('dbgApply').addEventListener('click', async () => {
+  const running = state.debug?.state === 'running';
+  const known = state.debug?.cfg?.fsr !== undefined;
+  const line = dbgComposeSet(running);   // 测量中一律带 FORCE(按钮已变黄示警)
+  try {
+    $('dbgError').hidden = true;
+    if (!running) {
+      // 🔴 次序:先起一轮,再下发参数。命令只能经采集器的下行通道走
+      //    (JLinkExe 只转发采集器持有的那个连接),没有 run 就无处可发。
+      //    而参数会落在 Quiet Time 里 —— 那时 acquiring=false,扰动键无需 FORCE、
+      //    本轮也不会被标 tainted,正好赶在记录开始之前生效。
+      await post('/api/debug/start', {note: 'hw-debug'});
+      if (!known) {
+        // 不知道设备现在是什么 ⇒ 什么都不写,只等 auto-GET 把真值读回来
+        toast('本轮已开始;正在读回设备配置…');
+        setTimeout(refreshDebug, 1500);
+        return;
+      }
+      await new Promise(r => setTimeout(r, 1200));   // 等采集器起来并接上下行
+    }
+    await post('/api/debug/cmd', {line});
+    state.dbgDirty.clear();
+    toast(running ? '已在测量中强制改写参数（本轮已标 tainted）' : '参数已下发,本轮开始');
+    setTimeout(refreshDebug, 600);
+  } catch (e) { errorBox('dbgError', e); }
 });
 $('dbgStop').addEventListener('click', async () => {
   try { await post('/api/debug/stop'); await refreshDebug(); }
   catch (e) { errorBox('dbgError', e); }
 });
-
 setInterval(refreshDebug,1000);
 window.addEventListener('resize',()=>{drawAll();drawDebug()});
-dbgPreviewSet();
 init();

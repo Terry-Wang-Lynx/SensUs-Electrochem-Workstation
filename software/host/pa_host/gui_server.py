@@ -532,8 +532,10 @@ class MeasurementController:
             self._audit_pos = 0
             self._auto_get_at = 0.0
             self._audit_cache = []
-            self._cfg_live = {}
-            self._afe_status = {}
+            # 🔴 **不清 _cfg_live / _afe_status**:它们描述的是**设备**,不是某一轮。
+            #    清掉的后果是 DEBUG 面板在两轮之间没有任何设备真值可显示,控件只能
+            #    退回 HTML 默认值(FSR 50nA、E 空)——而那时按「应用」就会把**猜的值**
+            #    写进硬件。保留上次已知值,新一轮的 auto-GET 几秒内就会刷新它。
             self._last_reject = {}
             self._dbg_cur_pos = 0
             self._dbg_cur = []
