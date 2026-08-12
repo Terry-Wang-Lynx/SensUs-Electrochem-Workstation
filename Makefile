@@ -20,6 +20,7 @@ test:
 	$(VENV_PYTHON) software/host/tests/test_it.py
 	$(VENV_PYTHON) software/host/tests/test_cv.py
 	$(VENV_PYTHON) software/host/tests/test_gui_workflow.py
+	$(VENV_PYTHON) software/host/tests/test_transient_phase.py
 	$(VENV_PYTHON) -m compileall -q software/host/pa_host
 	node --check software/host/pa_host/gui/app.js
 	node --check software/host/pa_host/gui/compact.js

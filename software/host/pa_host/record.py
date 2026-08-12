@@ -50,6 +50,12 @@ LINE_RE = re.compile(
     #    缺失时按 0(无饱和)处理 —— 对旧数据是正确的默认(当时用 SEL4,
     #    但那时电极是开路的,没有真信号,不会饱和)。
     r"(?:\s+sat=(?P<sat>\d+))?"
+    # 🔴 ep 是 2026-08-10 追加的**配置纪元**,同样做成可选尾组(旧日志继续可解析)。
+    #    为什么必须进样本行:`counts` 与 `sat` 的量纲本身随 epoch 变(sat 余量
+    #    依赖 FSR/offset),不带 epoch 的 counts 事后无法解释;而上行 RTT 是丢包
+    #    信道(NO_BLOCK_SKIP),靠"审计行 + 主机插值"会静默错归。
+    #    ⚠️ 缺失按 0 处理是**对旧数据**的正确默认;新数据里没有它 = 固件版本不对。
+    r"(?:\s+ep=(?P<ep>\d+))?"
     # CV 扫描追加逐点电位与圈数；IT 与历史日志没有这些字段。
     r"(?:\s+mv=(?P<mv>-?\d+)\s+cycle=(?P<cycle>\d+)\s+dir=(?P<direction>[+-]1))?\s*$"
 )
@@ -69,6 +75,8 @@ class Sample:
              **WE 已失恒电位控制**;bit1(2)=counts 逼近满量程:氧化方向超出 FSR−offset。
              ≠0 的样本**不是测量结果**(恒电位环开环),算 σ / 标定曲线前必须剔除。
              旧数据(2026-07-31 之前,协议无此字段)默认 0。
+    ep     : 配置纪元。同一 epoch 内的 counts 才可比;跨 epoch 只有 fa 可比。
+             只有固件打过 `CFG_CONFIRMED ep=n` 的 epoch 才可信。旧数据默认 0。
     """
 
     seq: int
@@ -79,6 +87,7 @@ class Sample:
     auto: bool
     ovf: int
     sat: int = 0
+    ep: int = 0
     potential_mv: int | None = None
     cycle: int | None = None
     direction: int | None = None
@@ -94,6 +103,7 @@ CSV_COLUMNS = [
     "auto",
     "ovf",
     "sat",  # 饱和标志位(bit0=LOW/还原吃光 offset, bit1=HIGH/氧化超量程)
+    "epoch",  # 配置纪元:该样本是在哪一版 AFE 配置下采的(见 audit.jsonl)
     "potential_mv",  # CV 实际阶梯电位；IT 为空
     "cycle",  # CV 圈数，从 1 开始；IT 为空
     "direction",  # CV 扫描方向：+1 正扫，-1 反扫；IT 为空
@@ -116,6 +126,7 @@ def parse_line(line: str) -> Sample | None:
         auto=m["auto"] == "1",
         ovf=int(m["ovf"]),
         sat=int(m["sat"]) if m["sat"] is not None else 0,
+        ep=int(m["ep"]) if m["ep"] is not None else 0,
         potential_mv=int(m["mv"]) if m["mv"] is not None else None,
         cycle=int(m["cycle"]) if m["cycle"] is not None else None,
         direction=int(m["direction"]) if m["direction"] is not None else None,
@@ -134,6 +145,7 @@ def sample_to_row(s: Sample, host_unix_s: float) -> list[str]:
         "1" if s.auto else "0",
         str(s.ovf),
         str(s.sat),
+        str(s.ep),
         "" if s.potential_mv is None else str(s.potential_mv),
         "" if s.cycle is None else str(s.cycle),
         "" if s.direction is None else str(s.direction),
@@ -148,7 +160,8 @@ def format_sample_line(s: Sample) -> str:
     )
     return (
         f"S seq={s.seq} ms={s.ms} counts={s.counts} fa={s.fa} "
-        f"tag={s.tag} auto={1 if s.auto else 0} ovf={s.ovf} sat={s.sat}{cv_fields}"
+        f"tag={s.tag} auto={1 if s.auto else 0} ovf={s.ovf} sat={s.sat} "
+        f"ep={s.ep}{cv_fields}"
     )
 
 

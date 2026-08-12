@@ -27,6 +27,15 @@
 #define MAX30131_STATUS1_EIS_CAL_DONE_Pos 3u
 #define MAX30131_STATUS1_INVALID_CFG_Pos 2u
 #define MAX30131_STATUS1_VDD_OOR_Pos 1u
+/*
+ * 🔴 PWR_RDY 的语义与名字相反(datasheet p82 原文):
+ *   "PWR_RDY is a read-only bit, and it indicates that VDD **had gone below the
+ *    UVLO Threshold (1.55V)**. This bit is not triggered by a soft reset.
+ *    This bit is cleared when STATUS 1 (register 0x00) is read or by setting SHDN."
+ * ⇒ **1 = 发生过掉压(坏),0 = 正常**。名字读起来像"电源就绪",按字面理解会把
+ *   每一次正常开机都报成故障。2026-08-10 首次实测 STATUS1=0x00 时我按字面读错过一次。
+ * ⇒ 而且它**读清**:任何读 0x00 的地方都会把它吃掉 ⇒ 必须用 sticky 累积器接。
+ */
 #define MAX30131_STATUS1_PWR_RDY_Pos 0u
 
 #define MAX30131_REG_INT_ENABLE1 0x05u
@@ -117,6 +126,69 @@
 #define MAX30131_REG_S1_IOFFSET_L 0x2Cu /* S1_IOFFSET[7:0]  */
 
 /* ------------------------------------------------------------------ */
+/* System ADC(12-bit,22 路输入;本设计只用它量 WE1 引脚电压)          */
+/* ------------------------------------------------------------------ */
+/*
+ * 用途:直接数字化 WE1 **引脚**电压,用来回答「不测量时芯片把电极放在哪个电位」——
+ * 这个问题从框图推过两次都被实验打脸(见 main.c 的两处 A/B 说明),必须实测。
+ * 依据:datasheet System ADC p64-65、寄存器 0x54-0x56 p117-119、FIFO tag Table 9 p72。
+ */
+#define MAX30131_REG_SYS_ADC_SETUP 0x54u
+#define MAX30131_SYSADC_AIN_GAIN_Pos 6u    /* [7:6] */
+#define MAX30131_SYSADC_PWR_GAIN_Pos 4u    /* [5:4] */
+#define MAX30131_SYSADC_SENSV_GAIN_Pos 2u  /* [3:2] 管 WOn/WEn/REn/CEn */
+/*
+ * 🔴 OPA_BYPASS_EN 必须保持 0。置 1 会旁路输入缓冲,datasheet 明说此时
+ * 「the signal must be able to drive a 14MΩ load」⇒ 在 WE 上等于挂了条
+ * 0.4V/14MΩ ≈ 29nA 的漏电路径,足以把我们要测的东西本身破坏掉。
+ * 缓冲使能时「the input signal loading is negligible」。
+ */
+#define MAX30131_SYSADC_OPA_BYPASS_EN_Pos 1u
+/* 增益码:00=2.0 / 01=1.0 / 10=0.5 / 11=0.25(V/V) */
+#define MAX30131_SYSADC_GAIN_2X 0x0u
+#define MAX30131_SYSADC_GAIN_1X 0x1u
+#define MAX30131_SYSADC_GAIN_0P5X 0x2u
+#define MAX30131_SYSADC_GAIN_0P25X 0x3u
+
+#define MAX30131_REG_SYS_ADC_IN_SEL1 0x55u
+/*
+ * ✅ 2026-08-11:位号已从 datasheet **位表本身**读到(p118「SYSTEM ADC IN SEL1
+ * (0x55)」的 BIT/Field 行),不再是按排版惯例推断:
+ *
+ *   BIT   7      6      5      4      3        2        1     0
+ *   Field AIN4  AIN3   AIN2   AIN1   VDD_SEL  GND_SEL   –    SYS_SELECT
+ *
+ * 🔴 **bit1 是保留位**。按"字段说明末项=LSB"顺序数会把 VDD 算成 bit2(=GND),
+ *    读回 0V 还会以为是别的毛病 —— 这是查表而非推断救回来的一次。
+ */
+#define MAX30131_SYSADC_SYS_SELECT_Pos 0u
+#define MAX30131_SYSADC_GND_SEL_Pos 2u
+#define MAX30131_SYSADC_VDD_SEL_Pos 3u
+
+#define MAX30131_REG_SYS_ADC_IN_SEL2 0x56u
+#define MAX30131_SYSADC_S1_CE_SEL_Pos 0u
+#define MAX30131_SYSADC_S1_RE_SEL_Pos 1u
+#define MAX30131_SYSADC_S1_WE_SEL_Pos 2u /* ← 我们要的那一位 */
+#define MAX30131_SYSADC_S1_WO_SEL_Pos 3u
+
+/* FIFO tag(Table 9 p72–73,8-bit tag 分支,数据在 bits[11:0]) */
+#define MAX30131_FIFO_TAG_S1_WO_V 0xD0u
+#define MAX30131_FIFO_TAG_S1_WE_V 0xD1u
+#define MAX30131_FIFO_TAG_S1_RE_V 0xD2u
+#define MAX30131_FIFO_TAG_S1_CE_V 0xD3u
+/*
+ * 0xE0 = VDD supply voltage(Table 9 p73 原文:"VDD supply voltage /
+ * AUTO, 8'hE0, VDD_ADC_DATA[11:0]")。0xE1 = Ground reference。
+ *
+ * 🔴 VDD 走的是 **SYS_PWR_GAIN**(0x54 [5:4]),与 WE/RE/CE/WO 的
+ *    SYS_SENSV_GAIN 是**两路独立增益**(p65 Figure 23)。VDD≈3.3V 远超
+ *    VREF=1.536V,必须用 0.25× 才在量程内(满量程 6.144V,LSB 1.5mV);
+ *    拿 SENSV 的增益去换算 VDD 会得到一个偏 4 倍的假数字。
+ */
+#define MAX30131_FIFO_TAG_VDD 0xE0u
+#define MAX30131_FIFO_TAG_GND 0xE1u
+
+/* ------------------------------------------------------------------ */
 /* 极化 DAC(单通道版只有 DACA/DACB)                                    */
 /* ------------------------------------------------------------------ */
 /*
@@ -170,6 +242,15 @@
 /* 转换控制                                                            */
 /* ------------------------------------------------------------------ */
 #define MAX30131_REG_CONVERT_SETUP1 0x80u
+
+/*
+ * 0x81 CONVERT SETUP2:TEMP_PERIOD[7:4] + SYS_PERIOD[3:0](p142)。
+ * 码表与 SENS_PERIOD 同一张:0x0=124ms / 0x1=242 / 0x2=476 / 0x3=945 / 0x4=1882 …
+ * TEMP_SELECT(0x60)本设计不开,所以 TEMP_PERIOD 取什么都无所谓,留 0。
+ */
+#define MAX30131_REG_CONVERT_SETUP2 0x81u
+#define MAX30131_CS2_SYS_PERIOD_Pos 0u  /* [3:0] */
+#define MAX30131_CS2_TEMP_PERIOD_Pos 4u /* [7:4] */
 #define MAX30131_CS1_SENS_PERIOD_Pos 0u   /* [3:0] */
 #define MAX30131_CS1_SYS_CONV_TYPE_Pos 4u
 #define MAX30131_CS1_IOFFSET_CONV_Pos 5u  /* [6:5] */
@@ -179,7 +260,18 @@
 #define MAX30131_CSTART_CONVERT_Pos 0u
 #define MAX30131_CSTART_AUTO_Pos 1u
 
+/*
+ * INTB SETUP(p149):bit2 = EN_VDD_OOR,bit[1:0] = INTB_OCFG。**复位值 EN_VDD_OOR=0**。
+ * 🔴 p82:"To enable VDD_OOR functionality, both EN_VDD_OOR (0x95) and REF_EN (0x68)
+ *   must be set to 1 (enabled); **otherwise, VDD_OOR is always set to 0**."
+ * ⇒ 不写这个寄存器,STATUS1.VDD_OOR 恒为 0 —— 那个"掉压监测"是**死的**。
+ *   本项目 2026-08-10 之前一直没写它,所以之前所有"VDD_OOR=0"都不构成证据。
+ * INTB_OCFG 取 0x0(open-drain)—— 本板 INTB 悬空,选开漏保证它永不驱动。
+ */
 #define MAX30131_REG_INTB_SETUP 0x95u
+#define MAX30131_INTB_EN_VDD_OOR_Pos 2u
+#define MAX30131_INTB_OCFG_Pos 0u
+#define MAX30131_INTB_OCFG_OPEN_DR 0u
 
 /* ------------------------------------------------------------------ */
 /* ID                                                                  */

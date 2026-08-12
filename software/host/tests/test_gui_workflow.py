@@ -117,7 +117,7 @@ def test_it_step_settings_keep_initial_and_target_potentials_distinct() -> None:
     assert SettingsController.same_analysis_protocol(settings, continuously_held)
 
 
-def test_it_positive_400mv_uses_high_common_mode_without_changing_legacy_conditions() -> None:
+def test_it_uses_verified_1200mv_common_mode_across_supported_potentials() -> None:
     legacy = SettingsController.validate({
         "initial_potential_v": 0.2,
         "potential_v": 0.2,
@@ -127,8 +127,21 @@ def test_it_positive_400mv_uses_high_common_mode_without_changing_legacy_conditi
         "potential_v": 0.4,
     })
 
-    assert SettingsController.working_electrode_mv(legacy) == 400
-    assert SettingsController.working_electrode_mv(near_rail) == 800
+    assert SettingsController.working_electrode_mv(legacy) == 1200
+    assert SettingsController.working_electrode_mv(near_rail) == 1200
+
+
+def test_default_it_method_matches_archived_180_second_protocol() -> None:
+    settings = SettingsController.validate({})
+
+    assert settings["method"] == "it"
+    assert settings["potential_v"] == 0.2
+    assert settings["duration_s"] == 180.0
+    assert settings["target_rate_hz"] == 10.0
+    assert settings["fit_window_s"] == 20.0
+    assert settings["fsr_nA"] == 2000
+    assert settings["offset_mode"] == "10pct"
+    assert settings["offset_nA"] == 200
 
 
 def test_live_cv_data_reader_only_appends_new_complete_rows() -> None:
@@ -211,3 +224,52 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"  FAIL {name}: {exc}")
     raise SystemExit(1 if failures else 0)
+
+
+def test_debug_run_never_touches_the_calibration_workspace() -> None:
+    """🔴 硬件 DEBUG 轮必须完全不进标定工作区。
+
+    为什么值得一个测试:调参数时会随手跑很多轮,若它们进了
+    measurement-index.csv 与标定点集合,污染要等到下次拟合曲线时才暴露,
+    那时已经分不清哪几行是调试轮。这条断言把"不污染"从约定变成机器保证。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "ws"
+        app._load_workspace()
+        before = sorted(p.name for p in app.save_dir.glob("*")) \
+            if app.save_dir.exists() else []
+
+        app._measurement_completed({
+            "run_id": "it_debug", "state": "completed",
+            "finished_at": 1.0, "run_dir": "/tmp/x", "raw_path": "/tmp/x/raw.csv",
+            "metadata": {"debug": True, "sample_name": "hw-debug",
+                         "sample_role": "test"},
+            "summary": {"steady_current_nA": -8.6},
+        })
+
+        after = sorted(p.name for p in app.save_dir.glob("*")) \
+            if app.save_dir.exists() else []
+        assert after == before, f"debug 轮写了文件:{set(after) - set(before)}"
+        assert app.point_records == [], "debug 轮不该产生标定点"
+        result = app.measurement.snapshot()["workflow_result"]
+        assert result is not None and result["debug"] is True
+        assert result.get("predicted_concentration_um") is None
+
+
+def test_debug_command_line_is_validated_before_reaching_the_firmware() -> None:
+    """超长/多行命令在上位机就挡掉 —— 固件侧只会回一条 too_long,不如这里说清。"""
+    app = AppState()
+    ctrl = app.measurement
+    ctrl.state = "running"
+    ctrl.cmd_path = Path(tempfile.mkdtemp()) / "cmd.txt"
+    ctrl.send_command("SET fsr=2 off=4")
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == "SET fsr=2 off=4\n"
+    for bad in ("", "   ", "SET a=1\nSTART", "SET " + "x" * 200):
+        try:
+            ctrl.send_command(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"应当拒绝:{bad[:30]!r}")
+    # 拒绝的命令一条都不许落进命令文件(否则固件会真的执行它)
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == "SET fsr=2 off=4\n"

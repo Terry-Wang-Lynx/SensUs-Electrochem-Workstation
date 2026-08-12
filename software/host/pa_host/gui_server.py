@@ -15,10 +15,13 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -41,7 +44,14 @@ from .it import (
     save_summary,
     summarize_run,
 )
-from .collect import find_rtt_address
+from .collect import (
+    DEVICE as JLINK_DEVICE,
+    JLINK_EXE,
+    OPENOCD_EXE,
+    OPENOCD_SCRIPTS,
+    SPEED_KHZ as JLINK_SPEED_KHZ,
+    find_rtt_address,
+)
 from .cv import (
     export_cv_csv,
     load_cv_run,
@@ -79,6 +89,99 @@ SETTINGS_PATH = PROJECT_DIR / "measurements" / "gui_settings.json"
 WORKFLOW_PATH = PROJECT_DIR / "measurements" / "gui_workflow.json"
 DEFAULT_SAVE_DIR = PROJECT_DIR / "measurements" / "experiment_data"
 JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "29734569")
+NCS_VENV_ACTIVATE = Path(
+    os.environ.get("SENSUS_NCS_VENV_ACTIVATE", "~/ncs/.venv/bin/activate")
+).expanduser()
+
+# ── 两相测量:还原瞬态 → 过零 → 氧化稳态 ────────────────────────────────
+# 工作点 E=+200mV 驱动**氧化**,所以稳态电流走器件的原生方向(流出 WE),
+# 不受 offset 天花板约束。但复位会把恒电位仪关掉、电极被放生漂到开路电位,
+# 而实测 OCP 比 +200mV 更正 ⇒ 重新加上 +200mV 是一次**向下**阶跃 ⇒ 起始瞬态
+# 是**还原**方向、实测起点 ≥500nA。还原方向的可测上限就是 offset 本身
+# (datasheet p41),所以两个相位要的 offset 恰好相反:
+#   瞬态期:offset 必须大(否则撞轨 ⇒ 电极根本不在 +200mV,那段数据条件是错的)
+#   测量期:offset 必须小(它只是白占量程 + 白加绝对容差)
+# 复位会重新制造瞬态,所以"改 offset 必须重烧"曾让这两件事无法同时满足;
+# 方案 C 的 RANGE 命令在线切档打破了这个循环。详见
+# docs/troubleshooting/electrochem-workstation-烧录与rtt取数.md §14。
+MEAS_FSR_CODE = 2        # 250nA:增益 max ±1%(trimmed 档)、慢钟组、天花板 240nA
+MEAS_OFFSET_SEL = 4      # SEL4 = 9nA 绝对档,容差 7–11nA(±2nA,对比 50%FS 的 ±50nA)
+SETTLE_WINDOW_S = 20.0   # 漂移速率的拟合窗口,与 FIT_WINDOW_S 取数窗口一致
+SETTLE_DRIFT_PA_S = 20.0 # 建议阈值,仅作提示;真正的判据交给人看数字
+
+
+def _transient_phase(times: list[float], currents: list[float],
+                     valid: list[bool]) -> dict[str, Any]:
+    """判断当前处于还原瞬态还是氧化稳态,并给出末窗漂移速率。
+
+    符号约定:``currents`` 是固件换算出的**还原电流**(nA),>0 = 还原
+    (非原生方向,受 offset 天花板限制),<0 = 氧化(原生方向)。
+
+    过零判据刻意取"**最后一个非负样本之后**",而不是"第一次过零" ——
+    实测 r12 在零附近来回穿了 25 次,取首次会早报 ~7s。
+    """
+    n = len(times)
+    if n == 0:
+        return {"phase": "idle", "n": 0}
+    last_nonneg = -1
+    for i in range(n - 1, -1, -1):
+        if currents[i] >= 0.0:
+            last_nonneg = i
+            break
+    if last_nonneg == n - 1:
+        phase = "reduction"            # 末点仍在还原侧,瞬态未结束
+        crossed_at = None
+    else:
+        phase = "oxidation"
+        crossed_at = times[last_nonneg + 1] if last_nonneg >= 0 else times[0]
+
+    # 末窗最小二乘斜率(pA/s)。纯 python:这里不值得为 5 行拟合引 numpy。
+    t_end = times[-1]
+    win_idx = [i for i in range(n) if times[i] >= t_end - SETTLE_WINDOW_S]
+    win = [(times[i], currents[i]) for i in win_idx if valid[i]]
+    # 末窗里只要还有撞轨样本,就说明电位控制在这段时间内失过效 ⇒ 不许算"已稳定"。
+    # (实测 r10:全程 59% 撞轨,末段却已平静 —— 只看斜率会把它判成可切档。)
+    win_railed = sum(1 for i in win_idx if not valid[i])
+    drift_pa_s: float | None = None
+    if len(win) >= 4:
+        m = len(win)
+        sx = sum(p[0] for p in win)
+        sy = sum(p[1] for p in win)
+        sxx = sum(p[0] * p[0] for p in win)
+        sxy = sum(p[0] * p[1] for p in win)
+        den = m * sxx - sx * sx
+        if den > 0:
+            # nA/s → pA/s;再取负号,让"氧化电流在长大"显示为正的漂移量级
+            drift_pa_s = -(m * sxy - sx * sy) / den * 1000.0
+    railed = sum(1 for v in valid if not v)
+    return {
+        "phase": phase,
+        "n": n,
+        "crossed_at_s": crossed_at,
+        "since_cross_s": (t_end - crossed_at) if crossed_at is not None else None,
+        "elapsed_s": t_end,
+        "drift_pa_s": drift_pa_s,
+        "drift_threshold_pa_s": SETTLE_DRIFT_PA_S,
+        "railed_samples": railed,
+        "railed_frac": railed / n,
+        "window_railed": win_railed,
+        # ready 只是"这几个提示条件都满足",不是"数据一定可信" —— 20pA/s 是我拍的,
+        # 真正该看的是 drift_pa_s 本身相对你信号大小的占比。
+        "ready": bool(phase == "oxidation" and drift_pa_s is not None
+                      and abs(drift_pa_s) <= SETTLE_DRIFT_PA_S
+                      and win_railed == 0),
+    }
+
+
+def ncs_venv_prefix() -> str:
+    """``source <ncs venv>/bin/activate && `` 前缀,venv 不存在时返回空串。
+
+    west 不在系统 PATH 上而在 NCS 的 venv 内;返回空串是为了兼容 west 已在
+    PATH 上的机器(以及 CI),此时让 west 自己去报错,而不是先报 activate 缺失。
+    """
+    if not NCS_VENV_ACTIVATE.exists():
+        return ""
+    return f"source {shlex.quote(str(NCS_VENV_ACTIVATE))} && "
 FSR_OPTIONS = {
     50: "MAX30131_FSR_50NA",
     100: "MAX30131_FSR_100NA",
@@ -167,9 +270,9 @@ class SettingsController:
         "target_rate_hz": 10.0,
         "sens_period_code": 0,
         "fit_window_s": 20.0,
-        "fsr_nA": 40000,
-        "offset_nA": 20000,
-        "offset_mode": "50pct",
+        "fsr_nA": 2000,
+        "offset_nA": 200,
+        "offset_mode": "10pct",
         "cv_low_v": -0.6,
         "cv_high_v": 0.6,
         "cv_scan_rate_v_s": 0.05,
@@ -213,6 +316,63 @@ class SettingsController:
         if not FIRMWARE_HEX.exists():
             return ""
         return hashlib.sha256(FIRMWARE_HEX.read_bytes()).hexdigest()
+
+    @staticmethod
+    def _flash_firmware() -> None:
+        """用可用的 SWD 后端把 hex 烧进片子并校验。
+
+        Homebrew 的默认 openocd 没有编入 jlink 驱动；本机的用户级
+        OpenOCD 显式启用 libjaylink，并已通过连接、写入、verify 三项硬件
+        检查。旧的 JLinkExe V8.80 仍是第一优先级；它随 CubeIDE 缺失时
+        才走 OpenOCD 回退。
+
+        两种后端都必须检查各自的写入和校验成功标记，不只看进程退出码。
+        """
+        if not JLINK_EXE.exists():
+            if not OPENOCD_EXE.exists():
+                raise RuntimeError(
+                    f"既找不到 JLinkExe({JLINK_EXE})，也找不到 OpenOCD"
+                )
+            done = subprocess.run(
+                [
+                    str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+                    "-f", "interface/jlink.cfg", "-c", "transport select swd",
+                    "-f", "target/nrf52.cfg",
+                    "-c", f"adapter serial {JLINK_SERIAL}",
+                    "-c", f"adapter speed {JLINK_SPEED_KHZ}",
+                    "-c", f"program {FIRMWARE_HEX} verify reset exit",
+                ],
+                cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+            )
+            blob = f"{done.stdout}\n{done.stderr}"
+            if "Programming Finished" not in blob or "Verified OK" not in blob:
+                tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
+                raise RuntimeError("OpenOCD 烧录未确认成功:" + " | ".join(tail))
+            return
+
+        script = f"loadfile {FIRMWARE_HEX}\nr\ng\nq\n"
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jlink", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(script)
+            script_path = Path(handle.name)
+        try:
+            done = subprocess.run(
+                [
+                    str(JLINK_EXE), "-device", JLINK_DEVICE, "-if", "SWD",
+                    "-speed", str(JLINK_SPEED_KHZ), "-autoconnect", "1",
+                    "-NoGui", "1", "-ExitOnError", "1",
+                    "-SelectEmuBySN", JLINK_SERIAL,
+                    "-CommanderScript", str(script_path),
+                ],
+                cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+            )
+        finally:
+            script_path.unlink(missing_ok=True)
+        blob = f"{done.stdout}\n{done.stderr}"
+        if "O.K." not in blob or "Script processing completed." not in blob:
+            tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
+            raise RuntimeError("JLinkExe 烧录未确认成功:" + " | ".join(tail))
 
     @staticmethod
     def same_analysis_protocol(first: dict[str, Any], second: dict[str, Any]) -> bool:
@@ -329,14 +489,8 @@ class SettingsController:
 
     @staticmethod
     def working_electrode_mv(settings: dict[str, Any]) -> int:
-        """Keep legacy I-T common mode unless a positive rail margin is needed."""
-        if settings["method"] == "cv":
-            return 800
-        highest_potential_mv = max(
-            int(round(settings["initial_potential_v"] * 1000)),
-            int(round(settings["potential_v"] * 1000)),
-        )
-        return 800 if highest_potential_mv > 390 else 400
+        """Use the debug branch's verified DC common mode."""
+        return 1200
 
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         settings = self.validate(payload)
@@ -361,6 +515,7 @@ class SettingsController:
             "/* Generated by the local electrochemistry workstation. */\n"
             f"#define GUI_MEASUREMENT_MODE_CV {1 if settings['method'] == 'cv' else 0}\n"
             f"#define GUI_WP_V_WE_MV {working_electrode_mv}\n"
+            "#define GUI_CV_V_WE_MV 800\n"
             f"#define GUI_WP_FSR {FSR_OPTIONS.get(settings['fsr_nA'], 'MAX30131_FSR_2000NA')}\n"
             f"#define GUI_WP_OFFSET_SEL {OFFSET_OPTIONS[settings['offset_mode']][0]}\n"
             f"#define GUI_IT_USE_EIS {1 if settings['fsr_nA'] in IT_WIDE_FSR_OPTIONS else 0}\n"
@@ -385,7 +540,13 @@ class SettingsController:
         try:
             _release_stale_measurement_bridge()
             FIRMWARE_CONFIG.write_text(header)
+            # 🔴 west 装在 NCS 自己的 venv 里(默认 ~/ncs/.venv/bin/west)。
+            #    `zephyr-env.sh` 只把 $ZEPHYR_BASE/scripts 塞进 PATH,**不激活该 venv**
+            #    ⇒ 不先激活就是 `zsh:1: command not found: west`,按钮看起来"没反应"
+            #    (失败 <1s,label 闪一下就弹回去)。2026-08-09 实测确认。
+            #    只在这个子 shell 里激活:NCS venv 与本工作站 venv 依赖冲突,不可合并。
             build = (
+                f"{ncs_venv_prefix()}"
                 "source ~/ncs/zephyr/zephyr-env.sh && "
                 "west build -b pa_converter_v40 -d software/firmware/build "
                 "software/firmware -- -DBOARD_ROOT=$PWD/software/firmware "
@@ -395,19 +556,15 @@ class SettingsController:
                 ["/bin/zsh", "-lc", build], cwd=PROJECT_DIR,
                 check=True, capture_output=True, text=True,
             )
-            subprocess.run([
-                "openocd", "-f", "interface/jlink.cfg",
-                "-c", f"adapter serial {JLINK_SERIAL}",
-                "-c", "transport select swd",
-                "-f", "target/nrf52.cfg",
-                "-c", f"program {FIRMWARE_HEX} verify reset exit",
-            ], cwd=PROJECT_DIR, check=True, capture_output=True, text=True)
+            self._flash_firmware()
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps({
                 "settings": settings,
                 "firmware_sha256": self._firmware_hash(),
             }, indent=2, ensure_ascii=False))
-        except (subprocess.CalledProcessError, OSError) as exc:
+        # RuntimeError:_flash_firmware() 的「exit 0 但没烧成」判据会抛它,
+        # 不接住的话会变成未处理 500,state 停在 "applying",前端只能看到通用错误。
+        except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
             output = getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or str(exc)
             detail = output.strip().splitlines()
             with self.lock:
@@ -469,6 +626,35 @@ class MeasurementController:
         self.started_at: float | None = None
         self.finished_at: float | None = None
         self.process: subprocess.Popen[str] | None = None
+        self.cmd_path: Path | None = None   # 方案 C:在线切档命令文件
+        self.cell_v_path: Path | None = None  # 电极电压连采 CSV(与电流不同速率)
+        self.audit_path: Path | None = None   # 配置变更审计 jsonl(每次改参数留痕)
+        # DEBUG 页的增量读状态。全部按"读位置 + 累积列表"做 ⇒ 1Hz 刷新不随
+        # 文件增长变慢(一轮 180s 就上千行,全量重读会明显卡)。
+        self._audit_pos = 0
+        self._auto_get_at = 0.0
+        self._audit_cache: list[dict[str, Any]] = []
+        self._cfg_live: dict[str, Any] = {}
+        self._afe_status: dict[str, Any] = {}
+        self._last_reject: dict[str, Any] = {}
+        self._phase: dict[str, Any] = {}
+        self._dbg_cur_pos = 0
+        self._dbg_cur: list[dict[str, Any]] = []
+        self._dbg_cur_hdr: list[str] | None = None
+        self._dbg_cv_pos = 0
+        self._dbg_cv: list[dict[str, Any]] = []
+        self._dbg_cv_hdr: list[str] | None = None
+        # 方案 C:运行时档位真值。**不能用 SettingsController 的值代替** ——
+        # 那是"最后一次烧录进去的编译期默认",而 RANGE 命令会在运行中改掉它,
+        # 两者可以不一致。唯一权威来源是固件回的 RANGE_APPLIED 行。
+        self.range_runtime: dict[str, Any] = {
+            "pending": None, "applied": None, "rejected": None, "at": None,
+        }
+        self._rtt_pos = 0
+        # 两相测量:过零并稳定后切到测量档。默认**手动** —— 自动切档会往数据里
+        # 注入一个跨档直流台阶(§13b 实测 +22.9nA),这一步该由人点。
+        self.auto_switch_meas = False
+        self._auto_switch_done = False
         self.summary: dict[str, Any] | None = None
         self.workflow_result: dict[str, Any] | None = None
         self.thread: threading.Thread | None = None
@@ -508,6 +694,32 @@ class MeasurementController:
             self.raw_path = Path(live_raw_path) if live_raw_path else self.run_dir / "raw.csv"
             self.raw_path.parent.mkdir(parents=True, exist_ok=True)
             self.raw_log = self.run_dir / "rtt.log"
+            self.cmd_path = self.run_dir / "cmd.txt"
+            self.cell_v_path = self.run_dir / "cellv.csv"
+            # 🔴 审计与 CSV **同目录同 run_id** —— 用户要的"每次测量都要出 csv 和
+            #    对应的操作审计日志"就是靠这个绑定,不靠时间戳事后猜。
+            self.audit_path = self.run_dir / "audit.jsonl"
+            # 🔴 新一轮必须清缓存与读位置 —— 不清会把上一轮的审计与曲线接在
+            #    这一轮后面(文件换了,读位置却没归零 ⇒ 直接读到文件尾之外)。
+            self._audit_pos = 0
+            self._auto_get_at = 0.0
+            self._audit_cache = []
+            # 🔴 **不清 _cfg_live / _afe_status**:它们描述的是**设备**,不是某一轮。
+            #    清掉的后果是 DEBUG 面板在两轮之间没有任何设备真值可显示,控件只能
+            #    退回 HTML 默认值(FSR 50nA、E 空)——而那时按「应用」就会把**猜的值**
+            #    写进硬件。保留上次已知值,新一轮的 auto-GET 几秒内就会刷新它。
+            self._last_reject = {}
+            self._phase = {}          # 阶段是**本轮**的属性,新一轮必须清
+            self._dbg_cur_pos = 0
+            self._dbg_cur = []
+            self._dbg_cur_hdr = None
+            self._dbg_cv_pos = 0
+            self._dbg_cv = []
+            self._dbg_cv_hdr = None
+            self.range_runtime = {"pending": None, "applied": None,
+                                  "rejected": None, "at": None}
+            self._rtt_pos = 0
+            self._auto_switch_done = False
             self.resampled_path = self.run_dir / (
                 "cv.csv" if method == "cv" else "resampled_10hz.csv"
             )
@@ -534,8 +746,23 @@ class MeasurementController:
                 "-m",
                 "pa_host.it_tool",
                 "measure",
-                "--socket",
-                "127.0.0.1:19021",
+                # 让 collector 持有唯一的 RTT 桥:有 V8.80 时优先 JLinkExe;
+                #    CubeIDE 缺失时自动回退到启用 libjaylink 的 OpenOCD。
+                #    两者都负责指定 RTT 控制块，RTT 仍出在 telnet 19021,
+                #    并且 finally 里有 terminate/wait/kill 的完整回收(禁 pkill)。
+                "--start-jlink",
+                "--elf",
+                str(FIRMWARE_ELF),
+                "--probe-serial",
+                JLINK_SERIAL,
+                # 方案 C:命令文件。外部另开 telnet 连接写下行**无效**
+                # (JLinkExe 只转发采集器持有的那个连接)⇒ 必须走这个文件。
+                "--cell-v",
+                str(self.cell_v_path),
+                "--audit",
+                str(self.audit_path),
+                "--cmd-file",
+                str(self.cmd_path),
                 "--out",
                 str(self.raw_path),
                 "--raw-log",
@@ -551,7 +778,6 @@ class MeasurementController:
                 command.append("--cv")
             log_handle = (self.run_dir / "collector.log").open("w", buffering=1)
             try:
-                self._start_bridge()
                 self.process = subprocess.Popen(
                     command,
                     cwd=PROJECT_DIR,
@@ -559,6 +785,13 @@ class MeasurementController:
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    # 🔴 自成进程组:进程树是
+                    #      gui_server → it_tool → pa_host.collect → JLinkExe
+                    #    只 terminate 第一层(it_tool)的话,孙进程 collect 与曾孙
+                    #    JLinkExe 都活下来,**并且不会因 idle-timeout 自愈**
+                    #    (2026-08-09 实测:停止 60s 后两者仍在跑、19021 仍被占,
+                    #    下一次烧录/测量就会撞上探头被占)。有了进程组才能整棵收掉。
+                    start_new_session=True,
                 )
             except Exception:
                 log_handle.close()
@@ -570,53 +803,14 @@ class MeasurementController:
             self.thread.start()
             return self.snapshot()
 
-    def _start_bridge(self) -> None:
-        assert self.run_dir is not None
-        rtt_address = find_rtt_address(FIRMWARE_ELF)
-        self.bridge_log_handle = (self.run_dir / "openocd.log").open("w", buffering=1)
-        command = [
-            "openocd", "-f", "interface/jlink.cfg",
-            "-c", f"adapter serial {JLINK_SERIAL}",
-            "-c", "transport select swd",
-            "-c", "adapter speed 4000",
-            "-f", "target/nrf52.cfg",
-            "-c", "init",
-            "-c", f'rtt setup 0x{rtt_address:08x} 0x800 "SEGGER RTT"',
-            "-c", "rtt server start 19021 0",
-        ]
-        self.bridge_process = subprocess.Popen(
-            command, cwd=PROJECT_DIR, stdout=self.bridge_log_handle,
-            stderr=subprocess.STDOUT, text=True,
-        )
-        deadline = time.monotonic() + 12
-        while time.monotonic() < deadline:
-            if self.bridge_process.poll() is not None:
-                raise RuntimeError("OpenOCD 硬件桥启动失败")
-            try:
-                with socket.create_connection(("127.0.0.1", 4444), timeout=0.4):
-                    break
-            except OSError:
-                time.sleep(0.2)
-        else:
-            raise RuntimeError("等待 OpenOCD 硬件桥超时")
-        self._openocd_telnet(
-			'rtt stop\n'
-			f'rtt setup 0x{rtt_address:08x} 0x800 "SEGGER RTT"\n'
-			'rtt start\nexit\n'
-        )
-
-    @staticmethod
-    def _openocd_telnet(commands: str) -> None:
-        with socket.create_connection(("127.0.0.1", 4444), timeout=3) as connection:
-            connection.sendall(commands.encode("ascii"))
-            connection.settimeout(0.4)
-            try:
-                while connection.recv(4096):
-                    pass
-            except (TimeoutError, socket.timeout):
-                pass
-
     def _stop_bridge(self) -> None:
+        """收掉硬件桥子进程。
+
+        🔴 2026-08-09 起本类不再自己起桥(collector 用 `--start-jlink` 自己持有
+        JLinkExe,见 start() 里的注释),`bridge_process` 恒为 None ⇒ 本方法实际是
+        no-op。保留是因为 start()/stop()/_watch() 三处的清理路径都调它,留着比
+        删掉三处调用更不容易出错;若将来又需要外部桥,这里是唯一的挂载点。
+        """
         process = self.bridge_process
         if process is not None and process.poll() is None:
             process.terminate()
@@ -640,7 +834,7 @@ class MeasurementController:
                 with socket.create_connection(("127.0.0.1", 19021), timeout=1) as conn:
                     conn.sendall(b"STOP\n")
             except OSError:
-                process.terminate()
+                self._terminate_tree(process)
             else:
                 threading.Thread(
                     target=self._terminate_if_running,
@@ -648,19 +842,301 @@ class MeasurementController:
                 ).start()
             return self.snapshot()
 
+    def send_range(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """方案 C:测量进行中在线切换 FSR / offset 档,**不复位、不中断极化**。
+
+        为什么必须经采集器的命令文件:JLinkExe 的 RTT telnet 只把采集器持有的
+        那个连接的输入送进下行通道,另开连接写命令目标端收不到(2026-08-09 实测)。
+        """
+        with self.lock:
+            if self.state != "running" or self.cmd_path is None:
+                raise RuntimeError("只有测量进行中才能在线切档")
+            fsr = int(payload["fsr_code"])
+            sel = int(payload["offset_sel"])
+            if not (0 <= fsr <= 5) or not (0 <= sel <= 7):
+                raise ValueError("fsr_code 需 0–5(50n/100n/250n/500n/1µ/2µ),"
+                                 "offset_sel 需 0–7(0/10%/20%/50%FS,9/19/40/80nA)")
+            line = f"RANGE {fsr} {sel}"
+            with self.cmd_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            self.range_runtime = {**self.range_runtime, "pending": line,
+                                  "rejected": None, "at": time.time()}
+            return _json_safe({"sent": line, "cmd_file": str(self.cmd_path),
+                               "note": "固件会回 RANGE_APPLIED / RANGE_REJECT,见 rtt.log"})
+
+    # ------------------------------------------------------------------
+    # 硬件 DEBUG 模式
+    # ------------------------------------------------------------------
+    def send_command(self, line: str) -> dict[str, Any]:
+        """下发任意一行命令。send_range() 是它的一个特例。
+
+        🔴 同样必须经采集器的命令文件 —— JLinkExe 的 RTT telnet 只把**采集器持有
+        的那个连接**的输入送进下行通道,另开 telnet 写命令目标端收不到
+        (2026-08-09 实测)。所以"没有测量在跑"时无处可发,只能拒绝。
+        """
+        line = line.strip()
+        if not line:
+            raise ValueError("命令为空")
+        if "\n" in line or "\r" in line:
+            raise ValueError("一行一条命令,不许含换行")
+        if len(line) >= 128:
+            # 与固件 AFE_CFG_LINE_MAX 同口径:超长在固件侧只会被拒,不如在这里挡
+            raise ValueError(f"命令过长({len(line)} ≥ 128 字符)")
+        with self.lock:
+            if self.state != "running" or self.cmd_path is None:
+                raise RuntimeError("命令只能在测量进行中下发(RTT 下行通道由采集器持有)")
+            with self.cmd_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            if line.startswith(("RANGE ", "SET ")):
+                self.range_runtime = {**self.range_runtime, "pending": line,
+                                      "rejected": None, "at": time.time()}
+            return _json_safe({"sent": line, "cmd_file": str(self.cmd_path)})
+
+    def _audit_events(self, limit: int = 60) -> list[dict[str, Any]]:
+        """读 audit.jsonl 的尾部。增量读:只从上次位置往后追加,不全量重读。"""
+        path = self.audit_path
+        if path is None or not path.exists():
+            return []
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(self._audit_pos)
+                fresh = fh.read()
+                self._audit_pos = fh.tell()
+        except OSError:
+            return self._audit_cache[-limit:]
+        for raw in fresh.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            self._audit_cache.append(event)
+            kind = event.get("kind")
+            if kind in ("CFG_APPLIED", "CFG_DERIVED", "CFG_BOOT"):
+                self._cfg_live.update({k: v for k, v in event.items()
+                                       if k not in ("raw", "kind")})
+            elif kind == "CFG_CONFIRMED":
+                self._cfg_live.update({k: v for k, v in event.items()
+                                       if k not in ("raw", "kind")})
+                self._cfg_live["confirmed_ep"] = event.get("ep")
+            elif kind == "AFE_STATUS":
+                self._afe_status = {k: v for k, v in event.items() if k != "kind"}
+            elif kind == "IT_PHASE":
+                self._phase = {k: v for k, v in event.items() if k != "kind"}
+            elif kind in ("CFG_REJECT", "CFG_FAULT", "CFG_ROLLBACK", "OCP_REJECT",
+                          "RANGE_REJECT"):
+                # 🔴 拒因必须摆到显眼处。埋在滚动日志尾部时,用户看到的是
+                #    "我点了下发,然后什么都没发生" —— 那和命令没送达同形。
+                self._last_reject = {k: v for k, v in event.items() if k != "kind"}
+                self._last_reject["kind"] = kind
+        # 只保留尾部,长跑不无限膨胀
+        if len(self._audit_cache) > 400:
+            del self._audit_cache[:-400]
+        return self._audit_cache[-limit:]
+
+    def _read_kv_csv(self, path: Path | None, pos_attr: str, cache_attr: str,
+                     wanted: tuple[str, ...]) -> list[dict[str, Any]]:
+        """增量读一个带表头的 CSV,只留 `wanted` 里的列。
+
+        为什么要增量:DEBUG 页 1Hz 刷新,一轮 180s 就是上千行;每次全量重读会
+        随时间线性变慢,长跑时界面明显卡顿。
+        """
+        cache: list[dict[str, Any]] = getattr(self, cache_attr)
+        if path is None or not path.exists():
+            return cache
+        pos = getattr(self, pos_attr)
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(pos)
+                fresh = fh.read()
+                setattr(self, pos_attr, fh.tell())
+        except OSError:
+            return cache
+        header = getattr(self, cache_attr + "_hdr", None)
+        for raw in fresh.splitlines():
+            raw = raw.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            parts = raw.split(",")
+            if header is None:
+                header = parts
+                setattr(self, cache_attr + "_hdr", header)
+                continue
+            if len(parts) != len(header):
+                continue
+            row: dict[str, Any] = {}
+            for key, value in zip(header, parts):
+                if key not in wanted:
+                    continue
+                try:
+                    row[key] = float(value) if "." in value else int(value)
+                except ValueError:
+                    row[key] = value
+            # 🔴 固件复位边界:dev_ms 回退 ⇒ 之前那些行属于上一次开机,丢掉。
+            #    不丢的话双轴图会把两次开机首尾相接:t0 取 min(dev_ms) 会落到
+            #    上一次开机的时刻,整条曲线的时间轴全错,而且看起来完全正常。
+            #    (2026-08-10 实测:RTT 上行缓冲在目标复位后不清空,残留几十行。)
+            if (cache and "dev_ms" in row and "dev_ms" in cache[-1]
+                    and row["dev_ms"] < cache[-1]["dev_ms"]):
+                cache.clear()
+            cache.append(row)
+        return cache
+
+    def _debug_series(self) -> dict[str, Any]:
+        """双轴图的两条流。
+
+        🔴 两条流必须都用**设备时钟 dev_ms** 对齐,不能一条用 load_run_csv 的
+        time_s、另一条用 host_unix_s:前者会裁掉静置段(t=0 的定义不同),后者含
+        轮询抖动。共用 dev_ms 后,t=0 = 两条流里最早的那个设备时刻,左右轴同轴。
+        ⚠️ dev_ms 来自 LFRC(±500ppm),作**相对量**可信,不当绝对时间用。
+        """
+        cur = self._read_kv_csv(self.raw_path, "_dbg_cur_pos", "_dbg_cur",
+                                ("dev_ms", "fa_fw", "sat", "epoch", "counts"))
+        cv = self._read_kv_csv(self.cell_v_path, "_dbg_cv_pos", "_dbg_cv",
+                               ("dev_ms", "e_mv", "we_mv", "re_mv", "epoch",
+                                "ocp", "we_code", "re_code"))
+        starts = [r["dev_ms"] for r in (cur[:1] + cv[:1]) if "dev_ms" in r]
+        t0 = min(starts) if starts else 0
+        return {
+            "t0_dev_ms": t0,
+            "current": {
+                "t": [(r.get("dev_ms", 0) - t0) / 1000.0 for r in cur],
+                "nA": [r.get("fa_fw", 0) / 1e6 for r in cur],
+                "valid": [not int(r.get("sat", 0) or 0) for r in cur],
+                "ep": [int(r.get("epoch", 0) or 0) for r in cur],
+            },
+            "cell_v": {
+                "t": [(r.get("dev_ms", 0) - t0) / 1000.0 for r in cv],
+                "e_mv": [r.get("e_mv", 0) for r in cv],
+                "clipped": [bool(r.get("we_code") in (0, 4095)
+                                 or r.get("re_code") in (0, 4095)) for r in cv],
+                "ocp": [int(r.get("ocp", 0) or 0) for r in cv],
+            },
+        }
+
+    def debug_snapshot(self) -> dict[str, Any]:
+        events = self._audit_events()
+        # 🔴 自愈:开机那几行 CFG_BOOT/CFG_APPLIED/CFG_DERIVED 常常收不到 ——
+        #   JLinkExe 的 `rtt start` 会把读指针对到当前写指针,**跳过缓冲里已有的
+        #   字节**,而那几行在 rtt start 之前(复位后 ~300ms)就写完了。
+        #   这正是 GET 幂等重放的用途:它不 ep++、不写任何寄存器,只把设备当前
+        #   认知整套重打一遍。检测到"在跑但一条 CFG_* 都没有"就自动补一次。
+        # 判据必须用**只有 CFG_DERIVED 才带**的字段(bits)。用 `not self._cfg_live`
+        # 不行:CFG_BOOT 只带 ep/ms/fw/reason,一到就让字典非空,GET 反而不发了
+        # ——"有几个键"和"有没有派生量"是两件事。
+        if (self.state == "running" and self._cfg_live.get("bits") is None
+                and time.time() - self._auto_get_at > 3.0):
+            self._auto_get_at = time.time()
+            try:
+                self.send_command("GET")
+            except (RuntimeError, ValueError):
+                pass
+        return _json_safe({
+            "state": self.state,
+            "message": self.message,
+            "error": self.error,
+            "run_id": self.run_id,
+            "run_dir": str(self.run_dir) if self.run_dir else "",
+            "raw_path": str(self.raw_path) if self.raw_path else "",
+            "audit_path": str(self.audit_path) if self.audit_path else "",
+            "cell_v_path": str(self.cell_v_path) if self.cell_v_path else "",
+            "cfg": self._cfg_live,
+            "afe_status": self._afe_status,
+            "last_reject": self._last_reject or None,
+            "phase": self._phase or None,
+            "cell_v": self._cell_voltages(),
+            "series": self._debug_series(),
+            # 只送尾部,并且倒序 —— 界面上最新的在最上面
+            "audit": list(reversed(events[-40:])),
+            "audit_total": len(self._audit_cache),
+        })
+
+    def switch_to_measurement_range(self) -> dict[str, Any]:
+        """切到测量档(FSR 250nA + offset SEL4=9nA)。
+
+        只在**已过零进入氧化稳态之后**才该调用:小 offset 把还原侧上限压到 9nA,
+        此后任何还原方向的摆动都会立刻撞轨失去电位控制。
+        """
+        return self.send_range({"fsr_code": MEAS_FSR_CODE,
+                                "offset_sel": MEAS_OFFSET_SEL})
+
+    def set_auto_switch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            self.auto_switch_meas = bool(payload.get("enabled"))
+            return _json_safe({"enabled": self.auto_switch_meas,
+                               "target": {"fsr_code": MEAS_FSR_CODE,
+                                          "offset_sel": MEAS_OFFSET_SEL}})
+
+    def _at_measurement_range(self) -> bool:
+        applied = (self.range_runtime or {}).get("applied") or {}
+        try:
+            return (int(applied.get("fsr_pa", -1)) == 250_000
+                    and int(applied.get("off_pa", -1)) == 9_000)
+        except (TypeError, ValueError):
+            return False
+
+    def _maybe_auto_switch(self) -> None:
+        """勾了自动切档时,过零并稳定后切一次(且只切一次)。"""
+        with self.lock:
+            if (not self.auto_switch_meas or self._auto_switch_done
+                    or self.state != "running" or self.cmd_path is None):
+                return
+            if self.range_runtime.get("pending") or self._at_measurement_range():
+                return
+        try:
+            snap = self.snapshot()
+        except Exception:                                  # noqa: BLE001
+            return
+        if not (snap.get("transient") or {}).get("ready"):
+            return
+        with self.lock:
+            if self._auto_switch_done:                     # 双检:snapshot 期间没持锁
+                return
+            self._auto_switch_done = True
+        try:
+            self.switch_to_measurement_range()
+        except Exception as exc:                           # noqa: BLE001
+            with self.lock:
+                self._auto_switch_done = False
+                self.range_runtime = {**self.range_runtime,
+                                      "rejected": f"自动切档失败:{exc}"}
+
     @staticmethod
-    def _terminate_if_running(process: subprocess.Popen[str], delay_s: float) -> None:
+    def _terminate_tree(process: subprocess.Popen[str]) -> None:
+        """整棵进程组收掉,而不是只收第一层。
+
+        🔴 只 `process.terminate()` 收不干净:树是
+        it_tool → pa_host.collect → JLinkExe,`terminate` 只打到 it_tool,
+        collect 与 JLinkExe 会一直活着占住探头和 telnet 19021(实测 60s 不自愈)。
+        配合 Popen(start_new_session=True) 才能用 killpg 一次收完。
+        JLinkExe 本身**不理 SIGTERM**(实测),但它父进程 collect 一退、stdin 管道
+        EOF,它就会自己退 —— 所以关键是让 collect 收到信号并跑完它的 finally。
+        """
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            process.terminate()
+
+    @classmethod
+    def _terminate_if_running(cls, process: subprocess.Popen[str], delay_s: float) -> None:
         time.sleep(delay_s)
         if process.poll() is None:
-            process.terminate()
+            cls._terminate_tree(process)
 
     def _watch(self, log_handle: Any) -> None:
         assert self.process is not None
         process = self.process
         while process.poll() is None:
+            self._scan_range_events()
+            self._maybe_auto_switch()
             with self.lock:
                 self.message = self._progress_message()
             time.sleep(0.8)
+        self._scan_range_events()
         return_code = process.wait()
         log_handle.close()
         self._stop_bridge()
@@ -707,6 +1183,42 @@ class MeasurementController:
                 self.error = f"测量已落盘，但分析失败：{exc}"
                 self.message = "分析失败，原始数据仍已保存"
         self._notify_complete()
+
+    def _scan_range_events(self) -> None:
+        """增量扫 rtt.log,取固件回的 RANGE_APPLIED / RANGE_REJECT。
+
+        为什么读文件而不是解析 collector 的 stdout:这两行走的是 RTT 上行,
+        由 collector 的 --raw-log 落到 rtt.log;stdout 里只有它自己的进度信息。
+        用读位置增量读 ⇒ 不重复处理、也不受文件增长影响。
+        """
+        if self.raw_log is None or not self.raw_log.exists():
+            return
+        try:
+            with self.raw_log.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(self._rtt_pos)
+                fresh = fh.read()
+                self._rtt_pos = fh.tell()
+        except OSError:
+            return
+        for line in fresh.splitlines():
+            line = line.strip()
+            if "RANGE_APPLIED" in line:
+                kv: dict[str, Any] = {}
+                for tok in line[line.index("RANGE_APPLIED"):].split()[1:]:
+                    if "=" in tok:
+                        k, _, v = tok.partition("=")
+                        try:
+                            kv[k] = int(v)
+                        except ValueError:
+                            kv[k] = v
+                with self.lock:
+                    self.range_runtime = {"pending": None, "applied": kv,
+                                          "rejected": None, "at": time.time()}
+            elif "RANGE_REJECT" in line:
+                with self.lock:
+                    self.range_runtime = {**self.range_runtime, "pending": None,
+                                          "rejected": line[line.index("RANGE_REJECT"):],
+                                          "at": time.time()}
 
     def _notify_complete(self) -> None:
         snapshot = self.snapshot()
@@ -797,6 +1309,78 @@ class MeasurementController:
                 continue
         return self._data_cache
 
+    def _cell_voltages(self) -> dict[str, Any] | None:
+        """读电极电压连采 CSV 的最后一行。
+
+        为什么单独一个文件而不是并进电流 CSV:System ADC 按 SYS_PERIOD(≈1Hz)走,
+        电流按 SENS_PERIOD(8Hz)走,两者**不同步**,塞一张表必然错行。
+        为什么只取最后一行:GUI 只需要"现在电极在哪个电位";全序列留给离线分析。
+        """
+        path = self.cell_v_path
+        if path is None or not path.exists():
+            return None
+        try:
+            rows = [
+                ln for ln in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if ln and not ln.startswith("#")
+            ]
+        except OSError:
+            return None
+        if len(rows) < 2:
+            return None
+        header = rows[0].split(",")
+        last = rows[-1].split(",")
+        if len(last) != len(header):
+            return None
+        out: dict[str, Any] = {}
+        for key, raw in zip(header, last):
+            try:
+                out[key] = float(raw) if "." in raw else int(raw)
+            except ValueError:
+                out[key] = raw
+        # 🔴 两类"撞轨"必须分开报,否则告警会互相淹没(2026-08-11 实测:CE 顶在
+        #    下轨让 65/66 行都亮 clipped,真正会让 E 失效的 WE/RE 削顶反而看不见了)。
+        #   clipped:WE 或 RE 出界 ⇒ **E 这个数不可信**(它就是这两路之差)
+        #   railed :CE 或 WO 撞轨 ⇒ 放大器用尽驱动范围、**环路饱和**,
+        #           E 可能仍读得出来但电解池已不在设定电位上(此时 e_mv 会偏离设定值)
+        out["clipped"] = any(out.get(k) in (0, 4095) for k in ("we_code", "re_code"))
+        # 🔴 2026-08-11 拆分。原来把 ce_code 与 wo_code 一起算 railed,现在不成立:
+        #   ① **CE 的规格下限是 0.1V,不是 0**(datasheet p11「CE Output Voltage Range」
+        #      CP_EN=0 ⇒ 0.1V ~ VDD−1.1V)。CE 掉到 80mV 时环路已经出规格,
+        #      按 code==0 判会漏报。100mV / 0.375mV ≈ 267 码。
+        #   ② **WO 出量程现在是设计使然**:V_WE 默认改 1200 后 WO≈V_WE+540≈1745mV
+        #      > System ADC 在 1.0× 下的满量程 1536mV ⇒ wo_code 恒 4095。
+        #      继续把它算作"撞轨"会让告警灯常红,而常红的灯等于没有灯。
+        #      ⇒ 单独报 wo_offscale,措辞是"看不见"而不是"坏了"。
+        ce_code = out.get("ce_code")
+        out["ce_railed"] = isinstance(ce_code, int) and (ce_code <= 267 or ce_code >= 4095)
+        out["wo_offscale"] = out.get("wo_code") in (0, 4095)
+        out["railed"] = bool(out["ce_railed"])
+        # 🔴 恒电位环用了多少驱动、还剩多少 —— 这两个数把"环路快饱和了"变成可读数字。
+        #   ce_drive_mv:C 放大器为了把电流推过电解池,需要把 CE 压到 RE 之下多少。
+        #                健康态实测只需 ~60 mV(v1:CE 140 / RE 201)。
+        #   ce_headroom_mv:CE 距 0 轨还有多少。它见底 ⇒ 环路钳不住设定电位。
+        if isinstance(out.get("ce_mv"), (int, float)) and isinstance(out.get("re_mv"), (int, float)):
+            out["ce_drive_mv"] = out["re_mv"] - out["ce_mv"]
+            # 规格下限是 0.1V ⇒ 余量按到 100mV 算,不是到 0
+            out["ce_headroom_mv"] = out["ce_mv"] - 100
+        # 🔴 V_WE 的合法窗口 —— 现在两头都能给实测值,不再靠编译期假定的 VDD=3000:
+        #     E + drive + 0.1V  ≤  V_WE  ≤  VDD − 1.1V   (CP_EN=0;=1 时是 −0.7V)
+        #   上限来自实测 VDD(tag 0xE0);下限来自实测 drive=RE−CE。
+        #   vdd_mv == -1 ⇒ 固件没上报(旧版本或通道没选中)⇒ 这几项都不给,
+        #   宁可缺字段也不拿假定值冒充实测(公理 A4:器件是权威)。
+        vdd = out.get("vdd_mv")
+        if isinstance(vdd, (int, float)) and vdd > 0:
+            out["we_max_mv"] = int(vdd) - 1100
+            out["we_max_mv_cp"] = int(vdd) - 700   # 开 CP_EN 后的上限
+            if isinstance(out.get("we_mv"), (int, float)):
+                out["we_headroom_mv"] = out["we_max_mv"] - out["we_mv"]
+            if isinstance(out.get("ce_drive_mv"), (int, float)) and \
+                    isinstance(out.get("e_mv"), (int, float)):
+                out["we_min_mv"] = int(out["e_mv"] + out["ce_drive_mv"] + 100)
+        out["rows"] = len(rows) - 1
+        return out
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             data = self._data()
@@ -819,6 +1403,18 @@ class MeasurementController:
                 "state": self.state,
                 "message": self.message,
                 "error": self.error,
+                # 方案 C:运行时档位。**与 settings 里的 fsr_nA/offset_nA 不是一回事** ——
+                # 那是最后一次烧录的编译期默认值,RANGE 命令能在运行中改掉实际档位。
+                "range_runtime": self.range_runtime,
+                "cell_v": self._cell_voltages(),
+                "transient": _transient_phase(data["time_s"], data["current_nA"],
+                                              data["valid"]),
+                "auto_switch": {
+                    "enabled": self.auto_switch_meas,
+                    "done": self._auto_switch_done,
+                    "target": {"fsr_code": MEAS_FSR_CODE,
+                               "offset_sel": MEAS_OFFSET_SEL},
+                },
                 "run_id": self.run_id,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
@@ -1294,6 +1890,37 @@ class AppState:
         metadata = self._prepare_export_metadata(metadata)
         return self.measurement.start(metadata=metadata, settings=current_settings)
 
+    def start_debug_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """硬件 DEBUG 模式的「一次 I-t 测量」。
+
+        与正式测量的差别只有三点,其余完全共用同一条已验证的 RTT/J-Link 路径:
+          ① metadata 打 `debug` 标记 ⇒ 收尾时不进标定工作区(见 _measurement_completed)
+          ② **不传 live_raw_path** ⇒ raw 留在 run_dir/raw.csv,不写进保存目录
+          ③ 不校验样品名/浓度/标定就绪 —— DEBUG 页刻意不暴露那套工作流
+
+        🔴 但两个门禁必须保留:自动测量运行期间不许插队(会抢探头),
+        已有测量在跑时不许再起(同上)。这两条与正式测量同口径。
+        """
+        if self.schedule.snapshot()["active"]:
+            raise RuntimeError("自动测量运行期间不能起硬件 DEBUG 轮(探头只有一支)")
+        if self.measurement.snapshot()["state"] == "running":
+            raise RuntimeError("已有测量正在运行")
+        # 🔴 刻意**不**要求 settings.applied。
+        #   正式测量要求它,是因为标定/拟合假设固件的 E 与时长跟 settings 一致;
+        #   debug 轮什么都不导出、不拟合,这个耦合不存在。
+        #   反过来,"固件与 GUI 设置不一致"恰恰是硬件调试时的常态 —— 要求先
+        #   重编译+烧录才能看一眼硬件,等于取消了这个页面的用途。
+        #   而且现在固件开机就打 CFG_BOOT/CFG_DERIVED 给出**真实生效**的配置,
+        #   那比 applied 这个上位机侧的标志是更硬的证据。不一致由 UI 提示,不拦。
+        metadata = {
+            "debug": True,
+            "sample_name": str(payload.get("note") or "hw-debug"),
+            "sample_role": "test",
+            "source": "debug_gui",
+        }
+        return self.measurement.start(
+            metadata=metadata, settings=self.settings.snapshot()["settings"])
+
     def _prepare_export_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
         prepared = dict(metadata)
         sample_name = str(prepared.get("sample_name") or "sample")
@@ -1458,6 +2085,21 @@ class AppState:
 
     def _measurement_completed(self, run: dict[str, Any]) -> None:
         metadata = dict(run.get("metadata") or {})
+        # 🔴 硬件 DEBUG 轮不进工作流:不导出、不进 measurement-index.csv、不触发
+        #    浓度预测。否则调参数时随手跑的几轮会污染标定工作区,而"污染"这件事
+        #    要到下次拟合曲线时才会暴露出来 —— 那时已经分不清哪几行是调试轮。
+        #    刻意**不新增第四个 sample_role**:那要串改 5 处调用点却买不到任何东西。
+        if metadata.get("debug"):
+            self.measurement.set_workflow_result({
+                "finished_at": run.get("finished_at"),
+                "run_id": run.get("run_id"),
+                "debug": True,
+                "state": run.get("state"),
+                "note": "硬件 DEBUG 轮:原始数据保留在 run_dir,不进标定工作区",
+                "run_dir": run.get("run_dir"),
+                "raw_path": run.get("raw_path"),
+            })
+            return
         sample_name = str(metadata.get("sample_name") or run.get("run_id") or "sample")
         concentration = metadata.get("known_concentration_um")
         role = str(metadata.get("sample_role") or "test")
@@ -1846,6 +2488,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/drift":
             self._send_json(APP.drift_payload())
             return
+        if parsed.path == "/api/debug":
+            payload = APP.measurement.debug_snapshot()
+            # 只作提示:不一致时 UI 提醒"固件里跑的可能不是 GUI 这套参数",
+            # 但**不阻止**调试轮(理由见 start_debug_run)。
+            payload["settings_applied"] = bool(
+                APP.settings.snapshot().get("applied"))
+            self._send_json(payload)
+            return
         if parsed.path == "/api/health":
             self._send_json({"ok": True, "project": str(PROJECT_DIR)})
             return
@@ -1867,8 +2517,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not APP.settings.snapshot()["applied"]:
                     raise RuntimeError("请先将当前检测条件应用到硬件")
                 result = APP.start_measurement(payload)
+            elif self.path == "/api/range":
+                result = APP.measurement.send_range(payload)
+            elif self.path == "/api/range/measurement":
+                result = APP.measurement.switch_to_measurement_range()
+            elif self.path == "/api/range/auto":
+                result = APP.measurement.set_auto_switch(payload)
             elif self.path == "/api/measurement/stop":
                 result = APP.measurement.stop()
+            # ── 硬件 DEBUG 模式 ───────────────────────────────────────────
+            # 复用 MeasurementController(它本来就是"一次 I-t 测量"这个抽象),
+            # 只是打上 debug 标记并**不传 live_raw_path** ⇒ raw 留在 run_dir。
+            elif self.path == "/api/debug/start":
+                result = APP.start_debug_run(payload)
+            elif self.path == "/api/debug/stop":
+                result = APP.measurement.stop()
+            elif self.path == "/api/debug/cmd":
+                result = APP.measurement.send_command(str(payload.get("line", "")))
             elif self.path == "/api/calibration/load":
                 result = APP.load_points(str(payload["path"]))
             elif self.path == "/api/calibration/fit":
@@ -1922,14 +2587,37 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
     print(f"i-t GUI: {url}", flush=True)
     if open_browser:
         threading.Timer(0.35, lambda: webbrowser.open(url)).start()
+    # 🔴 必须接 SIGTERM。Python 对 SIGTERM 的默认动作是**立刻退出、不跑 finally**
+    #    ⇒ `pkill -f gui_server` 之后,它起的 collector 与 JLinkExe 会活下来、
+    #    继续占着探头和 telnet 19021,下一次启动的 run 连不上就带 traceback 死。
+    #    2026-08-10 实测踩到:一个孤儿 collector 让新 run 直接
+    #    ConnectionResetError,而现场看起来像"探头坏了"。
+    def _graceful(_sig, _frm):
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _graceful)
+        except ValueError:
+            pass   # 非主线程时不给注册,忽略
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         APP.schedule.stop()
+        # 🔴 同步收干净,不能只靠 stop() 里那个 1.5s 延迟线程 —— 进程一退它就没了。
         APP.measurement.stop()
+        proc = APP.measurement.process
+        if proc is not None and proc.poll() is None:
+            MeasurementController._terminate_tree(proc)
+            try:
+                proc.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                pass
         server.server_close()
+        print("i-t GUI 已退出(采集子进程与 J-Link 已收回)", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:

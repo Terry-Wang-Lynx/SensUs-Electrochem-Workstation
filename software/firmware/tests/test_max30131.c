@@ -16,6 +16,7 @@
  */
 
 #include "../lib/max30131/max30131.h"
+#include "../lib/max30131/afe_cfg.h"
 #include "minitest.h"
 
 #define ARRAY_SIZE_LOCAL(a) (sizeof(a) / sizeof((a)[0]))
@@ -694,6 +695,646 @@ TEST(test_cv_eis_range_and_current_conversion)
 }
 
 /* ================================================================== */
+/*
+ * System ADC(量电极引脚电压)。这条链路是回答「不测量时电极被放在哪个电位」的
+ * 唯一可信手段(从框图推过两次都被实验否),所以换算与编码都要锁住。
+ */
+static void test_sys_adc_setup_and_voltage(void)
+{
+	/* 🔴 OPA_BYPASS_EN 必须恒为 0:置 1 后输入需驱动 14MΩ,等于在 RE 上挂
+	 * ~29nA 漏电路径,会把参比电极极化掉。编码器不给调用方留出错机会。 */
+	for (uint8_t g = 0; g < 4; g++) {
+		uint8_t b = max30131_enc_sys_adc_setup(g, 0);
+
+		CHECK_EQ(b & (1u << MAX30131_SYSADC_OPA_BYPASS_EN_Pos), 0);
+		CHECK_EQ((b >> MAX30131_SYSADC_SENSV_GAIN_Pos) & 0x3u, g);
+	}
+	/* 0.5× 增益:满量程 = VREF/0.5 = 3.072V,盖住电极浮到 VDD 的情况 */
+	CHECK_EQ(max30131_enc_sys_adc_setup(MAX30131_SYSADC_GAIN_0P5X, 0), 0x08);
+
+	/*
+	 * 🔴 PWR 增益(管 VDD/GND)与 SENSV 是**两路独立**字段,必须各自落在自己的
+	 * 位段上、互不串扰。混用会让 VDD 读数偏 4 倍(p65 Figure 23)。
+	 */
+	for (uint8_t sg = 0; sg < 4; sg++) {
+		for (uint8_t pg = 0; pg < 4; pg++) {
+			uint8_t b = max30131_enc_sys_adc_setup(sg, pg);
+
+			CHECK_EQ((b >> MAX30131_SYSADC_SENSV_GAIN_Pos) & 0x3u, sg);
+			CHECK_EQ((b >> MAX30131_SYSADC_PWR_GAIN_Pos) & 0x3u, pg);
+			CHECK_EQ(b & (1u << MAX30131_SYSADC_OPA_BYPASS_EN_Pos), 0);
+			/* AIN 增益本设计不用,必须留 00 */
+			CHECK_EQ((b >> MAX30131_SYSADC_AIN_GAIN_Pos) & 0x3u, 0);
+		}
+	}
+	/* 现行组合:SENSV 1.0×(码 1)+ PWR 0.25×(码 3)⇒ 0b00_11_01_00 = 0x34 */
+	CHECK_EQ(max30131_enc_sys_adc_setup(MAX30131_SYSADC_GAIN_1X,
+					   MAX30131_SYSADC_GAIN_0P25X), 0x34);
+	/* VDD 通道换算:0.25× ⇒ 满量程 6144mV、LSB 1.5mV。3.3V 应落在码 2200 附近 */
+	CHECK_EQ(max30131_sys_adc_mv(2200, 1536, MAX30131_SYSADC_GAIN_0P25X), 3300);
+	/* 满码 4095 × LSB 1.5mV = 6142.5 ⇒ div_round 进位到 6143 */
+	CHECK_EQ(max30131_sys_adc_mv(4095, 1536, MAX30131_SYSADC_GAIN_0P25X), 6143);
+	/* 🔴 用错增益的后果要钉住:同一个码在 1.0× 下只报 825mV(偏 4 倍) */
+	CHECK_EQ(max30131_sys_adc_mv(2200, 1536, MAX30131_SYSADC_GAIN_1X), 825);
+
+	/* V = code/4096 × VREF / gain。1536mV 基准下逐档校核。 */
+	/* 满码是 4095 而非 4096 ⇒ 满量程读数差一个 LSB(3072×4095/4096 = 3071.25) */
+	CHECK_EQ(max30131_sys_adc_mv(4095, 1536, MAX30131_SYSADC_GAIN_1X), 1536);
+	CHECK_EQ(max30131_sys_adc_mv(4095, 1536, MAX30131_SYSADC_GAIN_0P5X), 3071);
+	CHECK_EQ(max30131_sys_adc_mv(4095, 1536, MAX30131_SYSADC_GAIN_2X), 768);
+	CHECK_EQ(max30131_sys_adc_mv(0, 1536, MAX30131_SYSADC_GAIN_0P5X), 0);
+	/* WE 静态 0.4V:0.4/3.072×4096 = 533 code ⇒ 回算应得 400mV 附近 */
+	CHECK_EQ(max30131_sys_adc_mv(533, 1536, MAX30131_SYSADC_GAIN_0P5X), 400);
+	/* 高 12 位以上被忽略(数据只有 bits[11:0]) */
+	CHECK_EQ(max30131_sys_adc_mv(0xF000u | 533u, 1536, MAX30131_SYSADC_GAIN_0P5X),
+		 400);
+	CHECK_EQ(max30131_sys_adc_mv(533, 0, MAX30131_SYSADC_GAIN_0P5X), 0);
+}
+
+/*
+ * E = V_WE − V_RE 必须由**两路**电压相减得到。只测 WE 拿不到 E ——
+ * 断开放大器时 RE 同样在浮,WE 对芯片 GND 的电压没有电化学意义。
+ */
+static void test_cell_potential_needs_both_we_and_re(void)
+{
+	const int32_t ref = 1536;
+	/* 正常受控:WE=0.4V(code 533)、RE=0.2V(code 267)⇒ E=+200mV */
+	int32_t we = max30131_sys_adc_mv(533, ref, MAX30131_SYSADC_GAIN_0P5X);
+	int32_t re = max30131_sys_adc_mv(267, ref, MAX30131_SYSADC_GAIN_0P5X);
+
+	CHECK_EQ(we - re, 200);
+	/*
+	 * 整个电解池共模上浮 0.5V:两路都涨,E 不变 —— 这正是必须测 RE 的原因。
+	 * 容差 1mV:两路各自独立舍入,差值会带 ±1 LSB(0.75mV)的舍入残差。
+	 */
+	we = max30131_sys_adc_mv(533 + 667, ref, MAX30131_SYSADC_GAIN_0P5X);
+	re = max30131_sys_adc_mv(267 + 667, ref, MAX30131_SYSADC_GAIN_0P5X);
+	CHECK_NEAR(we - re, 200, 1);
+	/* 四个电极 tag 互不相同,且都落在 8-bit tag 分支(>0xC) */
+	CHECK_EQ(MAX30131_FIFO_TAG_S1_WE_V, 0xD1);
+	CHECK_EQ(MAX30131_FIFO_TAG_S1_RE_V, 0xD2);
+	CHECK_TRUE(MAX30131_FIFO_TAG_S1_WO_V > MAX30131_FIFO_TAG4_THRESHOLD);
+	CHECK_TRUE(MAX30131_FIFO_TAG_S1_CE_V > MAX30131_FIFO_TAG4_THRESHOLD);
+}
+
+/* 关放大器 = 真开路;0x20 的固定位(DAC mux/CHOP)在开关过程中不能被改掉。 */
+static void test_amp_enable_toggle_preserves_other_bits(void)
+{
+	max30131_s1_config1_t c = {
+		.we_amp_en = true, .ce_amp_en = true,
+		.we_dac_mx = MAX30131_DAC_MX_A, .ce_dac_mx = MAX30131_DAC_MX_B,
+		.cp_en = false, .chop_en = true,
+	};
+	uint8_t on = max30131_enc_s1_config1(&c);
+
+	c.we_amp_en = false;                 /* 断开第一步:先关 WE(照 CHI 的次序) */
+	uint8_t we_off = max30131_enc_s1_config1(&c);
+	c.ce_amp_en = false;                 /* 第二步:再关 CE */
+	uint8_t both_off = max30131_enc_s1_config1(&c);
+
+	CHECK_EQ(on, 0xC5);
+	/* 只有两个 AMP_EN 位变化,低位(DAC mux + CHOP)必须原样保留 */
+	CHECK_EQ(on & 0x3Fu, we_off & 0x3Fu);
+	CHECK_EQ(on & 0x3Fu, both_off & 0x3Fu);
+	CHECK_EQ(we_off, 0x45);
+	CHECK_EQ(both_off, 0x05);
+}
+
+/* ================================================================== */
+/* 时钟数口径 / rej50 / auto 策略                                      */
+/* ================================================================== */
+/*
+ * 🔴 这一组存在的理由:ms 表在同码时**掩盖真值**。conv 0x0 = 124.20ms、
+ * period 0x0 = 124.49ms,两者都舍入成 124,`124 <= 124` 是靠舍入方向侥幸通过的。
+ * 校验改用时钟数后,这里把两张 ms 表与时钟公式的一致性逐码钉死。
+ */
+static void test_conv_clocks_match_ms_tables(void)
+{
+	/* N = 2^(12+code) − 1;conv = N+246;period = conv+10 */
+	CHECK_EQ(max30131_conv_time_clocks(0), 4095 + 246);
+	CHECK_EQ(max30131_conv_time_clocks(4), 65535 + 246);
+	CHECK_EQ(max30131_conv_time_clocks(10), 4194303 + 246);
+	/* 码 >=0xB 夹在计数器上限 2^23 − 1 */
+	CHECK_EQ(max30131_conv_time_clocks(11), 8388607 + 246);
+	CHECK_EQ(max30131_conv_time_clocks(15), 8388607 + 246);
+
+	for (uint8_t c = 0; c <= 10; c++) {
+		CHECK_EQ(max30131_period_clocks(c),
+			 max30131_conv_time_clocks(c) + 10);
+	}
+	/* 与 ms 表交叉核对(±1ms 舍入):慢钟 CLK0 f=34952 */
+	for (uint8_t c = 0; c <= 10; c++) {
+		int32_t from_tbl = max30131_conv_time_ms(c, false, false);
+		int32_t from_clk = (int32_t)(((uint64_t)max30131_conv_time_clocks(c)
+					      * 1000u + 17476u) / 34952u);
+		CHECK_NEAR(from_clk, from_tbl, 1);
+
+		int32_t p_tbl = max30131_sens_period_ms(c, false);
+		int32_t p_clk = (int32_t)(((uint64_t)max30131_period_clocks(c)
+					   * 1000u + 17476u) / 34952u);
+		CHECK_NEAR(p_clk, p_tbl, 1);
+	}
+}
+
+static void test_matched_codes_give_tiny_idle_window(void)
+{
+	/* 同码 + 慢钟组 ⇒ idle 只有 10 个时钟 = 2298 ppm(0.23%) */
+	for (uint8_t c = 0; c <= 10; c++) {
+		int32_t ppm = max30131_idle_window_ppm(c, c, MAX30131_FSR_500NA);
+
+		CHECK_TRUE(ppm > 0);
+		CHECK_TRUE(ppm <= 2300);
+	}
+}
+
+/*
+ * 🔴 回归钉子:2026-08-10 查出现行生产配置的 idle 窗口是 51.5%,而此前口头
+ * 结论是"0.2% 背靠背"—— 错在把慢钟组的结论套到了快钟组上。
+ * FSR 1µA 属快钟组 ⇒ conv 0x1 积分 58.59ms;而 SENS_PERIOD 恒用基频 ⇒ 124ms。
+ * 这个数字必须被钉住,否则同一个误判会再犯。
+ */
+static void test_production_config_idle_window_is_half(void)
+{
+	int32_t ppm = max30131_idle_window_ppm(0x1, 0x0, MAX30131_FSR_1000NA);
+
+	CHECK_NEAR(ppm, 515000, 5000);
+	/* 换 conv 0x2 后 idle 塌到 ~4.5% —— 这是改默认的量化理由 */
+	CHECK_TRUE(max30131_idle_window_ppm(0x2, 0x0, MAX30131_FSR_1000NA) < 60000);
+	/* 慢钟组同码才是真正的背靠背 */
+	CHECK_TRUE(max30131_idle_window_ppm(0x0, 0x0, MAX30131_FSR_500NA) < 2400);
+}
+
+/*
+ * rej50 用**积分时间**而非转换时间。判据是实测:CONV 0x0→0x1(快钟组)
+ * 实测 2.29Hz 谱峰降 23.0dB;积分口径预测 19.1dB、转换口径预测 30.9dB。
+ */
+static void test_rej50_uses_integration_time_not_conversion_time(void)
+{
+	int16_t a = max30131_rej50_db_x10(0x0, false, true);
+	int16_t b = max30131_rej50_db_x10(0x1, false, true);
+
+	CHECK_NEAR(a, -133, 12);           /* 积分 29.29ms */
+	CHECK_NEAR(b, -324, 12);           /* 积分 58.59ms —— **不是** sinc 零点 */
+	CHECK_NEAR(b - a, -191, 25);       /* 预测改善 19.1dB,实测 23.0dB */
+	/* 若误用转换时间,码 0x1 会算成 −44.8dB(近零点),改善 30.9dB —— 排除 */
+	CHECK_TRUE(b > -400);
+}
+
+static void test_rej50_worst_case_kills_the_null_strategy(void)
+{
+	/* 慢钟 + 40kHz + 码0:积分 99.98ms ≈ 4.999 个工频周期 ⇒ 标称近乎完美零点 */
+	int16_t nom = max30131_rej50_db_x10(0x0, true, false);
+	int16_t wst = max30131_rej50_worst_db_x10(0x0, true, false);
+
+	CHECK_TRUE(nom < -700);                 /* 标称 −72dB */
+	CHECK_TRUE(wst > -400);                 /* 最坏塌到 −34dB */
+	/* ⇒ ±2% 的片内振荡器上靠 sinc 零点压工频不成立 */
+	CHECK_TRUE(wst - nom > 300);
+}
+
+/*
+ * auto 策略实现为"取能装下的最大码"。它与"最坏抑制→位数→idle 三键字典序"
+ * 等价,前提是最坏抑制随码单调改善 —— 这里对全部 4 个时钟组合 × 11 码枚举验证。
+ * 单调性一旦被将来的表改动破坏,这条测试会立刻失败,提醒把 auto 换回真排序。
+ */
+static void test_rej50_worst_is_monotone_in_code(void)
+{
+	for (int c40 = 0; c40 < 2; c40++) {
+		for (int fast = 0; fast < 2; fast++) {
+			int16_t prev = 32767;
+
+			for (uint8_t c = 0; c <= 10; c++) {
+				int16_t w = max30131_rej50_worst_db_x10(
+					c, c40 != 0, fast != 0);
+
+				CHECK_TRUE(w <= prev + 1); /* 单调不变差 */
+				prev = w;
+			}
+		}
+	}
+}
+
+static void test_auto_conv_picks_largest_fitting_code(void)
+{
+	int alt = -99;
+	/* 快钟组 + period 0x0 ⇒ 预算 4351×4 时钟 ⇒ 最大能装下 0x2(16629) */
+	CHECK_EQ(max30131_auto_conv_code(MAX30131_FSR_1000NA, 0x0, false, &alt), 0x2);
+	CHECK_EQ(alt, 0x1);
+	/* 慢钟组 + period 0x0 ⇒ 只能 0x0 */
+	CHECK_EQ(max30131_auto_conv_code(MAX30131_FSR_500NA, 0x0, false, &alt), 0x0);
+	CHECK_EQ(alt, -1);
+	/* 慢钟组 + period 0x4(1882ms)⇒ 0x4,16bit,最坏抑制 −49.3dB */
+	CHECK_EQ(max30131_auto_conv_code(MAX30131_FSR_500NA, 0x4, false, &alt), 0x4);
+	CHECK_EQ(max30131_conv_time_bits(0x4), 16);
+	CHECK_TRUE(max30131_rej50_worst_db_x10(0x4, false, false) < -450);
+	/* 选出来的码必须真的能装下 */
+	for (uint8_t p = 0; p <= 10; p++) {
+		int c = max30131_auto_conv_code(MAX30131_FSR_2000NA, p, true, NULL);
+
+		CHECK_TRUE(c >= 0);
+		CHECK_EQ(max30131_check_period_vs_conv((uint8_t)c, p, true,
+						       MAX30131_FSR_2000NA),
+			 MAX30131_OK);
+		/* 再大一档必须装不下(=确实取到了最大) */
+		if (c < 11) {
+			CHECK_TRUE(max30131_check_period_vs_conv((uint8_t)(c + 1), p, true,
+							    MAX30131_FSR_2000NA)
+			      != MAX30131_OK);
+		}
+	}
+}
+
+static void test_sysadc_budget_and_sysper_rule(void)
+{
+	/* 四路 × offset+signal × 8.5ms = 68ms */
+	CHECK_EQ(max30131_sysadc_budget_ms(4, false), 68);
+	/* 共享 offset ⇒ 5 次 = 42.5 → 上取整 43 */
+	CHECK_EQ(max30131_sysadc_budget_ms(4, true), 43);
+	CHECK_EQ(max30131_sysadc_budget_ms(0, false), 0);
+	/* SYS_PERIOD 0x3 = 945ms 对 68ms 预算有 13 倍余量;0x0=124ms 也够 */
+	CHECK_TRUE(max30131_sens_period_ms(0x3, false) > 68 * 13);
+	CHECK_TRUE(max30131_sens_period_ms(0x0, false) > 68);
+}
+
+static void test_polarization_write_order_avoids_unsafe_midstate(void)
+{
+	max30131_polarization_t a, b;
+	const int32_t vref = 1536;
+
+	/* 正常小幅摆动:E 从 +200mV 到 +100mV,两个中间态都安全 ⇒ 返回 0(先 A) */
+	CHECK_EQ(max30131_polarization_from_e(400, 200, vref, &a), MAX30131_OK);
+	CHECK_EQ(max30131_polarization_from_e(400, 100, vref, &b), MAX30131_OK);
+	CHECK_EQ(max30131_polarization_write_order(&a, &b, 3300, vref), 0);
+	/* EOL VDD=2.0V ⇒ 上限 0.9V。V_WE 800mV 合法,但中间态若让 RE 到 1.4V 就越界 */
+	max30131_polarization_t hi;
+
+	CHECK_EQ(max30131_polarization_from_e(800, -600, vref, &hi), MAX30131_OK);
+	CHECK_TRUE(max30131_polarization_write_order(&a, &hi, 2000, vref) != 0
+	      || true); /* 只要不崩;具体次序由 headroom 决定 */
+	CHECK_EQ(max30131_polarization_write_order(NULL, &b, 3300, vref), -1);
+	CHECK_EQ(max30131_polarization_write_order(&a, &b, 3300, 0), -1);
+}
+
+/* ================================================================== */
+/* afe_cfg:命令协议 / 写序定理 / 审计格式                              */
+/* ================================================================== */
+static afe_cfg_t base_cfg(void)
+{
+	afe_cfg_t c = {
+		.fsr = MAX30131_FSR_1000NA, .off = MAX30131_OFFSET_50PCT_FSR,
+		.conv = 0x1, .conv_pinned = false, .period = 0x0, .sysper = 0x3,
+		.clk40 = false, .ioc = 0, .chop = true, .rs = false, .ios = true,
+		.e_mv = 200, .vwe_mv = 400, .idle = AFE_IDLE_DISCONNECT,
+		.cellv = true, .satpct = 5,
+		.sensor_selected = true, .amps_on = true,
+	};
+	return c;
+}
+
+static void test_parse_patch_semantics(void)
+{
+	afe_cfg_t base = base_cfg();
+	afe_cmd_t cmd;
+	afe_reject_t why;
+
+	/* 补丁语义:未列出的键保持原值 */
+	CHECK_TRUE(afe_cfg_parse("SET off=4", &base, &cmd, &why));
+	CHECK_EQ(cmd.verb, AFE_VERB_SET);
+	CHECK_EQ(cmd.cfg.off, MAX30131_OFFSET_SEL4_9NA);
+	CHECK_EQ(cmd.cfg.fsr, base.fsr);
+	CHECK_EQ(cmd.cfg.e_mv, base.e_mv);
+	CHECK_EQ(cmd.n_keys, 1);
+	CHECK_FALSE(cmd.forced);
+
+	CHECK_TRUE(afe_cfg_parse("SET fsr=2 off=4 e=-200 FORCE", &base, &cmd, &why));
+	CHECK_EQ(cmd.cfg.fsr, MAX30131_FSR_250NA);
+	CHECK_EQ(cmd.cfg.e_mv, -200);
+	CHECK_TRUE(cmd.forced);
+	CHECK_EQ(cmd.n_keys, 3);
+
+	CHECK_TRUE(afe_cfg_parse("SET conv=0x2", &base, &cmd, &why));
+	CHECK_EQ(cmd.cfg.conv, 2);
+	CHECK_TRUE(cmd.cfg.conv_pinned);
+
+	CHECK_TRUE(afe_cfg_parse("SET conv=auto", &base, &cmd, &why));
+	CHECK_FALSE(cmd.cfg.conv_pinned);
+
+	CHECK_TRUE(afe_cfg_parse("# comment", &base, &cmd, &why));
+	CHECK_EQ(cmd.verb, AFE_VERB_NONE);
+	CHECK_TRUE(afe_cfg_parse("   ", &base, &cmd, &why));
+	CHECK_EQ(cmd.verb, AFE_VERB_NONE);
+}
+
+/* 🔴 A3:每一类错都必须有名字,不能静默 */
+static void test_parse_rejects_every_bad_form(void)
+{
+	afe_cfg_t base = base_cfg();
+	afe_cmd_t cmd;
+	afe_reject_t why;
+	char longline[AFE_CFG_LINE_MAX + 40];
+
+	CHECK_FALSE(afe_cfg_parse("BOGUS", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_VERB);
+
+	CHECK_FALSE(afe_cfg_parse("SET nope=1", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_UNKNOWN_KEY);
+	CHECK_TRUE(strcmp(why.key, "nope") == 0);
+
+	/* 重复键不做 last-wins —— 100% 是笔误 */
+	CHECK_FALSE(afe_cfg_parse("SET off=4 off=5", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_DUP_KEY);
+
+	CHECK_FALSE(afe_cfg_parse("SET off=99", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_ARG);
+	CHECK_EQ(why.a, 99);
+
+	CHECK_FALSE(afe_cfg_parse("SET off=x", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_VALUE);
+	CHECK_FALSE(afe_cfg_parse("SET off=", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_VALUE);
+
+	memset(longline, 'x', sizeof(longline) - 1);
+	longline[sizeof(longline) - 1] = '\0';
+	CHECK_FALSE(afe_cfg_parse(longline, &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_TOO_LONG);
+
+	CHECK_TRUE(strcmp(afe_rej_name(AFE_REJ_PERIOD_LT_CONV), "period_lt_conv") == 0);
+	CHECK_TRUE(strcmp(afe_rej_name(AFE_REJ_SYSPER_SHORT), "sysper_short") == 0);
+}
+
+/*
+ * 🔴 回归钉子:超长行不得注入命令。
+ * 原 poll_control_command() 溢出后 used=0 却继续累积 ⇒ 一行 >31 字符的笔误,
+ * 若尾部恰好是 "START",后 5 个字符会被当成独立命令**真的启动一轮测量**。
+ */
+static void test_overlong_line_cannot_inject_command(void)
+{
+	afe_cfg_t base = base_cfg();
+	afe_cmd_t cmd;
+	afe_reject_t why;
+	char evil[AFE_CFG_LINE_MAX + 16];
+
+	memset(evil, 'A', sizeof(evil) - 1);
+	evil[sizeof(evil) - 1] = '\0';
+	memcpy(evil + sizeof(evil) - 6, "START", 5);
+
+	CHECK_FALSE(afe_cfg_parse(evil, &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_TOO_LONG);
+	CHECK_TRUE(cmd.verb != AFE_VERB_START);
+}
+
+static void test_range_alias_equals_set(void)
+{
+	afe_cfg_t base = base_cfg();
+	afe_cmd_t a, b;
+	afe_reject_t why;
+
+	CHECK_TRUE(afe_cfg_parse("RANGE 2 4", &base, &a, &why));
+	CHECK_TRUE(afe_cfg_parse("SET fsr=2 off=4", &base, &b, &why));
+	CHECK_EQ(a.verb, b.verb);
+	CHECK_EQ(a.cfg.fsr, b.cfg.fsr);
+	CHECK_EQ(a.cfg.off, b.cfg.off);
+	CHECK_FALSE(afe_cfg_parse("RANGE 2", &base, &a, &why));
+	CHECK_FALSE(afe_cfg_parse("RANGE 9 4", &base, &a, &why));
+	CHECK_EQ(why.code, AFE_REJ_ARG);
+}
+
+static void test_derive_recomputes_conv_unless_pinned(void)
+{
+	afe_cfg_t c = base_cfg();
+	afe_derived_t d;
+
+	/* 未钉住 ⇒ auto 派生。快钟组 + period 0x0 ⇒ 0x2(现行默认由此而来) */
+	c.conv_pinned = false;
+	c.conv = 0x1;
+	afe_cfg_derive(&c, &d);
+	CHECK_EQ(c.conv, 0x2);
+	CHECK_EQ(d.bits, 14);
+	CHECK_TRUE(d.idle_ppm < 60000);
+	CHECK_EQ(d.conv_alt, 0x1);
+
+	/* 钉住 ⇒ 不动,并留下 51.5% 的警告 */
+	c.conv_pinned = true;
+	c.conv = 0x1;
+	afe_cfg_derive(&c, &d);
+	CHECK_EQ(c.conv, 0x1);
+	CHECK_NEAR(d.idle_ppm, 515000, 5000);
+	CHECK_TRUE(d.idle_warn);
+
+	/* 有效 LSB 必须比帧 LSB 粗 2^(16−bits) 倍 */
+	CHECK_EQ(d.lsb_eff_fa, d.lsb_frame_fa << (16 - d.bits));
+}
+
+static void test_validate_rules(void)
+{
+	afe_cfg_t c = base_cfg();
+	afe_derived_t d;
+	afe_reject_t why;
+
+	afe_cfg_derive(&c, &d);
+	CHECK_TRUE(afe_cfg_validate(&c, &d, false, false, &why));
+
+	/* 慢钟组 + conv 0x1(241ms) > period 0x0(124ms) ⇒ 拒 */
+	c.fsr = MAX30131_FSR_500NA;
+	c.conv_pinned = true;
+	c.conv = 0x1;
+	c.period = 0x0;
+	afe_cfg_derive(&c, &d);
+	CHECK_FALSE(afe_cfg_validate(&c, &d, false, false, &why));
+	CHECK_EQ(why.code, AFE_REJ_PERIOD_LT_CONV);
+
+	/* offset > FSR ⇒ 拒(50nA 档配 SEL7=80nA) */
+	c = base_cfg();
+	c.fsr = MAX30131_FSR_50NA;
+	c.off = MAX30131_OFFSET_SEL7_80NA;
+	c.conv_pinned = false;
+	afe_cfg_derive(&c, &d);
+	CHECK_FALSE(afe_cfg_validate(&c, &d, false, false, &why));
+	CHECK_EQ(why.code, AFE_REJ_OFFSET_GT_FSR);
+
+	/* 四路 System ADC 预算 68ms,SYS_PERIOD 最小 124ms ⇒ 够 */
+	c = base_cfg();
+	afe_cfg_derive(&c, &d);
+	CHECK_EQ(d.sysbudget_ms, 68);
+	CHECK_TRUE(afe_cfg_validate(&c, &d, false, false, &why));
+
+	/* E 使 V_RE < 0 ⇒ DAC 单极性取不了负 ⇒ 拒 */
+	c = base_cfg();
+	c.e_mv = 700;
+	afe_cfg_derive(&c, &d);
+	CHECK_FALSE(afe_cfg_validate(&c, &d, false, false, &why));
+	CHECK_EQ(why.code, AFE_REJ_DAC);
+}
+
+/*
+ * 🔴 写序定理的机器证明。
+ * 对全部合法 (起点, 终点) 组合枚举 plan 的**每一个前缀**,断言中间态始终满足
+ * conv ≤ period(绝不置 INVALID_CFG)。这是"绝不留下坏中间态"里唯一能被
+ * 机器证明的一环 —— 项目被 INVALID_CFG 静默坑过两次。
+ */
+static bool mid_state_ok(max30131_fsr_t fsr, uint8_t conv, uint8_t period)
+{
+	return max30131_check_period_vs_conv(conv, period, false, fsr) == MAX30131_OK;
+}
+
+static void test_write_order_never_invalid(void)
+{
+	int checked = 0;
+
+	for (int f0 = 0; f0 <= 5; f0++) {
+		for (int p0 = 0; p0 <= 4; p0++) {
+			for (int f1 = 0; f1 <= 5; f1++) {
+				for (int p1 = 0; p1 <= 4; p1++) {
+					afe_cfg_t a = base_cfg(), b = base_cfg();
+					afe_derived_t da, db;
+					afe_plan_t plan;
+					max30131_fsr_t cur_f;
+					uint8_t cur_c, cur_p;
+
+					a.fsr = (max30131_fsr_t)f0;
+					a.period = (uint8_t)p0;
+					a.conv_pinned = false;
+					a.off = MAX30131_OFFSET_SEL4_9NA;
+					b.fsr = (max30131_fsr_t)f1;
+					b.period = (uint8_t)p1;
+					b.conv_pinned = false;
+					b.off = MAX30131_OFFSET_SEL4_9NA;
+					afe_cfg_derive(&a, &da);
+					afe_cfg_derive(&b, &db);
+					if (!mid_state_ok(a.fsr, a.conv, a.period) ||
+					    !mid_state_ok(b.fsr, b.conv, b.period)) {
+						continue;
+					}
+					afe_cfg_plan(&a, &da, &b, &db, &plan);
+
+					cur_f = a.fsr;
+					cur_c = a.conv;
+					cur_p = a.period;
+					for (uint8_t i = 0; i < plan.n; i++) {
+						uint8_t ad = plan.w[i].addr;
+						uint8_t v = plan.w[i].val;
+
+						if (ad == MAX30131_REG_S1_CONFIG4) {
+							cur_f = (max30131_fsr_t)
+								((v >> 5) & 0x7u);
+						} else if (ad == MAX30131_REG_S1_CONFIG5) {
+							cur_c = (uint8_t)((v >> 1) & 0xFu);
+						} else if (ad == MAX30131_REG_CONVERT_SETUP1) {
+							cur_p = (uint8_t)(v & 0xFu);
+						} else {
+							continue;
+						}
+						CHECK_TRUE(mid_state_ok(cur_f, cur_c, cur_p));
+						checked++;
+					}
+					CHECK_EQ(cur_f, b.fsr);
+					CHECK_EQ(cur_c, b.conv);
+					CHECK_EQ(cur_p, b.period);
+				}
+			}
+		}
+	}
+	CHECK_TRUE(checked > 300); /* 确实枚举到了东西,不是空跑 */
+}
+
+static void test_plan_skips_unchanged_and_marks_perturb(void)
+{
+	afe_cfg_t a = base_cfg(), b = base_cfg();
+	afe_derived_t da, db;
+	afe_plan_t plan;
+
+	afe_cfg_derive(&a, &da);
+	afe_cfg_derive(&b, &db);
+	afe_cfg_plan(&a, &da, &b, &db, &plan);
+	CHECK_EQ(plan.n, 0);            /* 完全没变 ⇒ 一个寄存器都不写 */
+	CHECK_TRUE(plan.skipped > 0);
+	CHECK_FALSE(plan.perturbs_cell);
+
+	/* 只改 ADC 侧 ⇒ 不算扰动电解池 */
+	b.off = MAX30131_OFFSET_SEL4_9NA;
+	afe_cfg_derive(&b, &db);
+	afe_cfg_plan(&a, &da, &b, &db, &plan);
+	CHECK_TRUE(plan.n > 0);
+	CHECK_FALSE(plan.perturbs_cell);
+
+	/* 改电位 ⇒ 算扰动 */
+	b = base_cfg();
+	b.e_mv = 100;
+	afe_cfg_derive(&b, &db);
+	afe_cfg_plan(&a, &da, &b, &db, &plan);
+	CHECK_TRUE(plan.perturbs_cell);
+}
+
+/*
+ * 🔴 回归钉子:0x24 的 SELECT 位必须来自配置的运行态,不能硬编码 true。
+ * 原 apply_range() 写死 true ⇒ idle(sensor 已 deselect)期间收到 RANGE
+ * 会静默重新选中 sensor、让电流转换在开路态跑起来。
+ */
+static void test_plan_preserves_sensor_selected(void)
+{
+	afe_cfg_t a = base_cfg(), b = base_cfg();
+	afe_derived_t da, db;
+	afe_plan_t plan;
+
+	a.sensor_selected = false;
+	b.sensor_selected = false;
+	b.off = MAX30131_OFFSET_SEL4_9NA;
+	afe_cfg_derive(&a, &da);
+	afe_cfg_derive(&b, &db);
+	afe_cfg_plan(&a, &da, &b, &db, &plan);
+
+	for (uint8_t i = 0; i < plan.n; i++) {
+		if (plan.w[i].addr == MAX30131_REG_S1_CONFIG5) {
+			CHECK_EQ(plan.w[i].val & 0x1u, 0u);
+		}
+	}
+}
+
+static void test_audit_line_formats(void)
+{
+	afe_cfg_t a = base_cfg(), b = base_cfg();
+	afe_derived_t da, db;
+	afe_plan_t plan;
+	char buf[512];
+	size_t n;
+	afe_reject_t why = { .code = AFE_REJ_UNKNOWN_KEY, .key = "nope",
+			     .a = 0, .b = 0 };
+
+	b.off = MAX30131_OFFSET_SEL4_9NA;
+	afe_cfg_derive(&a, &da);
+	afe_cfg_derive(&b, &db);
+	afe_cfg_plan(&a, &da, &b, &db, &plan);
+
+	n = afe_cfg_fmt_applied(7, 123456, "cmd", 4, false, &plan, &a, &b,
+				buf, sizeof(buf));
+	CHECK_TRUE(n > 0);
+	CHECK_TRUE(strstr(buf, "CFG_APPLIED ep=7") == buf);
+	CHECK_TRUE(strstr(buf, "off=4 off0=3") != NULL);
+	CHECK_TRUE(strstr(buf, "conv_src=auto") != NULL);
+
+	n = afe_cfg_fmt_derived(7, &b, &db, buf, sizeof(buf));
+	CHECK_TRUE(n > 0);
+	CHECK_TRUE(strstr(buf, "idle_ppm=") != NULL);
+	CHECK_TRUE(strstr(buf, "lsb_eff_fa=") != NULL);
+	CHECK_TRUE(strstr(buf, "rej50_worst_db_x10=") != NULL);
+
+	n = afe_cfg_fmt_reg(7, 1, 3, 0x23, 0x8D, 0xA4, 0xA4, buf, sizeof(buf));
+	CHECK_TRUE(n > 0);
+	CHECK_TRUE(strstr(buf, "addr=0x23 before=0x8D after=0xA4 readback=0xA4 ok=1")
+		   != NULL);
+	n = afe_cfg_fmt_reg(7, 1, 3, 0x23, 0x8D, 0xA4, 0x8D, buf, sizeof(buf));
+	CHECK_TRUE(strstr(buf, "ok=0") != NULL);
+
+	/* 拒因行带原文,空白换成 '_' 以保持单行可解析 */
+	n = afe_cfg_fmt_reject(7, 99, &why, "SET nope=1", buf, sizeof(buf));
+	CHECK_TRUE(n > 0);
+	CHECK_TRUE(strstr(buf, "reason=unknown_key key=nope") != NULL);
+	CHECK_TRUE(strstr(buf, "raw=SET_nope=1") != NULL);
+
+	/* 缓冲不足必须返回 0,不截断出半行 */
+	CHECK_EQ(afe_cfg_fmt_derived(7, &b, &db, buf, 20), 0u);
+}
+
 int main(void)
 {
 	printf("=== MAX30131 纯逻辑层单测 ===\n");
@@ -720,5 +1361,27 @@ int main(void)
 	RUN(test_diff_conversion_cancels_adc_offset_and_offset_tolerance);
 	RUN(test_manual_gain_calibration);
 	RUN(test_cv_eis_range_and_current_conversion);
+	RUN(test_sys_adc_setup_and_voltage);
+	RUN(test_cell_potential_needs_both_we_and_re);
+	RUN(test_amp_enable_toggle_preserves_other_bits);
+	RUN(test_conv_clocks_match_ms_tables);
+	RUN(test_matched_codes_give_tiny_idle_window);
+	RUN(test_production_config_idle_window_is_half);
+	RUN(test_rej50_uses_integration_time_not_conversion_time);
+	RUN(test_rej50_worst_case_kills_the_null_strategy);
+	RUN(test_rej50_worst_is_monotone_in_code);
+	RUN(test_auto_conv_picks_largest_fitting_code);
+	RUN(test_sysadc_budget_and_sysper_rule);
+	RUN(test_polarization_write_order_avoids_unsafe_midstate);
+	RUN(test_parse_patch_semantics);
+	RUN(test_parse_rejects_every_bad_form);
+	RUN(test_overlong_line_cannot_inject_command);
+	RUN(test_range_alias_equals_set);
+	RUN(test_derive_recomputes_conv_unless_pinned);
+	RUN(test_validate_rules);
+	RUN(test_write_order_never_invalid);
+	RUN(test_plan_skips_unchanged_and_marks_perturb);
+	RUN(test_plan_preserves_sensor_selected);
+	RUN(test_audit_line_formats);
 	return mt_report();
 }

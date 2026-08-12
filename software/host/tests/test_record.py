@@ -52,8 +52,8 @@ def main() -> int:
                 sat=2)
     chk(parse_line(format_sample_line(s3)) == s3, "sat=2(HIGH 饱和)+ ovf 往返")
     cv = Sample(seq=10, ms=10123, counts=32000, fa=-250000, tag=0, auto=True,
-                ovf=0, potential_mv=-537, cycle=4, direction=1)
-    chk(parse_line(format_sample_line(cv)) == cv, "CV 电位、圈数、方向往返")
+                ovf=0, ep=3, potential_mv=-537, cycle=4, direction=1)
+    chk(parse_line(format_sample_line(cv)) == cv, "CV 电位、圈数、方向与 epoch 往返")
 
     print("\n=== 🔴 向后兼容:旧格式(无 sat 字段)必须仍能解析 ===")
     # 2026-07-31 那批 RTT 日志就是这个格式;sat 是 08-01 追加的可选字段
@@ -69,11 +69,23 @@ def main() -> int:
                  "S seq=1 ms=2 counts=3"):  # 字段不全
         chk(parse_line(junk) is None, f"忽略:{junk[:38]!r}")
 
+    print("\n=== 🔴 向后兼容二:有 sat 无 ep(2026-08-01~08-09 那批)===")
+    mid = "S seq=7 ms=900 counts=1128 fa=482790 tag=0 auto=1 ovf=0 sat=1"
+    p = parse_line(mid)
+    chk(p is not None and p.sat == 1 and p.ep == 0, "sat 解析、ep 默认 0")
+    newest = parse_line(
+        "S seq=7 ms=900 counts=1128 fa=482790 tag=0 auto=1 ovf=0 sat=1 ep=3")
+    chk(newest is not None and newest.ep == 3, "ep 解析")
+    chk(parse_line(format_sample_line(newest)) == newest, "带 ep 的往返")
+
     print("\n=== CSV 列数一致 ===")
     chk(len(sample_to_row(s, 1.0)) == len(CSV_COLUMNS),
         f"行宽 {len(CSV_COLUMNS)} 列对齐")
-    chk(CSV_COLUMNS[-3:] == ["potential_mv", "cycle", "direction"],
-        "CV 元数据追加在历史 IT 列之后")
+    # 追加只许发生在末尾:it.py / analyze.py 都用 DictReader 按名取值,
+    # 末尾追加对读侧不可见;插到中间会打断所有既有 CSV。
+    chk(CSV_COLUMNS[-4:] == ["epoch", "potential_mv", "cycle", "direction"],
+        "epoch 与 CV 元数据追加在历史 IT 列之后")
+    chk(CSV_COLUMNS[-5] == "sat", "sat 的历史列序未动")
 
     print("\n=== 完整性检查统计饱和 ===")
     r = check_integrity([s, s2, s3])

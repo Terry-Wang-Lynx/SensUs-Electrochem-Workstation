@@ -1,5 +1,8 @@
 include README.md
+include Makefile
 include Launch_Electrochem_Workstation.command
+recursive-include macos *.swift *.plist *.sh *.py
+recursive-include protocols *.md *.json *.h
 recursive-include software/firmware *.c *.h *.conf *.yml *.yaml *.dts *.cmake *.txt CMakeLists.txt Makefile Kconfig Kconfig.* *_defconfig
 recursive-include software/host/pa_host/gui *.html *.js *.css
 recursive-include software/host/tests *.py

@@ -45,6 +45,17 @@ make install
 make run
 ```
 
+构建并打开 macOS App：
+
+```bash
+make app
+open "dist/SensUs Workstation.app"
+```
+
+App 直接加载本分支的完整工作站页面，并提供置顶主窗口和可选悬浮检测窗。
+DEBUG 分支与 App 外壳的边界、硬件换算约束和推荐配置见
+[docs/DEBUG_APP_INTEGRATION.md](docs/DEBUG_APP_INTEGRATION.md)。
+
 硬件控制模式需要从完整源码仓库运行，因为应用条件时会现场生成配置、编译 Zephyr 固件并烧录。纯数据分析与界面资源也可从 wheel 安装。
 
 ## 实验流程
@@ -65,7 +76,10 @@ CV 不进入 I-T 标定/浓度预测链。扫描结束后会生成原始 CSV、�
 
 ## 电位完整性
 
-固件现在只在上电或应用新条件后初始化一次 AFE。后续测量通过 RTT `START` 命令触发，测量间隙持续保持配置电位，不再用 MCU 复位开始新一轮。
+固件现在只在上电或应用新条件后初始化一次 AFE。后续测量通过 RTT `START`
+命令触发，不再用 MCU 复位开始新一轮。测量间隙的电解池状态由
+`idle` 模式明确决定；当前正式方法默认 `idle=2`（断开），不宣称在轮次之间
+保持恒电位。
 
 采集期间固件每秒只读审计 DACA、DACB、DAC 路由、参考源和系统控制寄存器：
 
@@ -85,10 +99,14 @@ CV 不进入 I-T 标定/浓度预测链。扫描结束后会生成原始 CSV、�
 ```bash
 make test
 make firmware-test
+make app
 make package
 ```
 
-`make app` 生成经过临时签名的通用 macOS 应用（Apple Silicon 与 Intel），`make package` 生成 `dist/*.whl` 和包含固件源码的 `dist/*.tar.gz`。GitHub Actions 会执行主机端测试、固件纯逻辑层的 186 项断言，并构建分发包。完整 Zephyr 固件仍需本机的 NCS/Zephyr 工具链与自定义板定义。
+`make app` 生成经过临时签名的通用 macOS 应用（Apple Silicon 与 Intel），
+`make package` 生成 `dist/*.whl` 和包含固件源码、App 构建脚本与方法档案的
+`dist/*.tar.gz`。GitHub Actions 会执行主机端测试、固件纯逻辑层测试，并构建
+分发包。完整 Zephyr 固件仍需本机的 NCS/Zephyr 工具链与自定义板定义。
 
 ## 目录
 
@@ -97,6 +115,7 @@ software/host/pa_host/       Python 采集、分析、标定和 GUI 服务
 software/host/pa_host/gui/   本地 Web 界面
 software/firmware/           nRF52833 + MAX30131 Zephyr 固件
 software/firmware/tests/     可在普通主机运行的 AFE 纯逻辑测试
+protocols/                   受版本控制的实验方法与固件配置
 docs/                        调试记录与排查报告
 ```
 

@@ -119,10 +119,29 @@ private final class BackendManager {
         var request = URLRequest(url: healthURL)
         request.timeoutInterval = 0.7
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        URLSession.shared.dataTask(with: request) { _, response, error in
+        URLSession.shared.dataTask(with: request) { [projectRoot] data, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode
-            completion(error == nil && status == 200)
+            guard error == nil, status == 200, let data,
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let project = payload["project"] as? String else {
+                completion(false)
+                return
+            }
+            let reportedRoot = URL(fileURLWithPath: project, isDirectory: true)
+                .standardizedFileURL.path
+            completion(reportedRoot == projectRoot.standardizedFileURL.path)
         }.resume()
+    }
+
+    func stopServer() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        if let process, process.isRunning {
+            process.terminate()
+        }
+        process = nil
+        try? logHandle?.close()
+        logHandle = nil
     }
 
     private func beginHealthMonitoring() {
@@ -178,14 +197,17 @@ private final class BackendManager {
         if let configured = environment["SENSUS_PROJECT_DIR"], !configured.isEmpty {
             candidates.append(URL(fileURLWithPath: configured, isDirectory: true))
         }
-        if let saved = UserDefaults.standard.string(forKey: "projectRoot"), !saved.isEmpty {
-            candidates.append(URL(fileURLWithPath: saved, isDirectory: true))
-        }
+        // The bundle marker is written at build time and identifies the exact
+        // source tree this App was built for. It must win over a path saved by
+        // an older App build.
         if let marker = Bundle.main.url(forResource: "project-root", withExtension: "txt"),
            let path = try? String(contentsOf: marker, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !path.isEmpty {
             candidates.append(URL(fileURLWithPath: path, isDirectory: true))
+        }
+        if let saved = UserDefaults.standard.string(forKey: "projectRoot"), !saved.isEmpty {
+            candidates.append(URL(fileURLWithPath: saved, isDirectory: true))
         }
 
         var ancestor = Bundle.main.bundleURL.deletingLastPathComponent()
@@ -284,6 +306,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         return true
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        backend.stopServer()
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
         return false
@@ -367,8 +393,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 y: visibleFrame.maxY - frame.height - 20
             ))
         }
+        keepOverlayOnScreen()
         overlayPanel.setFrameAutosaveName("SensUsWorkstationOverlayWindow")
         overlayPanel.orderOut(nil)
+    }
+
+    private func keepOverlayOnScreen() {
+        let currentFrame = overlayPanel.frame
+        let targetScreen = NSScreen.screens.first(where: {
+            $0.visibleFrame.intersects(currentFrame)
+        }) ?? NSScreen.main
+        guard let visibleFrame = targetScreen?.visibleFrame else { return }
+
+        var frame = currentFrame
+        frame.size.width = min(frame.width, visibleFrame.width - 16)
+        frame.size.height = min(frame.height, visibleFrame.height - 16)
+        frame.origin.x = min(
+            max(frame.origin.x, visibleFrame.minX + 8),
+            visibleFrame.maxX - frame.width - 8
+        )
+        frame.origin.y = min(
+            max(frame.origin.y, visibleFrame.minY + 8),
+            visibleFrame.maxY - frame.height - 8
+        )
+        overlayPanel.setFrame(frame, display: false)
     }
 
     private func configureMenus() {
@@ -536,6 +584,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     @objc private func showOverlayWindow() {
         loadOverlayPage()
         mainWindow.orderOut(nil)
+        keepOverlayOnScreen()
         overlayPanel.level = .floating
         overlayPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         overlayPanel.orderFrontRegardless()
