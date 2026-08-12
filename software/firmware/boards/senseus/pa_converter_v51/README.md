@@ -175,6 +175,39 @@ MCUboot 的精简 SMP 不实现可选的 "MCUMgr parameters" 命令,忽略即可
 **时间窗**:有可引导 app 时只有上电后 **5 s**;slot0 为空时(`BOOT_SERIAL_NO_APPLICATION=y`)
 **永久等待**,所以"软砖"总能纯 USB 救回来。
 
+### ✅ 已在**完全脱离调试器**的条件下验证(2026-08-12)
+
+SWD 探头**从板子上拔掉**后重跑一遍:
+
+```
+[捕获] /dev/cu.usbmodem1101 —— 立刻上传
+100.0% • 78 kB • 15.0 kB/s
+Waiting for response to ResetWrite... OK
+Upgrade complete.
+[t~0s] 板端口已消失 ⇒ app 已接管运行
+```
+
+🔴 **「端口消失」本身就是镜像通过校验的证据** —— 因为 `BOOT_SERIAL_NO_APPLICATION=y`:
+若上传的镜像无效,MCUboot 会**永久**留在 recovery、端口不会消失。
+(脱离探头后没法用 SWD 读 PC,这条推断替代了直接观测。)
+
+### 🔴 现阶段的真实使用限制:每次烧录都要**手动拔插一次 USB-C**
+
+当前 app 是 V4 那套 RTT 固件,**不带 USB CDC 也不带 SMP server** ⇒ 平时板端**没有** USB 口
+⇒ 进 DFU 窗口的唯一办法是**物理断电重上电**。
+(主机侧无法远程复位:板子唯一的电源就是那根 USB-C,macOS 也不能单口断 VBUS。)
+
+自动化办法:挂一个轮询器,端口一出现就立刻上传,这样不用掐那 5 秒 ——
+本次用的脚本见 `<主仓>` 的会话记录,核心就是
+`for ...; do p=$(ls /dev/cu.usbmodem* | grep -v <探头序列号>); [ -n "$p" ] && break; sleep 0.2; done`
+然后立刻 `smpmgr --port "$p" upgrade ...`。
+
+**要做到"零接触烧录",需要 Phase 2 给 app 加上其一:**
+1. **USB CDC + SMP server** ⇒ 之后可 `smpmgr os reset` 软复位进窗口(**推荐** ——
+   与 V5.1 的数据通路本来就要走 USB CDC 是同一件事,一并做最省事);
+2. `BOOT_SERIAL_BOOT_MODE` + retention(`gpregret`)⇒ app 收命令写标记再软复位,
+   MCUboot 直接停在 recovery,连 5 s 窗口都不用等。
+
 ## 7. 两条债
 
 1. 🔴 **签名用的是 MCUboot 默认开发密钥** `~/ncs/bootloader/mcuboot/root-rsa-2048.pem`
