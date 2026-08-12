@@ -49,62 +49,81 @@
             </div>
           </section>
 
-          <aside class="panel control-panel">
-            <div class="panel-head"><div><h2>IT 条件</h2><p id="settingsMessage">参数尚未应用到硬件</p></div><div class="live-badge" id="settingsBadge">未应用</div></div>
-            <div class="it-settings">
-              <label>测量方法<select disabled><option>恒电位 IT</option></select></label>
-              <div class="field-pair">
-                <label>测试电位<div class="input-unit"><input id="potentialV" type="number" min="-0.4" max="0.39" step="0.01" value="0.2"><span>V</span></div></label>
-                <label>测量时长<div class="input-unit"><input id="durationS" type="number" min="10" max="3600" step="1" value="180"><span>s</span></div></label>
-              </div>
-              <div class="field-pair">
-                <label>硬件采样频率<select id="sensPeriodCode"><option value="0">8.06 Hz</option><option value="1">4.13 Hz</option><option value="2">2.10 Hz</option><option value="3">1.06 Hz</option><option value="4">0.53 Hz</option><option value="5">0.27 Hz</option></select></label>
-                <label>输出采样频率<div class="input-unit"><input id="sampleRateHz" type="number" min="0.5" max="10" step="0.5" value="10"><span>Hz</span></div></label>
-              </div>
-              <label>末段拟合窗口<div class="input-unit"><input id="fitWindowS" type="number" min="1" step="1" value="20"><span>s</span></div></label>
-              <div class="field-pair">
-                <label>电流量程<select id="fsrNA"><option value="50">50 nA</option><option value="100">100 nA</option><option value="250">250 nA</option><option value="500" selected>500 nA</option><option value="1000">1 µA</option><option value="2000">2 µA</option></select></label>
-                <label>偏置电流<select id="offsetNA"><option value="9nA">9 nA</option><option value="19nA" selected>19 nA</option><option value="40nA">40 nA</option><option value="80nA">80 nA</option><option value="10pct" data-pct="10">10% FSR</option><option value="20pct" data-pct="20">20% FSR</option><option value="50pct" data-pct="50">50% FSR</option></select></label>
-              </div>
-              <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
-              <div class="notice warn" id="reflashWarn" hidden></div>
-              <button class="secondary full apply-settings" id="applySettings">应用条件并烧录硬件</button>
-              <div class="range-live cellv-live" id="cellvLive">
-                <div class="range-live-head"><span>电极电位<em>(System ADC 连采)</em></span><div class="live-badge" id="cellvBadge">无数据</div></div>
-                <strong id="cellvE">—</strong>
-                <small id="cellvDetail">固件按 SYS_PERIOD(≈1Hz)与电流并行采样；idle 与测量期间都采</small>
-              </div>
-              <div class="range-live phase-live" id="phaseLive">
-                <div class="range-live-head"><span>测量相位<em>(E=+200 mV,信号为氧化)</em></span><div class="live-badge" id="phaseBadge">待机</div></div>
-                <strong id="phaseNow">—</strong>
-                <small id="phaseDetail">开始测量后显示：还原瞬态 → 过零 → 氧化稳态</small>
-                <button class="secondary full" id="switchMeasRange" disabled>切到测量档（250 nA / offset 9 nA）</button>
-                <label class="inline-toggle phase-auto"><input type="checkbox" id="autoSwitchRange"><span>过零并稳定后自动切档</span></label>
-                <div class="notice error" id="phaseError" hidden></div>
-              </div>
-              <div class="range-live" id="rangeLive">
-                <div class="range-live-head"><span>运行档位<em>(硬件真值)</em></span><div class="live-badge" id="rangeBadge">未知</div></div>
-                <strong id="rangeNow">—</strong>
-                <small id="rangeDetail">开始测量后可在线切档,不复位、不中断极化</small>
-                <div class="field-pair range-pick">
-                  <label>量程<select id="rangeFsr"><option value="0">50 nA</option><option value="1">100 nA</option><option value="2">250 nA</option><option value="3">500 nA</option><option value="4" selected>1 µA</option><option value="5">2 µA</option></select></label>
-                  <label>偏置<select id="rangeOff"><option value="1">10% FSR</option><option value="2">20% FSR</option><option value="3" selected>50% FSR</option><option value="4">9 nA</option><option value="5">19 nA</option><option value="6">40 nA</option><option value="7">80 nA</option></select></label>
+          <section class="panel control-panel">
+            <div class="panel-head control-head">
+              <div><h2>测量控制</h2><p id="settingsMessage">参数尚未应用到硬件</p></div>
+              <div class="control-head-actions">
+                <div class="live-badge" id="settingsBadge">未应用</div>
+                <div class="segmented control-tabs" id="measureControlTabs" role="tablist" aria-label="测量控制分区">
+                  <button data-control-tab="sample" role="tab">样品与测量</button>
+                  <button class="active" data-control-tab="settings" role="tab">IT 条件</button>
+                  <button data-control-tab="hardware" role="tab">运行状态</button>
                 </div>
-                <button class="secondary full" id="applyRange" disabled>在线切档(不复位)</button>
-                <div class="notice error" id="rangeError" hidden></div>
               </div>
             </div>
-            <div class="sample-role-block"><span>本轮用途</span><div class="segmented role-segmented" id="sampleRole"><button class="active" data-role="calibration">标定</button><button data-role="test">测试</button></div></div>
-            <label>样品名称<input id="sampleName" placeholder="例如：未知样品 01"></label>
-            <label><span id="concentrationLabel">已知浓度（标定必填）</span><div class="input-unit"><input id="knownConcentration" type="number" min="0" step="0.001" placeholder="请输入标定浓度"><span>µM</span></div></label>
-            <div class="auto-save-preview"><span>自动保存</span><strong id="autoSaveName">样品名称-浓度.csv</strong></div>
-            <div class="action-row"><button class="primary" id="startMeasure">开始标定测量</button><button class="icon-button" id="stopMeasure" title="停止当前测量" disabled>■</button></div>
-            <button class="secondary full" id="useForCalibration" hidden disabled>将结果加入标定</button>
-            <button class="secondary full" id="predictConcentration" hidden disabled>根据标定模型预测浓度</button>
-            <div class="prediction-result" id="predictionResult" hidden><span>自动预测浓度</span><strong>--</strong><small>µM</small></div>
-            <div class="saved-result" id="savedResult" hidden><span>已保存</span><strong id="savedResultPath"></strong></div>
-            <div class="notice error" id="measureError" hidden></div>
-          </aside>
+
+            <div class="control-content">
+              <section class="measure-control-panel sample-controls" data-control-panel="sample" role="tabpanel">
+                <div class="sample-role-block"><span>本轮用途</span><div class="segmented role-segmented" id="sampleRole"><button class="active" data-role="calibration">标定</button><button data-role="test">测试</button></div></div>
+                <label>样品名称<input id="sampleName" placeholder="例如：未知样品 01"></label>
+                <label><span id="concentrationLabel">已知浓度（标定必填）</span><div class="input-unit"><input id="knownConcentration" type="number" min="0" step="0.001" placeholder="请输入标定浓度"><span>µM</span></div></label>
+                <div class="auto-save-preview"><span>自动保存</span><strong id="autoSaveName">样品名称-浓度.csv</strong></div>
+                <div class="action-row"><button class="primary" id="startMeasure">开始标定测量</button><button class="icon-button" id="stopMeasure" title="停止当前测量" disabled>■</button></div>
+                <button class="secondary full" id="useForCalibration" hidden disabled>将结果加入标定</button>
+                <button class="secondary full" id="predictConcentration" hidden disabled>根据标定模型预测浓度</button>
+                <div class="prediction-result" id="predictionResult" hidden><span>自动预测浓度</span><strong>--</strong><small>µM</small></div>
+                <div class="saved-result" id="savedResult" hidden><span>已保存</span><strong id="savedResultPath"></strong></div>
+              </section>
+
+              <section class="measure-control-panel it-settings active" data-control-panel="settings" role="tabpanel">
+                <label>测量方法<select disabled><option>恒电位 IT</option></select></label>
+                <div class="field-pair">
+                  <label>测试电位<div class="input-unit"><input id="potentialV" type="number" min="-0.4" max="0.39" step="0.01" value="0.2"><span>V</span></div></label>
+                  <label>测量时长<div class="input-unit"><input id="durationS" type="number" min="10" max="3600" step="1" value="180"><span>s</span></div></label>
+                </div>
+                <div class="field-pair">
+                  <label>硬件采样频率<select id="sensPeriodCode"><option value="0">8.06 Hz</option><option value="1">4.13 Hz</option><option value="2">2.10 Hz</option><option value="3">1.06 Hz</option><option value="4">0.53 Hz</option><option value="5">0.27 Hz</option></select></label>
+                  <label>输出采样频率<div class="input-unit"><input id="sampleRateHz" type="number" min="0.5" max="10" step="0.5" value="10"><span>Hz</span></div></label>
+                </div>
+                <label>末段拟合窗口<div class="input-unit"><input id="fitWindowS" type="number" min="1" step="1" value="20"><span>s</span></div></label>
+                <div class="field-pair">
+                  <label>电流量程<select id="fsrNA"><option value="50">50 nA</option><option value="100">100 nA</option><option value="250">250 nA</option><option value="500" selected>500 nA</option><option value="1000">1 µA</option><option value="2000">2 µA</option></select></label>
+                  <label>偏置电流<select id="offsetNA"><option value="9nA">9 nA</option><option value="19nA" selected>19 nA</option><option value="40nA">40 nA</option><option value="80nA">80 nA</option><option value="10pct" data-pct="10">10% FSR</option><option value="20pct" data-pct="20">20% FSR</option><option value="50pct" data-pct="50">50% FSR</option></select></label>
+                </div>
+                <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
+                <div class="notice warn" id="reflashWarn" hidden></div>
+                <button class="secondary full apply-settings" id="applySettings">应用条件并烧录硬件</button>
+              </section>
+
+              <section class="measure-control-panel hardware-controls" data-control-panel="hardware" role="tabpanel">
+                <div class="range-live cellv-live" id="cellvLive">
+                  <div class="range-live-head"><span>电极电位<em>(System ADC 连采)</em></span><div class="live-badge" id="cellvBadge">无数据</div></div>
+                  <strong id="cellvE">—</strong>
+                  <small id="cellvDetail">固件按 SYS_PERIOD(≈1Hz)与电流并行采样；idle 与测量期间都采</small>
+                </div>
+                <div class="range-live phase-live" id="phaseLive">
+                  <div class="range-live-head"><span>测量相位<em>(E=+200 mV,信号为氧化)</em></span><div class="live-badge" id="phaseBadge">待机</div></div>
+                  <strong id="phaseNow">—</strong>
+                  <small id="phaseDetail">开始测量后显示：还原瞬态 → 过零 → 氧化稳态</small>
+                  <button class="secondary full" id="switchMeasRange" disabled>切到测量档（250 nA / offset 9 nA）</button>
+                  <label class="inline-toggle phase-auto"><input type="checkbox" id="autoSwitchRange"><span>过零并稳定后自动切档</span></label>
+                  <div class="notice error" id="phaseError" hidden></div>
+                </div>
+                <div class="range-live" id="rangeLive">
+                  <div class="range-live-head"><span>运行档位<em>(硬件真值)</em></span><div class="live-badge" id="rangeBadge">未知</div></div>
+                  <strong id="rangeNow">—</strong>
+                  <small id="rangeDetail">开始测量后可在线切档,不复位、不中断极化</small>
+                  <div class="field-pair range-pick">
+                    <label>量程<select id="rangeFsr"><option value="0">50 nA</option><option value="1">100 nA</option><option value="2">250 nA</option><option value="3">500 nA</option><option value="4" selected>1 µA</option><option value="5">2 µA</option></select></label>
+                    <label>偏置<select id="rangeOff"><option value="1">10% FSR</option><option value="2">20% FSR</option><option value="3" selected>50% FSR</option><option value="4">9 nA</option><option value="5">19 nA</option><option value="6">40 nA</option><option value="7">80 nA</option></select></label>
+                  </div>
+                  <button class="secondary full" id="applyRange" disabled>在线切档(不复位)</button>
+                  <div class="notice error" id="rangeError" hidden></div>
+                </div>
+              </section>
+            </div>
+            <div class="notice error control-error" id="measureError" hidden></div>
+          </section>
         </div>
       </section>
 

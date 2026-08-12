@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, sampleRole: 'calibration', chartWindowS: 5, lastHandledRunId: null };
+const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, sampleRole: 'calibration', chartWindowS: 5, lastHandledRunId: null, measureControlInitialized: false };
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
   calibrate: ['标定与漂移', '选择标定范围并管理过渡期 bias'],
@@ -36,7 +36,7 @@ function setSampleRole(role, quiet=false){
 }
 function renderWorkflow(data){
   state.workflow=data;$('saveDirectory').value=data.save_dir||'';
-  const labels={collect:'采集中',select:'待选范围',stabilization:'稳定化中',test:'曲线已锁定'};
+  const labels={collect:'标定采集',select:'待选范围',stabilization:'稳定化中',test:'测试就绪'};
   $('workflowBadge').textContent=labels[data.stage]||'待配置';$('workflowBadge').className=`live-badge ${data.calibration_ready?'running':''}`;
   $('workflowMessage').textContent=data.calibration_ready?`测试曲线采用 ${data.selected_points_count} / ${data.points_count} 个候选点；后续采集不会自动改写`:data.points_count&&!data.settings_match?'当前 IT 条件与已有标定不同；请恢复原条件或新建标定批次':`已记录 ${data.points_count} 个候选点，请到“标定与漂移”选择用于拟合的范围`;
   $('calibrationStep').classList.toggle('active',data.stage==='collect');$('selectionStep').classList.toggle('active',data.stage==='select');$('testStep').classList.toggle('active',['stabilization','test'].includes(data.stage));
@@ -73,6 +73,21 @@ document.querySelectorAll('.nav-item').forEach(button => button.addEventListener
   $('pageSubtitle').textContent = pages[button.dataset.view][1];
   requestAnimationFrame(() => {drawAll(); drawDebug();});
 }));
+
+function setMeasureControlTab(name) {
+  $('measureControlTabs').querySelectorAll('[data-control-tab]').forEach(button => {
+    const active = button.dataset.controlTab === name;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
+  document.querySelectorAll('[data-control-panel]').forEach(panel => {
+    panel.classList.toggle('active', panel.dataset.controlPanel === name);
+  });
+}
+$('measureControlTabs').addEventListener('click', event => {
+  const button = event.target.closest('[data-control-tab]');
+  if (button) setMeasureControlTab(button.dataset.controlTab);
+});
 
 function setupCanvas(canvas) {
   const ratio = window.devicePixelRatio || 1, rect = canvas.getBoundingClientRect();
@@ -346,6 +361,7 @@ function renderOffsetLabels(fsr){$('offsetNA').querySelectorAll('option[data-pct
 function signedPotential(value){const number=Number(value);return `${number>0?'+':''}${number.toFixed(2)}`}
 function renderSettings(data){
   state.settings=data; const s=data.settings, periods=[124,242,476,945,1882,3757], nativeRate=1000/periods[s.sens_period_code??0];
+  if(!state.measureControlInitialized){setMeasureControlTab(data.applied?'sample':'settings');state.measureControlInitialized=true}
   $('potentialV').value=s.potential_v; $('durationS').value=s.duration_s; $('sensPeriodCode').value=String(s.sens_period_code??0); $('sampleRateHz').value=s.target_rate_hz; $('fitWindowS').value=s.fit_window_s; $('fsrNA').value=String(s.fsr_nA);renderOffsetLabels(s.fsr_nA);$('offsetNA').value=s.offset_mode||`${s.offset_nA??19}nA`;
   $('outputPoints').textContent=`${Math.round(s.duration_s*s.target_rate_hz)} 点 · 原生 ${fmt(nativeRate,2)} Hz`;
   pages.measure[1]=`${s.duration_s} 秒 IT 检测与末 ${s.fit_window_s} 秒稳态分析`; if($('view-measure').classList.contains('active'))$('pageSubtitle').textContent=pages.measure[1]; $('validCount').nextElementSibling.textContent=`/ ${Math.round(s.duration_s*s.target_rate_hz)}`;

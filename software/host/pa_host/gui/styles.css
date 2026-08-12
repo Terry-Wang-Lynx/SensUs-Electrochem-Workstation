@@ -110,3 +110,115 @@
 .live-badge.warn{color:#8a5d0f;border-color:#e2c48a;background:#fff8ec}
 #dbgLoopWarn b{display:inline}
 #dbgLoopWarn{line-height:1.7}
+
+/* ── 工作站主布局：曲线优先，控制区横向展开 ─────────────────────────── */
+html,body,.app-shell{height:100%;overflow:hidden}
+.app-shell{min-height:0}
+main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hidden}
+.topbar{height:60px;padding:0 22px}
+.topbar h1{font-size:18px}
+.view{min-height:0}
+.view.active{overflow:auto}
+
+#view-measure.active{display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;
+  height:100%;padding:10px 16px;overflow:hidden}
+.workflow-bar{display:grid;grid-template-columns:minmax(175px,.75fr) auto minmax(330px,1.35fr) auto;
+  align-items:center;gap:16px;margin:0;padding:0 14px;min-height:58px}
+.workflow-heading{min-height:0;padding:0;border:0}
+.workflow-heading>div:first-child{min-width:0}
+.workflow-heading p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.workflow-heading .live-badge{flex:0 0 auto;white-space:nowrap}
+.workflow-body{display:contents}
+.workflow-steps{height:auto}
+.workflow-steps i{width:18px}
+.workflow-bar .save-directory{min-width:0}
+.workflow-bar .reset-calibration{margin:0;white-space:nowrap}
+
+.workspace-grid{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(250px,1fr) auto;
+  gap:10px;min-height:0}
+.workspace-grid>.chart-panel{display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-height:0;overflow:hidden}
+.workspace-grid>.chart-panel .chart-wrap{height:auto;min-height:0}
+.workspace-grid>.chart-panel .panel-head{min-height:54px;padding:9px 16px}
+.workspace-grid>.chart-panel .metric-strip>div{padding:6px 16px}
+.workspace-grid>.chart-panel .metric-strip strong{font-size:17px;line-height:1.45}
+
+.control-panel{display:grid;grid-template-rows:auto minmax(0,1fr) auto;align-self:stretch;overflow:hidden}
+.control-head{min-height:50px;padding:8px 14px}
+.control-head-actions{display:flex;align-items:center;gap:10px}
+.control-tabs button{min-width:82px;padding:6px 10px}
+.control-content{height:190px;min-height:190px;overflow:auto}
+.control-content input,.control-content select{padding:7px 9px}
+.measure-control-panel{display:none;height:100%}
+.measure-control-panel.active{display:grid}
+
+.sample-controls{grid-template-columns:180px minmax(170px,1fr) minmax(180px,1fr) minmax(235px,1.15fr);
+  grid-auto-rows:min-content;align-items:end;gap:8px 12px;padding:10px 16px}
+.sample-controls label,.sample-controls .sample-role-block{margin:0}
+.sample-controls .sample-role-block{display:grid;gap:6px;align-items:stretch;justify-content:stretch}
+.sample-controls .role-segmented button{min-width:0;flex:1}
+.sample-controls .auto-save-preview{grid-column:1/4;margin:0;padding:8px 10px;min-width:0}
+.sample-controls .action-row{grid-column:4;grid-row:1;margin:0;align-self:end}
+.sample-controls>.full{grid-column:4;width:100%;margin:0}
+.sample-controls .prediction-result,.sample-controls .saved-result{grid-column:1/-1;margin:0;padding:8px 10px}
+.sample-controls .saved-result strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.it-settings.measure-control-panel{padding:10px 16px;grid-template-columns:repeat(4,minmax(130px,1fr));
+  grid-auto-rows:min-content;gap:8px 12px;align-content:start}
+.it-settings.measure-control-panel.active{display:grid}
+.it-settings.measure-control-panel label{margin:0}
+.it-settings.measure-control-panel>.field-pair{display:contents}
+.it-settings.measure-control-panel .sampling-note{grid-column:span 2;margin:0;padding:7px 10px;min-height:44px}
+.it-settings.measure-control-panel .apply-settings{grid-column:span 2;width:100%;margin:0;align-self:stretch}
+.it-settings.measure-control-panel>.notice{grid-column:1/-1;margin:0;padding:8px}
+
+.hardware-controls{grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:9px 16px}
+.hardware-controls.active{display:grid}
+.hardware-controls .range-live{height:100%;margin:0;padding:9px 12px;overflow:hidden}
+.hardware-controls .range-live>small{min-height:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hardware-controls .range-live .range-pick{display:grid;grid-template-columns:1fr 1fr;padding:5px 0 0}
+.hardware-controls .range-live .range-pick label{gap:3px}
+.hardware-controls .range-live .range-pick select{padding:5px 7px}
+.hardware-controls .range-live .full{margin-top:5px;padding:6px 10px}
+.hardware-controls .phase-live .phase-auto{margin-top:8px}
+.control-error{margin:0;border-width:1px 0 0;border-radius:0;padding:8px 14px}
+
+#view-calibrate.active,#view-schedule.active{height:100%;padding:16px 18px}
+.schedule-layout{min-height:100%}
+.schedule-layout>.panel{min-height:0}
+.history-list{max-height:calc(100vh - 185px)}
+
+@media(max-width:1350px){
+  .workflow-bar{grid-template-columns:minmax(170px,.7fr) minmax(300px,1.3fr) auto}
+  .workflow-steps{display:none}
+  .sample-controls{grid-template-columns:160px 1fr 1fr minmax(220px,.9fr)}
+  .it-settings.measure-control-panel{grid-template-columns:repeat(4,minmax(115px,1fr))}
+}
+@media(max-width:1050px){
+  html,body,.app-shell{overflow:auto}
+  main{height:auto;min-height:100vh;overflow:visible}
+  #view-measure.active{height:auto;min-height:calc(100vh - 60px);overflow:visible}
+  .workspace-grid{grid-template-rows:minmax(320px,48vh) auto}
+  .workflow-bar{grid-template-columns:1fr auto;padding:12px 14px}
+  .workflow-bar .save-directory{grid-column:1/-1}
+  .control-content{height:300px;min-height:300px}
+  .sample-controls{grid-template-columns:1fr 1fr}
+  .sample-controls .action-row{grid-column:2;grid-row:auto}
+  .sample-controls .auto-save-preview{grid-column:1}
+  .sample-controls>.full{grid-column:2}
+  .it-settings.measure-control-panel{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .it-settings.measure-control-panel .sampling-note{grid-column:span 2}
+  .it-settings.measure-control-panel .apply-settings{grid-column:span 1}
+  .hardware-controls{grid-template-columns:1fr;overflow:auto}
+  .hardware-controls .range-live{height:auto;min-height:150px}
+}
+@media(max-width:720px){
+  main{display:block}
+  .control-head{align-items:flex-start;gap:8px}
+  .control-head-actions{align-items:flex-end;flex-direction:column-reverse}
+  .control-tabs button{min-width:0}
+  .control-content{height:390px;min-height:390px}
+  .sample-controls,.it-settings.measure-control-panel{grid-template-columns:1fr 1fr}
+  .sample-controls .action-row,.sample-controls .auto-save-preview,.sample-controls>.full,
+  .sample-controls .prediction-result,.sample-controls .saved-result{grid-column:1/-1}
+  .it-settings.measure-control-panel .sampling-note,.it-settings.measure-control-panel .apply-settings{grid-column:1/-1}
+}
