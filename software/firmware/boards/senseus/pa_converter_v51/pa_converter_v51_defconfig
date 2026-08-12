@@ -1,0 +1,25 @@
+# pA-Converter V5.1 板级默认值 —— 硬约束在此结构化落死
+
+# 🔴 [1] LFXO 已砍(P0.00/P0.01 在 PCB 上悬空,BOM 无 32.768kHz 晶体)→ 用内部 LFRC
+#     代价:±500ppm(≈±43s/天),放弃 RTC 时间权威,绝对时间靠上位机对齐
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC=y
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_500PPM=y
+
+# 🔴 [2] DC/DC 严禁使能 —— 见 .dts 里的 `&reg1`(DCC 悬空、电感未贴)。
+#     ⚠️ CONFIG_BOARD_ENABLE_DCDC 已从 Zephyr 移除(NCS 3.4 / Zephyr 4.x),
+#        写了会报 "undefined symbol" 并中止构建。唯一机制是 devicetree。
+
+# 🔴 [3] 板上无 UART 引脚 ⇒ 不要 UART console。
+#     但 **SERIAL 必须开** —— USB CDC ACM 是 serial 设备,MCUboot 的 serial recovery
+#     和(Phase 2)数据通路都要它。这是与 V4.0 defconfig 的关键差异(V4 是 SERIAL=n)。
+CONFIG_SERIAL=y
+CONFIG_UART_CONSOLE=n
+# 板上没有硬件 UART 在用 ⇒ 不编 nrfx UART 驱动,省 flash
+CONFIG_UART_NRFX=n
+# CDC ACM 需要中断驱动 + line control(主机打开串口才发数据)
+CONFIG_UART_INTERRUPT_DRIVEN=y
+CONFIG_UART_LINE_CTRL=y
+
+CONFIG_GPIO=y
+CONFIG_ARM_MPU=y
+CONFIG_HW_STACK_PROTECTION=y

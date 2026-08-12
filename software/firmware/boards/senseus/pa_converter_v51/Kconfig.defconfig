@@ -1,0 +1,6 @@
+if BOARD_PA_CONVERTER_V51
+
+config BOARD
+	default "pa_converter_v51"
+
+endif

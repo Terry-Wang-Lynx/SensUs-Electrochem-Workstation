@@ -1,0 +1,212 @@
+/*
+ * pA-Converter V5.1 —— 自定义板(nRF52833-QDAA / QFN40)
+ *
+ * V5.1 = 插电脑的极小板:**USB-C 供电 + USB 传数据,无 BLE、无纽扣电池**。
+ * 与 V4.0 的关系见 hardware/ver5.1/README.md。
+ *
+ * 🔴 引脚全部来自 **PCB 实解**(`hardware/ver5.1/pA-converter-v51/pA-converter-v51.kicad_pcb`),
+ *    不是原理图导出(遵 memory schematic-pcb-divergence-2026-07)。
+ *    实解结论(2026-08-12):
+ *      U2.4=/MISO(P0.04) U2.5=/SCLK(P0.05) U2.6=/MOSI(P1.09) U2.7=/CSN(P0.11)
+ *        ⇒ **与 V4.0 逐脚相同**,SPI 部分整段照搬
+ *      U2.9=VDDH  U2.10=VBUS  两脚同接 /VBUS   ⇒ **高压模式**(见下 [4])
+ *      U2.12=/D-  U2.13=/D+   接 J1 的 A7/A6  ⇒ USB 可用
+ *      U2.24=ANT  **悬空**                     ⇒ **无射频**,不要开 BT
+ *      U2.39=DCC  **悬空**                     ⇒ DC/DC 严禁使能(同 V4)
+ *      U2.2/3=P0.00/P0.01(XL1/XL2)悬空       ⇒ 无 LFXO,用 LFRC
+ *      U2.16=/nRESET → CN1 pin4               ⇒ 但 UICR.PSELRESET 未编程,当前是普通 GPIO
+ *
+ * 五条硬约束在本文件 / defconfig 里结构化落死,不靠 overlay:
+ *   [1] LFXO 已砍       → defconfig 用 LFRC(±500ppm)
+ *   [2] DC/DC 严禁使能  → &reg1 显式 LDO(DCC 电感未贴,置 DCDC 会连 SWD 一起砖化)
+ *   [3] 无 UART 引脚    → uart0 关闭;console 走 RTT(数据通路 Phase 2 才迁到 USB CDC)
+ *   [4] 高压模式        → VDD 由片内 REG0 产生,**必须先把 UICR.REGOUT0 烧成 3.3V**,
+ *                         否则 VDD=1.8V:SWD 电平只有 1.8V 且 MAX30131 的 V_WE 窗口为空。
+ *                         已于 2026-08-12 烧入(REGOUT0=5),全过程见
+ *                         docs/troubleshooting/nrf52-failed-to-power-up-dap.md §0。
+ *                         ⚠️ nRF52833 的 REG0 **只有 LDO**(datasheet §5.3.8.2),
+ *                            没有运行时可配项 ⇒ 这里无需也无法写 &reg0。
+ *   [5] 无按键、无引出 GPIO → 进 bootloader 只能靠「上电等窗口 + 无 app 就停住」,
+ *                         故 chosen 里给出 zephyr,uart-mcumgr,MCUboot 走 USB CDC serial recovery。
+ *
+ * ⚠️ INTB(MAX30131 中断输出)同 V4 仍未接 ⇒ 固件只能轮询,此处不声明 int-gpios。
+ */
+
+/dts-v1/;
+
+#include <nordic/nrf52833_qdaa.dtsi>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
+#include <zephyr/dt-bindings/regulator/nrf5x.h>
+
+/ {
+	model = "pA-Converter V5.1 (custom, USB)";
+	compatible = "senseus,pa-converter-v51";
+
+	chosen {
+		zephyr,flash = &flash0;
+		zephyr,sram = &sram0;
+		zephyr,code-partition = &slot0_partition;
+
+		/*
+		 * 🔴 [5] MCUboot 的 serial recovery 走这个节点。
+		 * NCS 1.8.0 起接口由 Kconfig 改为 devicetree chosen 指定
+		 * (见 doc/nrf/app_dev/bootloaders_dfu/mcuboot_serial_recovery.rst)。
+		 * 放在**板文件**里,MCUboot 与 app 用同一块板 ⇒ 两个 image 都能看到。
+		 */
+		zephyr,uart-mcumgr = &cdc_acm_uart0;
+	};
+
+	aliases {
+		afe0 = &max30131;
+	};
+};
+
+&pinctrl {
+	/*
+	 * SPI1 → MAX30131(4 线 SPI,mode 0,≤8MHz)—— 与 V4.0 逐脚相同
+	 *   SCLK : P0.05
+	 *   MOSI : P1.09   🔴 **在 port 1**,极易误写成 P0.09
+	 *   MISO : P0.04
+	 *   CSN  : P0.11   (由 cs-gpios 管,不进 pinctrl)
+	 */
+	spi1_default: spi1_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 9)>,
+				<NRF_PSEL(SPIM_MISO, 0, 4)>;
+		};
+	};
+
+	spi1_sleep: spi1_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 9)>,
+				<NRF_PSEL(SPIM_MISO, 0, 4)>;
+			low-power-enable;
+		};
+	};
+};
+
+&spi1 {
+	status = "okay";
+	compatible = "nordic,nrf-spim";
+	pinctrl-0 = <&spi1_default>;
+	pinctrl-1 = <&spi1_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	/* CSN = P0.11,低有效 */
+	cs-gpios = <&gpio0 11 GPIO_ACTIVE_LOW>;
+
+	/*
+	 * MAX30131:SPI mode 0(CPOL=0 / CPHA=0)⇒ 不写 spi-cpol / spi-cpha。
+	 * 频率保守取 4MHz(器件上限 8MHz)。寄存器语义全在 lib/max30131/(已单测),
+	 * 不写 Zephyr sensor driver —— 与 V4 保持同一份换算逻辑。
+	 */
+	max30131: max30131@0 {
+		compatible = "senseus,max30131";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+		label = "MAX30131";
+	};
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+/* 🔴 MOSI 在 P1.09,**必须**开 gpio1,否则 pinctrl 拿不到该脚 */
+&gpio1 {
+	status = "okay";
+};
+
+&gpiote {
+	status = "okay";
+};
+
+/* 看门狗:USB 拔出/掉压可落进 POR 盲区不自恢复,必配(同 V4 的 board_guards.c) */
+&wdt0 {
+	status = "okay";
+};
+
+/*
+ * 🔴🔴 [2] DC/DC 严禁使能 —— DCC(U2.39)在 PCB 上**悬空**,电感未贴。
+ * 置成 DCDC 模式会让芯片彻底不工作,**连 SWD 都上不来**(一烧就砖,只能 recover 抢)。
+ * SoC dtsi 默认已是 LDO,这里**显式再写一遍**:让约束在板文件里可见,
+ * 而不是依赖上游默认值哪天变了没人发现。
+ * (旧机制 CONFIG_BOARD_ENABLE_DCDC 已从 Zephyr 移除,devicetree 是现在唯一入口。)
+ */
+&reg1 {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+/* [3] 板上没有任何 UART 引脚(CN1 只有 SWDIO/SWCLK/nRESET/VTref/GND) */
+&uart0 {
+	status = "disabled";
+};
+
+/*
+ * USB 设备控制器。V5.1 的 D+/D- 已连到 J1(A6/A7),DECUSB 挂了 C2 4.7µF,
+ * HFXO 晶体 X1 在位(USB 必须有 HFXO)。
+ * ⚠️ J1 只有 CC1 挂了 Rd(R5 5.1k),CC2 悬空,且 D+/D- 只接 A 侧
+ *    ⇒ **只有一个插入方向能工作**(下一版修,见 hardware/ver5.1/README.md)。
+ */
+zephyr_udc0: &usbd {
+	compatible = "nordic,nrf-usbd";
+	status = "okay";
+
+	/* MCUboot serial recovery 与(Phase 2)数据通路共用的 CDC ACM 口 */
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+		label = "pA-Converter V5.1 CDC";
+	};
+};
+
+&flash0 {
+	/*
+	 * 🔴 分区表 = **MCUboot 双槽**布局(512KB / 0x80000)。
+	 *
+	 *   boot     0x00000000 +0x18000 ( 96KB)  MCUboot 本体(带 USB 栈)
+	 *   slot0    0x00018000 +0x30000 (192KB)  运行镜像
+	 *   slot1    0x00048000 +0x30000 (192KB)  DFU 上传目标(serial recovery 只写 slot1)
+	 *   storage  0x00078000 + 0x8000 ( 32KB)  settings
+	 *                                = 0x80000 ✅
+	 *
+	 * 🔴 尺寸的依据是**实测用量**,不是拍脑袋(2026-08-12 首次构建):
+	 *      MCUboot(带 USB CDC serial recovery)= 60936 B
+	 *      app 签名后                          = 77960 B
+	 *    初版给 MCUboot 64KB ⇒ **92.98% 满**,一长就溢出 ⇒ 提到 96KB(用量 62%)。
+	 *    app 那 192KB 槽只用 40%,余量充足;两槽等大是 swap 算法的前提。
+	 *    ⚠️ 改动此表后**必须重新构建并看 "Memory region" 一行**确认没超。
+	 *
+	 * ⚠️ 实测(NCS v3.4.0 + sysbuild):本配置下**没有**生成 partitions.yml / pm_config.h
+	 *    ⇒ Partition Manager 未接管,**此表就是最终生效的布局**。
+	 *    若将来 NCS 版本变化导致 PM 接管(会出现 partitions.yml),则以 PM 为准,
+	 *    别在这里改数字去追它 —— 先确认哪一套在生效。
+	 */
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x00018000>;
+		};
+
+		slot0_partition: partition@18000 {
+			label = "image-0";
+			reg = <0x00018000 0x00030000>;
+		};
+
+		slot1_partition: partition@48000 {
+			label = "image-1";
+			reg = <0x00048000 0x00030000>;
+		};
+
+		storage_partition: partition@78000 {
+			label = "storage";
+			reg = <0x00078000 0x00008000>;
+		};
+	};
+};
