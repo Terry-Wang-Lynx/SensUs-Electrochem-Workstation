@@ -55,6 +55,10 @@ SET fsr=5 off=1 conv=auto period=0 e=200 vwe=1200 idle=2 sysper=3 cellv=1 ioc=0
 它是当前实验基线，不应由 App 外壳另行覆盖。正式使用前仍应在“硬件 DEBUG”页
 确认设备回报的 `CFG_APPLIED/CFG_DERIVED`、电位与饱和状态。
 
+2026-08-12 正式标定的固化方法为 `+0.2 V / 180 s`，上位机输出
+`10 Hz / 1800 点`，标定值取最后 `20 s` 的有效点。完整的机器可读配置、
+编译头文件和方法说明归档在 `protocols/it_200mV_180s/`。
+
 ## 使用方式
 
 ```bash

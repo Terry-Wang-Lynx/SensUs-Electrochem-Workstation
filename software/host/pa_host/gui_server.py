@@ -47,6 +47,8 @@ from .it import (
 from .collect import (
     DEVICE as JLINK_DEVICE,
     JLINK_EXE,
+    OPENOCD_EXE,
+    OPENOCD_SCRIPTS,
     SPEED_KHZ as JLINK_SPEED_KHZ,
 )
 
@@ -264,17 +266,37 @@ class SettingsController:
 
     @staticmethod
     def _flash_firmware() -> None:
-        """用 JLinkExe V8.80 把 hex 烧进片子。
+        """用可用的 SWD 后端把 hex 烧进片子并校验。
 
-        🔴 为什么不是 openocd:Homebrew 的 openocd **没有编 jlink 驱动**
-        (`Error: The specified adapter driver was not found (jlink)`;libjaylink
-        不在其依赖里,`brew` 的稳定 bottle 同样没有,重装无效)。JLinkExe V8.80 是本项目
-        唯一验证过能连这两支克隆探头的通道,见
-        docs/troubleshooting/jlink-v9克隆-swd-turnaround不松线.md。2026-08-09 换。
+        Homebrew 的默认 openocd 没有编入 jlink 驱动；本机的用户级
+        OpenOCD 显式启用 libjaylink，并已通过连接、写入、verify 三项硬件
+        检查。旧的 JLinkExe V8.80 仍是第一优先级；它随 CubeIDE 缺失时
+        才走 OpenOCD 回退。
 
-        🔴 必须查输出标记:JLinkExe 连不上目标时也可能 exit 0,不能只靠 returncode。
-        成功标记取自 2026-08-09 实测输出(`O.K.` + `Script processing completed.`)。
+        两种后端都必须检查各自的写入和校验成功标记，不只看进程退出码。
         """
+        if not JLINK_EXE.exists():
+            if not OPENOCD_EXE.exists():
+                raise RuntimeError(
+                    f"既找不到 JLinkExe({JLINK_EXE})，也找不到 OpenOCD"
+                )
+            done = subprocess.run(
+                [
+                    str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+                    "-f", "interface/jlink.cfg", "-c", "transport select swd",
+                    "-f", "target/nrf52.cfg",
+                    "-c", f"adapter serial {JLINK_SERIAL}",
+                    "-c", f"adapter speed {JLINK_SPEED_KHZ}",
+                    "-c", f"program {FIRMWARE_HEX} verify reset exit",
+                ],
+                cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+            )
+            blob = f"{done.stdout}\n{done.stderr}"
+            if "Programming Finished" not in blob or "Verified OK" not in blob:
+                tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
+                raise RuntimeError("OpenOCD 烧录未确认成功:" + " | ".join(tail))
+            return
+
         script = f"loadfile {FIRMWARE_HEX}\nr\ng\nq\n"
         with tempfile.NamedTemporaryFile(
             "w", suffix=".jlink", delete=False, encoding="utf-8"
@@ -571,11 +593,9 @@ class MeasurementController:
                 "-m",
                 "pa_host.it_tool",
                 "measure",
-                # 🔴 2026-08-09:原来是 `--socket 127.0.0.1:19021` + 自己起一条
-                #    openocd RTT 桥。但 Homebrew 的 openocd 没编 jlink 驱动
-                #    (`adapter driver was not found (jlink)`),这条桥从来起不来。
-                #    改成让 collector 走它自己那条已实现且验证过的 JLinkExe V8.80
-                #    通道:它负责 SetRTTAddr + rtt start,RTT 仍出在 telnet 19021,
+                # 让 collector 持有唯一的 RTT 桥:有 V8.80 时优先 JLinkExe;
+                #    CubeIDE 缺失时自动回退到启用 libjaylink 的 OpenOCD。
+                #    两者都负责指定 RTT 控制块，RTT 仍出在 telnet 19021,
                 #    并且 finally 里有 terminate/wait/kill 的完整回收(禁 pkill)。
                 "--start-jlink",
                 "--elf",

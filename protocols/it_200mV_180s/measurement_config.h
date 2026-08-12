@@ -1,7 +1,7 @@
 #ifndef SENSUS_MEASUREMENT_CONFIG_H
 #define SENSUS_MEASUREMENT_CONFIG_H
 
-/* Safe source-tree defaults; the GUI writes measurement_config.h at runtime. */
+/* Archived firmware configuration for L-DOPA I-T, +0.2 V, 180 s. */
 #define GUI_WP_FSR MAX30131_FSR_2000NA
 #define GUI_WP_OFFSET_SEL MAX30131_OFFSET_10PCT_FSR
 #define GUI_WP_START_E_MV 200

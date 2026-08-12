@@ -6,7 +6,7 @@
     B 段(离线)交给 analyze.py。两段刻意分开:收数不能因为分析崩掉而丢数据。
 
 三种取数来源
-    --start-jlink   ★推荐★ 自己起 JLinkExe(SetRTTAddr + rtt start),从 telnet 19021 读
+    --start-jlink   ★推荐★ 自己起 RTT 桥(JLinkExe/OpenOCD),从 telnet 19021 读
     --socket H:P    连一个已经在跑的 RTT telnet 服务
     --tail FILE     跟读一个 RTT 日志文件(你自己起的 logger)
 
@@ -20,8 +20,8 @@
     python3 -m pa_host.analyze /tmp/fake.csv --fsr-pa 50000
 
 🔴 两个必须知道的坑(2026-07-31 实测)
-    1. **必须用 J-Link V8.80**,不能用 /usr/local/bin 的 V9.46 —— V9.x 的 DLL 丢了对这支
-       克隆探头固件的 legacy 回退,连不上目标。
+    1. SEGGER 后端只能用已验证的 J-Link V8.80，不能用 V9.46。
+       V8.80 不存在时，本模块回退到已验证的 libjaylink OpenOCD。
        见 docs/troubleshooting/jlink-v9克隆-swd-turnaround不松线.md
     2. **`JLinkRTTLoggerExe` 的自动搜索找不到本固件的 RTT 控制块**(实测在 0x20001040,
        魔术字与缓冲都正常),而它**不接受地址参数** ⇒ 只能走 `JLinkExe` 的
@@ -59,7 +59,9 @@ from .record import (
     sample_to_row,
 )
 
-# 🔴 只能用 V8.80;路径来自 STM32CubeIDE 自带的 J-Link 工具链
+# 首选已验证的 V8.80;路径来自 STM32CubeIDE 自带的 J-Link 工具链。
+# 若 CubeIDE 被移除，回退到启用 libjaylink 的开源 OpenOCD：它仍通过同一个
+# RTT 端口向上层提供完全相同的行协议，不改测量和解析逻辑。
 JLINK_V880_DIR = Path(
     "/Applications/STM32CubeIDE.app/Contents/Eclipse/plugins/"
     "com.st.stm32cube.ide.mcu.externaltools.jlink.macos64_2.5.100.202509120932/tools/bin"
@@ -89,6 +91,36 @@ def _resolve_jlink_exe() -> Path:
 
 
 JLINK_EXE = _resolve_jlink_exe()
+
+
+def _resolve_openocd() -> tuple[Path, Path]:
+    """选取启用 J-Link 驱动的 OpenOCD 及其 scripts 目录。"""
+    configured = os.environ.get("SENSUS_OPENOCD_EXE")
+    candidates = [Path(configured).expanduser()] if configured else []
+    candidates.extend([
+        Path.home() / ".local/share/sensus-openocd-jlink/bin/openocd",
+        Path(shutil.which("openocd") or "/nonexistent/openocd"),
+    ])
+    executable = next((path for path in candidates if path.exists()), candidates[0])
+
+    configured_scripts = os.environ.get("SENSUS_OPENOCD_SCRIPTS")
+    script_candidates = (
+        [Path(configured_scripts).expanduser()] if configured_scripts else []
+    )
+    script_candidates.extend([
+        executable.parent.parent / "share/openocd/scripts",
+        Path("/opt/homebrew/share/openocd/scripts"),
+        Path("/usr/local/share/openocd/scripts"),
+    ])
+    scripts = next(
+        (path for path in script_candidates
+         if (path / "interface/jlink.cfg").exists()),
+        script_candidates[0],
+    )
+    return executable, scripts
+
+
+OPENOCD_EXE, OPENOCD_SCRIPTS = _resolve_openocd()
 
 # 从 ELF 提 _SEGGER_RTT 用
 ZEPHYR_SDK_NM = Path(
@@ -141,34 +173,57 @@ def find_rtt_address(elf: Path) -> int:
 # --------------------------------------------------------------------------
 def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
                     port: int, reset_before_read: bool = False) -> subprocess.Popen:
-    """起 JLinkExe,SetRTTAddr + rtt start,RTT 数据出到 telnet `port`。
+    """起 RTT 桥，数据出到 telnet ``port``。
 
-    stdin 保持打开 —— JLinkExe 一旦读到 EOF 就退出,RTT 服务随之关闭。
+    优先保留已验证的 JLinkExe V8.80 通路。它不存在时，使用
+    libjaylink OpenOCD 建立等价的 RTT server。
     """
-    if not JLINK_EXE.exists():
+    if JLINK_EXE.exists():
+        cmd = [str(JLINK_EXE), "-NoGui", "1", "-RTTTelnetPort", str(port)]
+        if probe_serial:
+            cmd += ["-SelectEmuBySN", probe_serial]
+
+        print(f"[collect] 启动 JLinkExe,RTT 控制块 @ 0x{rtt_addr:08X},telnet {port}",
+              file=sys.stderr)
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT, text=True,
+        )
+        assert proc.stdin is not None
+        reset_cmds = "r\nsleep 100\ng\nsleep 500\n" if reset_before_read else ""
+        proc.stdin.write(
+            f"si SWD\nspeed {SPEED_KHZ}\ndevice {DEVICE}\nconnect\n"
+            f"{reset_cmds}exec SetRTTAddr 0x{rtt_addr:08X}\nrtt start\n"
+        )
+        proc.stdin.flush()   # 不关 stdin:JLinkExe 读到 EOF 会退出
+        return proc
+
+    if not OPENOCD_EXE.exists() or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").exists():
         sys.exit(
-            f"找不到 {JLINK_EXE}\n"
-            "→ 需要 J-Link **V8.80**。注意克隆探头配 V9.x 连不上(见模块 docstring)。"
+            f"找不到 {JLINK_EXE}，也找不到可用的 libjaylink OpenOCD\n"
+            "→ 设 SENSUS_JLINK_EXE 指向 V8.80，或设 SENSUS_OPENOCD_EXE/"
+            "SENSUS_OPENOCD_SCRIPTS。"
         )
 
-    cmd = [str(JLINK_EXE), "-NoGui", "1", "-RTTTelnetPort", str(port)]
-    if probe_serial:
-        cmd += ["-SelectEmuBySN", probe_serial]
-
-    print(f"[collect] 启动 JLinkExe,RTT 控制块 @ 0x{rtt_addr:08X},telnet {port}",
+    adapter_serial = f"adapter serial {probe_serial}; " if probe_serial else ""
+    reset_cmds = "reset halt; reset run; sleep 500; " if reset_before_read else ""
+    server_commands = (
+        f"{adapter_serial}adapter speed {SPEED_KHZ}; init; {reset_cmds}"
+        f"rtt setup 0x{rtt_addr:08X} 0x100 \"SEGGER RTT\"; "
+        f"rtt start; rtt server start {port} 0"
+    )
+    cmd = [
+        str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+        "-f", "interface/jlink.cfg", "-c", "transport select swd",
+        "-f", "target/nrf52.cfg", "-c", server_commands,
+    ]
+    print(f"[collect] 启动 libjaylink OpenOCD,RTT 控制块 @ "
+          f"0x{rtt_addr:08X},telnet {port}",
           file=sys.stderr)
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+    return subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT, text=True,
     )
-    assert proc.stdin is not None
-    reset_cmds = "r\nsleep 100\ng\nsleep 500\n" if reset_before_read else ""
-    proc.stdin.write(
-        f"si SWD\nspeed {SPEED_KHZ}\ndevice {DEVICE}\nconnect\n"
-        f"{reset_cmds}exec SetRTTAddr 0x{rtt_addr:08X}\nrtt start\n"
-    )
-    proc.stdin.flush()   # 🔴 不关 stdin:关了 JLinkExe 就退出
-    return proc
 
 
 def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
@@ -553,7 +608,7 @@ def main(argv: list[str] | None = None) -> int:
 
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--start-jlink", action="store_true",
-                     help="★推荐★ 自己起 JLinkExe(SetRTTAddr + rtt start)并读 telnet")
+                     help="★推荐★ 自己起 RTT 桥(JLinkExe/OpenOCD)并读 telnet")
     measure_cmd_help = ("命令文件(append-only,一行一条,如 `RANGE 2 5`)。"
                         "采集器用自己的 RTT socket 转发 —— 另开连接写下行无效,见模块内注释")
     ap.add_argument("--cmd-file", type=Path, default=None, help=measure_cmd_help)

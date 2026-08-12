@@ -83,6 +83,7 @@ software/host/pa_host/       Python 采集、分析、标定和 GUI 服务
 software/host/pa_host/gui/   本地 Web 界面
 software/firmware/           nRF52833 + MAX30131 Zephyr 固件
 software/firmware/tests/     可在普通主机运行的 AFE 纯逻辑测试
+protocols/                   受版本控制的实验方法与固件配置
 docs/                        调试记录与排查报告
 ```
 

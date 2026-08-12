@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "ldopa-it-200mV-180s",
+  "name": "L-DOPA I-T +0.2 V 180 s",
+  "technique": "IT",
+  "settings": {
+    "initial_potential_v": 0.2,
+    "potential_v": 0.2,
+    "prestep_s": 0.0,
+    "duration_s": 180.0,
+    "target_rate_hz": 10.0,
+    "sens_period_code": 0,
+    "fit_window_s": 20.0,
+    "fsr_nA": 2000,
+    "offset_mode": "10pct"
+  },
+  "derived": {
+    "native_period_ms": 124,
+    "native_rate_hz": 8.064516129,
+    "output_points": 1800,
+    "offset_nA": 200,
+    "conv_time_code": 2,
+    "adc_bits": 14
+  },
+  "afe_baseline": {
+    "e_mv": 200,
+    "vwe_mv": 1200,
+    "fsr_code": 5,
+    "offset_select": 1,
+    "conv_source": "auto",
+    "sens_period_code": 0,
+    "system_period_code": 3,
+    "ioffset_conversion": 0,
+    "idle_mode": 2,
+    "cell_voltage_sampling": true,
+    "rs": 0
+  }
+}
