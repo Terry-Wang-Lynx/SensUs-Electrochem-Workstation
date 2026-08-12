@@ -73,44 +73,107 @@ storage  0x00078000 + 0x8000 ( 32KB)   settings
 - ⚠️ 实测本配置下**没有**生成 `partitions.yml` / `pm_config.h` ⇒ **Partition Manager 未接管,
   DTS 里这张表就是最终布局**。若将来 NCS 版本变化导致 PM 接管,先确认哪套在生效,别盲改数字。
 
-## 4. 验证到什么程度(诚实标注)
+## 4. 🟢 验证状态:**端到端已在硬件上跑通**(2026-08-12)
 
 | 项 | 状态 |
 |---|---|
-| 构建通过、两镜像都装得下 | ✅ 实测 |
-| serial recovery 全部配置在 `.config` 里生效(非只写在片段) | ✅ 回读确认 |
-| `zephyr,uart-mcumgr = &cdc_acm_uart0` 在 MCUboot 的 DTS 里解析成功 | ✅ 回读确认 |
+| 构建通过、两镜像都装得下 | ✅ |
+| serial recovery 配置在 `.config` 里生效(非只写在片段) | ✅ 回读确认 |
+| `zephyr,uart-mcumgr = &cdc_acm_uart0` 在 MCUboot 的 DTS 里解析 | ✅ 回读确认 |
 | swap-using-move 生效 | ✅ 回读确认 |
-| **上电等 5 s / 无 app 停住 / USB 上传成功** | ❌ **未在硬件上验证** |
+| MCUboot 运行、HFXO 起振、VBUS 检出、USBD 使能 | ✅ 见下 |
+| **无 app 时永久停在 recovery**(`BOOT_SERIAL_NO_APPLICATION`) | ✅ 端口数分钟后仍在 |
+| **USB 枚举 + SMP 握手** | ✅ `/dev/cu.usbmodem1101`,产品串 `pA_Converter V5_1 MCUBOOT` |
+| **经 USB 上传 78 KB 并启动** | ✅ `Upgrade complete.`,15.2 kB/s |
+| **app 运行 + 调试口存活** | ✅ `PC=0x24F2E`(≥slot0),`unsecured` 计数 0 |
 
-## 5. 首烧(SWD bootstrap,一次性)
+芯片侧实测寄存器(诊断时很有用):
 
-🔴 **前置条件:`UICR.REGOUT0` 必须已烧成 3.3 V**,否则 VDD=1.8 V、SWD 电平对不上根本连不上。
-V5.1 首板已于 2026-08-12 烧入(`REGOUT0=5`),全过程见
-`<主仓>/docs/troubleshooting/nrf52-failed-to-power-up-dap.md` §0。
+```
+CLOCK.HFCLKSTAT    (0x4000040C) = 0x00010001   SRC=xtal, STATE=running
+POWER.USBREGSTATUS (0x40000438) = 0x00000003   VBUSDETECT=1, OUTPUTRDY=1
+USBD.ENABLE        (0x40027500) = 0x00000001
+USBD.USBPULLUP     (0x40027504) = 0x00000001   已在总线上呈现自己
+USBD.FRAMECNTR     (0x40027520) = 递增          ← 主机在发 SOF ⇒ 数据线通
+```
+
+### 🔴 坑 A:macOS 的「允许配件连接」弹窗会伪装成"数据线没通"
+
+第一次插上时 macOS 弹窗问是否信任新 USB 设备。**在点允许之前**,现象是:
+
+- 没有任何 `/dev/cu.usbmodem*` 新增
+- `USBD.FRAMECNTR` **完全冻结**、`USBD.EVENTS_USBRESET = 0`
+- 而芯片侧一切正常(`USBPULLUP=1`)
+
+⇒ 这套现象与「D+/D− 虚焊」**完全同形**,本次据此错误地判过一次"数据线没通"。
+**排查顺序:先确认系统层面允许了这个配件,再去怀疑焊接。**
+(判据:`FRAMECNTR` 递增 = 主机在发 SOF = 数据线电气通。)
+
+### 🔴 坑 B:build code B 上,烧 app 之前必须先编 `UICR.APPROTECT = 0x5A`
+
+否则 app 一跑就锁 AP,下一次 `connect` 时 **J-Link 会自动 mass erase 来"解锁"**,
+连 UICR 一起擦掉(`REGOUT0` 随之丢失,VDD 退回 1.8 V)。
+本次实际踩过一次,全过程与源码级证据见
+`<主仓>/docs/troubleshooting/nrf52-failed-to-power-up-dap.md` §0.6。
+
+## 5. 首烧(SWD bootstrap,一次性)—— 两个 UICR 前置条件
+
+🔴 **烧任何东西之前,先把两个 UICR 值编好**(缺一个都会自毁,见 §4 坑 B):
+
+```
+w4 4001E504, 1          # NVMC.CONFIG = WEN
+w4 10001208, 0000005A   # UICR.APPROTECT = HwDisabled  ← 缺它:app 一跑就被 J-Link mass erase
+w4 10001304, 00000005   # UICR.REGOUT0  = 3.3V         ← 缺它:VDD=1.8V,SWD 电平对不上连不上
+w4 4001E504, 0
+r                        # 复位后生效;验 VTref 应从 1.74V 变成 ~3.17V
+```
+
+V5.1 首板已于 2026-08-12 编好两者。**换板/换芯片后必须重做**(UICR 是每颗芯片的)。
+
+**建议只 SWD 烧 MCUboot,app 走 USB** —— 这样能顺便验证 USB 通路:
 
 ```
 JL=/Applications/STM32CubeIDE.app/.../tools/bin/JLinkExe      # 🔴 必须 V8.80,不能 V9.46
 si SWD / speed 1000 / device nRF52833_xxAA / connect
 loadfile /tmp/build_v51/mcuboot/zephyr/zephyr.hex
-loadfile /tmp/build_v51/firmware/zephyr/zephyr.signed.hex
-r
+r / g
 ```
 
-⚠️ app 必须烧 **`.signed.hex`**(带 MCUboot 镜像头),烧 `zephyr.hex` 会被 MCUboot 判为无效镜像。
+🔴🔴 **绝对不要用 `erase`** —— JLinkExe 的 chip erase 在 nRF52 上**连 UICR 一起擦**,
+上面两个值立刻丢失、SWD 当场连不上。只用 `loadfile`(它按需擦对应扇区)。
 
-## 6. 之后的 USB 烧录
+⚠️ 若要 SWD 直烧 app,必须用 **`.signed.hex`**(带 MCUboot 镜像头);
+烧 `zephyr.hex` 会被 MCUboot 判为无效镜像。
 
-上传件:`/tmp/build_v51/dfu_application.zip`(内含 `firmware.signed.bin`)。
+## 6. 之后的 USB 烧录(✅ 已实测跑通)
 
-🔴 **主机侧 SMP 客户端本机未装**(`mcumgr` / `nrfutil` / `newtmgr` / `smpmgr` 全无)。
-需要装一个;建议 **`smpmgr`**(纯 Python,可进项目 `.venv`,与现有主机栈一致)。
+主机侧用 **`smpmgr`**(纯 Python)。本机装在临时 venv 里验证过,**尚未加进项目 `.venv`**:
 
-流程:插 USB → 板子在 5 s 窗口内枚举出一个 CDC ACM 口(macOS 上是 `/dev/cu.usbmodem*`)
-→ 用 SMP 客户端上传到 slot1 → MCUboot swap 后跑新镜像。
+```sh
+python3 -m venv /tmp/smpvenv && /tmp/smpvenv/bin/pip install smpmgr
+```
 
-⚠️ 分辨串口:`/dev/cu.usbmodem0000297345691` 是 **J-Link 探头自己的** CDC(序列号 29734569),
-不是板子。板子的口只在 MCUboot 的 DFU 窗口内、或 app 起了 USB CDC 之后才出现。
+```sh
+# 1) 认端口(板子的口只在 MCUboot 窗口内、或 app 起了 USB CDC 之后才出现)
+ls /dev/cu.usbmodem*
+#    ⚠️ /dev/cu.usbmodem0000297345691 是 **J-Link 探头自己的** CDC(序列号 29734569),不是板子
+#    板子会是类似 /dev/cu.usbmodem1101,产品串 "pA_Converter V5_1 MCUBOOT"
+
+# 2) 握手(可选,确认在 recovery 里)
+/tmp/smpvenv/bin/smpmgr --port /dev/cu.usbmodem1101 --timeout 5 image state-read
+#    slot 为空时回 "No images on device!" —— 正常
+
+# 3) 上传 + 标记启动 + 复位,一条命令
+/tmp/smpvenv/bin/smpmgr --port /dev/cu.usbmodem1101 --timeout 10 \
+    upgrade /tmp/build_v51/firmware/zephyr/zephyr.signed.bin
+#    实测:78 KB / 15.2 kB/s / "Upgrade complete."
+```
+
+⚠️ 那条 `Error reading MCUMgr parameters ... ENOTSUP` 警告**无害** ——
+MCUboot 的精简 SMP 不实现可选的 "MCUMgr parameters" 命令,忽略即可。
+
+**时间窗**:有可引导 app 时只有上电后 **5 s**;slot0 为空时(`BOOT_SERIAL_NO_APPLICATION=y`)
+**永久等待**,所以"软砖"总能纯 USB 救回来。
 
 ## 7. 两条债
 
