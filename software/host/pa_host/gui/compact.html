@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SensUs 悬浮检测</title>
+  <link rel="stylesheet" href="/assets/compact.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div class="status-line">
+        <span id="statusDot" class="status-dot"></span>
+        <strong id="statusText">连接中</strong>
+      </div>
+      <span id="conditionText">读取条件…</span>
+    </header>
+
+    <section class="live">
+      <div>
+        <span id="liveCurrent">--</span>
+        <span id="liveUnit">nA</span>
+      </div>
+      <span id="liveMeta">尚无实时数据</span>
+    </section>
+
+    <section class="chart-shell">
+      <canvas id="liveChart" aria-label="实时电流曲线"></canvas>
+      <span id="chartEmpty">等待数据</span>
+    </section>
+
+    <section class="progress-row">
+      <div class="progress"><i id="progressBar"></i></div>
+      <span id="progressText">0%</span>
+    </section>
+
+    <section id="sampleControls" class="controls">
+      <div id="sampleRole" class="segmented">
+        <button type="button" data-role="calibration" class="active">标定</button>
+        <button type="button" data-role="test">测试</button>
+      </div>
+      <div class="field-row">
+        <label>
+          <span>样品</span>
+          <input id="sampleName" placeholder="样品名称" autocomplete="off">
+        </label>
+        <label id="concentrationField">
+          <span>浓度 / µM</span>
+          <input id="concentration" type="number" min="0" step="any" placeholder="必填">
+        </label>
+      </div>
+    </section>
+
+    <p id="message">正在连接工作站…</p>
+    <button id="measureButton" class="measure" type="button" disabled>开始标定测量</button>
+  </main>
+  <script src="/assets/compact.js"></script>
+</body>
+</html>
