@@ -35,6 +35,8 @@ open "dist/SensUs V5.1 Workstation.app"
 V5.1 App 会按 USB 产品描述符和序列号锁定板卡；优先用只读状态流确认 DATA，
 空闲状态没有即时上行时则按本仓库 DTS 中 `CDC0=SMP、CDC1=DATA` 的声明核对
 macOS USB 接口布局。
+V5.1 正式 I-T 默认条件为 `+0.200 V / 150 s / 10 Hz 输出 / 末 20 s 拟合`，
+并保持 `2 µA FSR、10% offset、124 ms SENS_PERIOD、V_WE=1200 mV、idle=2`。
 界面可以在板卡未连接时启动，但“开始测量”会保持禁用；只有点击“应用条件并烧录硬件”
 时才会使用 SMP 进入 MCUboot 并上传签名固件。检测到多块 V5.1 板卡时会拒绝自动选择。
 

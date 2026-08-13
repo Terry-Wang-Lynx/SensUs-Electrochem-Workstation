@@ -19,6 +19,7 @@ function toast(message) { const node = $('toast'); node.textContent = message; n
 function errorBox(id, error) { const node = $(id); node.textContent = error?.message || String(error); node.hidden = false; }
 function fmt(value, digits = 2) { return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : '--'; }
 function concentrationValue(){return $('knownConcentration').value===''?null:$('knownConcentration').value}
+function defaultItDuration(){return state.hardware?.transport==='serial'?150:180}
 function previewFilename(){const sample=($('sampleName').value||'样品名称').trim().replace(/[\\/:*?"<>|]/g,'_'), concentration=concentrationValue();$('autoSaveName').textContent=`${sample}-${concentration===null?'unknown':`${Number(concentration)}uM`}.csv`}
 function updateStartState(){
   const running=state.measurement?.state==='running', ready=state.workflow?.calibration_ready;
@@ -182,7 +183,7 @@ function drawAll(){
   }else{
     const rawPoints=[],validPoints=[],invalidPoints=[];
     (d.time_s||[]).forEach((time,i)=>{const point=[time,current[i]];rawPoints.push(point);(d.valid?.[i]===false?invalidPoints:validPoints).push(point)});
-    const duration=Number(state.measurement?.settings?.duration_s||state.settings?.settings?.duration_s||180),latest=rawPoints.at(-1)?.[0]||0;
+    const duration=Number(state.measurement?.settings?.duration_s||state.settings?.settings?.duration_s||defaultItDuration()),latest=rawPoints.at(-1)?.[0]||0;
     const xmin=state.chartWindowS===null?0:Math.max(0,latest-state.chartWindowS),xmax=state.chartWindowS===null?duration:Math.max(state.chartWindowS,latest),visible=points=>points.filter(point=>point[0]>=xmin&&point[0]<=xmax);
     allSeries.push({points:visible(rawPoints),color:'#9aa7aa',width:.7},{points:visible(validPoints),color:'#167b74',width:0,dots:true,pointRadius:1.5},{points:visible(invalidPoints),color:'#c33c54',width:0,dots:true,pointRadius:1.7});
     $('chartEmpty').hidden=rawPoints.length>0;
@@ -344,7 +345,7 @@ function updateMeasurement(data){
   $('liveCurrentUnit').textContent=cv?'µA':'nA';
   $('liveCurrentTime').textContent=live?(cv?`${fmt(live.potential_v,3)} V · 第 ${live.cycle} 圈 · 点 ${Number(live.index)+1}`:`t = ${fmt(live.time_s,2)} s · 点 ${Number(live.index)+1}`):'尚无数据';
   $('liveCurrentBox').classList.toggle('invalid',Boolean(live&&!live.valid));
-  const latest=data.data?.time_s?.at(-1)||0, duration=Number(data.settings?.duration_s||180), nativeCount=data.data?.time_s?.length||0,wideIt=!cv&&Number(data.settings?.fsr_nA)>2000;
+  const latest=data.data?.time_s?.at(-1)||0, duration=Number(data.settings?.duration_s||defaultItDuration()), nativeCount=data.data?.time_s?.length||0,wideIt=!cv&&Number(data.settings?.fsr_nA)>2000;
   const nativeRate=cv?Number(data.settings?.cv_scan_rate_v_s)/Number(data.settings?.cv_step_v):wideIt?Number(data.settings?.target_rate_hz):1000/[124,242,476,945,1882,3757][Number(data.settings?.sens_period_code||0)], expectedNative=Math.round(duration*nativeRate);
   $('validCount').textContent=nativeCount||'--'; $('validCount').nextElementSibling.textContent=`/ ≈ ${expectedNative}`;
   $('progressValue').textContent=complete?100:Math.min(100,Math.round(latest/duration*100));
@@ -379,7 +380,7 @@ async function refreshHardware(){try{updateHardware(await api('/api/hardware'))}
 async function measurementRefreshLoop(){
   await refreshMeasurement();
   const running = state.measurement?.state === 'running';
-  const duration = Number(state.measurement?.settings?.duration_s || 180);
+  const duration = Number(state.measurement?.settings?.duration_s || defaultItDuration());
   /* Long CV runs still render every native point; batching UI refreshes keeps
    * the 72,000-point status payload responsive without decimation. */
   setTimeout(measurementRefreshLoop, running ? (duration <= 300 ? 100 : 2000) : 1000);

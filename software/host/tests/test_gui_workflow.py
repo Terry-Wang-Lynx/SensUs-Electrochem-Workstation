@@ -144,6 +144,21 @@ def test_default_it_method_matches_archived_180_second_protocol() -> None:
     assert settings["offset_nA"] == 200
 
 
+def test_v51_it_profile_uses_requested_150_second_method() -> None:
+    settings = SettingsController.validate(SettingsController.V51_DEFAULTS)
+
+    assert settings["method"] == "it"
+    assert settings["initial_potential_v"] == 0.2
+    assert settings["potential_v"] == 0.2
+    assert settings["duration_s"] == 150.0
+    assert settings["target_rate_hz"] == 10.0
+    assert settings["sens_period_code"] == 0
+    assert settings["fit_window_s"] == 20.0
+    assert settings["fsr_nA"] == 2000
+    assert settings["offset_mode"] == "10pct"
+    assert settings["offset_nA"] == 200
+
+
 def test_live_cv_data_reader_only_appends_new_complete_rows() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         raw = Path(tmp) / "live.csv"

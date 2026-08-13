@@ -83,6 +83,7 @@ MEASUREMENT_DURATION_S = 180.0
 COLLECTOR_DURATION_S = 190.0
 TARGET_RATE_HZ = 10.0
 FIT_WINDOW_S = 20.0
+V51_IT_DURATION_S = 150.0
 FIRMWARE_ELF = PROJECT_DIR / "software" / "firmware" / "build" / "firmware" / "zephyr" / "zephyr.elf"
 FIRMWARE_HEX = PROJECT_DIR / "software" / "firmware" / "build" / "firmware" / "zephyr" / "zephyr.hex"
 FIRMWARE_CONFIG = PROJECT_DIR / "software" / "firmware" / "src" / "measurement_config.h"
@@ -555,6 +556,19 @@ class SettingsController:
         "cv_step_v": 0.001,
         "cv_quiet_s": 2.0,
         "cv_eis_fsr_uA": 40,
+    }
+    V51_DEFAULTS = {
+        **DEFAULTS,
+        "initial_potential_v": 0.2,
+        "potential_v": 0.2,
+        "prestep_s": 0.0,
+        "duration_s": V51_IT_DURATION_S,
+        "target_rate_hz": 10.0,
+        "sens_period_code": 0,
+        "fit_window_s": 20.0,
+        "fsr_nA": 2000,
+        "offset_nA": 200,
+        "offset_mode": "10pct",
     }
 
     def __init__(self) -> None:
@@ -2759,6 +2773,21 @@ class AppState:
 APP = AppState()
 
 
+def _activate_v51_profile() -> None:
+    """Select V5.1 method defaults and keep its App state separate from V4."""
+    global APP, RUNS_DIR, SETTINGS_PATH, WORKFLOW_PATH, DEFAULT_SAVE_DIR
+    profile_dir = PROJECT_DIR / "measurements" / "v51"
+    RUNS_DIR = profile_dir / "gui_runs"
+    SETTINGS_PATH = profile_dir / "gui_settings.json"
+    WORKFLOW_PATH = profile_dir / "gui_workflow.json"
+    DEFAULT_SAVE_DIR = profile_dir / "experiment_data"
+    SettingsController.DEFAULTS = dict(SettingsController.V51_DEFAULTS)
+    # The module-level AppState is created before CLI arguments are parsed.
+    # Recreate it once, before serving requests, so all controllers and paths
+    # use the V5.1 profile without changing the V4 process defaults.
+    APP = AppState()
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2983,6 +3012,8 @@ def main(argv: list[str] | None = None) -> int:
     HARDWARE_TRANSPORT = "serial" if args.transport == "v51" else args.transport
     SERIAL_DATA_PORT = args.serial_port
     SERIAL_DATA_EXPLICIT = bool(args.serial_port)
+    if HARDWARE_TRANSPORT == "serial":
+        _activate_v51_profile()
     if HARDWARE_TRANSPORT == "serial" and not SERIAL_DATA_PORT:
         if HARDWARE_AUTO_DISCOVERY:
             refresh_v51_ports(force=True)
