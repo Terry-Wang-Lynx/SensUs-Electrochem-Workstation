@@ -3,8 +3,9 @@
 The GUI deliberately uses only Python's standard library on the server side;
 the browser renders the plots with a small canvas-based frontend.  This keeps
 the one-click tool usable on the lab Mac without installing a desktop GUI
-toolkit.  Hardware acquisition is still delegated to ``pa_host.it_tool`` so
-the tested RTT/J-Link path remains the single source of truth.
+toolkit. Hardware acquisition is delegated to ``pa_host.it_tool``. V4.0 uses
+RTT/J-Link; V5.1 uses its DATA USB CDC while retaining the same line protocol,
+parser and analysis pipeline.
 """
 
 from __future__ import annotations
@@ -89,9 +90,24 @@ SETTINGS_PATH = PROJECT_DIR / "measurements" / "gui_settings.json"
 WORKFLOW_PATH = PROJECT_DIR / "measurements" / "gui_workflow.json"
 DEFAULT_SAVE_DIR = PROJECT_DIR / "measurements" / "experiment_data"
 JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "29734569")
+SERIAL_DATA_PORT = os.environ.get("SENSUS_SERIAL_PORT", "")
+SERIAL_SMP_PORT = os.environ.get("SENSUS_SMP_PORT", "")
+SERIAL_MCUBOOT_PORT = os.environ.get("SENSUS_MCUBOOT_PORT", SERIAL_SMP_PORT)
+HARDWARE_TRANSPORT = os.environ.get(
+    "SENSUS_TRANSPORT", "serial" if SERIAL_DATA_PORT else "rtt"
+).lower()
 NCS_VENV_ACTIVATE = Path(
     os.environ.get("SENSUS_NCS_VENV_ACTIVATE", "~/ncs/.venv/bin/activate")
 ).expanduser()
+SMPMGR_EXE = Path(
+    os.environ.get("SENSUS_SMPMGR")
+    or shutil.which("smpmgr")
+    or "/tmp/smpvenv/bin/smpmgr"
+)
+V51_SIGNED_BIN = (
+    PROJECT_DIR / "software" / "firmware" / "build" / "firmware" /
+    "zephyr" / "zephyr.signed.bin"
+)
 
 # ── 两相测量:还原瞬态 → 过零 → 氧化稳态 ────────────────────────────────
 # 工作点 E=+200mV 驱动**氧化**,所以稳态电流走器件的原生方向(流出 WE),
@@ -375,6 +391,47 @@ class SettingsController:
             raise RuntimeError("JLinkExe 烧录未确认成功:" + " | ".join(tail))
 
     @staticmethod
+    def _upgrade_v51_firmware() -> None:
+        """Reset the V5.1 app over SMP, then upload its signed image to MCUboot.
+
+        DATA and SMP are deliberately separate CDC interfaces.  Explicit port
+        paths are required so applying a method can never target an unrelated
+        serial device by heuristic discovery.  No UICR or MCUboot region is
+        written by this path.
+        """
+        if not SMPMGR_EXE.exists():
+            raise RuntimeError(f"找不到 smpmgr:{SMPMGR_EXE}")
+        if not SERIAL_SMP_PORT:
+            raise RuntimeError("V5.1 应用参数前必须设置 SENSUS_SMP_PORT")
+        if not SERIAL_MCUBOOT_PORT:
+            raise RuntimeError("V5.1 应用参数前必须设置 SENSUS_MCUBOOT_PORT")
+        if not V51_SIGNED_BIN.exists():
+            raise RuntimeError(f"找不到 V5.1 签名镜像:{V51_SIGNED_BIN}")
+
+        subprocess.run(
+            [str(SMPMGR_EXE), "--port", SERIAL_SMP_PORT, "--timeout", "5",
+             "os", "reset"],
+            check=True, capture_output=True, text=True,
+        )
+        deadline = time.monotonic() + 4.0
+        boot_port = Path(SERIAL_MCUBOOT_PORT)
+        while time.monotonic() < deadline and not boot_port.exists():
+            time.sleep(0.1)
+        if not boot_port.exists():
+            raise RuntimeError(
+                f"MCUboot CDC 未在 4 秒内出现:{SERIAL_MCUBOOT_PORT}"
+            )
+        done = subprocess.run(
+            [str(SMPMGR_EXE), "--port", str(boot_port), "--timeout", "10",
+             "upgrade", str(V51_SIGNED_BIN)],
+            check=True, capture_output=True, text=True,
+        )
+        blob = f"{done.stdout}\n{done.stderr}"
+        if "Upgrade complete." not in blob:
+            tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
+            raise RuntimeError("V5.1 USB 更新未确认成功:" + " | ".join(tail))
+
+    @staticmethod
     def same_analysis_protocol(first: dict[str, Any], second: dict[str, Any]) -> bool:
         """Compare settings that determine sampled IT data and its analysis.
 
@@ -545,18 +602,33 @@ class SettingsController:
             #    ⇒ 不先激活就是 `zsh:1: command not found: west`,按钮看起来"没反应"
             #    (失败 <1s,label 闪一下就弹回去)。2026-08-09 实测确认。
             #    只在这个子 shell 里激活:NCS venv 与本工作站 venv 依赖冲突,不可合并。
-            build = (
-                f"{ncs_venv_prefix()}"
-                "source ~/ncs/zephyr/zephyr-env.sh && "
-                "west build -b pa_converter_v40 -d software/firmware/build "
-                "software/firmware -- -DBOARD_ROOT=$PWD/software/firmware "
-                "-DDTS_ROOT=$PWD/software/firmware"
-            )
+            if HARDWARE_TRANSPORT == "serial":
+                build = (
+                    f"{ncs_venv_prefix()}"
+                    "source ~/ncs/zephyr/zephyr-env.sh && "
+                    "west build -p always -b pa_converter_v51 "
+                    "-d software/firmware/build software/firmware -- "
+                    "-DSB_CONFIG_BOOTLOADER_MCUBOOT=y "
+                    "-DBOARD_ROOT=$PWD/software/firmware "
+                    "-DDTS_ROOT=$PWD/software/firmware"
+                )
+            else:
+                build = (
+                    f"{ncs_venv_prefix()}"
+                    "source ~/ncs/zephyr/zephyr-env.sh && "
+                    "west build -p always -b pa_converter_v40 "
+                    "-d software/firmware/build software/firmware -- "
+                    "-DBOARD_ROOT=$PWD/software/firmware "
+                    "-DDTS_ROOT=$PWD/software/firmware"
+                )
             subprocess.run(
                 ["/bin/zsh", "-lc", build], cwd=PROJECT_DIR,
                 check=True, capture_output=True, text=True,
             )
-            self._flash_firmware()
+            if HARDWARE_TRANSPORT == "serial":
+                self._upgrade_v51_firmware()
+            else:
+                self._flash_firmware()
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps({
                 "settings": settings,
@@ -735,7 +807,12 @@ class MeasurementController:
             self.user_stop_requested = False
             self._reset_data_cache()
             self.state = "running"
-            self.message = f"已启动硬件 {method.upper()} 测量，等待 RTT 数据"
+            transport_label = (
+                "V5.1 USB DATA" if HARDWARE_TRANSPORT == "serial" else "RTT"
+            )
+            self.message = (
+                f"已启动硬件 {method.upper()} 测量，等待 {transport_label} 数据"
+            )
             self.on_complete = on_complete
 
             env = os.environ.copy()
@@ -746,15 +823,6 @@ class MeasurementController:
                 "-m",
                 "pa_host.it_tool",
                 "measure",
-                # 让 collector 持有唯一的 RTT 桥:有 V8.80 时优先 JLinkExe;
-                #    CubeIDE 缺失时自动回退到启用 libjaylink 的 OpenOCD。
-                #    两者都负责指定 RTT 控制块，RTT 仍出在 telnet 19021,
-                #    并且 finally 里有 terminate/wait/kill 的完整回收(禁 pkill)。
-                "--start-jlink",
-                "--elf",
-                str(FIRMWARE_ELF),
-                "--probe-serial",
-                JLINK_SERIAL,
                 # 方案 C:命令文件。外部另开 telnet 连接写下行**无效**
                 # (JLinkExe 只转发采集器持有的那个连接)⇒ 必须走这个文件。
                 "--cell-v",
@@ -774,6 +842,20 @@ class MeasurementController:
                 "--idle-timeout",
                 "25",
             ]
+            if HARDWARE_TRANSPORT == "serial":
+                if not SERIAL_DATA_PORT:
+                    self.state = "error"
+                    self.error = "V5.1 需要明确指定 DATA CDC 路径"
+                    raise RuntimeError(
+                        self.error + "(--serial-port 或 SENSUS_SERIAL_PORT)"
+                    )
+                command += ["--serial", SERIAL_DATA_PORT]
+            else:
+                # collector 持有唯一 RTT 桥并负责完整回收。
+                command += [
+                    "--start-jlink", "--elf", str(FIRMWARE_ELF),
+                    "--probe-serial", JLINK_SERIAL,
+                ]
             if method == "cv":
                 command.append("--cv")
             log_handle = (self.run_dir / "collector.log").open("w", buffering=1)
@@ -2621,11 +2703,21 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
 
 
 def main(argv: list[str] | None = None) -> int:
+    global HARDWARE_TRANSPORT, SERIAL_DATA_PORT
     parser = argparse.ArgumentParser(description="本地 i-t 电化学检测 GUI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--open-browser", action="store_true")
+    parser.add_argument("--transport", choices=("rtt", "serial"),
+                        default=HARDWARE_TRANSPORT,
+                        help="V4.0 用 rtt;V5.1 用 serial")
+    parser.add_argument("--serial-port", default=SERIAL_DATA_PORT,
+                        help="V5.1 DATA CDC 路径;不得填 SMP 口")
     args = parser.parse_args(argv)
+    HARDWARE_TRANSPORT = args.transport
+    SERIAL_DATA_PORT = args.serial_port
+    if HARDWARE_TRANSPORT == "serial" and not SERIAL_DATA_PORT:
+        parser.error("--transport serial 必须同时给 --serial-port")
     serve(args.host, args.port, args.open_browser)
     return 0
 

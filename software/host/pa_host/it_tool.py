@@ -100,12 +100,14 @@ def _plot_calibration(points, model: CalibrationModel, output: str | Path) -> No
 
 
 def _cmd_measure(args: argparse.Namespace) -> int:
-    # Keep this wrapper transparent: collect.py owns the RTT protocol and raw CSV.
+    # Keep this wrapper transparent: collect.py owns the line protocol and raw CSV.
     cmd = [sys.executable, "-m", "pa_host.collect",
            "--out", str(args.out), "--duration", str(args.duration),
            "--idle-timeout", str(args.idle_timeout), "--progress-every", "100"]
     cmd += ["--cv"] if args.cv else ["--it-10hz"]
-    if args.start_jlink:
+    if args.serial:
+        cmd += ["--serial", args.serial]
+    elif args.start_jlink:
         cmd += ["--start-jlink", "--elf", str(args.elf)]
         if args.probe_serial:
             cmd += ["--probe-serial", args.probe_serial]
@@ -130,12 +132,14 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="10Hz i-t 标定与浓度预测工具")
     sub = ap.add_subparsers(dest="command", required=True)
 
-    measure = sub.add_parser("measure", help="从 RTT 收取原始 120s 数据")
+    measure = sub.add_parser("measure", help="从 RTT/USB CDC 收取原始数据")
     source = measure.add_mutually_exclusive_group()
     source.add_argument("--socket", default=None,
                          help="连接已启动的 RTT socket,如 127.0.0.1:19021")
     source.add_argument("--start-jlink", action="store_true",
                         help="用项目推荐的 J-Link V8.80 自动启动 RTT")
+    source.add_argument("--serial", default=None,
+                        help="V5.1 DATA CDC,如 /dev/cu.usbmodemXXXX")
     measure.add_argument("--elf", type=Path,
                          default=Path("/tmp/pabuild/firmware/zephyr/zephyr.elf"))
     measure.add_argument("--probe-serial")

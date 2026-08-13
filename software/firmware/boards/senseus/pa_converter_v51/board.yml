@@ -1,0 +1,6 @@
+board:
+  name: pa_converter_v51
+  full_name: pA-Converter V5.1 (custom)
+  vendor: senseus
+  socs:
+    - name: nrf52833

@@ -1,0 +1,139 @@
+/*
+ * pA-Converter V5.1 -- nRF52833-QDAA + MAX30131 + USB-C.
+ *
+ * Pin/net evidence: SensUs-HW hardware/ver5.1/pA-converter-v51 source PCB.
+ * The MAX30131 bus and WE/RE/CE nets are unchanged from V4.0.  INTB is
+ * still not routed, so the shared electrochemistry implementation remains
+ * polling based.  VBUS feeds VDDH; REG0 must be programmed to 3.3 V in UICR.
+ */
+
+/dts-v1/;
+
+#include <nordic/nrf52833_qdaa.dtsi>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
+#include <zephyr/dt-bindings/regulator/nrf5x.h>
+
+/ {
+	model = "pA-Converter V5.1 (custom)";
+	compatible = "senseus,pa-converter-v51";
+
+	chosen {
+		zephyr,flash = &flash0;
+		zephyr,sram = &sram0;
+		zephyr,code-partition = &slot0_partition;
+		zephyr,uart-mcumgr = &cdc_acm_uart0;
+		zephyr,console = &cdc_acm_uart1;
+	};
+
+	aliases {
+		afe0 = &max30131;
+	};
+};
+
+&pinctrl {
+	spi1_default: spi1_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 9)>,
+				<NRF_PSEL(SPIM_MISO, 0, 4)>;
+		};
+	};
+
+	spi1_sleep: spi1_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 9)>,
+				<NRF_PSEL(SPIM_MISO, 0, 4)>;
+			low-power-enable;
+		};
+	};
+};
+
+&spi1 {
+	status = "okay";
+	compatible = "nordic,nrf-spim";
+	pinctrl-0 = <&spi1_default>;
+	pinctrl-1 = <&spi1_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 11 GPIO_ACTIVE_LOW>;
+
+	max30131: max30131@0 {
+		compatible = "senseus,max30131";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+	};
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&gpiote {
+	status = "okay";
+};
+
+&wdt0 {
+	status = "okay";
+};
+
+/* The optional REG1 DC/DC inductor is not fitted on V5.1. */
+&reg1 {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+&reg0 {
+	/* nRF52833 has no REG0 DC/DC control; keep the upstream HV node disabled. */
+	status = "disabled";
+};
+
+&uart0 {
+	status = "disabled";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x00018000>;
+		};
+
+		slot0_partition: partition@18000 {
+			label = "image-0";
+			reg = <0x00018000 0x0002e000>;
+		};
+
+		slot1_partition: partition@46000 {
+			label = "image-1";
+			reg = <0x00046000 0x0002e000>;
+		};
+
+		storage_partition: partition@74000 {
+			label = "storage";
+			reg = <0x00074000 0x0000c000>;
+		};
+	};
+};
+
+zephyr_udc0: &usbd {
+	compatible = "nordic,nrf-usbd";
+	status = "okay";
+
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+		label = "pA-Converter V5.1 SMP";
+	};
+
+	cdc_acm_uart1: cdc_acm_uart1 {
+		compatible = "zephyr,cdc-acm-uart";
+		label = "pA-Converter V5.1 DATA";
+	};
+};

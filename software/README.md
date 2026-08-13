@@ -1,7 +1,6 @@
-# software/ — ver4.0 固件与上位机(唯一入口)
+# software/ — V4.0/V5.1 共用电化学固件与上位机
 
-> **本目录定位**:ver4.0 单板(MAX30131 + nRF52833 + CR2032)的固件,以及配套的
-> 上位机收数/分析栈。**本文件是 software/ 的唯一入口**,新增/移动文件必须同步更新本文件。
+> **本目录定位**:V4.0/V5.1 共用的 MAX30131 电化学固件与上位机收数/分析栈。V4.0 使用 RTT，V5.1 使用两个 USB CDC（SMP + DATA）；电化学状态机与行协议不分叉。**本文件是 software/ 的唯一入口**,新增/移动文件必须同步更新本文件。
 >
 > **建立**:2026-07-27 ｜ 更新:2026-07-31
 > **阶段**:固件最小闭环**已编译通过**,待首烧 ｜ 板已回板 · SWD 已连通
@@ -103,6 +102,27 @@ DACA/DACB 后回读，并在采集中每秒审计 DAC、路由、参考源和系
 PYTHONPATH=software/host .venv/bin/python3 -m pa_host.gui_server --open-browser
 ```
 
+## V5.1 构建与 USB DATA 采集
+
+V5.1 分区为 MCUboot `0x00000–0x17fff`、slot0 `0x18000–0x45fff`、slot1 `0x46000–0x73fff`和 storage `0x74000–0x7ffff`。应用启动前只读审计 `UICR.APPROTECT=0x5a`、`UICR.REGOUT0=5` 与 VDDH 供电状态，不写 UICR；任一项不符都不启动 USB/AFE。
+
+```bash
+# NCS 3.4.0；产物在 build/firmware 和 build/mcuboot
+source ~/ncs/.venv/bin/activate
+source ~/ncs/zephyr/zephyr-env.sh
+west build -p always -b pa_converter_v51 -d software/firmware/build \
+  software/firmware -- -DSB_CONFIG_BOOTLOADER_MCUBOOT=y \
+  -DBOARD_ROOT=$PWD/software/firmware -DDTS_ROOT=$PWD/software/firmware
+
+# DATA 口上的行协议、START/STOP/配置命令与 V4 RTT 逐字段一致
+PYTHONPATH=software/host .venv/bin/python3 -m pa_host.it_tool measure \
+  --serial /dev/cu.usbmodemDATA --out run.csv --raw-log run.usb.log
+```
+
+V5.1 串口采集器打开 DATA 后会先丢弃一个可能从中间开始的旧行，再自动发送只读 `GET`/`STATUS`，最后才发 `START`。这保证每个采集文件自带 `CFG_APPLIED`/`CFG_DERIVED`/`CFG_CONFIRMED` 和测量前 `STATUS1` 证据，也避免旧的半行与 `IT_START` 拼接后引起重复 `START`。
+
+MCUboot 和 app 的 USB 上传仍使用交接资料里的公开开发密钥，只适合 bring-up；产品发布前必须换成私有签名密钥并同步重烧 MCUboot。V5.1 现阶段还使用 Zephyr 默认测试 VID/PID，也不是产品配置。
+
 ## 1. 现在能跑什么(不需要硬件)
 
 ```bash
@@ -121,8 +141,7 @@ python3 -m pa_host.collect --tail /tmp/fake_rtt.log --out /tmp/e2e.csv --idle-ti
 ../../.venv/bin/python3 -m pa_host.analyze /tmp/e2e.csv --dev-clock --fsr-pa 50000
 ```
 
-⚠️ **`collect.py` 刻意零第三方依赖**(只用 `record.py` + 标准库)——收数不能因为
-numpy/matplotlib 装不上而丢数据。numpy 只有 `analyze.py`/`synth.py` 才需要。
+⚠️ RTT 采集路径仍只需标准库；V5.1 USB CDC 路径额外需要 `pyserial>=3.5`。numpy/matplotlib 只由分析和绘图流程使用。
 
 ## 1b. 回板后怎么烧 + 怎么取数
 
@@ -186,7 +205,7 @@ software/
 └── host/
     ├── pa_host/
     │   ├── record.py          ★ 固件 RTT 行协议 ↔ CSV 的单一真源(纯标准库)
-    │   ├── collect.py           A 段:RTT → CSV,边收边查完整性(零第三方依赖)
+    │   ├── collect.py           A 段:RTT/USB CDC → CSV,边收边查完整性
     │   ├── analyze.py           B 段:σ/3σ/PSD/Allan/漂移/ER·NFR + 出图(需 numpy)
     │   └── synth.py             合成数据(回板前跑通全链;禁止用于对外指标)
     └── tests/test_analyze.py    用「已知答案」反验算法

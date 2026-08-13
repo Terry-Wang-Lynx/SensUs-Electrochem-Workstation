@@ -13,12 +13,13 @@ list(APPEND BOARD_ROOT ${CMAKE_CURRENT_LIST_DIR})
 list(APPEND DTS_ROOT ${CMAKE_CURRENT_LIST_DIR})
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(pa_converter_v40_fw)
+project(pa_converter_fw)
 
 target_sources(app PRIVATE
   src/main.c
   src/max30131_spi.c
   src/board_guards.c
+  src/control_transport.c
   lib/max30131/max30131.c        # 纯逻辑层,与单测同源
   lib/max30131/afe_cfg.c         # 命令解析/校验/写序/审计格式化,同源单测
 )

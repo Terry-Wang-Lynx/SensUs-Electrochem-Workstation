@@ -1,6 +1,8 @@
 # SensUs Electrochemistry Workstation
 
-SensUs 是一套基于 MAX30131 与 nRF52833 的三电极电化学工作站软件。本仓库独立包含 Zephyr 固件、RTT 采集链路，以及面向实验人员的本地交互界面。
+SensUs 是一套基于 MAX30131 与 nRF52833 的三电极电化学工作站软件。本仓库独立包含 Zephyr 固件、V4.0 RTT / V5.1 USB CDC 采集链路，以及面向实验人员的本地交互界面。
+
+V5.1 仅切换板级供电、启动和数据传输：MAX30131 寄存器配置、I-T/CV 状态机、FIFO/epoch/饱和判定、System ADC 电位审计和上位机解析都与 V4.0 共用同一份实现。V5.1 板级与安全启动说明见 [V5.1 board support](software/firmware/boards/senseus/pa_converter_v51/README.md)。
 
 界面已经打通以下流程：
 
@@ -43,6 +45,13 @@ http://127.0.0.1:8765/
 ```bash
 make install
 make run
+```
+
+V5.1 需要明确传入 DATA CDC（不是 SMP CDC）：
+
+```bash
+PYTHONPATH=software/host .venv/bin/python3 -m pa_host.gui_server \
+  --transport serial --serial-port /dev/cu.usbmodemDATA --open-browser
 ```
 
 构建并打开 macOS App：
