@@ -39,11 +39,11 @@
         </section>
         <div class="workspace-grid">
           <section class="panel chart-panel">
-            <div class="panel-head"><div><h2>IT 曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small>nA</small><em id="liveCurrentTime">尚无数据</em></div><div class="segmented" id="chartWindow"><button data-window="all">全程</button><button data-window="20">20 s</button><button class="active" data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
+            <div class="panel-head"><div><h2 id="chartTitle">I-T 计时电流曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small id="liveCurrentUnit">nA</small><em id="liveCurrentTime">尚无数据</em></div><div class="segmented" id="chartWindow"><button data-window="all">全程</button><button data-window="20">20 s</button><button class="active" data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
             <div class="chart-wrap"><canvas id="itChart" aria-label="IT 电流时间曲线"></canvas><div class="chart-legend"><span><i class="valid-point"></i>有效点</span><span><i class="invalid-point"></i>异常点</span></div><div class="empty-chart" id="chartEmpty">开始测量后显示实时电流</div></div>
             <div class="metric-strip">
-              <div><span>稳态电流</span><strong id="steadyCurrent">--</strong><small>nA</small></div>
-              <div><span>标准差</span><strong id="steadySd">--</strong><small>nA</small></div>
+              <div><span id="metricPrimaryLabel">稳态电流</span><strong id="steadyCurrent">--</strong><small id="metricPrimaryUnit">nA</small></div>
+              <div><span id="metricSecondaryLabel">标准差</span><strong id="steadySd">--</strong><small id="metricSecondaryUnit">nA</small></div>
               <div><span>显示原生点</span><strong id="validCount">--</strong><small>/ ≈ 1452</small></div>
               <div><span>进度</span><strong id="progressValue">0</strong><small>%</small></div>
             </div>
@@ -51,7 +51,7 @@
 
           <section class="panel control-panel">
             <div class="panel-head control-head">
-              <div><h2>测量控制</h2><p id="settingsMessage">参数尚未应用到硬件</p></div>
+              <div><h2 id="settingsTitle">I-T 条件</h2><p id="settingsMessage">参数尚未应用到硬件</p></div>
               <div class="control-head-actions">
                 <div class="live-badge" id="settingsBadge">未应用</div>
                 <div class="segmented control-tabs" id="measureControlTabs" role="tablist" aria-label="测量控制分区">
