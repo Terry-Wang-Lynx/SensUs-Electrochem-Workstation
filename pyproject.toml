@@ -12,6 +12,7 @@ dependencies = [
   "numpy>=1.24",
   "matplotlib>=3.7",
   "pyserial>=3.5",
+  "smpmgr==0.18.1",
 ]
 
 [project.optional-dependencies]

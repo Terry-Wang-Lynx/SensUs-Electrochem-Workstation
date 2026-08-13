@@ -24,6 +24,20 @@ make app
 open "dist/SensUs Workstation.app"
 ```
 
+V5.1 使用独立 App；它走双 USB CDC、监听 8766，并与 V4 App 的 Bundle ID、
+窗口状态和日志目录隔离：
+
+```bash
+make app-v51
+open "dist/SensUs V5.1 Workstation.app"
+```
+
+V5.1 App 会按 USB 产品描述符和序列号锁定板卡；优先用只读状态流确认 DATA，
+空闲状态没有即时上行时则按本仓库 DTS 中 `CDC0=SMP、CDC1=DATA` 的声明核对
+macOS USB 接口布局。
+界面可以在板卡未连接时启动，但“开始测量”会保持禁用；只有点击“应用条件并烧录硬件”
+时才会使用 SMP 进入 MCUboot 并上传签名固件。检测到多块 V5.1 板卡时会拒绝自动选择。
+
 App 同时提供完整工作站和迷你悬浮检测窗。点击主窗口标题栏的“画中画”按钮，或按
 `Command-Shift-O`，即可切换到悬浮模式；悬浮窗只保留实时电流、逐点曲线、进度、
 样品信息与开始/停止按钮，并可显示在 macOS 全屏视频上方。点击悬浮窗标题栏的
@@ -47,7 +61,14 @@ make install
 make run
 ```
 
-V5.1 需要明确传入 DATA CDC（不是 SMP CDC）：
+V5.1 终端模式可让工作站自动识别 DATA/SMP：
+
+```bash
+PYTHONPATH=software/host .venv/bin/python3 -m pa_host.gui_server \
+  --transport v51 --port 8766 --open-browser
+```
+
+也可以明确传入 DATA CDC（不是 SMP CDC）：
 
 ```bash
 PYTHONPATH=software/host .venv/bin/python3 -m pa_host.gui_server \

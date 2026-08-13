@@ -93,21 +93,280 @@ JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "29734569")
 SERIAL_DATA_PORT = os.environ.get("SENSUS_SERIAL_PORT", "")
 SERIAL_SMP_PORT = os.environ.get("SENSUS_SMP_PORT", "")
 SERIAL_MCUBOOT_PORT = os.environ.get("SENSUS_MCUBOOT_PORT", SERIAL_SMP_PORT)
+SERIAL_DATA_EXPLICIT = bool(SERIAL_DATA_PORT)
+SERIAL_SMP_EXPLICIT = bool(SERIAL_SMP_PORT)
+SERIAL_MCUBOOT_EXPLICIT = bool(os.environ.get("SENSUS_MCUBOOT_PORT"))
 HARDWARE_TRANSPORT = os.environ.get(
     "SENSUS_TRANSPORT", "serial" if SERIAL_DATA_PORT else "rtt"
 ).lower()
+HARDWARE_AUTO_DISCOVERY = HARDWARE_TRANSPORT == "v51"
 NCS_VENV_ACTIVATE = Path(
     os.environ.get("SENSUS_NCS_VENV_ACTIVATE", "~/ncs/.venv/bin/activate")
 ).expanduser()
 SMPMGR_EXE = Path(
     os.environ.get("SENSUS_SMPMGR")
     or shutil.which("smpmgr")
+    or (Path(sys.executable).with_name("smpmgr")
+        if Path(sys.executable).with_name("smpmgr").exists() else "")
     or "/tmp/smpvenv/bin/smpmgr"
 )
 V51_SIGNED_BIN = (
     PROJECT_DIR / "software" / "firmware" / "build" / "firmware" /
     "zephyr" / "zephyr.signed.bin"
 )
+
+V51_USB_VID = 0x2FE3
+V51_USB_PID = 0x0100
+V51_DATA_MARKERS = (
+    b"CFG_BOOT", b"IT_READY", b"CV_READY", b"AFE_STATUS",
+    b"CELL_V", b"POTENTIAL_AUDIT", b"STATUS1",
+)
+_V51_DISCOVERY_LOCK = threading.RLock()
+_V51_DISCOVERY: dict[str, Any] = {
+    "discovery": "not_started",
+    "serial_number": "",
+    "product": "",
+    "error": "",
+    "updated_at": 0.0,
+}
+
+
+def _v51_port_infos() -> list[Any]:
+    """Return only V5.1 CDC devices reported by the operating system.
+
+    Product string matching is primary.  The VID/PID fallback is retained for
+    early firmware builds whose USB product descriptor was not populated.
+    When macOS exposes both ``tty`` and ``cu`` aliases, only ``cu`` is used.
+    """
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return []
+    infos = []
+    for info in list_ports.comports():
+        product = str(getattr(info, "product", "") or "")
+        description = str(getattr(info, "description", "") or "")
+        v51_named = "pA-Converter V5.1" in f"{product} {description}"
+        v51_id = (
+            getattr(info, "vid", None) == V51_USB_VID
+            and getattr(info, "pid", None) == V51_USB_PID
+        )
+        if v51_named or v51_id:
+            infos.append(info)
+    cu_infos = [info for info in infos if str(info.device).startswith("/dev/cu.")]
+    return cu_infos or infos
+
+
+def _probe_v51_data_port(device: str, timeout_s: float = 0.35) -> bool:
+    """Identify DATA CDC by reading its machine-readable status lines.
+
+    This probe sends no firmware command and performs no electrochemical
+    action.  Opening a CDC device asserts DTR so the DATA interface can emit
+    its existing status stream; SMP remains silent.
+    """
+    try:
+        import serial
+        with serial.Serial(device, 115200, timeout=0.1, write_timeout=0.1) as port:
+            port.dtr = True
+            deadline = time.monotonic() + timeout_s
+            received = bytearray()
+            while time.monotonic() < deadline and len(received) < 65536:
+                received.extend(port.read(4096))
+                if any(marker in received for marker in V51_DATA_MARKERS):
+                    return True
+    except (OSError, ValueError):
+        return False
+    except Exception as exc:
+        # pyserial raises backend-specific SerialException subclasses.
+        if exc.__class__.__module__.startswith("serial"):
+            return False
+        raise
+    return False
+
+
+def _verified_v51_macos_layout(app_infos: list[Any]) -> bool:
+    """Match Zephyr CDC0(SMP)/CDC1(DATA) to macOS data interfaces 1/3."""
+    if sys.platform != "darwin" or len(app_infos) != 2:
+        return False
+    suffixes = []
+    for info in app_infos:
+        match = re.search(r"(\d+)$", str(info.device))
+        if not match:
+            return False
+        suffixes.append(int(match.group(1)))
+    suffixes.sort()
+    # V5.1 DTS declares SMP first and DATA second.  Each CDC ACM function uses
+    # a control/data pair, so their macOS data-interface suffixes are N+1/N+3.
+    return suffixes[1] == suffixes[0] + 2
+
+
+def _choose_v51_ports(
+    infos: list[Any], probe: Any = _probe_v51_data_port,
+) -> dict[str, Any]:
+    """Choose one V5.1 board and distinguish DATA/SMP without writing to it."""
+    result: dict[str, Any] = {
+        "data_port": "", "smp_port": "", "mcuboot_port": "",
+        "serial_number": "", "product": "", "discovery": "not_found",
+        "error": "",
+    }
+    if not infos:
+        return result
+
+    def serial_key(info: Any) -> str:
+        return str(getattr(info, "serial_number", "") or "unknown")
+
+    groups: dict[str, list[Any]] = {}
+    for info in infos:
+        groups.setdefault(serial_key(info), []).append(info)
+    if len(groups) > 1:
+        result["discovery"] = "ambiguous"
+        result["error"] = "检测到多块 V5.1 板卡；请只连接待测板"
+        return result
+
+    board_infos = next(iter(groups.values()))
+    board_infos.sort(key=lambda info: str(info.device))
+    result["serial_number"] = serial_key(board_infos[0])
+    result["product"] = str(getattr(board_infos[0], "product", "") or "")
+    recovery = [
+        info for info in board_infos
+        if "MCUBOOT" in str(getattr(info, "product", "") or "").upper()
+        or "MCUBOOT" in str(getattr(info, "description", "") or "").upper()
+    ]
+    if recovery:
+        result["mcuboot_port"] = str(recovery[0].device)
+        result["product"] = str(getattr(recovery[0], "product", "") or "")
+        result["discovery"] = "mcuboot"
+        return result
+
+    app_infos = board_infos
+    if len(app_infos) < 2:
+        result["discovery"] = "partial"
+        result["error"] = "V5.1 应用模式应出现 DATA 与 SMP 两个 USB 端口"
+        return result
+
+    identified = []
+    # Probe the higher macOS suffix first because that is DATA on the verified
+    # V5.1 unit.  The decision still requires a status marker; if absent, the
+    # other interface is checked too.
+    for info in reversed(app_infos):
+        if probe(str(info.device)):
+            identified.append(info)
+            break
+    if len(identified) == 1:
+        data_info = identified[0]
+        smp_infos = [info for info in app_infos if info is not data_info]
+        if len(smp_infos) != 1:
+            result["discovery"] = "ambiguous"
+            result["error"] = "V5.1 USB 接口数量异常"
+            return result
+        result["data_port"] = str(data_info.device)
+        result["smp_port"] = str(smp_infos[0].device)
+        result["mcuboot_port"] = result["smp_port"]
+        result["discovery"] = "verified_status_stream"
+        return result
+
+    # The V5.1 DTS declares CDC0=SMP then CDC1=DATA.  macOS exposes their data
+    # interfaces in USB descriptor order (N+1 and N+3), so this layout is a
+    # deterministic board-definition check rather than an arbitrary port guess.
+    result["smp_port"] = str(app_infos[0].device)
+    result["data_port"] = str(app_infos[-1].device)
+    result["mcuboot_port"] = result["smp_port"]
+    if _verified_v51_macos_layout(app_infos):
+        result["discovery"] = "verified_usb_layout"
+    else:
+        result["discovery"] = "inferred_port_order"
+        result["error"] = "未读到 DATA 状态标记，端口顺序仅为推断"
+    return result
+
+
+def refresh_v51_ports(force: bool = False) -> dict[str, Any]:
+    """Refresh cached V5.1 paths while preserving explicitly configured paths."""
+    global SERIAL_DATA_PORT, SERIAL_SMP_PORT, SERIAL_MCUBOOT_PORT
+    with _V51_DISCOVERY_LOCK:
+        paths_present = (
+            SERIAL_DATA_PORT and Path(SERIAL_DATA_PORT).exists()
+            and SERIAL_SMP_PORT and Path(SERIAL_SMP_PORT).exists()
+        )
+        app = globals().get("APP")
+        measurement_running = bool(
+            app is not None and getattr(app.measurement, "state", "") == "running"
+        )
+        inferred_age = time.time() - float(_V51_DISCOVERY.get("updated_at") or 0)
+        retry_inference = (
+            _V51_DISCOVERY.get("discovery") == "inferred_port_order"
+            and inferred_age >= 5.0 and not measurement_running
+        )
+        if not force and paths_present and not retry_inference:
+            return hardware_status(refresh=False)
+
+        chosen = _choose_v51_ports(_v51_port_infos())
+        if not SERIAL_DATA_EXPLICIT:
+            SERIAL_DATA_PORT = str(chosen["data_port"])
+        if not SERIAL_SMP_EXPLICIT:
+            SERIAL_SMP_PORT = str(chosen["smp_port"])
+        if not SERIAL_MCUBOOT_EXPLICIT:
+            SERIAL_MCUBOOT_PORT = str(
+                chosen["mcuboot_port"] or SERIAL_SMP_PORT
+            )
+        _V51_DISCOVERY.update(chosen)
+        _V51_DISCOVERY["updated_at"] = time.time()
+        return hardware_status(refresh=False)
+
+
+def hardware_status(refresh: bool = True) -> dict[str, Any]:
+    """Return the transport and USB evidence shown by the App."""
+    if HARDWARE_TRANSPORT != "serial":
+        return {
+            "transport": "rtt", "board": "V4.0", "connected": True,
+            "data_port": "", "smp_port": "", "mcuboot_port": "",
+            "recovery": False, "serial_number": JLINK_SERIAL,
+            "product": "J-Link / MAX30131", "discovery": "configured",
+            "error": "",
+        }
+    if refresh:
+        return refresh_v51_ports(force=False)
+    recovery = bool(
+        _V51_DISCOVERY.get("discovery") == "mcuboot"
+        and _V51_DISCOVERY.get("mcuboot_port")
+        and Path(str(_V51_DISCOVERY["mcuboot_port"])).exists()
+    )
+    connected = bool(
+        SERIAL_DATA_PORT and SERIAL_SMP_PORT
+        and Path(SERIAL_DATA_PORT).exists() and Path(SERIAL_SMP_PORT).exists()
+    )
+    return {
+        "transport": "serial", "board": "V5.1", "connected": connected,
+        "data_port": SERIAL_DATA_PORT, "smp_port": SERIAL_SMP_PORT,
+        "mcuboot_port": str(_V51_DISCOVERY.get("mcuboot_port") or ""),
+        "recovery": recovery,
+        "serial_number": str(_V51_DISCOVERY.get("serial_number") or ""),
+        "product": str(_V51_DISCOVERY.get("product") or ""),
+        "discovery": str(_V51_DISCOVERY.get("discovery") or "not_started"),
+        "error": str(_V51_DISCOVERY.get("error") or ""),
+    }
+
+
+def _require_v51_ports(require_smp: bool = False) -> dict[str, Any]:
+    status = refresh_v51_ports(force=True)
+    if status["recovery"]:
+        raise RuntimeError("V5.1 当前处于 MCUboot 恢复模式，请先完成或退出固件更新")
+    if not status["connected"] or not SERIAL_DATA_PORT:
+        detail = status.get("error") or "未识别到 V5.1 DATA/SMP 双 USB 端口"
+        raise RuntimeError(detail)
+    if require_smp and not SERIAL_SMP_PORT:
+        raise RuntimeError("未识别到 V5.1 SMP USB 端口，禁止烧录")
+    return status
+
+
+def _wait_for_v51_mcuboot_port(timeout_s: float = 6.0) -> str:
+    """Wait for the single MCUboot CDC descriptor after an authenticated reset."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        chosen = _choose_v51_ports(_v51_port_infos(), probe=lambda _path: False)
+        if chosen["mcuboot_port"]:
+            return str(chosen["mcuboot_port"])
+        time.sleep(0.1)
+    raise RuntimeError("MCUboot CDC 未在 6 秒内出现")
 
 # ── 两相测量:还原瞬态 → 过零 → 氧化稳态 ────────────────────────────────
 # 工作点 E=+200mV 驱动**氧化**,所以稳态电流走器件的原生方向(流出 WE),
@@ -394,17 +653,14 @@ class SettingsController:
     def _upgrade_v51_firmware() -> None:
         """Reset the V5.1 app over SMP, then upload its signed image to MCUboot.
 
-        DATA and SMP are deliberately separate CDC interfaces.  Explicit port
-        paths are required so applying a method can never target an unrelated
-        serial device by heuristic discovery.  No UICR or MCUboot region is
-        written by this path.
+        DATA and SMP are deliberately separate CDC interfaces.  The board is
+        matched by its V5.1 USB descriptor and DATA is verified from its
+        machine-readable status stream before SMP is used.  No UICR or
+        MCUboot region is written by this path.
         """
+        _require_v51_ports(require_smp=True)
         if not SMPMGR_EXE.exists():
             raise RuntimeError(f"找不到 smpmgr:{SMPMGR_EXE}")
-        if not SERIAL_SMP_PORT:
-            raise RuntimeError("V5.1 应用参数前必须设置 SENSUS_SMP_PORT")
-        if not SERIAL_MCUBOOT_PORT:
-            raise RuntimeError("V5.1 应用参数前必须设置 SENSUS_MCUBOOT_PORT")
         if not V51_SIGNED_BIN.exists():
             raise RuntimeError(f"找不到 V5.1 签名镜像:{V51_SIGNED_BIN}")
 
@@ -413,16 +669,9 @@ class SettingsController:
              "os", "reset"],
             check=True, capture_output=True, text=True,
         )
-        deadline = time.monotonic() + 4.0
-        boot_port = Path(SERIAL_MCUBOOT_PORT)
-        while time.monotonic() < deadline and not boot_port.exists():
-            time.sleep(0.1)
-        if not boot_port.exists():
-            raise RuntimeError(
-                f"MCUboot CDC 未在 4 秒内出现:{SERIAL_MCUBOOT_PORT}"
-            )
+        boot_port = _wait_for_v51_mcuboot_port()
         done = subprocess.run(
-            [str(SMPMGR_EXE), "--port", str(boot_port), "--timeout", "10",
+            [str(SMPMGR_EXE), "--port", boot_port, "--timeout", "10",
              "upgrade", str(V51_SIGNED_BIN)],
             check=True, capture_output=True, text=True,
         )
@@ -551,6 +800,10 @@ class SettingsController:
 
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         settings = self.validate(payload)
+        if HARDWARE_TRANSPORT == "serial":
+            # Fail before touching the generated config or spending time on a
+            # build if the exact V5.1 DATA/SMP pair is not present.
+            _require_v51_ports(require_smp=True)
         with self.lock:
             self.state = "applying"
             self.message = "正在编译并写入硬件参数"
@@ -752,6 +1005,10 @@ class MeasurementController:
     def start(self, metadata: dict[str, Any] | None = None,
               on_complete: Any = None,
               settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        if HARDWARE_TRANSPORT == "serial":
+            # Resolve the DATA path before creating a run directory.  A
+            # disconnected attempt therefore cannot look like an experiment.
+            _require_v51_ports(require_smp=False)
         with self.lock:
             if self.state == "running":
                 raise RuntimeError("已有测量正在运行")
@@ -843,12 +1100,6 @@ class MeasurementController:
                 "25",
             ]
             if HARDWARE_TRANSPORT == "serial":
-                if not SERIAL_DATA_PORT:
-                    self.state = "error"
-                    self.error = "V5.1 需要明确指定 DATA CDC 路径"
-                    raise RuntimeError(
-                        self.error + "(--serial-port 或 SENSUS_SERIAL_PORT)"
-                    )
                 command += ["--serial", SERIAL_DATA_PORT]
             else:
                 # collector 持有唯一 RTT 桥并负责完整回收。
@@ -1551,6 +1802,8 @@ class ScheduleController:
         self.metadata_hook: Any = None
 
     def start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if HARDWARE_TRANSPORT == "serial":
+            _require_v51_ports(require_smp=False)
         interval_minutes = float(payload.get("interval_minutes", 5))
         settings = SettingsController.validate(payload.get("settings", {}))
         sample_role = (
@@ -2555,6 +2808,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             self._send_json(APP.measurement.snapshot())
             return
+        if parsed.path == "/api/hardware":
+            self._send_json(hardware_status())
+            return
         if parsed.path == "/api/calibration":
             self._send_json(APP.model_payload())
             return
@@ -2579,7 +2835,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
         if parsed.path == "/api/health":
-            self._send_json({"ok": True, "project": str(PROJECT_DIR)})
+            self._send_json({
+                "ok": True,
+                "project": str(PROJECT_DIR),
+                "transport": HARDWARE_TRANSPORT,
+                # Health checks must stay fast while USB discovery is running
+                # in another request; otherwise the native App watchdog can
+                # mistake enumeration latency for a crashed backend.
+                "hardware": hardware_status(refresh=False),
+            })
             return
         if parsed.path.startswith("/assets/"):
             name = Path(parsed.path.removeprefix("/assets/")).name
@@ -2703,21 +2967,27 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
 
 
 def main(argv: list[str] | None = None) -> int:
-    global HARDWARE_TRANSPORT, SERIAL_DATA_PORT
+    global HARDWARE_TRANSPORT, HARDWARE_AUTO_DISCOVERY
+    global SERIAL_DATA_PORT, SERIAL_DATA_EXPLICIT
     parser = argparse.ArgumentParser(description="本地 i-t 电化学检测 GUI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--open-browser", action="store_true")
-    parser.add_argument("--transport", choices=("rtt", "serial"),
+    parser.add_argument("--transport", choices=("rtt", "serial", "v51"),
                         default=HARDWARE_TRANSPORT,
-                        help="V4.0 用 rtt;V5.1 用 serial")
+                        help="V4.0 用 rtt;V5.1 App 用 v51 自动识别或 serial 显式指定")
     parser.add_argument("--serial-port", default=SERIAL_DATA_PORT,
                         help="V5.1 DATA CDC 路径;不得填 SMP 口")
     args = parser.parse_args(argv)
-    HARDWARE_TRANSPORT = args.transport
+    HARDWARE_AUTO_DISCOVERY = args.transport == "v51"
+    HARDWARE_TRANSPORT = "serial" if args.transport == "v51" else args.transport
     SERIAL_DATA_PORT = args.serial_port
+    SERIAL_DATA_EXPLICIT = bool(args.serial_port)
     if HARDWARE_TRANSPORT == "serial" and not SERIAL_DATA_PORT:
-        parser.error("--transport serial 必须同时给 --serial-port")
+        if HARDWARE_AUTO_DISCOVERY:
+            refresh_v51_ports(force=True)
+        else:
+            parser.error("--transport serial 必须同时给 --serial-port")
     serve(args.host, args.port, args.open_browser)
     return 0
 

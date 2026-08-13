@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, sampleRole: 'calibration', method: 'it', chartWindowS: 5, lastHandledRunId: null, measureControlInitialized: false };
+const state = { measurement: null, hardware: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, sampleRole: 'calibration', method: 'it', chartWindowS: 5, lastHandledRunId: null, measureControlInitialized: false };
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
   calibrate: ['标定与漂移', '选择标定范围并管理过渡期 bias'],
@@ -23,7 +23,8 @@ function previewFilename(){const sample=($('sampleName').value||'样品名称').
 function updateStartState(){
   const running=state.measurement?.state==='running', ready=state.workflow?.calibration_ready;
   const cv=state.method==='cv';
-  $('startMeasure').disabled=running||!state.settings?.applied||!state.workflow?.save_dir||(!cv&&state.sampleRole==='test'&&!ready);
+  const hardwareReady=state.hardware?.transport!=='serial'||Boolean(state.hardware?.connected);
+  $('startMeasure').disabled=running||!hardwareReady||!state.settings?.applied||!state.workflow?.save_dir||(!cv&&state.sampleRole==='test'&&!ready);
   $('startMeasure').textContent=cv?'开始 CV 扫描':state.sampleRole==='calibration'?'开始标定测量':'开始测试并预测';
 }
 function setSampleRole(role, quiet=false){
@@ -347,12 +348,34 @@ function updateMeasurement(data){
   const nativeRate=cv?Number(data.settings?.cv_scan_rate_v_s)/Number(data.settings?.cv_step_v):wideIt?Number(data.settings?.target_rate_hz):1000/[124,242,476,945,1882,3757][Number(data.settings?.sens_period_code||0)], expectedNative=Math.round(duration*nativeRate);
   $('validCount').textContent=nativeCount||'--'; $('validCount').nextElementSibling.textContent=`/ ≈ ${expectedNative}`;
   $('progressValue').textContent=complete?100:Math.min(100,Math.round(latest/duration*100));
-  const hardwareState=data.state==='error'?'error':running?'busy':data.state==='completed'?'ok':'';
-  $('deviceDot').className=`status-dot ${hardwareState}`;
-  $('deviceState').textContent=data.state==='error'?'硬件 / 采集异常':running?'设备测量中':data.state==='completed'?'上轮测量完成':'硬件待测';
+  if(data.state==='error'){$('deviceDot').className='status-dot error';$('deviceState').textContent='硬件 / 采集异常'}
+  else if(running){$('deviceDot').className='status-dot busy';$('deviceState').textContent='设备测量中'}
+  else if(data.state==='completed'){$('deviceDot').className='status-dot ok';$('deviceState').textContent='上轮测量完成'}
+  else renderHardwareIndicator();
   if(data.error){$('measureError').textContent=data.error;$('measureError').hidden=false}else $('measureError').hidden=true; updateStartState();drawAll();void handleWorkflowCompletion(data);
 }
 async function refreshMeasurement(){try{updateMeasurement(await api('/api/status'))}catch(e){$('deviceState').textContent='服务未连接';$('deviceDot').className='status-dot'}}
+function renderHardwareIndicator(){
+  const hardware=state.hardware;if(!hardware)return;
+  if(hardware.transport==='rtt'){
+    $('deviceState').textContent='V4.0 RTT 已配置';$('deviceTransport').textContent='J-Link · MAX30131';$('deviceDot').className='status-dot ok';return;
+  }
+  const serial=hardware.serial_number?` · ${hardware.serial_number}`:'';
+  if(hardware.recovery){
+    $('deviceState').textContent='V5.1 MCUboot 恢复模式';$('deviceTransport').textContent=`USB 固件更新端口${serial}`;$('deviceDot').className='status-dot busy';return;
+  }
+  if(hardware.connected){
+    $('deviceState').textContent='V5.1 USB 已连接';$('deviceTransport').textContent=`DATA + SMP · MAX30131${serial}`;$('deviceDot').className='status-dot ok';return;
+  }
+  $('deviceState').textContent='V5.1 USB 未连接';$('deviceTransport').textContent=hardware.error||'请连接 DATA 与 SMP 双 USB 端口';$('deviceDot').className='status-dot error';
+}
+function updateHardware(data){
+  state.hardware=data;$('deviceTransport').title=[data.product,data.data_port,data.smp_port].filter(Boolean).join(' · ');
+  const measurementState=state.measurement?.state;
+  if(!['running','error','completed'].includes(measurementState)||!data.connected)renderHardwareIndicator();
+  updateStartState();
+}
+async function refreshHardware(){try{updateHardware(await api('/api/hardware'))}catch(e){state.hardware=null;$('deviceState').textContent='服务未连接';$('deviceTransport').textContent=e.message;$('deviceDot').className='status-dot'}}
 async function measurementRefreshLoop(){
   await refreshMeasurement();
   const running = state.measurement?.state === 'running';
@@ -441,12 +464,12 @@ $('calculateDrift').onclick=async()=>{try{const data=await post('/api/drift/calc
 $('applyDrift').addEventListener('change',async()=>{try{renderDrift(await post('/api/drift/toggle',{enabled:$('applyDrift').checked}));state.calibration=await api('/api/calibration');renderCalibration();toast($('applyDrift').checked?'漂移校正已启用':'漂移校正已停用')}catch(e){$('applyDrift').checked=!$('applyDrift').checked;toast(e.message)}});
 
 function renderScheduleMode(){const cv=state.method==='cv',role=$('scheduleRole').value,note={stabilization:'连续运行稳定化 I-T；全部数据自动保存，当前测试曲线保持锁定。',test:'每轮 I-T 完成后使用已锁定曲线自动预测，不更新标定。',calibration:'每轮结果只加入候选标定点；完成后仍需手动选择范围并生成曲线。'};$('scheduleRole').disabled=cv;$('scheduleModeNote').textContent=cv?'按当前 CV 条件完整扫描并逐轮保存；计划间隔必须长于单次扫描时长。':note[role];if(!cv&&role==='stabilization'&&$('schedulePrefix').value==='自动样品')$('schedulePrefix').value='稳定化IT'}
-function updateSchedule(data){state.schedule=data;$('scheduleBadge').textContent=data.active?'运行中':'未运行';$('scheduleBadge').className=`live-badge ${data.active?'running':''}`;$('scheduleMessage').textContent=data.message;$('completedRuns').textContent=data.completed_runs;$('startSchedule').disabled=data.active||!state.settings?.applied;$('stopSchedule').disabled=!data.active;const next=data.next_run_at?new Date(data.next_run_at*1000):null,stop=data.stop_at?new Date(data.stop_at*1000):null;$('nextRun').textContent=next?`下次 ${next.toLocaleTimeString('zh-CN',{hour12:false})}${stop?` · 结束 ${stop.toLocaleTimeString('zh-CN',{hour12:false})}`:''}`:'--';const list=$('historyList');list.innerHTML=data.history?.length?'':'<div class="empty-history">暂无自动测量记录</div>';(data.history||[]).forEach(h=>{const el=document.createElement('div');el.className='history-item';const c=h.summary?.steady_current_nA,role={calibration:'候选标定',stabilization:'稳定化',test:'测试',cv:'CV'}[h.metadata?.sample_role]||'';el.innerHTML=`<strong>${h.metadata?.sample_name||h.run_id}</strong><span class="history-current">${c==null?(h.summary?.cycles_observed?`${h.summary.cycles_observed} 圈`:'--'):fmt(c)+' nA'}</span><small>${h.finished_at?new Date(h.finished_at*1000).toLocaleString('zh-CN'):''}</small><span>${role} · ${h.state==='completed'?'完成':'异常'}</span>`;list.appendChild(el)})}
+function updateSchedule(data){state.schedule=data;$('scheduleBadge').textContent=data.active?'运行中':'未运行';$('scheduleBadge').className=`live-badge ${data.active?'running':''}`;$('scheduleMessage').textContent=data.message;$('completedRuns').textContent=data.completed_runs;const hardwareReady=state.hardware?.transport!=='serial'||Boolean(state.hardware?.connected);$('startSchedule').disabled=data.active||!hardwareReady||!state.settings?.applied;$('stopSchedule').disabled=!data.active;const next=data.next_run_at?new Date(data.next_run_at*1000):null,stop=data.stop_at?new Date(data.stop_at*1000):null;$('nextRun').textContent=next?`下次 ${next.toLocaleTimeString('zh-CN',{hour12:false})}${stop?` · 结束 ${stop.toLocaleTimeString('zh-CN',{hour12:false})}`:''}`:'--';const list=$('historyList');list.innerHTML=data.history?.length?'':'<div class="empty-history">暂无自动测量记录</div>';(data.history||[]).forEach(h=>{const el=document.createElement('div');el.className='history-item';const c=h.summary?.steady_current_nA,role={calibration:'候选标定',stabilization:'稳定化',test:'测试',cv:'CV'}[h.metadata?.sample_role]||'';el.innerHTML=`<strong>${h.metadata?.sample_name||h.run_id}</strong><span class="history-current">${c==null?(h.summary?.cycles_observed?`${h.summary.cycles_observed} 圈`:'--'):fmt(c)+' nA'}</span><small>${h.finished_at?new Date(h.finished_at*1000).toLocaleString('zh-CN'):''}</small><span>${role} · ${h.state==='completed'?'完成':'异常'}</span>`;list.appendChild(el)})}
 $('scheduleRole').addEventListener('change',renderScheduleMode);
 $('startSchedule').onclick=async()=>{try{$('scheduleError').hidden=true;updateSchedule(await post('/api/schedule/start',{interval_minutes:$('intervalMinutes').value,max_runs:$('maxRuns').value,total_minutes:$('totalMinutes').value,sample_prefix:$('schedulePrefix').value,known_concentration_um:$('scheduleConcentration').value===''?null:$('scheduleConcentration').value,sample_role:$('scheduleRole').value,start_now:$('startNow').checked}))}catch(e){errorBox('scheduleError',e)}};
 $('stopSchedule').onclick=async()=>{try{updateSchedule(await post('/api/schedule/stop'))}catch(e){errorBox('scheduleError',e)}};
 
-async function init(){setInterval(()=>$('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);try{renderSettings(await api('/api/settings'))}catch{}try{renderWorkflow(await api('/api/workflow'))}catch{}try{state.calibration=await api('/api/calibration');renderCalibration()}catch{}try{renderDrift(await api('/api/drift'))}catch{}try{updateSchedule(await api('/api/schedule'))}catch{}setSampleRole(state.workflow?.calibration_ready?'test':'calibration',true);previewFilename();measurementRefreshLoop();setInterval(async()=>{try{updateSchedule(await api('/api/schedule'))}catch{}},1000)}
+async function init(){setInterval(()=>$('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);await refreshHardware();try{renderSettings(await api('/api/settings'))}catch{}try{renderWorkflow(await api('/api/workflow'))}catch{}try{state.calibration=await api('/api/calibration');renderCalibration()}catch{}try{renderDrift(await api('/api/drift'))}catch{}try{updateSchedule(await api('/api/schedule'))}catch{}setSampleRole(state.workflow?.calibration_ready?'test':'calibration',true);previewFilename();measurementRefreshLoop();setInterval(refreshHardware,2000);setInterval(async()=>{try{updateSchedule(await api('/api/schedule'))}catch{}},1000)}
 
 // ══════════════════════════════════════════════════════════════════════════
 // 硬件 DEBUG 模式

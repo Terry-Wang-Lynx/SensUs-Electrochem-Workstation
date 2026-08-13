@@ -2,8 +2,35 @@ import AppKit
 import Foundation
 import WebKit
 
-private let workstationURL = URL(string: "http://127.0.0.1:8765/")!
-private let healthURL = URL(string: "http://127.0.0.1:8765/api/health")!
+#if SENSUS_V51
+private let workstationPort = "8766"
+private let workstationName = "SensUs V5.1 电化学工作站"
+private let overlayName = "SensUs V5.1 悬浮检测"
+private let backendTransport = "v51"
+private let expectedBackendTransport = "serial"
+private let appStoragePrefix = "SensUsV51Workstation"
+private let logDirectoryName = "SensUs V5.1 Workstation"
+#else
+private let workstationPort = "8765"
+private let workstationName = "SensUs 电化学工作站"
+private let overlayName = "SensUs 悬浮检测"
+private let backendTransport = "rtt"
+private let expectedBackendTransport = "rtt"
+private let appStoragePrefix = "SensUsWorkstation"
+private let logDirectoryName = "SensUs Workstation"
+#endif
+
+private let workstationURL = URL(string: "http://127.0.0.1:\(workstationPort)/")!
+private let healthURL = URL(
+    string: "http://127.0.0.1:\(workstationPort)/api/health"
+)!
+private let projectRootDefaultsKey = "\(appStoragePrefix).projectRoot"
+private let alwaysOnTopDefaultsKey = "\(appStoragePrefix).alwaysOnTop"
+private let mainWindowFrameName = "\(appStoragePrefix).mainWindow"
+private let overlayWindowFrameName = "\(appStoragePrefix).overlayWindow"
+private let overlayToolbarIdentifier = NSToolbar.Identifier(
+    "\(appStoragePrefix).overlayToolbar"
+)
 
 private final class BackendManager {
     private(set) var process: Process?
@@ -17,7 +44,7 @@ private final class BackendManager {
     init() {
         projectRoot = Self.resolveProjectRoot()
         let logs = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/SensUs Workstation", isDirectory: true)
+            .appendingPathComponent("Library/Logs/\(logDirectoryName)", isDirectory: true)
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
         logURL = logs.appendingPathComponent("server.log")
     }
@@ -75,7 +102,8 @@ private final class BackendManager {
         process.arguments = [
             "-m", "pa_host.gui_server",
             "--host", "127.0.0.1",
-            "--port", "8765",
+            "--port", workstationPort,
+            "--transport", backendTransport,
         ]
         process.currentDirectoryURL = projectRoot
         var environment = ProcessInfo.processInfo.environment
@@ -123,13 +151,17 @@ private final class BackendManager {
             let status = (response as? HTTPURLResponse)?.statusCode
             guard error == nil, status == 200, let data,
                   let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let project = payload["project"] as? String else {
+                  let project = payload["project"] as? String,
+                  let transport = payload["transport"] as? String else {
                 completion(false)
                 return
             }
             let reportedRoot = URL(fileURLWithPath: project, isDirectory: true)
                 .standardizedFileURL.path
-            completion(reportedRoot == projectRoot.standardizedFileURL.path)
+            completion(
+                reportedRoot == projectRoot.standardizedFileURL.path
+                && transport == expectedBackendTransport
+            )
         }.resume()
     }
 
@@ -206,7 +238,8 @@ private final class BackendManager {
            !path.isEmpty {
             candidates.append(URL(fileURLWithPath: path, isDirectory: true))
         }
-        if let saved = UserDefaults.standard.string(forKey: "projectRoot"), !saved.isEmpty {
+        if let saved = UserDefaults.standard.string(forKey: projectRootDefaultsKey),
+           !saved.isEmpty {
             candidates.append(URL(fileURLWithPath: saved, isDirectory: true))
         }
 
@@ -220,7 +253,9 @@ private final class BackendManager {
             manager.fileExists(atPath: $0
                 .appendingPathComponent("software/host/pa_host/gui_server.py").path)
         }) {
-            UserDefaults.standard.set(root.standardizedFileURL.path, forKey: "projectRoot")
+            UserDefaults.standard.set(
+                root.standardizedFileURL.path, forKey: projectRootDefaultsKey
+            )
             return root.standardizedFileURL
         }
         return candidates.first ?? Bundle.main.bundleURL.deletingLastPathComponent()
@@ -270,10 +305,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var overlayWebView: WKWebView!
     private weak var pinButton: NSButton?
     private var pinned: Bool = {
-        if UserDefaults.standard.object(forKey: "alwaysOnTop") == nil {
+        if UserDefaults.standard.object(forKey: alwaysOnTopDefaultsKey) == nil {
             return true
         }
-        return UserDefaults.standard.bool(forKey: "alwaysOnTop")
+        return UserDefaults.standard.bool(forKey: alwaysOnTopDefaultsKey)
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -332,7 +367,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             backing: .buffered,
             defer: false
         )
-        mainWindow.title = "SensUs 电化学工作站"
+        mainWindow.title = workstationName
         mainWindow.delegate = self
         mainWindow.contentView = mainWebView
         mainWindow.minSize = NSSize(width: 940, height: 620)
@@ -341,16 +376,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         mainWindow.titlebarAppearsTransparent = false
         mainWindow.toolbarStyle = .unified
 
-        let toolbar = NSToolbar(identifier: "SensUsWorkstationToolbar")
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier(
+            "\(appStoragePrefix).toolbar"
+        ))
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
         mainWindow.toolbar = toolbar
 
-        if !mainWindow.setFrameUsingName("SensUsWorkstationMainWindow") {
+        if !mainWindow.setFrameUsingName(mainWindowFrameName) {
             mainWindow.center()
         }
-        mainWindow.setFrameAutosaveName("SensUsWorkstationMainWindow")
+        mainWindow.setFrameAutosaveName(mainWindowFrameName)
         applyPinnedState()
         mainWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -364,7 +401,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             backing: .buffered,
             defer: false
         )
-        overlayPanel.title = "SensUs 悬浮检测"
+        overlayPanel.title = overlayName
         overlayPanel.delegate = self
         overlayPanel.contentView = overlayWebView
         overlayPanel.minSize = NSSize(width: 340, height: 440)
@@ -379,13 +416,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         overlayPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         overlayPanel.animationBehavior = .utilityWindow
 
-        let toolbar = NSToolbar(identifier: "SensUsOverlayToolbar")
+        let toolbar = NSToolbar(identifier: overlayToolbarIdentifier)
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
         overlayPanel.toolbar = toolbar
 
-        if !overlayPanel.setFrameUsingName("SensUsWorkstationOverlayWindow"),
+        if !overlayPanel.setFrameUsingName(overlayWindowFrameName),
            let visibleFrame = NSScreen.main?.visibleFrame {
             let frame = overlayPanel.frame
             overlayPanel.setFrameOrigin(NSPoint(
@@ -394,7 +431,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             ))
         }
         keepOverlayOnScreen()
-        overlayPanel.setFrameAutosaveName("SensUsWorkstationOverlayWindow")
+        overlayPanel.setFrameAutosaveName(overlayWindowFrameName)
         overlayPanel.orderOut(nil)
     }
 
@@ -424,14 +461,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "关于 SensUs 电化学工作站",
+        appMenu.addItem(withTitle: "关于 \(workstationName)",
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "隐藏 SensUs 电化学工作站",
+        appMenu.addItem(withTitle: "隐藏 \(workstationName)",
                         action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "退出 SensUs 电化学工作站",
+        appMenu.addItem(withTitle: "退出 \(workstationName)",
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
@@ -477,7 +514,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        if toolbar.identifier == "SensUsOverlayToolbar" {
+        if toolbar.identifier == overlayToolbarIdentifier {
             return [.flexibleSpace, .showMain, .reloadPage]
         }
         return [.flexibleSpace, .showOverlay, .pinWindow, .reloadPage, .openBrowser]
@@ -538,7 +575,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     @objc private func togglePin() {
         pinned.toggle()
-        UserDefaults.standard.set(pinned, forKey: "alwaysOnTop")
+        UserDefaults.standard.set(pinned, forKey: alwaysOnTopDefaultsKey)
         applyPinnedState()
     }
 
