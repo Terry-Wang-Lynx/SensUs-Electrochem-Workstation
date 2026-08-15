@@ -1,6 +1,6 @@
 /*
- * pA-Converter V4.0 固件最小闭环
- *   MAX30131 单芯片 AFE(SPI)+ nRF52833 + CR2032 · 数据经 RTT 上报
+ * pA-Converter 共用电化学固件
+ *   MAX30131 单芯片 AFE(SPI) + nRF52833;板级传输由 control_transport 选择
  *
  * 🔴 本版**不开 BLE**(用户 2026-07-31 拍板:蓝牙一时半会不用)。
  *    连带好处:`DEC5` 缺 820pF 的风险窗口正是 BLE TX 的 mA 级电流突变,
@@ -15,6 +15,7 @@
  */
 
 #include "board_guards.h"
+#include "control_transport.h"
 #include "max30131_spi.h"
 
 #include "afe_cfg.h"
@@ -26,7 +27,6 @@
 #include "measurement_config.default.h"
 #endif
 
-#include <SEGGER_RTT.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <stdio.h>
@@ -1107,7 +1107,8 @@ enum control_command {
 static enum control_command pending_control;
 
 /*
- * 从 RTT 下行取字符、拼成整行、交给 handle_command_line()。本函数**只管拼行**。
+ * 从板级传输下行取字符、拼成整行、交给 handle_command_line()。
+ * 本函数**只管拼行**,V4 RTT 与 V5.1 USB 共用命令和确认协议。
  *
  * 🔴 修一个静默注入漏洞(2026-08-10 发现,原代码存在):溢出时原来是
  *      `used = 0U;`  ← 丢掉已收部分,却**继续把后续字符往缓冲里塞**
@@ -1124,7 +1125,7 @@ static enum control_command poll_control_command(void)
 	static bool overflow;
 	char ch;
 
-	while (SEGGER_RTT_Read(0U, &ch, 1U) == 1U) {
+	while (control_transport_read_char(&ch) == 1) {
 		if (ch == '\r' || ch == '\n') {
 			if (overflow) {
 				printk("CFG_REJECT ep=%u ms=%lld reason=too_long "
@@ -2904,12 +2905,36 @@ static void cfg_load_defaults(void)
 	afe_cfg_derive(&cfg_live, &drv_live);
 	cfg_epoch = 1U;
 	printk("CFG_BOOT ep=%u ms=%lld fw=%s reason=boot\n", cfg_epoch,
-	       (long long)k_uptime_get(), "v4-dbg1");
+	       (long long)k_uptime_get(),
+#if defined(CONFIG_BOARD_PA_CONVERTER_V51)
+	       "v5.1-usb2-req"
+#else
+	       "v4-dbg1"
+#endif
+	);
 }
 
 int main(void)
 {
+	/* V5.1 must pass the read-only power/UICR audit before USB or AFE starts. */
+	if (board_guards_preflight() != 0) {
+		LOG_ERR("board preflight failed; USB and AFE remain disabled");
+		while (1) {
+			k_msleep(1000);
+		}
+	}
+	if (control_transport_init() != 0) {
+		LOG_ERR("control/data transport initialization failed");
+		while (1) {
+			k_msleep(1000);
+		}
+	}
+
+#if defined(CONFIG_BOARD_PA_CONVERTER_V51)
+	LOG_INF("=== pA-Converter V5.1 firmware start(USB / polling / no BLE) ===");
+#else
 	LOG_INF("=== pA-Converter V4.0 固件启动(轮询模式 / 无 BLE)===");
+	#endif
 	cfg_load_defaults();
 
 	/* 三条焊死项:DCDCEN=0 断言 + POFCON 2.0V + 看门狗 */

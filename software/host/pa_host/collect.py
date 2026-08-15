@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""实时收数落盘 —— 从固件 RTT 读行,校验后追加写 CSV。
+"""实时收数落盘 —— 从固件文本传输读行,校验后追加写 CSV。
 
 用途
     A 段(实时):把固件经 SEGGER RTT 吐出的行协议落成 CSV,边收边做完整性检查。
     B 段(离线)交给 analyze.py。两段刻意分开:收数不能因为分析崩掉而丢数据。
 
-三种取数来源
+四种取数来源
     --start-jlink   ★推荐★ 自己起 RTT 桥(JLinkExe/OpenOCD),从 telnet 19021 读
     --socket H:P    连一个已经在跑的 RTT telnet 服务
     --tail FILE     跟读一个 RTT 日志文件(你自己起的 logger)
+    --serial PORT   V5.1 USB DATA CDC(文本行/命令双向)
 
 用法
     # 最常用:一条命令搞定(RTT 地址自动从 ELF 提取)
@@ -197,6 +198,7 @@ RTT_TELNET_PORT = 19021
 # 🔴 按**挂钟时间**重发,不依赖 socket 空闲 —— 固件仍在吐上一轮数据时永不空闲。
 TRIGGER_RESEND_INTERVAL_S = 1.0
 TRIGGER_MAX_RESENDS = 20
+SERIAL_TRIGGER_RESEND_INTERVAL_S = 3.0
 # 命令文件轮询间隔(方案 C:外部命令经采集器 socket 转发给固件)
 CMD_POLL_INTERVAL_S = 0.5
 DEFAULT_ELF = Path("/tmp/pabuild/firmware/zephyr/zephyr.elf")
@@ -548,6 +550,155 @@ def tail_lines(path: Path, idle_timeout: float | None = None):
                 time.sleep(0.1)
 
 
+def read_serial_lines(port: str, baudrate: int = 115200,
+                      idle_timeout: float | None = None,
+                      trigger: str | None = None,
+                      cmd_file: Path | None = None,
+                      serial_factory=None):
+    """Read the unchanged line protocol from the V5.1 DATA CDC interface.
+
+    CDC ACM ignores the nominal baud rate, but pyserial requires one. Opening
+    the port asserts DTR; the V5.1 app waits for that event before emitting
+    startup identity lines. The other CDC interface is SMP and must not be
+    passed here.
+    """
+    if serial_factory is None:
+        try:
+            import serial
+        except ImportError as exc:
+            raise SystemExit(
+                "USB 串口采集需要 pyserial>=3.5;请重新执行 pip install -e ."
+            ) from exc
+        serial_factory = serial.Serial
+
+    armed_only = trigger == "ARMED"
+    trigger_command = None if armed_only else (
+        "START" if trigger == "FRESH_START" else trigger
+    )
+    try:
+        trigger_bytes = (
+            _encode_firmware_command(trigger_command)
+            if trigger_command else None
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    trigger_pending = trigger_bytes is not None
+    resends = 0
+    warned_unacked = False
+    last_trigger_at = 0.0
+    last_cmd_poll = 0.0
+    cmd_pos = 0
+    cmd_pending = ""
+    armed_start_sent = False
+    buf = b""
+    last_data = time.monotonic()
+
+    try:
+        stream_context = serial_factory(
+            port=port, baudrate=baudrate, timeout=0.1, write_timeout=1.0
+        )
+    except Exception as exc:
+        raise SystemExit(f"打不开 V5.1 DATA CDC {port}: {exc}") from exc
+
+    print(f"[collect] 已打开 V5.1 DATA CDC {port}(DTR=1)", file=sys.stderr)
+    with stream_context as stream:
+        # A persistent app may hand us the tail of an already-started line.
+        # Discard exactly that first physical line before sending commands.
+        sync_deadline = time.monotonic() + 2.0
+        while b"\n" not in buf and time.monotonic() < sync_deadline:
+            try:
+                chunk = stream.read(4096)
+            except Exception as exc:
+                raise SystemExit(f"V5.1 DATA CDC 读取失败:{exc}") from exc
+            if chunk:
+                buf += chunk
+                last_data = time.monotonic()
+        if b"\n" in buf:
+            _discarded, buf = buf.split(b"\n", 1)
+            print("[collect] DATA CDC 已对齐到完整行边界", file=sys.stderr)
+        else:
+            buf = b""
+            print("[collect] ⚠️ DATA CDC 2s 内无可对齐行", file=sys.stderr)
+
+        # GET/STATUS are read-only and make every USB run self-describing.
+        preamble = b"GET\nSTATUS\n" + (trigger_bytes or b"")
+        stream.write(preamble)
+        stream.flush()
+        if trigger_pending:
+            resends = 1
+            last_trigger_at = time.monotonic()
+
+        while True:
+            now = time.monotonic()
+            if cmd_file is not None and now - last_cmd_poll >= CMD_POLL_INTERVAL_S:
+                last_cmd_poll = now
+                try:
+                    if cmd_file.exists():
+                        with cmd_file.open("r", encoding="utf-8") as fh:
+                            fh.seek(cmd_pos)
+                            fresh = fh.read()
+                            cmd_pos = fh.tell()
+                        command_lines, cmd_pending = _split_complete_lines(
+                            fresh, cmd_pending
+                        )
+                        for raw_cmd in command_lines:
+                            raw_cmd = raw_cmd.strip()
+                            if not raw_cmd or raw_cmd.startswith("#"):
+                                continue
+                            command_bytes = _encode_firmware_command(raw_cmd)
+                            stream.write(command_bytes)
+                            stream.flush()
+                            if armed_only and raw_cmd == "START":
+                                armed_start_sent = True
+                                trigger_command = "START"
+                                trigger_bytes = b"START\n"
+                                trigger_pending = True
+                                resends = 0
+                                warned_unacked = False
+                                last_trigger_at = time.monotonic()
+                            print(f"[collect] 已经 DATA CDC 转发命令:{raw_cmd}",
+                                  file=sys.stderr)
+                except (OSError, ValueError) as exc:
+                    print(f"[collect] ⚠️ DATA CDC 命令失败:{exc}", file=sys.stderr)
+
+            if trigger_pending and now - last_trigger_at >= SERIAL_TRIGGER_RESEND_INTERVAL_S:
+                if resends < TRIGGER_MAX_RESENDS:
+                    stream.write(trigger_bytes)
+                    stream.flush()
+                    resends += 1
+                    last_trigger_at = now
+                elif not warned_unacked:
+                    warned_unacked = True
+                    print(f"[collect] 🔴 DATA CDC 重发 {resends} 次仍未收到启动标记",
+                          file=sys.stderr)
+
+            try:
+                chunk = stream.read(4096)
+            except Exception as exc:
+                raise SystemExit(f"V5.1 DATA CDC 读取失败:{exc}") from exc
+            if chunk:
+                last_data = time.monotonic()
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    line = raw.decode("utf-8", "replace")
+                    start_seen = (
+                        parse_it_start(line) is not None
+                        or parse_cv_start(line) is not None
+                    )
+                    if armed_only and start_seen and not armed_start_sent:
+                        print("[collect] 忽略 ARMED 前的旧 START 标记",
+                              file=sys.stderr)
+                        continue
+                    if trigger_pending and start_seen:
+                        trigger_pending = False
+                        print(f"[collect] 固件已确认 {trigger_command}"
+                              f"(DATA CDC 重发 {resends} 次)", file=sys.stderr)
+                    yield line
+            elif idle_timeout is not None and time.monotonic() - last_data > idle_timeout:
+                return
+
+
 # --------------------------------------------------------------------------
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # 🔴 三条标记行的尾部在 2026-08-10 加了 `ep=` / `tainted=`。这些正则原来都是
@@ -808,7 +959,7 @@ def parse_cv_aborted(line: str) -> tuple[str, int, int] | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="从 RTT 实时收数并落盘 CSV")
+    ap = argparse.ArgumentParser(description="从 RTT/USB CDC 实时收数并落盘 CSV")
     ap.add_argument("--out", required=True, type=Path, help="输出 CSV 路径")
     ap.add_argument("--raw-log", type=Path,
                     help="可选:同时保存未解析的 RTT 原始行(含启动/标定日志)")
@@ -830,6 +981,8 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--socket", metavar="HOST:PORT",
                      help="连已在跑的 RTT telnet(如 127.0.0.1:19021)")
     src.add_argument("--tail", type=Path, help="跟读一个 RTT 日志文件")
+    src.add_argument("--serial", metavar="PORT",
+                     help="V5.1 DATA CDC,如 /dev/cu.usbmodemXXXX。不得填 SMP 口")
 
     ap.add_argument("--elf", type=Path, default=DEFAULT_ELF,
                     help=f"用于自动提取 RTT 控制块地址的 ELF(默认 {DEFAULT_ELF})")
@@ -880,6 +1033,10 @@ def main(argv: list[str] | None = None) -> int:
                                   idle_timeout=args.idle_timeout,
                                   trigger=args.trigger,
                                   trigger_state=trigger_state)
+    elif args.serial:
+        lines = read_serial_lines(args.serial, cmd_file=args.cmd_file,
+                                  idle_timeout=args.idle_timeout,
+                                  trigger=args.trigger)
     else:
         lines = tail_lines(args.tail, args.idle_timeout)
 
@@ -984,7 +1141,8 @@ def main(argv: list[str] | None = None) -> int:
             out_ref["cur"] = out
             if new_file:
                 method = "CV" if args.cv else "IT"
-                out.write(f"# pA-Converter V4.0 {method} 实时采集\n")
+                board = "V5.1" if args.serial else "V4.0"
+                out.write(f"# pA-Converter {board} {method} 实时采集\n")
                 out.write(f"# 起始 unix 时间: {time.time():.3f}\n")
                 out.write(",".join(CSV_COLUMNS) + "\n")
 

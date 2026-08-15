@@ -3,8 +3,9 @@
 The GUI deliberately uses only Python's standard library on the server side;
 the browser renders the plots with a small canvas-based frontend.  This keeps
 the one-click tool usable on the lab Mac without installing a desktop GUI
-toolkit.  Hardware acquisition is still delegated to ``pa_host.it_tool`` so
-the tested RTT/J-Link path remains the single source of truth.
+toolkit. Hardware acquisition is delegated to ``pa_host.it_tool``. V4.0 uses
+RTT/J-Link; V5.1 uses its DATA USB CDC while retaining the same line protocol,
+parser and analysis pipeline.
 """
 
 from __future__ import annotations
@@ -115,6 +116,19 @@ WORKFLOW_PATH = PROJECT_DIR / "measurements" / "gui_workflow.json"
 HISTORY_PATH = PROJECT_DIR / "measurements" / "workspace_history.json"
 DEFAULT_SAVE_DIR = PROJECT_DIR / "measurements" / "experiment_data"
 JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "").strip()
+SERIAL_DATA_PORT = os.environ.get("SENSUS_SERIAL_PORT", "").strip()
+SERIAL_SMP_PORT = os.environ.get("SENSUS_SMP_PORT", "").strip()
+HARDWARE_TRANSPORT = os.environ.get("SENSUS_TRANSPORT", "auto").lower()
+JLINK_CDC_SERIAL = os.environ.get("SENSUS_JLINK_CDC_SERIAL", "0000297345691")
+SMPMGR_EXE = Path(
+    os.environ.get("SENSUS_SMPMGR")
+    or shutil.which("smpmgr")
+    or "/tmp/smpvenv/bin/smpmgr"
+)
+V51_UPLOAD_SCRIPT = (
+    PROJECT_DIR.parent.parent / "software" / "ver5.1" / "scripts" /
+    "03-usb-upload.sh"
+)
 
 
 def _escape_applescript(value: object) -> str:
@@ -372,6 +386,68 @@ def _port_accepts_connections(port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def _discover_serial_data_port() -> str | None:
+    """Find the V5.1 DATA CDC without confusing it with SMP or J-Link CDC."""
+    if SERIAL_DATA_PORT:
+        return SERIAL_DATA_PORT
+    try:
+        from serial.tools import list_ports
+        import serial
+    except ImportError:
+        return None
+
+    candidates = sorted(
+        str(info.device) for info in list_ports.comports()
+        if str(info.device) and JLINK_CDC_SERIAL not in str(info.device)
+        and ("usbmodem" in str(info.device).lower()
+             or "usbserial" in str(info.device).lower()
+             or str(info.device).upper().startswith("COM"))
+    )
+    for candidate in candidates:
+        try:
+            with serial.Serial(candidate, 115200, timeout=0.1,
+                               write_timeout=0.5) as stream:
+                stream.dtr = True
+                stream.write(b"GET req=workstation-probe\n")
+                stream.flush()
+                deadline = time.monotonic() + 1.5
+                received = bytearray()
+                while time.monotonic() < deadline:
+                    chunk = stream.read(256)
+                    if chunk:
+                        received.extend(chunk)
+                        text = received.decode("utf-8", "replace")
+                        if ("CFG_CONFIRMED" in text
+                                and "req=workstation-probe" in text):
+                            return candidate
+        except (OSError, ValueError, serial.SerialException):
+            continue
+    return None
+
+
+def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
+    """Resolve auto mode once when the GUI starts, preserving explicit modes."""
+    global SERIAL_DATA_PORT
+    mode = requested.lower()
+    if mode not in {"auto", "rtt", "serial"}:
+        raise ValueError(f"未知硬件传输模式:{requested}")
+    if serial_port:
+        SERIAL_DATA_PORT = serial_port
+    if mode == "serial":
+        if not SERIAL_DATA_PORT:
+            SERIAL_DATA_PORT = _discover_serial_data_port() or ""
+        if not SERIAL_DATA_PORT:
+            raise ValueError("USB 模式未找到 V5.1 DATA CDC，请指定 --serial-port")
+        return "serial"
+    if mode == "rtt":
+        return "rtt"
+    discovered = _discover_serial_data_port()
+    if discovered:
+        SERIAL_DATA_PORT = discovered
+        return "serial"
+    return "rtt"
 
 
 def _release_stale_measurement_bridge() -> None:
@@ -747,6 +823,36 @@ class SettingsController:
             tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
             raise RuntimeError("JLinkExe 烧录未确认成功:" + " | ".join(tail))
 
+    @staticmethod
+    def _upgrade_v51_firmware() -> None:
+        """Reset the V5.1 app over SMP, then upload its signed image via USB."""
+        image = FIRMWARE_BUILD_DIR / "zephyr.signed.bin"
+        if not image.exists():
+            raise RuntimeError(f"找不到 V5.1 签名镜像:{image}")
+        if not SMPMGR_EXE.exists():
+            raise RuntimeError(f"找不到 smpmgr:{SMPMGR_EXE}")
+        if not SERIAL_SMP_PORT:
+            raise RuntimeError(
+                "USB 固件更新需要 SENSUS_SMP_PORT 指向 SMP CDC"
+            )
+        if not V51_UPLOAD_SCRIPT.exists():
+            raise RuntimeError(f"找不到 USB 上传脚本:{V51_UPLOAD_SCRIPT}")
+
+        subprocess.run(
+            [str(SMPMGR_EXE), "--port", SERIAL_SMP_PORT, "--timeout", "5",
+             "os", "reset"],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        done = subprocess.run(
+            ["/bin/bash", str(V51_UPLOAD_SCRIPT), str(image)],
+            cwd=PROJECT_DIR.parent.parent,
+            check=True, capture_output=True, text=True, timeout=150,
+        )
+        blob = f"{done.stdout}\n{done.stderr}"
+        if "Upgrade complete." not in blob:
+            tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
+            raise RuntimeError("V5.1 USB 更新未确认成功:" + " | ".join(tail))
+
     @classmethod
     def same_analysis_protocol(
         cls, first: dict[str, Any], second: dict[str, Any]
@@ -1009,7 +1115,9 @@ class SettingsController:
             "#endif\n"
         )
         try:
-            _release_stale_measurement_bridge()
+            usb_transport = HARDWARE_TRANSPORT == "serial"
+            if not usb_transport:
+                _release_stale_measurement_bridge()
             firmware_source = "build"
             prebuilt_metadata = FIRMWARE_PREBUILT_DIR / "firmware.json"
             try:
@@ -1018,7 +1126,7 @@ class SettingsController:
                 )["settings"])
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                 prebuilt_settings = None
-            if settings == prebuilt_settings:
+            if settings == prebuilt_settings and not usb_transport:
                 firmware_source = "prebuilt"
                 FIRMWARE_CONFIG.write_text(header)
                 firmware_hex = FIRMWARE_PREBUILT_DIR / "zephyr.hex"
@@ -1058,9 +1166,15 @@ class SettingsController:
                 build = (
                     f"{ncs_venv_prefix()}"
                     f"call {shlex.quote(str(NCS_DIR / 'zephyr/zephyr-env.cmd'))} && "
-                    "west build -b pa_converter_v40 -d software/firmware/build "
-                    "software/firmware -- -DBOARD_ROOT=%CD%/software/firmware "
-                    "-DDTS_ROOT=%CD%/software/firmware"
+                    + ("west build -p always -b pa_converter_v51 "
+                     "-d software/firmware/build software/firmware -- "
+                     "-DSB_CONFIG_BOOTLOADER_MCUBOOT=y "
+                     "-DBOARD_ROOT=%CD%/software/firmware "
+                     "-DDTS_ROOT=%CD%/software/firmware"
+                     if usb_transport else
+                     "west build -b pa_converter_v40 -d software/firmware/build "
+                     "software/firmware -- -DBOARD_ROOT=%CD%/software/firmware "
+                     "-DDTS_ROOT=%CD%/software/firmware")
                 )
                 self._run_build(["cmd", "/c", build])
             else:
@@ -1069,18 +1183,29 @@ class SettingsController:
                     f"export ZEPHYR_TOOLCHAIN_VARIANT=zephyr && "
                     f"export ZEPHYR_SDK_INSTALL_DIR={shlex.quote(str(ZEPHYR_SDK_DIR))} && "
                     f"source {shlex.quote(str(NCS_DIR / 'zephyr/zephyr-env.sh'))} && "
-                    "west build -b pa_converter_v40 -d software/firmware/build "
-                    "software/firmware -- -DBOARD_ROOT=$PWD/software/firmware "
-                    "-DDTS_ROOT=$PWD/software/firmware"
+                    + ("west build -p always -b pa_converter_v51 "
+                     "-d software/firmware/build software/firmware -- "
+                     "-DSB_CONFIG_BOOTLOADER_MCUBOOT=y "
+                     "-DBOARD_ROOT=$PWD/software/firmware "
+                     "-DDTS_ROOT=$PWD/software/firmware"
+                     if usb_transport else
+                     "west build -b pa_converter_v40 -d software/firmware/build "
+                     "software/firmware -- -DBOARD_ROOT=$PWD/software/firmware "
+                     "-DDTS_ROOT=$PWD/software/firmware")
                 )
                 self._run_build(["/bin/zsh", "-lc", build])
             firmware_hex = FIRMWARE_BUILD_DIR / "zephyr.hex"
-            self._flash_firmware(firmware_hex)
+            firmware_artifact = firmware_hex
+            if usb_transport:
+                self._upgrade_v51_firmware()
+                firmware_artifact = FIRMWARE_BUILD_DIR / "zephyr.signed.bin"
+            else:
+                self._flash_firmware(firmware_hex)
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps({
                 "settings": settings,
                 "firmware_source": firmware_source,
-                "firmware_sha256": self._firmware_hash(firmware_hex),
+                "firmware_sha256": self._firmware_hash(firmware_artifact),
             }, indent=2, ensure_ascii=False))
         # RuntimeError:_flash_firmware() 的「exit 0 但没烧成」判据会抛它,
         # 不接住的话会变成未处理 500,state 停在 "applying",前端只能看到通用错误。
@@ -1861,7 +1986,12 @@ class MeasurementController:
                     "display_text": "正在估计",
                     "reason": "insufficient_data",
                 })
-            self.message = f"已启动硬件 {method.upper()} 测量，等待 RTT 数据"
+            transport_label = (
+                "V5.1 USB DATA" if HARDWARE_TRANSPORT == "serial" else "RTT"
+            )
+            self.message = (
+                f"已启动硬件 {method.upper()} 测量，等待 {transport_label} 数据"
+            )
             self.on_complete = on_complete
 
             env = os.environ.copy()
@@ -1872,13 +2002,6 @@ class MeasurementController:
                 "-m",
                 "pa_host.it_tool",
                 "measure",
-                # 让 collector 持有唯一的 RTT 桥:有 V8.80 时优先 JLinkExe;
-                #    CubeIDE 缺失时自动回退到启用 libjaylink 的 OpenOCD。
-                #    两者都负责指定 RTT 控制块，RTT 仍出在 telnet 19021,
-                #    并且 finally 里有 terminate/wait/kill 的完整回收(禁 pkill)。
-                "--start-jlink",
-                "--elf",
-                str(_firmware_artifact("zephyr.elf")),
                 # 方案 C:命令文件。外部另开 telnet 连接写下行**无效**
                 # (JLinkExe 只转发采集器持有的那个连接)⇒ 必须走这个文件。
                 "--cell-v",
@@ -1902,8 +2025,19 @@ class MeasurementController:
                 "--idle-timeout",
                 "25",
             ]
-            if JLINK_SERIAL:
-                command += ["--probe-serial", JLINK_SERIAL]
+            if HARDWARE_TRANSPORT == "serial":
+                if not SERIAL_DATA_PORT:
+                    self.state = "error"
+                    self.error = "V5.1 需要明确指定 DATA CDC 路径"
+                    raise RuntimeError(self.error)
+                command += ["--serial", SERIAL_DATA_PORT]
+            else:
+                # collector 持有唯一 RTT 桥并负责完整回收。
+                command += [
+                    "--start-jlink", "--elf", str(_firmware_artifact("zephyr.elf")),
+                ]
+                if JLINK_SERIAL:
+                    command += ["--probe-serial", JLINK_SERIAL]
             if method == "cv":
                 command.append("--cv")
             log_handle = (self.run_dir / "collector.log").open("w", buffering=1)
@@ -6080,11 +6214,23 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
 
 
 def main(argv: list[str] | None = None) -> int:
+    global HARDWARE_TRANSPORT, SERIAL_DATA_PORT, SERIAL_SMP_PORT
     parser = argparse.ArgumentParser(description="本地 i-t 电化学检测 GUI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--open-browser", action="store_true")
+    parser.add_argument("--transport", choices=("auto", "rtt", "serial"),
+                        default=HARDWARE_TRANSPORT,
+                        help="auto 自动检测；V4.0 用 rtt；V5.1 用 serial")
+    parser.add_argument("--serial-port", default=SERIAL_DATA_PORT,
+                        help="V5.1 DATA CDC 路径；auto 可省略")
+    parser.add_argument("--smp-port", default=SERIAL_SMP_PORT,
+                        help="V5.1 SMP CDC 路径；仅 USB 固件更新需要")
     args = parser.parse_args(argv)
+    HARDWARE_TRANSPORT = _resolve_hardware_transport(
+        args.transport, args.serial_port or ""
+    )
+    SERIAL_SMP_PORT = str(args.smp_port or "").strip()
     serve(args.host, args.port, args.open_browser)
     return 0
 

@@ -10,6 +10,9 @@
 #ifndef BOARD_GUARDS_H_
 #define BOARD_GUARDS_H_
 
+/* V5.1 在启动 USB/AFE 前只读核验 UICR 与高压供电状态。 */
+int board_guards_preflight(void);
+
 /*
  * 开机尽早调用(main 的第一件事)。
  * 返回 0 成功;负 errno 表示看门狗装不上(此时**不要**继续跑采集,

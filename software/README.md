@@ -1,4 +1,4 @@
-# software/ — ver4.0 固件与上位机(唯一入口)
+# software/ — ver4.0 / ver5.1 固件与上位机(唯一入口)
 
 > **本目录定位**:ver4.0 单板(MAX30131 + nRF52833 + CR2032)的固件,以及配套的
 > 上位机收数/分析栈。**本文件是 software/ 的唯一入口**,新增/移动文件必须同步更新本文件。
@@ -36,6 +36,10 @@ PYTHONPATH=software/host .venv/bin/python3 -m pa_host.it_tool measure \
 # 也可以把 --socket 换成 --start-jlink。默认发送 START 命令触发新一轮，
 # 不再复位 MCU/AFE，测量间隙保持恒电位。
 
+# V5.1 USB：DATA CDC 端口用于同一套文本协议，SMP CDC 不要传给 collect.py。
+PYTHONPATH=software/host .venv/bin/python3 -m pa_host.it_tool measure \
+  --serial /dev/cu.usbmodem1103 --out run.csv --raw-log run.usb.log
+
 # 2) 将原生约 8 Hz 数据重采样为 10 Hz/1800 点
 PYTHONPATH=software/host .venv/bin/python3 -m pa_host.it_tool resample \
   run.csv --out run_10hz.csv
@@ -67,7 +71,7 @@ PYTHONPATH=software/host .venv/bin/python3 -m pa_host.it_tool predict \
 文件按 `样品名称-已知浓度.csv` 命名，重复名称追加 `-r2` 等序号避免覆盖；同时保留
 原生点 `-raw.csv`、汇总 JSON 和曲线 PNG。采集期间每个原生点会直接追加写入工作
 目录中的 `-raw.csv`，中途停止也不会丢掉此前已经收到的点。
-固件收到 RTT `START` 命令后发送 `IT_START`，达到目标样本数后发送机器可读的
+固件收到 RTT 或 USB DATA CDC 的 `START` 命令后发送 `IT_START`，达到目标样本数后发送机器可读的
 `IT_DONE` 标记；采集器收到后立即收尾，不再等待额外的固定超时。后续测量不复位
 MCU/AFE，测量间隙保持配置电位。
 
@@ -121,8 +125,8 @@ python3 -m pa_host.collect --tail /tmp/fake_rtt.log --out /tmp/e2e.csv --idle-ti
 ../../.venv/bin/python3 -m pa_host.analyze /tmp/e2e.csv --dev-clock --fsr-pa 50000
 ```
 
-⚠️ **`collect.py` 刻意零第三方依赖**(只用 `record.py` + 标准库)——收数不能因为
-numpy/matplotlib 装不上而丢数据。numpy 只有 `analyze.py`/`synth.py` 才需要。
+`collect.py` 的 RTT 路径只用标准库；USB DATA CDC 路径需要安装 `pyserial`。
+完整依赖由 `make install` 根据 `pyproject.toml` 安装，numpy/matplotlib 仍只负责分析和绘图。
 
 ## 1b. 回板后怎么烧 + 怎么取数
 
@@ -151,8 +155,14 @@ EOF
 
 # 2) 取数(RTT → CSV → 指标)
 cd software/host
-python3 -m pa_host.collect --start-rtt --out run.csv --probe-serial 29734569
+python3 -m pa_host.collect --start-jlink --out run.csv --probe-serial 29734569
 ../../.venv/bin/python3 -m pa_host.analyze run.csv --fsr-pa 50000 --plot run.png
+
+# V5.1 仅插 Type-C：自动模式会探测能回 CFG_CONFIRMED 的 DATA CDC。
+PYTHONPATH=software/host .venv/bin/python3 -m pa_host.gui_server \
+  --transport auto --open-browser
+# 也可显式指定：--transport serial --serial-port /dev/cu.usbmodem1103
+# 参数应用/USB 升级另需 --smp-port 指向另一个 CDC，例如 /dev/cu.usbmodem1101。
 ```
 
 ⚠️ **别用 `pkill` 杀 J-Link 进程** —— 会把这支探头打掉线。`collect.py` 用的是
