@@ -144,12 +144,12 @@ def test_default_it_method_matches_archived_180_second_protocol() -> None:
     assert settings["offset_nA"] == 200
 
 
-def test_v51_it_profile_uses_requested_150_second_method() -> None:
+def test_v51_it_profile_uses_requested_negative_200mv_150_second_method() -> None:
     settings = SettingsController.validate(SettingsController.V51_DEFAULTS)
 
     assert settings["method"] == "it"
-    assert settings["initial_potential_v"] == 0.2
-    assert settings["potential_v"] == 0.2
+    assert settings["initial_potential_v"] == -0.2
+    assert settings["potential_v"] == -0.2
     assert settings["duration_s"] == 150.0
     assert settings["target_rate_hz"] == 10.0
     assert settings["sens_period_code"] == 0

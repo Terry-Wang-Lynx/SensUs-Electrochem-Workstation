@@ -2,9 +2,9 @@
  * pA-Converter V5.1 -- nRF52833-QDAA + MAX30131 + USB-C.
  *
  * Pin/net evidence: SensUs-HW hardware/ver5.1/pA-converter-v51 source PCB.
- * The MAX30131 bus and WE/RE/CE nets are unchanged from V4.0.  INTB is
- * still not routed, so the shared electrochemistry implementation remains
- * polling based.  VBUS feeds VDDH; REG0 must be programmed to 3.3 V in UICR.
+ * The MAX30131 bus and WE/RE/CE nets are unchanged from V4.0. INTB is still
+ * not routed, so the shared electrochemistry implementation remains polling
+ * based. VBUS feeds VDDH; REG0 must be programmed to 3.3 V in UICR.
  */
 
 /dts-v1/;
@@ -15,7 +15,7 @@
 #include <zephyr/dt-bindings/regulator/nrf5x.h>
 
 / {
-	model = "pA-Converter V5.1 (custom)";
+	model = "pA-Converter V5.1 (custom, USB)";
 	compatible = "senseus,pa-converter-v51";
 
 	chosen {
@@ -32,6 +32,7 @@
 };
 
 &pinctrl {
+	/* SPI1 -> MAX30131: SCLK P0.05, MOSI P1.09, MISO P0.04. */
 	spi1_default: spi1_default {
 		group1 {
 			psels = <NRF_PSEL(SPIM_SCK, 0, 5)>,
@@ -62,6 +63,7 @@
 		compatible = "senseus,max30131";
 		reg = <0>;
 		spi-max-frequency = <4000000>;
+		label = "MAX30131";
 	};
 };
 
@@ -69,6 +71,7 @@
 	status = "okay";
 };
 
+/* MOSI is on P1.09, so GPIO1 must remain enabled. */
 &gpio1 {
 	status = "okay";
 };
@@ -81,7 +84,7 @@
 	status = "okay";
 };
 
-/* The optional REG1 DC/DC inductor is not fitted on V5.1. */
+/* DCC is unconnected and the REG1 DC/DC inductor is not fitted. */
 &reg1 {
 	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
 };
@@ -91,6 +94,7 @@
 	status = "disabled";
 };
 
+/* The PCB has no physical UART connection. */
 &uart0 {
 	status = "disabled";
 };

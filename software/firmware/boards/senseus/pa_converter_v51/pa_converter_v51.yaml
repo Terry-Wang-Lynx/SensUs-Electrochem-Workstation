@@ -1,5 +1,5 @@
 identifier: pa_converter_v51
-name: pA-Converter V5.1 (custom)
+name: pA-Converter V5.1 (custom, USB)
 type: mcu
 arch: arm
 toolchain:

@@ -559,8 +559,8 @@ class SettingsController:
     }
     V51_DEFAULTS = {
         **DEFAULTS,
-        "initial_potential_v": 0.2,
-        "potential_v": 0.2,
+        "initial_potential_v": -0.2,
+        "potential_v": -0.2,
         "prestep_s": 0.0,
         "duration_s": V51_IT_DURATION_S,
         "target_rate_hz": 10.0,
