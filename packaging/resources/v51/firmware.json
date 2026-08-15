@@ -1,0 +1,26 @@
+{
+  "settings": {
+    "method": "it",
+    "initial_potential_v": 0.2,
+    "potential_v": 0.2,
+    "working_electrode_v": 1.2,
+    "prestep_s": 0.0,
+    "duration_s": 180.0,
+    "adaptive_stop": false,
+    "target_rate_hz": 10.0,
+    "sens_period_code": 0,
+    "fit_window_s": 20.0,
+    "fsr_nA": 2000,
+    "offset_nA": 200,
+    "offset_mode": "10pct",
+    "cv_low_v": -0.6,
+    "cv_high_v": 0.6,
+    "cv_scan_rate_v_s": 0.05,
+    "cv_cycles": 30,
+    "cv_step_v": 0.001,
+    "cv_quiet_s": 2.0,
+    "cv_eis_fsr_uA": 40
+  },
+  "image": "images/app.signed.bin",
+  "sha256": "0a4156a970903a8ee2220aefeac687627a3eee7ea5e39cca476425cb4157bc7f"
+}

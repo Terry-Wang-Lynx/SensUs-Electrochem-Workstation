@@ -145,12 +145,21 @@ make test
 make firmware-test
 make app
 make package
+make portable-macos
+make dmg
 ```
 
 `make app` 生成经过临时签名的通用 macOS 应用（Apple Silicon 与 Intel），
 `make package` 生成 `dist/*.whl` 和包含固件源码、App 构建脚本与方法档案的
 `dist/*.tar.gz`。GitHub Actions 会执行主机端测试、固件纯逻辑层测试，并构建
 分发包。完整 Zephyr 固件仍需本机的 NCS/Zephyr 工具链与自定义板定义。
+
+给其他同学使用时，优先分发 `artifacts/releases/<version>/` 下的便携包。macOS
+便携包面向 Apple Silicon/macOS 13+，Windows 包面向 Windows 10/11 x64；两者不要求
+安装项目 Python 环境。Windows 包由 `windows/build_portable.ps1` 或
+`portable-release` GitHub Actions 在 Windows 上原生生成。稳定前端的签名更新、
+缓存、重启激活和回退机制见
+[docs/PORTABLE_DISTRIBUTION.md](docs/PORTABLE_DISTRIBUTION.md)。
 
 ## 目录
 
@@ -161,6 +170,7 @@ software/firmware/           nRF52833 + MAX30131 Zephyr 固件
 software/firmware/tests/     可在普通主机运行的 AFE 纯逻辑测试
 protocols/                   受版本控制的实验方法与固件配置
 docs/                        调试记录与排查报告
+packaging/                   便携运行时、签名更新与跨平台发布脚本
 ```
 
 固件和数据链路的详细说明见 [software/README.md](software/README.md)。

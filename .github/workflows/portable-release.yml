@@ -1,0 +1,57 @@
+name: portable-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev,analysis]"
+      - name: Run host tests
+        run: make test VENV_PYTHON=python
+      - name: Install packaged OpenOCD fallback
+        run: brew install open-ocd
+      - name: Build portable DMG
+        env:
+          SENSUS_FRONTEND_MANIFEST_URL: ${{ vars.SENSUS_FRONTEND_MANIFEST_URL }}
+          SENSUS_FRONTEND_PUBLIC_KEY: ${{ vars.SENSUS_FRONTEND_PUBLIC_KEY }}
+        run: make dmg VENV_PYTHON=python PYTHON=python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SensUs-Workstation-macOS-arm64
+          path: artifacts/releases/**/*.dmg
+          if-no-files-found: error
+
+  windows-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev,analysis]"
+      - name: Run host tests
+        run: python -m pytest -q software/host/tests
+      - name: Build portable ZIP
+        shell: pwsh
+        env:
+          SENSUS_FRONTEND_MANIFEST_URL: ${{ vars.SENSUS_FRONTEND_MANIFEST_URL }}
+          SENSUS_FRONTEND_PUBLIC_KEY: ${{ vars.SENSUS_FRONTEND_PUBLIC_KEY }}
+        run: ./windows/build_portable.ps1 -Python python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SensUs-Workstation-Windows-x64
+          path: artifacts/releases/**/*.zip
+          if-no-files-found: error

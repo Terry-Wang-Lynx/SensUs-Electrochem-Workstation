@@ -77,26 +77,20 @@ from .live_metrics import (
 )
 from .stability_eta import StabilityEtaEstimator
 from .workspace_history import WorkspaceHistory
+from .frontend_update import FrontendUpdater
+from . import runtime
 
 _IS_WIN = sys.platform == "win32"
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-
-
-def _find_project_dir() -> Path:
-    configured = os.environ.get("SENSUS_PROJECT_DIR")
-    candidates = [Path(configured).expanduser()] if configured else []
-    candidates.extend([Path.cwd(), *Path.cwd().parents, PACKAGE_DIR, *PACKAGE_DIR.parents])
-    for candidate in candidates:
-        if (candidate / "software" / "firmware" / "CMakeLists.txt").exists():
-            return candidate.resolve()
-    return PACKAGE_DIR.parents[2]
-
-
-PROJECT_DIR = _find_project_dir()
-GUI_DIR = PACKAGE_DIR / "gui"
-RUNS_DIR = PROJECT_DIR / "measurements" / "gui_runs"
+PROJECT_DIR = runtime.project_dir()
+STATE_DIR = runtime.state_dir()
+FRONTEND_UPDATER = FrontendUpdater(
+    PACKAGE_DIR / "gui", STATE_DIR, PROJECT_DIR
+)
+GUI_DIR = FRONTEND_UPDATER.prepare_startup()
+RUNS_DIR = STATE_DIR / "gui_runs"
 DEFAULT_PORT = 8765
 MEASUREMENT_DURATION_S = 180.0
 COLLECTOR_DURATION_S = 190.0
@@ -109,12 +103,12 @@ CONFIG_GATE_LEGACY_PROBE_DELAY_S = 6.0
 FIRMWARE_BUILD_DIR = PROJECT_DIR / "software" / "firmware" / "build" / "firmware" / "zephyr"
 FIRMWARE_PREBUILT_DIR = PROJECT_DIR / "software" / "firmware" / "prebuilt"
 FIRMWARE_CONFIG = PROJECT_DIR / "software" / "firmware" / "src" / "measurement_config.h"
-SETTINGS_PATH = PROJECT_DIR / "measurements" / "gui_settings.json"
-FILTER_SETTINGS_PATH = PROJECT_DIR / "measurements" / "filter_settings.json"
-PLATEAU_SETTINGS_PATH = PROJECT_DIR / "measurements" / "plateau_settings.json"
-WORKFLOW_PATH = PROJECT_DIR / "measurements" / "gui_workflow.json"
-HISTORY_PATH = PROJECT_DIR / "measurements" / "workspace_history.json"
-DEFAULT_SAVE_DIR = PROJECT_DIR / "measurements" / "experiment_data"
+SETTINGS_PATH = STATE_DIR / "gui_settings.json"
+FILTER_SETTINGS_PATH = STATE_DIR / "filter_settings.json"
+PLATEAU_SETTINGS_PATH = STATE_DIR / "plateau_settings.json"
+WORKFLOW_PATH = STATE_DIR / "gui_workflow.json"
+HISTORY_PATH = STATE_DIR / "workspace_history.json"
+DEFAULT_SAVE_DIR = runtime.default_measurements_dir()
 JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "").strip()
 SERIAL_DATA_PORT = os.environ.get("SENSUS_SERIAL_PORT", "").strip()
 SERIAL_SMP_PORT = os.environ.get("SENSUS_SMP_PORT", "").strip()
@@ -126,8 +120,11 @@ SMPMGR_EXE = Path(
     or "/tmp/smpvenv/bin/smpmgr"
 )
 V51_UPLOAD_SCRIPT = (
-    PROJECT_DIR.parent.parent / "software" / "ver5.1" / "scripts" /
+    PROJECT_DIR / "software" / "ver5.1" / "scripts" /
     "03-usb-upload.sh"
+)
+V51_PREBUILT_IMAGE = (
+    PROJECT_DIR / "software" / "ver5.1" / "images" / "app.signed.bin"
 )
 
 
@@ -615,7 +612,10 @@ class SettingsController:
         self.apply_lock = threading.Lock()
         self.settings = dict(self.DEFAULTS)
         loaded_saved = False
-        firmware_verified = False
+        self._loaded_saved = False
+        self._saved_firmware_hash = ""
+        self._saved_transport = "rtt"
+        self._saved_firmware_source = "build"
         if SETTINGS_PATH.exists():
             try:
                 saved = json.loads(SETTINGS_PATH.read_text())
@@ -624,21 +624,21 @@ class SettingsController:
                 saved_settings = saved.get("settings", saved)
                 self.settings = self.validate(saved_settings)
                 loaded_saved = True
-                expected_hash = str(saved.get("firmware_sha256") or "")
-                firmware_verified = bool(
-                    expected_hash and expected_hash == self._firmware_hash()
-                )
+                self._loaded_saved = True
+                self._saved_firmware_hash = str(saved.get("firmware_sha256") or "")
+                self._saved_transport = str(saved.get("transport") or "rtt")
+                self._saved_firmware_source = str(saved.get("firmware_source") or "build")
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
-        self.applied = firmware_verified
-        self.state = "applied" if firmware_verified else "not_applied"
-        if firmware_verified:
-            self.message = "已恢复与当前固件一致的硬件参数"
-        elif loaded_saved:
+        self.applied = False
+        self.state = "not_applied"
+        if loaded_saved:
             self.message = "已恢复参数，但当前固件尚未烧录确认"
         else:
             self.message = "参数尚未应用到硬件"
         self.error = ""
+        if HARDWARE_TRANSPORT in {"rtt", "serial"}:
+            self.restore_for_transport(HARDWARE_TRANSPORT)
 
     @staticmethod
     def _firmware_hash(firmware_hex: Path | None = None) -> str:
@@ -646,6 +646,31 @@ class SettingsController:
         if not firmware_hex.exists():
             return ""
         return hashlib.sha256(firmware_hex.read_bytes()).hexdigest()
+
+    def restore_for_transport(self, transport: str) -> None:
+        if not self._loaded_saved:
+            return
+        if self._saved_firmware_source == "prebuilt":
+            artifact = (
+                V51_PREBUILT_IMAGE if self._saved_transport == "serial"
+                else FIRMWARE_PREBUILT_DIR / "zephyr.hex"
+            )
+        else:
+            artifact = FIRMWARE_BUILD_DIR / (
+                "zephyr.signed.bin" if self._saved_transport == "serial" else "zephyr.hex"
+            )
+        verified = bool(
+            self._saved_firmware_hash
+            and self._saved_transport == transport
+            and self._saved_firmware_hash == self._firmware_hash(artifact)
+        )
+        with self.lock:
+            self.applied = verified
+            self.state = "applied" if verified else "not_applied"
+            self.message = (
+                "已恢复与当前固件一致的硬件参数"
+                if verified else "已恢复参数，但当前硬件尚未烧录确认"
+            )
 
     @staticmethod
     def _run_build(command: list[str], timeout_s: float = 600) -> None:
@@ -827,27 +852,39 @@ class SettingsController:
     def _upgrade_v51_firmware() -> None:
         """Reset the V5.1 app over SMP, then upload its signed image via USB."""
         image = FIRMWARE_BUILD_DIR / "zephyr.signed.bin"
+        if not image.exists() and V51_PREBUILT_IMAGE.exists():
+            image = V51_PREBUILT_IMAGE
         if not image.exists():
             raise RuntimeError(f"找不到 V5.1 签名镜像:{image}")
-        if not SMPMGR_EXE.exists():
+        if not runtime.is_frozen() and not SMPMGR_EXE.exists():
             raise RuntimeError(f"找不到 smpmgr:{SMPMGR_EXE}")
         if not SERIAL_SMP_PORT:
             raise RuntimeError(
                 "USB 固件更新需要 SENSUS_SMP_PORT 指向 SMP CDC"
             )
-        if not V51_UPLOAD_SCRIPT.exists():
+        if not runtime.is_frozen() and not _IS_WIN and not V51_UPLOAD_SCRIPT.exists():
             raise RuntimeError(f"找不到 USB 上传脚本:{V51_UPLOAD_SCRIPT}")
 
+        smpmgr = (
+            runtime.module_command("smpmgr")
+            if runtime.is_frozen() else [str(SMPMGR_EXE)]
+        )
         subprocess.run(
-            [str(SMPMGR_EXE), "--port", SERIAL_SMP_PORT, "--timeout", "5",
-             "os", "reset"],
+            [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "5", "os", "reset"],
             check=True, capture_output=True, text=True, timeout=15,
         )
-        done = subprocess.run(
-            ["/bin/bash", str(V51_UPLOAD_SCRIPT), str(image)],
-            cwd=PROJECT_DIR.parent.parent,
-            check=True, capture_output=True, text=True, timeout=150,
-        )
+        if runtime.is_frozen() or _IS_WIN:
+            done = subprocess.run(
+                [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "10", "upgrade",
+                 str(image)],
+                check=True, capture_output=True, text=True, timeout=150,
+            )
+        else:
+            done = subprocess.run(
+                ["/bin/bash", str(V51_UPLOAD_SCRIPT), str(image)],
+                cwd=PROJECT_DIR,
+                check=True, capture_output=True, text=True, timeout=150,
+            )
         blob = f"{done.stdout}\n{done.stderr}"
         if "Upgrade complete." not in blob:
             tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
@@ -1119,23 +1156,38 @@ class SettingsController:
             if not usb_transport:
                 _release_stale_measurement_bridge()
             firmware_source = "build"
-            prebuilt_metadata = FIRMWARE_PREBUILT_DIR / "firmware.json"
+            prebuilt_dir = (
+                PROJECT_DIR / "software" / "ver5.1"
+                if usb_transport else FIRMWARE_PREBUILT_DIR
+            )
+            prebuilt_metadata = prebuilt_dir / "firmware.json"
             try:
                 prebuilt_settings = self.validate(json.loads(
                     prebuilt_metadata.read_text(encoding="utf-8")
                 )["settings"])
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                 prebuilt_settings = None
-            if settings == prebuilt_settings and not usb_transport:
+            can_use_prebuilt = settings == prebuilt_settings and (
+                not usb_transport or runtime.is_frozen()
+            )
+            if can_use_prebuilt:
                 firmware_source = "prebuilt"
-                FIRMWARE_CONFIG.write_text(header)
-                firmware_hex = FIRMWARE_PREBUILT_DIR / "zephyr.hex"
-                self._flash_firmware(firmware_hex)
+                if not runtime.is_frozen():
+                    FIRMWARE_CONFIG.write_text(header)
+                firmware_hex = (
+                    V51_PREBUILT_IMAGE if usb_transport
+                    else FIRMWARE_PREBUILT_DIR / "zephyr.hex"
+                )
+                if usb_transport:
+                    self._upgrade_v51_firmware()
+                else:
+                    self._flash_firmware(firmware_hex)
                 SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
                 SETTINGS_PATH.write_text(json.dumps({
                     "settings": settings,
                     "firmware_source": firmware_source,
                     "firmware_sha256": self._firmware_hash(firmware_hex),
+                    "transport": "serial" if usb_transport else "rtt",
                 }, indent=2, ensure_ascii=False))
                 with self.lock:
                     self.settings = settings
@@ -1144,6 +1196,10 @@ class SettingsController:
                     self.message = "推荐条件已使用随包固件应用到硬件"
                     self.error = ""
                 return self.snapshot()
+            if runtime.is_frozen():
+                raise RuntimeError(
+                    "便携版只能烧录随包稳定固件；自定义条件请使用源码版工具链"
+                )
             if (not _IS_WIN and (
                 not (NCS_DIR / "zephyr/zephyr-env.sh").exists()
                 or not NCS_VENV_ACTIVATE.exists()
@@ -1206,6 +1262,7 @@ class SettingsController:
                 "settings": settings,
                 "firmware_source": firmware_source,
                 "firmware_sha256": self._firmware_hash(firmware_artifact),
+                "transport": "serial" if usb_transport else "rtt",
             }, indent=2, ensure_ascii=False))
         # RuntimeError:_flash_firmware() 的「exit 0 但没烧成」判据会抛它,
         # 不接住的话会变成未处理 500,state 停在 "applying",前端只能看到通用错误。
@@ -1995,11 +2052,10 @@ class MeasurementController:
             self.on_complete = on_complete
 
             env = os.environ.copy()
-            host_dir = str(PROJECT_DIR / "software" / "host")
-            env["PYTHONPATH"] = host_dir + os.pathsep + env.get("PYTHONPATH", "")
-            command = [
-                sys.executable,
-                "-m",
+            if not runtime.is_frozen():
+                host_dir = str(PROJECT_DIR / "software" / "host")
+                env["PYTHONPATH"] = host_dir + os.pathsep + env.get("PYTHONPATH", "")
+            command = runtime.module_command(
                 "pa_host.it_tool",
                 "measure",
                 # 方案 C:命令文件。外部另开 telnet 连接写下行**无效**
@@ -2024,7 +2080,7 @@ class MeasurementController:
                 ),
                 "--idle-timeout",
                 "25",
-            ]
+            )
             if HARDWARE_TRANSPORT == "serial":
                 if not SERIAL_DATA_PORT:
                     self.state = "error"
@@ -4195,6 +4251,14 @@ class AppState:
         self.schedule.metadata_hook = self._prepare_export_metadata
         self.measurement.completion_hook = self._measurement_completed
 
+    def hardware_idle(self) -> bool:
+        """Updates may use the network only while no hardware operation is active."""
+        return bool(
+            not self.measurement.is_busy()
+            and not self.schedule.snapshot()["active"]
+            and self.settings.snapshot()["state"] != "applying"
+        )
+
     @staticmethod
     def _resolve_save_dir(value: str) -> Path:
         raw = os.path.expandvars(os.path.expanduser(value.strip()))
@@ -6024,6 +6088,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/health":
             self._send_json({"ok": True, "project": str(PROJECT_DIR)})
             return
+        if parsed.path == "/api/frontend":
+            self._send_json(FRONTEND_UPDATER.mark_ready())
+            return
         if parsed.path.startswith("/assets/"):
             name = Path(parsed.path.removeprefix("/assets/")).name
             asset = GUI_DIR / name
@@ -6036,7 +6103,9 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         try:
             payload = self._body()
-            if self.path == "/api/measurement/start":
+            if self.path == "/api/frontend/ready":
+                result = FRONTEND_UPDATER.mark_ready()
+            elif self.path == "/api/measurement/start":
                 with APP.operation_lock:
                     if APP.schedule.snapshot()["active"]:
                         raise RuntimeError("自动测量运行期间不能插入手动测量")
@@ -6173,6 +6242,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
           open_browser: bool = False) -> None:
     server = ThreadingHTTPServer((host, port), RequestHandler)
+    FRONTEND_UPDATER.start(APP.hardware_idle)
     url = f"http://{host}:{server.server_port}/"
     print(f"i-t GUI: {url}", flush=True)
     if open_browser:
@@ -6198,6 +6268,7 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
     except KeyboardInterrupt:
         pass
     finally:
+        FRONTEND_UPDATER.stop()
         APP.schedule.stop()
         # 🔴 同步收干净,不能只靠 stop() 里那个 1.5s 延迟线程 —— 进程一退它就没了。
         APP.measurement.stop()
@@ -6231,6 +6302,7 @@ def main(argv: list[str] | None = None) -> int:
         args.transport, args.serial_port or ""
     )
     SERIAL_SMP_PORT = str(args.smp_port or "").strip()
+    APP.settings.restore_for_transport(HARDWARE_TRANSPORT)
     serve(args.host, args.port, args.open_browser)
     return 0
 

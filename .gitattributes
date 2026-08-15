@@ -1,0 +1,3 @@
+packaging/resources/v51/images/*.bin binary
+packaging/resources/v51/images/*.hex binary
+packaging/resources/v51/images/*.zip binary

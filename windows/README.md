@@ -45,15 +45,13 @@ set SENSUS_PROJECT_DIR=%CD%
 windows\build_win.bat
 ```
 
-需要预先安装 Python 3.10+。打包脚本会：
-1. 创建 venv 并安装依赖
-2. 生成 Windows 图标（需要 Pillow）
-3. 用 PyInstaller 打包为单个 EXE
+需要预先安装 Python 3.10+。打包脚本会在 `artifacts/build-env/` 创建隔离环境，
+用 PyInstaller 生成 onedir 后端，并打包 WebView2 原生窗口、V4/V5.1 稳定固件资源。
 
-输出：`dist\SensUs-Workstation.exe`
+输出：`artifacts\releases\<version>\SensUs-Workstation-Windows-x64-<version>.zip`
 
-> **注意**：打包后的 EXE 只包含**分析工具和 GUI 界面**。
-> 如果需要编译/烧录固件，需要从完整源码仓库运行，并安装：
+> **注意**：便携版可以采集并使用随包稳定固件；如果要编译自定义条件，仍需从完整
+> 源码仓库运行，并安装：
 > - [nRF Connect SDK](https://www.nordicsemi.com/Products/Development-software/nRF-Connect-SDK) (Zephyr RTOS + west)
 > - [SEGGER J-Link](https://www.segger.com/downloads/jlink/) (V8.80 推荐)
 > - [GNU Arm Embedded Toolchain](https://developer.arm.com/tools-and-software/open-source-software/developer-tools/gnu-toolchain)
@@ -84,7 +82,7 @@ windows\build_win.bat
 
 | 功能 | macOS | Windows |
 |------|-------|---------|
-| 原生 App 窗口 | ✅ Swift + AppKit | ❌（使用浏览器） |
+| 原生 App 窗口 | ✅ Swift + AppKit | ✅ WebView2（便携版） |
 | 悬浮检测窗 | ✅ 画中画模式 | ❌ |
 | 窗口置顶 | ✅ 工具栏按钮 | ❌ |
 | 浏览器界面 | ✅ | ✅ |
@@ -96,9 +94,8 @@ windows\build_win.bat
 | 标定/预测 | ✅ | ✅ |
 | 自动测量 | ✅ | ✅ |
 
-> **Windows 用户**：所有核心功能（I-T/CV 采集、标定、分析、预测）
-> 在浏览器界面中完全可用。缺少的只是 macOS 的原生 App 外壳和悬浮窗功能。
-> 建议将浏览器固定到任务栏作为快捷方式。
+> **Windows 用户**：源码启动继续使用浏览器；便携包默认使用 WebView2 原生窗口。
+> I-T/CV 采集、标定、分析、预测和自动测量共用同一后端。
 
 ## 故障排查
 

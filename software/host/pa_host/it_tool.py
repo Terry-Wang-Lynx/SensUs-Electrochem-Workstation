@@ -40,6 +40,7 @@ from .it import (
     resample_run_10hz,
     summarize_run,
 )
+from .runtime import module_command
 
 
 def _plot_run(path: str | Path, output: str | Path, window_s: float) -> None:
@@ -102,9 +103,10 @@ def _plot_calibration(points, model: CalibrationModel, output: str | Path) -> No
 
 def _cmd_measure(args: argparse.Namespace) -> int:
     # Keep this wrapper transparent: collect.py owns the line protocol and raw CSV.
-    cmd = [sys.executable, "-m", "pa_host.collect",
-           "--out", str(args.out), "--duration", str(args.duration),
-           "--idle-timeout", str(args.idle_timeout), "--progress-every", "100"]
+    cmd = module_command(
+        "pa_host.collect", "--out", args.out, "--duration", args.duration,
+        "--idle-timeout", args.idle_timeout, "--progress-every", "100"
+    )
     cmd += ["--cv"] if args.cv else ["--it-10hz"]
     if getattr(args, "serial", None):
         cmd += ["--serial", args.serial]

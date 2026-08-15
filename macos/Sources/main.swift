@@ -12,12 +12,16 @@ private final class BackendManager {
     private var consecutiveHealthFailures = 0
     private var recoveryInProgress = false
     let projectRoot: URL
+    let stateURL: URL
     let logURL: URL
 
     init() {
         projectRoot = Self.resolveProjectRoot()
+        stateURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/SensUs Workstation", isDirectory: true)
         let logs = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/SensUs Workstation", isDirectory: true)
+        try? FileManager.default.createDirectory(at: stateURL, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
         logURL = logs.appendingPathComponent("server.log")
     }
@@ -44,23 +48,40 @@ private final class BackendManager {
     }
 
     private func launchServer() throws {
-        let serverModule = projectRoot
-            .appendingPathComponent("software/host/pa_host/gui_server.py")
-        guard FileManager.default.fileExists(atPath: serverModule.path) else {
-            throw BackendError.projectNotFound(projectRoot.path)
-        }
-
-        let pythonCandidates = [
-            projectRoot.appendingPathComponent(".venv/bin/python3").path,
-            projectRoot.appendingPathComponent(".venv/bin/python").path,
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/python3",
-            "/usr/bin/python3",
-        ]
-        guard let python = pythonCandidates.first(where: {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }) else {
-            throw BackendError.pythonNotFound
+        let bundledBackend = Bundle.main.resourceURL?
+            .appendingPathComponent("backend/SensUsBackend")
+        let usingBundledBackend = bundledBackend.map {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        } ?? false
+        let executable: URL
+        let arguments: [String]
+        if let bundledBackend, usingBundledBackend {
+            executable = bundledBackend
+            arguments = ["gui", "--host", "127.0.0.1", "--port", "8765"]
+        } else {
+            let serverModule = projectRoot
+                .appendingPathComponent("software/host/pa_host/gui_server.py")
+            guard FileManager.default.fileExists(atPath: serverModule.path) else {
+                throw BackendError.projectNotFound(projectRoot.path)
+            }
+            let pythonCandidates = [
+                projectRoot.appendingPathComponent(".venv/bin/python3").path,
+                projectRoot.appendingPathComponent(".venv/bin/python").path,
+                "/opt/homebrew/bin/python3",
+                "/usr/local/bin/python3",
+                "/usr/bin/python3",
+            ]
+            guard let python = pythonCandidates.first(where: {
+                FileManager.default.isExecutableFile(atPath: $0)
+            }) else {
+                throw BackendError.pythonNotFound
+            }
+            executable = URL(fileURLWithPath: python)
+            arguments = [
+                "-m", "pa_host.gui_server",
+                "--host", "127.0.0.1",
+                "--port", "8765",
+            ]
         }
 
         try? logHandle?.close()
@@ -71,18 +92,27 @@ private final class BackendManager {
         logHandle = handle
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: python)
-        process.arguments = [
-            "-m", "pa_host.gui_server",
-            "--host", "127.0.0.1",
-            "--port", "8765",
-        ]
-        process.currentDirectoryURL = projectRoot
+        process.executableURL = executable
+        process.arguments = arguments
+        process.currentDirectoryURL = usingBundledBackend ? stateURL : projectRoot
         var environment = ProcessInfo.processInfo.environment
         environment["SENSUS_PROJECT_DIR"] = projectRoot.path
+        environment["SENSUS_RESOURCE_DIR"] = projectRoot.path
+        environment["SENSUS_STATE_DIR"] = stateURL.path
         environment["PYTHONUNBUFFERED"] = "1"
-        environment["PYTHONPATH"] = projectRoot
-            .appendingPathComponent("software/host").path
+        if usingBundledBackend {
+            if let resources = Bundle.main.resourceURL {
+                let openocd = resources.appendingPathComponent("tools/openocd/bin/openocd")
+                let scripts = resources.appendingPathComponent("tools/openocd/share/openocd/scripts")
+                if FileManager.default.isExecutableFile(atPath: openocd.path) {
+                    environment["SENSUS_OPENOCD_EXE"] = openocd.path
+                    environment["SENSUS_OPENOCD_SCRIPTS"] = scripts.path
+                }
+            }
+        } else {
+            environment["PYTHONPATH"] = projectRoot
+                .appendingPathComponent("software/host").path
+        }
         process.environment = environment
         process.standardOutput = handle
         process.standardError = handle
@@ -193,6 +223,10 @@ private final class BackendManager {
         let manager = FileManager.default
         let environment = ProcessInfo.processInfo.environment
         var candidates: [URL] = []
+
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent("workstation", isDirectory: true))
+        }
 
         if let configured = environment["SENSUS_PROJECT_DIR"], !configured.isEmpty {
             candidates.append(URL(fileURLWithPath: configured, isDirectory: true))

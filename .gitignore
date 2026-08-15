@@ -8,6 +8,7 @@ __pycache__/
 # Package and build products
 build/
 dist/
+artifacts/
 *.egg-info/
 software/firmware/build/
 software/firmware/tests/build/
@@ -28,3 +29,4 @@ measurements/
 
 # Windows PyInstaller specs
 *.spec
+!packaging/portable.spec

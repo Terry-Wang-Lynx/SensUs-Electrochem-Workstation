@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sensus-electrochem-workstation"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local GUI and acquisition workflow for the SensUs MAX30131 electrochemistry workstation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,13 @@ dependencies = [
 [project.optional-dependencies]
 analysis = ["scipy>=1.10"]
 dev = ["build>=1.2", "pytest>=8"]
+portable = [
+  "cryptography>=43",
+  "pyinstaller>=6.11",
+  "pillow>=10",
+  "pywebview>=5.3; sys_platform == 'win32'",
+  "smpmgr==0.18.1",
+]
 
 [project.scripts]
 sensus-workstation = "pa_host.gui_server:main"

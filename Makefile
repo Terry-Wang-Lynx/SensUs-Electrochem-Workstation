@@ -18,13 +18,15 @@ else
 	NULL := /dev/null
 endif
 
-.PHONY: install run app test firmware-test package clean-package clean help
+.PHONY: install run app portable-macos dmg test firmware-test package clean-package clean help
 
 help:
 	@echo SensUs Electrochem Workstation build targets:
 	@echo   make install          Create venv and install dependencies
 	@echo   make run              Start the GUI server (browser interface)
 	@echo   make app              Build macOS native app (macOS only)
+	@echo   make portable-macos   Build self-contained macOS arm64 app
+	@echo   make dmg              Build self-contained macOS arm64 DMG
 	@echo   make test             Run host tests
 	@echo   make firmware-test    Run firmware logic tests
 	@echo   make package          Build wheel and source distribution
@@ -47,6 +49,20 @@ ifeq ($(OS),Windows_NT)
 	@echo "Use 'make run' for the browser interface, or 'windows\build_win.bat' to build a Windows EXE."
 else
 	./macos/build_app.sh
+endif
+
+portable-macos:
+ifeq ($(OS),Windows_NT)
+	@echo "Use windows\\build_win.bat on Windows."
+else
+	./packaging/build_macos_portable.sh
+endif
+
+dmg:
+ifeq ($(OS),Windows_NT)
+	@echo "DMG builds are only available on macOS."
+else
+	./packaging/create_dmg.sh
 endif
 
 test:
