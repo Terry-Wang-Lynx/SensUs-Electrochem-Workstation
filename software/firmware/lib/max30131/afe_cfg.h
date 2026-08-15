@@ -27,6 +27,7 @@
 /* 命令行长度上限。最长实际命令(全部键 + FORCE)约 111 字符。 */
 #define AFE_CFG_LINE_MAX 128
 #define AFE_CFG_MAX_KEYS 16
+#define AFE_CFG_REQ_MAX 32
 /* plan 里最多要写的寄存器数:0x14 0x20 0x21 0x22 0x23 0x24 0x54 0x55 0x56 0x80 0x81
  * + DACA(2)+ DACB(2) */
 #define AFE_CFG_MAX_WRITES 16
@@ -147,6 +148,8 @@ typedef struct {
 	bool legacy_range;
 	/* PEEK/POKE/OCP 的裸参数 */
 	int32_t arg0, arg1;
+	/* GET 请求标识；空字符串表示兼容旧的裸 GET。 */
+	char req[AFE_CFG_REQ_MAX + 1];
 } afe_cmd_t;
 
 /*
@@ -177,6 +180,17 @@ bool afe_cfg_validate(const afe_cfg_t *cfg, const afe_derived_t *d,
 void afe_cfg_plan(const afe_cfg_t *old_cfg, const afe_derived_t *old_d,
 		  const afe_cfg_t *new_cfg, const afe_derived_t *new_d,
 		  afe_plan_t *out);
+
+/*
+ * 枚举 `cfg` 在器件上应有的全部可配寄存器字节。与 plan 不同，
+ * 这个清单不跳过“未变”字节，专供 GET 只读核验使用。DAC 由执行层
+ * 按最后一次成功写入的运行态目标另行核验。
+ */
+void afe_cfg_expected_regs(const afe_cfg_t *cfg, afe_plan_t *out);
+
+/* GET 物理快照还必须没有绕过 cfg_live 的 Debug POKE。 */
+bool afe_cfg_verify_snapshot_ok(bool registers_ok, bool status_read_ok,
+				bool register_desynced);
 
 /* 审计行格式化器。返回写入长度(不含 NUL);缓冲不足返回 0。 */
 size_t afe_cfg_fmt_applied(uint32_t ep, int64_t ms, const char *src,

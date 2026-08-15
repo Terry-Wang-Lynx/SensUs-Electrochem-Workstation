@@ -1,0 +1,32 @@
+{
+  "name": "SensUs pA-Converter V4 recommended IT firmware",
+  "board": "pa_converter_v40/nrf52833",
+  "ncs_version": "v3.4.0",
+  "zephyr_version": "4.4.0",
+  "zephyr_sdk_version": "1.0.1",
+  "rtt_address": "0x20001100",
+  "settings": {
+    "method": "it",
+    "initial_potential_v": 0.2,
+    "potential_v": 0.2,
+    "prestep_s": 0.0,
+    "duration_s": 180.0,
+    "target_rate_hz": 10.0,
+    "sens_period_code": 0,
+    "fit_window_s": 20.0,
+    "fsr_nA": 2000,
+    "offset_nA": 200,
+    "offset_mode": "10pct",
+    "cv_low_v": -0.6,
+    "cv_high_v": 0.6,
+    "cv_scan_rate_v_s": 0.05,
+    "cv_cycles": 30,
+    "cv_step_v": 0.001,
+    "cv_quiet_s": 2.0,
+    "cv_eis_fsr_uA": 40
+  },
+  "sha256": {
+    "zephyr.hex": "cf2a079729af3a4710f6c4b989a98ee50349a17c28d8071e14ba48076015ba60",
+    "zephyr.elf": "b8277f72c50895533f5515171376e1bfc90b89cf2b2b103e7f79fb5234b80df6"
+  }
+}

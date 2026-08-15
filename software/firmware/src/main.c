@@ -1,6 +1,6 @@
 /*
- * pA-Converter 共用电化学固件
- *   MAX30131 单芯片 AFE(SPI) + nRF52833;板级传输由 control_transport 选择
+ * pA-Converter V4.0 固件最小闭环
+ *   MAX30131 单芯片 AFE(SPI)+ nRF52833 + CR2032 · 数据经 RTT 上报
  *
  * 🔴 本版**不开 BLE**(用户 2026-07-31 拍板:蓝牙一时半会不用)。
  *    连带好处:`DEC5` 缺 820pF 的风险窗口正是 BLE TX 的 mA 级电流突变,
@@ -15,7 +15,6 @@
  */
 
 #include "board_guards.h"
-#include "control_transport.h"
 #include "max30131_spi.h"
 
 #include "afe_cfg.h"
@@ -27,6 +26,7 @@
 #include "measurement_config.default.h"
 #endif
 
+#include <SEGGER_RTT.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <stdio.h>
@@ -92,8 +92,8 @@ static bool     run_tainted;  /* 本轮被 FORCE 扰动过 ⇒ IT_DONE 带 taint
  * 让 poll_control_command() 只管拼行、不管语义。
  */
 static void handle_command_line(const char *line);
-static void afe_status_poll(const char *why, bool force);
-static void replay_state(const char *src);
+static bool afe_status_poll(const char *why, bool force);
+static void replay_state(const char *src, const char *req);
 #define WP_REF        MAX30131_REF_1536MV      /* 内部 1.536V;CR2032 EOL 2.0V 只此档 */
 #define WP_METHOD_CV  GUI_MEASUREMENT_MODE_CV
 #define WP_IT_USE_EIS GUI_IT_USE_EIS
@@ -125,7 +125,7 @@ static void replay_state(const char *src);
  *   headroom 校验按 WP_VDD_ASSUMED_MV=3000 判(上限 1900),现在 VDD 已能实测,
  *   不符会打 VDD_MISMATCH。
  */
-#define WP_DEFAULT_V_WE_MV 1200                /* 见上;可 SET vwe= 改 */
+#define WP_DEFAULT_V_WE_MV GUI_WP_V_WE_MV      /* 实时测量页生成;可 SET vwe= 改 */
 #define WP_V_WE_MV    cfg_live.vwe_mv
 #define WP_E_MV       cfg_live.e_mv            /* E = V_WE - V_RE(测量电位) */
 #define WP_STARTUP_E_MV GUI_WP_START_E_MV      /* 用户可见的阶跃起始电位 */
@@ -395,6 +395,7 @@ static uint8_t sysadc_gain = WP_SYSADC_GAIN_FIXED;
 
 /* 本轮 i-t 试验的电位保持时间。到时后固件停转换并保持配置的空闲电位。 */
 #define WP_MEASUREMENT_DURATION_MS GUI_MEASUREMENT_DURATION_MS
+#define WP_IT_ADAPTIVE_STOP GUI_IT_ADAPTIVE_STOP
 /*
  * 🔴 采样周期现在是运行时量 ⇒ 期望样本数也必须运行时算,不能再用 GUI_SENS_PERIOD_MS
  *    这个编译期常量。`SET period=` 改完周期而样本数还按旧周期算,会让一轮的时长
@@ -566,6 +567,19 @@ static int afe_probe(void)
 	return 0;
 }
 
+/*
+ * 记住固件最后一次成功写入的 DAC 码。它们不能直接用 cfg_live.e
+ * 重算：Quiet Time/轮次结束可合法回到 GUI_WP_START_E_MV，与测量目标
+ * e 不同。POKE 刻意不更新这份期望，下一次 GET 才能发现脱节。
+ */
+static uint16_t daca_expected_code;
+static uint16_t dacb_expected_code;
+static bool daca_expected_valid;
+static bool dacb_expected_valid;
+/* POKE 可修改 cfg_live 未覆盖的任意寄存器，只能由重启后的全量初始化清除。 */
+static bool debug_register_desynced;
+static uint8_t debug_desync_addr;
+
 /* 写 DAC 后立即回读。任何写错、丢写或寄存器位序错误都会阻止测量启动。 */
 static int write_dac_verified(uint8_t msb_reg, uint8_t enlsb_reg,
 			      uint16_t code, const char *name)
@@ -586,6 +600,15 @@ static int write_dac_verified(uint8_t msb_reg, uint8_t enlsb_reg,
 			"实际 bytes=%02x/%02x", name, code, expected_msb,
 			expected_enlsb, actual[0], actual[1]);
 		return -EIO;
+	}
+	if (msb_reg == MAX30131_REG_DACA_MSB &&
+	    enlsb_reg == MAX30131_REG_DACA_ENLSB) {
+		daca_expected_code = code;
+		daca_expected_valid = true;
+	} else if (msb_reg == MAX30131_REG_DACB_MSB &&
+		   enlsb_reg == MAX30131_REG_DACB_ENLSB) {
+		dacb_expected_code = code;
+		dacb_expected_valid = true;
 	}
 	return 0;
 }
@@ -1084,8 +1107,7 @@ enum control_command {
 static enum control_command pending_control;
 
 /*
- * 从板级传输下行取字符、拼成整行、交给 handle_command_line()。
- * 本函数**只管拼行**,V4 RTT 与 V5.1 USB 共用完全相同的状态机和命令语义。
+ * 从 RTT 下行取字符、拼成整行、交给 handle_command_line()。本函数**只管拼行**。
  *
  * 🔴 修一个静默注入漏洞(2026-08-10 发现,原代码存在):溢出时原来是
  *      `used = 0U;`  ← 丢掉已收部分,却**继续把后续字符往缓冲里塞**
@@ -1102,7 +1124,7 @@ static enum control_command poll_control_command(void)
 	static bool overflow;
 	char ch;
 
-	while (control_transport_read_char(&ch) == 1) {
+	while (SEGGER_RTT_Read(0U, &ch, 1U) == 1U) {
 		if (ch == '\r' || ch == '\n') {
 			if (overflow) {
 				printk("CFG_REJECT ep=%u ms=%lld reason=too_long "
@@ -1763,7 +1785,7 @@ static int run_it_eis_measurement(uint32_t *sample_count, uint32_t *timing_overr
 	uint32_t expected = (WP_MEASUREMENT_DURATION_MS + WP_IT_SAMPLE_INTERVAL_MS - 1U) /
 			    WP_IT_SAMPLE_INTERVAL_MS;
 	int64_t started_ms = k_uptime_get();
-	while (*sample_count < expected) {
+	while (WP_IT_ADAPTIVE_STOP || *sample_count < expected) {
 		board_guards_feed();
 		enum control_command command = poll_control_command();
 		if (command != CONTROL_NONE) {
@@ -1869,7 +1891,7 @@ static bool afe_fault_vdd;
 
 #define AFE_STATUS_HEARTBEAT_MS 30000
 
-static void afe_status_poll(const char *why, bool force)
+static bool afe_status_poll(const char *why, bool force)
 {
 	uint8_t st = 0;
 	int64_t now = k_uptime_get();
@@ -1878,7 +1900,7 @@ static void afe_status_poll(const char *why, bool force)
 	if (status1_read(&st) != 0) {
 		printk("AFE_STATUS ep=%u ms=%lld status1=read_fail why=%s\n",
 		       cfg_epoch, (long long)now, why);
-		return;
+		return false;
 	}
 	invalid = (st & BIT(MAX30131_STATUS1_INVALID_CFG_Pos)) != 0U;
 	/*
@@ -1927,7 +1949,7 @@ static void afe_status_poll(const char *why, bool force)
 
 	if (!force && st == status1_last && sticky == 0U &&
 	    now - status1_reported_ms < AFE_STATUS_HEARTBEAT_MS) {
-		return;
+		return true;
 	}
 	status1_last = st;
 	status1_reported_ms = now;
@@ -1942,6 +1964,7 @@ static void afe_status_poll(const char *why, bool force)
 	       (st >> MAX30131_STATUS1_FIFO_DATA_RDY_Pos) & 1,
 	       invalid_cfg_streak, acquiring ? 1 : 0, why);
 	status1_sticky = 0U;
+	return true;
 }
 
 /* ================================================================== */
@@ -2054,13 +2077,6 @@ static int afe_cfg_commit(const afe_cmd_t *cmd, const char *src)
 		printk("%s\n", audit_line);
 	}
 
-	/* System ADC 增益寄存器不在 plan 里(它是常量),开启连采时补写一次 */
-	if (cand.cellv && !prev.cellv) {
-		(void)max30131_spi_write_reg(MAX30131_REG_SYS_ADC_SETUP,
-			max30131_enc_sys_adc_setup(WP_SYSADC_SENSV_GAIN,
-						   WP_SYSADC_PWR_GAIN));
-	}
-
 	if (exec_plan(&plan, ep, "apply") != 0) {
 		goto rollback;
 	}
@@ -2078,7 +2094,10 @@ static int afe_cfg_commit(const afe_cmd_t *cmd, const char *src)
 		enter_idle_state();
 	}
 
-	afe_status_poll("post_commit", true);
+	if (!afe_status_poll("post_commit", true)) {
+		printk("CFG_FAULT ep=%u cause=status_read tag=post_commit\n", ep);
+		goto rollback;
+	}
 	{
 		uint8_t st = status1_last;
 
@@ -2299,31 +2318,139 @@ static void ocp_run(int32_t window_ms, bool forced)
 /* ================================================================== */
 /* 命令分派                                                            */
 /* ================================================================== */
+static void cfg_verify_fault(const char *cause, uint8_t addr, uint8_t expected,
+			     uint8_t actual, int rc, const char *req)
+{
+	if (req != NULL && req[0] != '\0') {
+		printk("CFG_FAULT ep=%u cause=%s addr=0x%02x expected=0x%02x "
+		       "actual=0x%02x rc=%d req=%s\n", cfg_epoch, cause, addr,
+		       expected, actual, rc, req);
+	} else {
+		printk("CFG_FAULT ep=%u cause=%s addr=0x%02x expected=0x%02x "
+		       "actual=0x%02x rc=%d\n", cfg_epoch, cause, addr, expected,
+		       actual, rc);
+	}
+}
+
+/* 单次 SPI 只读核验；不尝试“修复”，否则 GET 就不再幂等。 */
+static bool verify_expected_reg(uint8_t addr, uint8_t expected, const char *req)
+{
+	uint8_t actual = 0U;
+	int rc = max30131_spi_read_reg(addr, &actual);
+
+	if (rc != 0) {
+		cfg_verify_fault("verify_read", addr, expected, actual, rc, req);
+		return false;
+	}
+	if (actual != expected) {
+		cfg_verify_fault("verify_mismatch", addr, expected, actual, 0, req);
+		return false;
+	}
+	return true;
+}
+
+static bool verify_live_config(const char *req)
+{
+	afe_plan_t expected;
+	bool ok = true;
+	uint8_t msb = 0U, enlsb = 0U;
+
+	afe_cfg_expected_regs(&cfg_live, &expected);
+	if (debug_register_desynced) {
+		cfg_verify_fault("verify_desync", debug_desync_addr, 0U, 0U, -EIO, req);
+		ok = false;
+	}
+	for (uint8_t i = 0U; i < expected.n; i++) {
+		if (!verify_expected_reg(expected.w[i].addr, expected.w[i].val, req)) {
+			ok = false;
+		}
+	}
+
+	if (daca_expected_valid) {
+		bool msb_ok, enlsb_ok;
+
+		max30131_enc_dac(daca_expected_code, true, &msb, &enlsb);
+		msb_ok = verify_expected_reg(MAX30131_REG_DACA_MSB, msb, req);
+		enlsb_ok = verify_expected_reg(MAX30131_REG_DACA_ENLSB, enlsb, req);
+		if (!msb_ok || !enlsb_ok) {
+			ok = false;
+		}
+	} else {
+		cfg_verify_fault("verify_unavailable", MAX30131_REG_DACA_MSB, 0U, 0U,
+				  -ENODATA, req);
+		ok = false;
+	}
+	if (dacb_expected_valid) {
+		bool msb_ok, enlsb_ok;
+
+		max30131_enc_dac(dacb_expected_code, true, &msb, &enlsb);
+		msb_ok = verify_expected_reg(MAX30131_REG_DACB_MSB, msb, req);
+		enlsb_ok = verify_expected_reg(MAX30131_REG_DACB_ENLSB, enlsb, req);
+		if (!msb_ok || !enlsb_ok) {
+			ok = false;
+		}
+	} else {
+		cfg_verify_fault("verify_unavailable", MAX30131_REG_DACB_MSB, 0U, 0U,
+				  -ENODATA, req);
+		ok = false;
+	}
+	return ok;
+}
+
 /* GET:幂等重放当前状态。**不 ep++、不写任何寄存器** —— 上行丢行时靠它补齐。 */
-static void replay_state(const char *src)
+static void replay_state(const char *src, const char *req)
 {
 	afe_plan_t empty = { 0 };
+	bool registers_ok = verify_live_config(req);
+	bool status_read_ok;
+	bool verify_ok;
 
 	if (afe_cfg_fmt_applied(cfg_epoch, k_uptime_get(), src, 0, false, &empty,
 				&cfg_live, &cfg_live, audit_line, sizeof(audit_line)) > 0) {
-		printk("%s\n", audit_line);
+		if (req != NULL && req[0] != '\0') {
+			printk("%s req=%s\n", audit_line, req);
+		} else {
+			printk("%s\n", audit_line);
+		}
 	}
 	if (afe_cfg_fmt_derived(cfg_epoch, &cfg_live, &drv_live, audit_line,
 				sizeof(audit_line)) > 0) {
-		printk("%s\n", audit_line);
+		if (req != NULL && req[0] != '\0') {
+			printk("%s req=%s\n", audit_line, req);
+		} else {
+			printk("%s\n", audit_line);
+		}
 	}
-	afe_status_poll(src, true);
+	status_read_ok = afe_status_poll(src, true);
+	if (!status_read_ok) {
+		cfg_verify_fault("verify_status", MAX30131_REG_STATUS1, 0U, 0U,
+				 -EIO, req);
+	}
+	verify_ok = afe_cfg_verify_snapshot_ok(registers_ok, status_read_ok,
+					     debug_register_desynced);
 	/*
 	 * 🔴 重放也要给确认行。GET 确实读了 STATUS1 —— 那就是一次真的"器件同意"。
 	 * 不给的话界面对**开机 epoch** 永远显示"未确认"(而 afe_configure 明明已经
 	 * 逐个寄存器写完并回读过 DAC),这是误报;而"未确认"这个提示一旦开始误报,
 	 * 真正未确认的那次就没人会当真了。
 	 */
-	printk("CFG_CONFIRMED ep=%u status1=0x%02x invalid_cfg=%d vdd_oor=%d "
-	       "brownout=%d nregs=0 skipped=0 src=%s\n", cfg_epoch, status1_last,
-	       (status1_last >> MAX30131_STATUS1_INVALID_CFG_Pos) & 1,
-	       (status1_last >> MAX30131_STATUS1_VDD_OOR_Pos) & 1,
-	       (status1_last >> MAX30131_STATUS1_PWR_RDY_Pos) & 1, src);
+	if (req != NULL && req[0] != '\0') {
+		printk("CFG_CONFIRMED ep=%u status1=0x%02x invalid_cfg=%d vdd_oor=%d "
+		       "brownout=%d verify_ok=%d nregs=0 skipped=0 src=%s req=%s\n",
+		       cfg_epoch, status1_last,
+		       (status1_last >> MAX30131_STATUS1_INVALID_CFG_Pos) & 1,
+		       (status1_last >> MAX30131_STATUS1_VDD_OOR_Pos) & 1,
+		       (status1_last >> MAX30131_STATUS1_PWR_RDY_Pos) & 1,
+		       verify_ok ? 1 : 0, src, req);
+	} else {
+		printk("CFG_CONFIRMED ep=%u status1=0x%02x invalid_cfg=%d vdd_oor=%d "
+		       "brownout=%d verify_ok=%d nregs=0 skipped=0 src=%s\n", cfg_epoch,
+		       status1_last,
+		       (status1_last >> MAX30131_STATUS1_INVALID_CFG_Pos) & 1,
+		       (status1_last >> MAX30131_STATUS1_VDD_OOR_Pos) & 1,
+		       (status1_last >> MAX30131_STATUS1_PWR_RDY_Pos) & 1,
+		       verify_ok ? 1 : 0, src);
+	}
 }
 
 static void handle_command_line(const char *line)
@@ -2353,7 +2480,7 @@ static void handle_command_line(const char *line)
 		pending_control = CONTROL_STOP;
 		break;
 	case AFE_VERB_GET:
-		replay_state("get");
+		replay_state("get", cmd.req);
 		break;
 	case AFE_VERB_STATUS:
 		afe_status_poll("status_cmd", true);
@@ -2387,13 +2514,16 @@ static void handle_command_line(const char *line)
 		/*
 		 * 🔴 POKE 绕过全部校验与 cfg_live 记账 ⇒ 之后 cfg_live 与器件可能不符。
 		 * 所以强制要 FORCE,并明确标注 desync：任何用 POKE 之后的数据都必须
-		 * 先发一次 GET 重建认知,否则换算口径无法保证。
+		 * 重新烧录/复位后才能进入正式测量。GET 只读核验会持续拒绝，
+		 * 因为 POKE 可能改了 cfg_live 清单之外的寄存器。
 		 */
 		if (!cmd.forced) {
 			printk("CFG_REJECT ep=%u reason=arg key=poke_needs_FORCE "
 			       "a=%d b=%d\n", cfg_epoch, cmd.arg0, cmd.arg1);
 			break;
 		}
+		debug_register_desynced = true;
+		debug_desync_addr = (uint8_t)cmd.arg0;
 		(void)max30131_spi_read_reg((uint8_t)cmd.arg0, &before);
 		(void)max30131_spi_write_reg((uint8_t)cmd.arg0, (uint8_t)cmd.arg1);
 		(void)max30131_spi_read_reg((uint8_t)cmd.arg0, &after);
@@ -2774,40 +2904,12 @@ static void cfg_load_defaults(void)
 	afe_cfg_derive(&cfg_live, &drv_live);
 	cfg_epoch = 1U;
 	printk("CFG_BOOT ep=%u ms=%lld fw=%s reason=boot\n", cfg_epoch,
-	       (long long)k_uptime_get(),
-#if defined(CONFIG_BOARD_PA_CONVERTER_V51)
-	       "v5.1-usb1"
-#else
-	       "v4-dbg1"
-#endif
-	);
+	       (long long)k_uptime_get(), "v4-dbg1");
 }
 
 int main(void)
 {
-	/*
-	 * V5.1 must validate its externally programmed 3.3 V UICR setting before
-	 * starting USB or touching the AFE.  The watchdog is deliberately armed
-	 * only after USB DATA DTR is present.
-	 */
-	if (board_guards_preflight() != 0) {
-		LOG_ERR("board preflight failed; USB and AFE remain disabled");
-		while (1) {
-			k_msleep(1000);
-		}
-	}
-	if (control_transport_init() != 0) {
-		LOG_ERR("control/data transport initialization failed");
-		while (1) {
-			k_msleep(1000);
-		}
-	}
-
-#if defined(CONFIG_BOARD_PA_CONVERTER_V51)
-	LOG_INF("=== pA-Converter V5.1 firmware start(USB / polling / no BLE) ===");
-#else
 	LOG_INF("=== pA-Converter V4.0 固件启动(轮询模式 / 无 BLE)===");
-#endif
 	cfg_load_defaults();
 
 	/* 三条焊死项:DCDCEN=0 断言 + POFCON 2.0V + 看门狗 */
@@ -2851,7 +2953,7 @@ int main(void)
 		}
 	}
 	/* 配置已落到器件上 ⇒ 立即把「设备自己认为的状态」整套打出来 */
-	replay_state("boot");
+	replay_state("boot", NULL);
 
 	if (WP_RUN_STARTUP_DIAGNOSTIC) {
 		board_guards_feed();
@@ -3080,7 +3182,7 @@ int main(void)
 	LOG_INF("进入 AUTO i-t 采集: %u native samples (约8Hz; host重采样10Hz), E=%d mV",
 		expected_samples, WP_E_MV);
 
-	while (native_samples < expected_samples) {
+	while (WP_IT_ADAPTIVE_STOP || native_samples < expected_samples) {
 		board_guards_feed();
 		enum control_command command = poll_control_command();
 		if (command == CONTROL_START) {
@@ -3091,7 +3193,8 @@ int main(void)
 			stop_requested = true;
 			break;
 		}
-		uint16_t left = (uint16_t)(expected_samples - native_samples);
+		uint16_t left = WP_IT_ADAPTIVE_STOP
+			? UINT16_MAX : (uint16_t)(expected_samples - native_samples);
 		uint16_t n = drain_fifo(left);
 		native_samples += n;
 		int64_t now_ms = k_uptime_get();
@@ -3126,10 +3229,10 @@ int main(void)
 				expected_samples);
 			run_period_code = cfg_live.period;
 		}
-		if (native_samples >= expected_samples) {
+		if (!WP_IT_ADAPTIVE_STOP && native_samples >= expected_samples) {
 			break;
 		}
-		if (k_uptime_get() - measurement_start_ms >
+		if (!WP_IT_ADAPTIVE_STOP && k_uptime_get() - measurement_start_ms >
 			WP_MEASUREMENT_DURATION_MS + 10000) {
 			LOG_ERR("AUTO i-t 超过时限:仅获得 %u/%u 个原生样本",
 				native_samples, expected_samples);

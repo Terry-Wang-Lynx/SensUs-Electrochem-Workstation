@@ -179,6 +179,12 @@ static bool tok_eq(const char *tok, size_t len, const char *lit)
 	return strlen(lit) == len && strncmp(tok, lit, len) == 0;
 }
 
+static bool req_char_ok(char c)
+{
+	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+	       (c >= 'a' && c <= 'z') || c == '-';
+}
+
 bool afe_cfg_parse(const char *line, const afe_cfg_t *base, afe_cmd_t *out,
 		   afe_reject_t *why)
 {
@@ -299,6 +305,27 @@ bool afe_cfg_parse(const char *line, const afe_cfg_t *base, afe_cmd_t *out,
 			set_reject(why, AFE_REJ_VALUE, NULL, 0, 0);
 			return false;
 		}
+		if (out->verb == AFE_VERB_GET && tok_eq(tok, klen, "req")) {
+			if (out->req[0] != '\0') {
+				set_reject(why, AFE_REJ_DUP_KEY, "req", 0, 0);
+				return false;
+			}
+			if (vlen2 > AFE_CFG_REQ_MAX) {
+				set_reject(why, AFE_REJ_ARG, "req", (int32_t)vlen2,
+					   AFE_CFG_REQ_MAX);
+				return false;
+			}
+			for (size_t i = 0; i < vlen2; i++) {
+				if (!req_char_ok(eq[1 + i])) {
+					set_reject(why, AFE_REJ_VALUE, "req",
+						   (unsigned char)eq[1 + i], 0);
+					return false;
+				}
+			}
+			memcpy(out->req, eq + 1, vlen2);
+			out->req[vlen2] = '\0';
+			continue;
+		}
 		int found = -1;
 
 		for (int k = 0; k < K_COUNT; k++) {
@@ -355,6 +382,12 @@ bool afe_cfg_parse(const char *line, const afe_cfg_t *base, afe_cmd_t *out,
 		apply_key(&out->cfg, (enum key_id)found, v, is_auto);
 	}
 
+	if (out->verb == AFE_VERB_GET &&
+	    (n_bare != 0 || n_keys != 0 || out->forced)) {
+		set_reject(why, AFE_REJ_ARG, "get", n_bare + n_keys,
+			   out->forced ? 1 : 0);
+		return false;
+	}
 	if (is_range) {
 		if (n_bare != 2) {
 			set_reject(why, AFE_REJ_VALUE, "range", n_bare, 2);
@@ -550,6 +583,42 @@ static uint8_t byte_80(const afe_cfg_t *c)
 	return max30131_enc_convert_setup1(false, c->ioc, false, c->period);
 }
 
+static uint8_t byte_14(const afe_cfg_t *c)
+{
+	return max30131_enc_system_control(false, false, false, c->clk40);
+}
+
+static uint8_t byte_54(const afe_cfg_t *c)
+{
+	return c->cellv
+		? max30131_enc_sys_adc_setup(MAX30131_SYSADC_GAIN_1X,
+					       MAX30131_SYSADC_GAIN_0P25X)
+		: 0U;
+}
+
+static uint8_t byte_55(const afe_cfg_t *c)
+{
+	return c->cellv
+		? (uint8_t)((1u << MAX30131_SYSADC_SYS_SELECT_Pos) |
+			    (1u << MAX30131_SYSADC_VDD_SEL_Pos))
+		: 0U;
+}
+
+static uint8_t byte_56(const afe_cfg_t *c)
+{
+	return c->cellv
+		? (uint8_t)((1u << MAX30131_SYSADC_S1_WE_SEL_Pos) |
+			    (1u << MAX30131_SYSADC_S1_RE_SEL_Pos) |
+			    (1u << MAX30131_SYSADC_S1_CE_SEL_Pos) |
+			    (1u << MAX30131_SYSADC_S1_WO_SEL_Pos))
+		: 0U;
+}
+
+static uint8_t byte_81(const afe_cfg_t *c)
+{
+	return c->cellv ? (uint8_t)(c->sysper & 0x0Fu) : 0U;
+}
+
 void afe_cfg_plan(const afe_cfg_t *old_cfg, const afe_derived_t *old_d,
 		  const afe_cfg_t *new_cfg, const afe_derived_t *new_d,
 		  afe_plan_t *out)
@@ -571,6 +640,8 @@ void afe_cfg_plan(const afe_cfg_t *old_cfg, const afe_derived_t *old_d,
 	uint32_t p_old = max30131_period_clocks(old_cfg->period);
 	uint32_t p_new = max30131_period_clocks(new_cfg->period);
 	bool widen_first = p_new > p_old;
+
+	push(out, MAX30131_REG_SYSTEM_CONTROL, byte_14(new_cfg), byte_14(old_cfg));
 
 	/*
 	 * 🔴 「松的先写,紧的后写」。period 变大时先放宽窗口,变小时最后收紧;
@@ -621,20 +692,17 @@ void afe_cfg_plan(const afe_cfg_t *old_cfg, const afe_derived_t *old_d,
 	     max30131_enc_s1_config3(old_cfg->ios, false));
 
 	/* System ADC:通道变多 ⇒ 先放宽 sysper;变少 ⇒ 先关通道再收紧 */
-	const uint8_t sel2_all = (uint8_t)((1u << MAX30131_SYSADC_S1_WE_SEL_Pos) |
-					   (1u << MAX30131_SYSADC_S1_RE_SEL_Pos) |
-					   (1u << MAX30131_SYSADC_S1_CE_SEL_Pos) |
-					   (1u << MAX30131_SYSADC_S1_WO_SEL_Pos));
-	uint8_t sel2_new = new_cfg->cellv ? sel2_all : 0u;
-	uint8_t sel2_old = old_cfg->cellv ? sel2_all : 0u;
-	uint8_t sel1_new = new_cfg->cellv
-				   ? (uint8_t)(1u << MAX30131_SYSADC_SYS_SELECT_Pos) : 0u;
-	uint8_t sel1_old = old_cfg->cellv
-				   ? (uint8_t)(1u << MAX30131_SYSADC_SYS_SELECT_Pos) : 0u;
-	uint8_t b81_new = (uint8_t)(new_cfg->sysper & 0x0Fu);
-	uint8_t b81_old = (uint8_t)(old_cfg->sysper & 0x0Fu);
+	uint8_t b54_new = byte_54(new_cfg);
+	uint8_t b54_old = byte_54(old_cfg);
+	uint8_t sel2_new = byte_56(new_cfg);
+	uint8_t sel2_old = byte_56(old_cfg);
+	uint8_t sel1_new = byte_55(new_cfg);
+	uint8_t sel1_old = byte_55(old_cfg);
+	uint8_t b81_new = byte_81(new_cfg);
+	uint8_t b81_old = byte_81(old_cfg);
 
 	if (new_cfg->cellv && !old_cfg->cellv) {
+		push(out, MAX30131_REG_SYS_ADC_SETUP, b54_new, b54_old);
 		push(out, MAX30131_REG_CONVERT_SETUP2, b81_new, b81_old);
 		push(out, MAX30131_REG_SYS_ADC_IN_SEL2, sel2_new, sel2_old);
 		push(out, MAX30131_REG_SYS_ADC_IN_SEL1, sel1_new, sel1_old);
@@ -642,7 +710,46 @@ void afe_cfg_plan(const afe_cfg_t *old_cfg, const afe_derived_t *old_d,
 		push(out, MAX30131_REG_SYS_ADC_IN_SEL1, sel1_new, sel1_old);
 		push(out, MAX30131_REG_SYS_ADC_IN_SEL2, sel2_new, sel2_old);
 		push(out, MAX30131_REG_CONVERT_SETUP2, b81_new, b81_old);
+		push(out, MAX30131_REG_SYS_ADC_SETUP, b54_new, b54_old);
 	}
+}
+
+static void expected_push(afe_plan_t *p, uint8_t addr, uint8_t val)
+{
+	if (p->n >= AFE_CFG_MAX_WRITES) {
+		return;
+	}
+	p->w[p->n].addr = addr;
+	p->w[p->n].val = val;
+	p->n++;
+}
+
+void afe_cfg_expected_regs(const afe_cfg_t *cfg, afe_plan_t *out)
+{
+	if (cfg == NULL || out == NULL) {
+		return;
+	}
+	memset(out, 0, sizeof(*out));
+	expected_push(out, MAX30131_REG_SYSTEM_CONTROL, byte_14(cfg));
+	expected_push(out, MAX30131_REG_S1_CONFIG1, byte_20(cfg));
+	expected_push(out, MAX30131_REG_S1_CONFIG2, byte_21(cfg));
+	expected_push(out, MAX30131_REG_S1_CONFIG3,
+		      max30131_enc_s1_config3(cfg->ios, false));
+	expected_push(out, MAX30131_REG_S1_CONFIG4,
+		      max30131_enc_s1_config4(cfg->fsr, cfg->off));
+	expected_push(out, MAX30131_REG_S1_CONFIG5,
+		      max30131_enc_s1_config5(cfg->conv, cfg->sensor_selected));
+	expected_push(out, MAX30131_REG_SYS_ADC_SETUP, byte_54(cfg));
+	expected_push(out, MAX30131_REG_SYS_ADC_IN_SEL1, byte_55(cfg));
+	expected_push(out, MAX30131_REG_SYS_ADC_IN_SEL2, byte_56(cfg));
+	expected_push(out, MAX30131_REG_CONVERT_SETUP1, byte_80(cfg));
+	expected_push(out, MAX30131_REG_CONVERT_SETUP2, byte_81(cfg));
+}
+
+bool afe_cfg_verify_snapshot_ok(bool registers_ok, bool status_read_ok,
+				bool register_desynced)
+{
+	return registers_ok && status_read_ok && !register_desynced;
 }
 
 /* ------------------------------------------------------------------ */
@@ -664,7 +771,8 @@ size_t afe_cfg_fmt_applied(uint32_t ep, int64_t ms, const char *src,
 		"fsr=%d fsr0=%d off=%d off0=%d conv=%u conv0=%u conv_src=%s "
 		"period=%u period0=%u sysper=%u sysper0=%u clk40=%d clk400=%d "
 		"e_mv=%d e_mv0=%d vwe_mv=%d vwe_mv0=%d ioc=%u ioc0=%u "
-		"idle=%d idle0=%d cellv=%d cellv0=%d chop=%d chop0=%d "
+		"idle=%d idle0=%d cellv=%d cellv0=%d satpct=%u satpct0=%u "
+		"chop=%d chop0=%d "
 		"rs=%d rs0=%d ios=%d ios0=%d sel=%d sel0=%d amps=%d amps0=%d",
 		ep, (long long)ms, src == NULL ? "?" : src, nlines, forced ? 1 : 0,
 		plan->perturbs_cell ? 1 : 0, plan->n, plan->skipped,
@@ -674,6 +782,7 @@ size_t afe_cfg_fmt_applied(uint32_t ep, int64_t ms, const char *src,
 		c->clk40 ? 1 : 0, o->clk40 ? 1 : 0,
 		c->e_mv, o->e_mv, c->vwe_mv, o->vwe_mv, c->ioc, o->ioc,
 		(int)c->idle, (int)o->idle, c->cellv ? 1 : 0, o->cellv ? 1 : 0,
+		c->satpct, o->satpct,
 		c->chop ? 1 : 0, o->chop ? 1 : 0, c->rs ? 1 : 0, o->rs ? 1 : 0,
 		c->ios ? 1 : 0, o->ios ? 1 : 0,
 		c->sensor_selected ? 1 : 0, o->sensor_selected ? 1 : 0,

@@ -11,14 +11,7 @@
 #define BOARD_GUARDS_H_
 
 /*
- * 在任何会启动 USB/AFE 的外设初始化之前调用。V4.0 是只读 no-op;
- * V5.1 会审计 UICR/供电模式并强制关闭未装电感的 REG1 DC/DC。
- * 这里不会启动看门狗,因此可以安全地等待 USB 主机打开 DATA 口。
- */
-int board_guards_preflight(void);
-
-/*
- * 传输建立后调用。
+ * 开机尽早调用(main 的第一件事)。
  * 返回 0 成功;负 errno 表示看门狗装不上(此时**不要**继续跑采集,
  * 因为失去了 brownout 的唯一自恢复路径)。
  */

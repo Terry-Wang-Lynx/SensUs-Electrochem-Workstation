@@ -1,0 +1,48 @@
+# SensUs Electrochem Workstation — Windows Makefile
+# 使用: make -f Makefile.win <目标>
+# 或直接使用: .\windows\build_win.bat 等脚本
+
+PYTHON ?= python
+VENV := .venv
+VENV_PYTHON := $(VENV)/Scripts/python
+VENV_PIP := $(VENV)/Scripts/pip
+
+.PHONY: install run test clean package help
+
+help:
+	@echo SensUs 电化学工作站 — Windows 构建目标
+	@echo.
+	@echo   make -f Makefile.win install         创建 venv 并安装依赖
+	@echo   make -f Makefile.win run              启动 GUI 服务器
+	@echo   make -f Makefile.win test             运行测试
+	@echo   make -f Makefile.win package          生成 wheel 和源码分发包
+	@echo   make -f Makefile.win clean            清理构建产物
+	@echo.
+	@echo 一键启动(双击): Launch_Electrochem_Workstation.bat
+	@echo 打包为 EXE:      windows\build_win.bat
+
+install:
+	$(PYTHON) -m venv $(VENV)
+	$(VENV_PIP) install -e ".[dev,analysis]"
+
+run:
+	set SENSUS_PROJECT_DIR=$(CURDIR) && $(VENV_PYTHON) -m pa_host.gui_server --open-browser
+
+test:
+	$(VENV_PYTHON) -m pytest -q software/host/tests
+	$(VENV_PYTHON) -m compileall -q software/host/pa_host
+	node --check software/host/pa_host/gui/app.js
+	node --check software/host/pa_host/gui/compact.js
+
+firmware-test:
+	cd software/firmware/tests && make clean all
+
+package: clean-package
+	$(VENV_PYTHON) -m build
+
+clean-package:
+	del /q build dist software\host\*.egg-info 2>nul || true
+
+clean:
+	del /q build dist software\host\*.egg-info 2>nul || true
+	del /q .venv-installed 2>nul || true

@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""实时收数落盘 —— 从固件文本传输读行,校验后追加写 CSV。
+"""实时收数落盘 —— 从固件 RTT 读行,校验后追加写 CSV。
 
 用途
     A 段(实时):把固件经 SEGGER RTT 吐出的行协议落成 CSV,边收边做完整性检查。
     B 段(离线)交给 analyze.py。两段刻意分开:收数不能因为分析崩掉而丢数据。
 
-四种取数来源
+三种取数来源
     --start-jlink   ★推荐★ 自己起 RTT 桥(JLinkExe/OpenOCD),从 telnet 19021 读
     --socket H:P    连一个已经在跑的 RTT telnet 服务
     --tail FILE     跟读一个 RTT 日志文件(你自己起的 logger)
-    --serial PORT   V5.1 USB DATA CDC(文本行/命令双向)
 
 用法
     # 最常用:一条命令搞定(RTT 地址自动从 ELF 提取)
@@ -63,12 +62,20 @@ from .record import (
 # 首选已验证的 V8.80;路径来自 STM32CubeIDE 自带的 J-Link 工具链。
 # 若 CubeIDE 被移除，回退到启用 libjaylink 的开源 OpenOCD：它仍通过同一个
 # RTT 端口向上层提供完全相同的行协议，不改测量和解析逻辑。
-JLINK_V880_DIR = Path(
+_IS_WIN = sys.platform == "win32"
+
+JLINK_V880_DIR_MACOS = Path(
     "/Applications/STM32CubeIDE.app/Contents/Eclipse/plugins/"
     "com.st.stm32cube.ide.mcu.externaltools.jlink.macos64_2.5.100.202509120932/tools/bin"
 )
+# Windows: SEGGER J-Link 默认安装路径
+JLINK_DIR_WIN = Path("C:/Program Files/SEGGER/JLink")
+# Windows: STM32CubeIDE 自带的 J-Link
+JLINK_CUBEIDE_WIN = Path("C:/ST/STM32CubeIDE/STM32CubeIDE/plugins/"
+    "com.st.stm32cube.ide.mcu.externaltools.jlink.win32_2.5.100.202509120932/tools/bin")
+
 def _resolve_jlink_exe() -> Path:
-    """选 JLinkExe:显式 env > V8.80 > PATH。
+    """选 JLinkExe (Windows: JLink.exe):显式 env > V8.80 > PATH。
 
     🔴 这个顺序不能反。本机 `shutil.which("JLinkExe")` 解析到
     /usr/local/bin/JLinkExe → /Applications/SEGGER/JLink_V946/JLinkExe = V9.46,
@@ -77,18 +84,41 @@ def _resolve_jlink_exe() -> Path:
     原实现把 which() 排在 V8.80 前面 ⇒ 本文件顶部「只能用 V8.80」的注释
     与实际行为相反,默认就挑中了坏的那支。2026-08-09 修。
     """
+    jlink_name = "JLink.exe" if _IS_WIN else "JLinkExe"
     override = os.environ.get("SENSUS_JLINK_EXE")
     if override:
         return Path(override)
-    v880 = JLINK_V880_DIR / "JLinkExe"
-    if v880.exists():
-        return v880
-    found = shutil.which("JLinkExe")
+    # 按优先级搜索各平台已知位置
+    candidates: list[Path] = []
+    if _IS_WIN:
+        candidates = [
+            JLINK_CUBEIDE_WIN / jlink_name,
+            JLINK_DIR_WIN / jlink_name,
+        ]
+    else:
+        candidates = [JLINK_V880_DIR_MACOS / jlink_name]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    found = shutil.which(jlink_name)
     if found:
-        print(f"[collect] ⚠️ 回退到 PATH 里的 {found};若是 V9.x 会连不上克隆探头,"
-              f"请设 SENSUS_JLINK_EXE 指向 V8.80", file=sys.stderr)
-        return Path(found)
-    return v880
+        try:
+            probe = subprocess.run(
+                [found, "-version"], capture_output=True, text=True, timeout=5,
+                check=False,
+            )
+            banner = f"{probe.stdout}\n{probe.stderr}"
+        except (OSError, subprocess.TimeoutExpired):
+            banner = ""
+        if "V8.80" in banner:
+            return Path(found)
+        print(
+            f"[collect] PATH 里的 {found} 不是已验证的 V8.80;"
+            "自动使用 OpenOCD 兼容通道",
+            file=sys.stderr,
+        )
+    # Return a deliberately absent path so callers select the OpenOCD branch.
+    return Path("/__sensus_no_compatible_jlink__/JLinkExe")
 
 
 JLINK_EXE = _resolve_jlink_exe()
@@ -97,22 +127,41 @@ JLINK_EXE = _resolve_jlink_exe()
 def _resolve_openocd() -> tuple[Path, Path]:
     """选取启用 J-Link 驱动的 OpenOCD 及其 scripts 目录。"""
     configured = os.environ.get("SENSUS_OPENOCD_EXE")
-    candidates = [Path(configured).expanduser()] if configured else []
-    candidates.extend([
-        Path.home() / ".local/share/sensus-openocd-jlink/bin/openocd",
-        Path(shutil.which("openocd") or "/nonexistent/openocd"),
-    ])
+    candidates: list[Path] = [Path(configured).expanduser()] if configured else []
+    if _IS_WIN:
+        openocd_name = "openocd.exe"
+        candidates.extend([
+            Path(os.environ.get("OPENOCD_HOME", "")) / "bin" / openocd_name,
+            Path("C:/Program Files/OpenOCD/bin") / openocd_name,
+            Path.home() / ".local/share/sensus-openocd-jlink/bin" / openocd_name,
+            Path(shutil.which("openocd") or "openocd.exe"),
+        ])
+    else:
+        candidates.extend([
+            Path.home() / ".local/share/sensus-openocd-jlink/bin/openocd",
+            Path("/opt/homebrew/bin/openocd"),
+            Path("/usr/local/bin/openocd"),
+            Path(shutil.which("openocd") or "/nonexistent/openocd"),
+        ])
     executable = next((path for path in candidates if path.exists()), candidates[0])
 
     configured_scripts = os.environ.get("SENSUS_OPENOCD_SCRIPTS")
-    script_candidates = (
+    script_candidates: list[Path] = (
         [Path(configured_scripts).expanduser()] if configured_scripts else []
     )
-    script_candidates.extend([
-        executable.parent.parent / "share/openocd/scripts",
-        Path("/opt/homebrew/share/openocd/scripts"),
-        Path("/usr/local/share/openocd/scripts"),
-    ])
+    if _IS_WIN:
+        script_candidates.extend([
+            executable.parent.parent / "share/openocd/scripts",
+            Path(os.environ.get("OPENOCD_HOME", "")) / "share/openocd/scripts",
+            Path("C:/Program Files/OpenOCD/share/openocd/scripts"),
+            Path.home() / ".local/share/sensus-openocd-jlink/share/openocd/scripts",
+        ])
+    else:
+        script_candidates.extend([
+            executable.parent.parent / "share/openocd/scripts",
+            Path("/opt/homebrew/share/openocd/scripts"),
+            Path("/usr/local/share/openocd/scripts"),
+        ])
     scripts = next(
         (path for path in script_candidates
          if (path / "interface/jlink.cfg").exists()),
@@ -124,10 +173,21 @@ def _resolve_openocd() -> tuple[Path, Path]:
 OPENOCD_EXE, OPENOCD_SCRIPTS = _resolve_openocd()
 
 # 从 ELF 提 _SEGGER_RTT 用
+if _IS_WIN:
+    _ZEPHYR_SDK_NM_DEFAULT = Path(
+        os.environ.get("ZEPHYR_SDK_HOME", str(Path.home() / "zephyr-sdk-1.0.1"))
+    ) / "gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-nm.exe"
+else:
+    _ZEPHYR_SDK_NM_DEFAULT = Path(
+        os.environ.get(
+            "SENSUS_ZEPHYR_SDK_DIR",
+            str(Path.home() / "sensus-toolchains/zephyr-sdk-1.0.1"),
+        )
+    ).expanduser() / "gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-nm"
 ZEPHYR_SDK_NM = Path(
     os.environ.get("SENSUS_ARM_NM")
     or shutil.which("arm-zephyr-eabi-nm")
-    or (Path.home() / "zephyr-sdk-1.0.1/gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-nm")
+    or _ZEPHYR_SDK_NM_DEFAULT
 )
 
 DEVICE = "nRF52833_xxAA"
@@ -137,10 +197,59 @@ RTT_TELNET_PORT = 19021
 # 🔴 按**挂钟时间**重发,不依赖 socket 空闲 —— 固件仍在吐上一轮数据时永不空闲。
 TRIGGER_RESEND_INTERVAL_S = 1.0
 TRIGGER_MAX_RESENDS = 20
-SERIAL_TRIGGER_RESEND_INTERVAL_S = 3.0
 # 命令文件轮询间隔(方案 C:外部命令经采集器 socket 转发给固件)
 CMD_POLL_INTERVAL_S = 0.5
 DEFAULT_ELF = Path("/tmp/pabuild/firmware/zephyr/zephyr.elf")
+
+
+class _AcquisitionDuration:
+    """Measure a collection timeout from the confirmed acquisition start."""
+
+    def __init__(self, duration_s: float | None) -> None:
+        self.duration_s = duration_s
+        self.started_at_s: float | None = None
+
+    def mark_started(self, now_s: float) -> None:
+        if self.started_at_s is None:
+            self.started_at_s = now_s
+
+    def expired(self, now_s: float) -> bool:
+        return bool(
+            self.duration_s
+            and self.started_at_s is not None
+            and now_s - self.started_at_s > self.duration_s
+        )
+
+
+def _split_complete_lines(text: str, pending: str = "") -> tuple[list[str], str]:
+    """Split an append-only command stream without dropping a partial line."""
+    combined = pending + text
+    if not combined:
+        return [], ""
+    chunks = combined.splitlines(keepends=True)
+    if chunks and not chunks[-1].endswith(("\n", "\r")):
+        pending = chunks.pop()
+    else:
+        pending = ""
+    return [chunk.rstrip("\r\n") for chunk in chunks], pending
+
+
+def _encode_firmware_command(command: str) -> bytes:
+    """Encode one firmware command, rejecting characters RTT cannot carry."""
+    normalized = command.rstrip("\r\n")
+    try:
+        return (normalized + "\n").encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("firmware commands only support ASCII characters") from exc
+
+
+def _firmware_command_arg(value: str) -> str:
+    """Argparse adapter that reports non-ASCII trigger commands cleanly."""
+    try:
+        _encode_firmware_command(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -155,7 +264,21 @@ def find_rtt_address(elf: Path) -> int:
     if not elf.exists():
         sys.exit(f"找不到 ELF: {elf}\n→ 用 --rtt-address 手动给,或用 --elf 指对路径")
     if not ZEPHYR_SDK_NM.exists():
-        sys.exit(f"找不到 nm: {ZEPHYR_SDK_NM}\n→ 用 --rtt-address 手动给")
+        metadata_candidates = [
+            elf.parent / "firmware.json",
+            elf.parents[3] / "prebuilt/firmware.json" if len(elf.parents) > 3 else elf,
+        ]
+        for metadata in metadata_candidates:
+            try:
+                payload = json.loads(metadata.read_text(encoding="utf-8"))
+                value = payload["rtt_address"]
+                return int(value, 0) if isinstance(value, str) else int(value)
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        sys.exit(
+            f"找不到 nm: {ZEPHYR_SDK_NM}，也无法从固件元数据读取 RTT 地址\n"
+            "→ 安装固件工具链，或用 --rtt-address 手动给"
+        )
 
     out = subprocess.run(
         [str(ZEPHYR_SDK_NM), str(elf)], capture_output=True, text=True, check=False
@@ -254,10 +377,15 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
     #    所以这个坑从上行日志上看不出来。
     #    重发直到看见 `IT_START` 为止;看见就立刻停 —— 固件的运行态循环同样接
     #    CONTROL_START,多发一条会被当成再起一轮。
-    trigger_command = "START" if trigger == "FRESH_START" else trigger
+    # ARMED 只建立 RTT/命令通道，不立刻启动测量。Debug 首次进入时用它先 GET
+    # 设备真值，再经 cmd_file 发 SET → START。它不能等同于 trigger=None：后者
+    # 会让 collector 把连接前缓冲里的旧 IT_START/S 行误当成本轮数据。
+    armed_only = trigger == "ARMED"
+    trigger_command = None if armed_only else (
+        "START" if trigger == "FRESH_START" else trigger
+    )
     trigger_bytes = (
-        (trigger_command.rstrip("\r\n") + "\n").encode("ascii")
-        if trigger_command else None
+        _encode_firmware_command(trigger_command) if trigger_command else None
     )
     trigger_pending = trigger_bytes is not None
     resends = 0
@@ -285,6 +413,8 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
     #    不截断文件 ⇒ 无写读竞态,事后还能查发过什么。
     last_cmd_poll = 0.0
     cmd_pos = 0
+    cmd_pending = ""
+    armed_start_sent = False
     with sock:
         while True:
             # 与重发同理:必须在循环顶部按**挂钟时间**判。数据以 8 样本/秒连续流入时
@@ -294,15 +424,37 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                 last_cmd_poll = time.monotonic()
                 try:
                     if cmd_file.exists():
-                        with cmd_file.open("r", encoding="utf-8") as fh:
+                        with cmd_file.open("r", encoding="utf-8", errors="replace") as fh:
                             fh.seek(cmd_pos)
                             fresh = fh.read()
                             cmd_pos = fh.tell()
-                        for raw_cmd in fresh.splitlines():
+                        command_lines, cmd_pending = _split_complete_lines(
+                            fresh, cmd_pending
+                        )
+                        for raw_cmd in command_lines:
                             raw_cmd = raw_cmd.strip()
                             if not raw_cmd or raw_cmd.startswith("#"):
                                 continue
-                            sock.sendall((raw_cmd + "\n").encode("ascii"))
+                            try:
+                                command_bytes = _encode_firmware_command(raw_cmd)
+                            except ValueError as exc:
+                                print(
+                                    f"[collect] ⚠️ 拒绝命令文件中的非 ASCII 命令:"
+                                    f"{raw_cmd!r} ({exc})",
+                                    file=sys.stderr,
+                                )
+                                continue
+                            sock.sendall(command_bytes)
+                            if armed_only and raw_cmd == "START":
+                                armed_start_sent = True
+                                trigger_command = "START"
+                                # RTT 已由 GET 确认，但 START 仍按普通 trigger 的规则
+                                # 重发到看见 IT_START 为止，不能把一次 sendall 当确认。
+                                trigger_bytes = b"START\n"
+                                trigger_pending = True
+                                resends = 0
+                                warned_unacked = False
+                                last_trigger_at = time.monotonic()
                             print(f"[collect] 已转发命令:{raw_cmd}", file=sys.stderr)
                 except OSError as exc:
                     print(f"[collect] ⚠️ 读命令文件失败:{exc}", file=sys.stderr)
@@ -358,6 +510,12 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                         parse_it_start(line) is not None
                         or parse_cv_start(line) is not None
                     )
+                    # ARMED 阶段允许 GET/CFG/CELL_V 上行通过，但忽略 RTT 缓冲里
+                    # 早于本次 START 的旧 IT_START。否则 outer collector 会提前
+                    # 打开采样门禁，把上一轮残留 S 行归到这轮。
+                    if armed_only and start_seen and not armed_start_sent:
+                        print("[collect] 忽略 ARMED 前的旧 START 标记", file=sys.stderr)
+                        continue
                     if trigger_pending and start_seen:
                         trigger_pending = False
                         print(f"[collect] 固件已确认 {trigger_command}"
@@ -388,140 +546,6 @@ def tail_lines(path: Path, idle_timeout: float | None = None):
                 if idle_timeout is not None and time.monotonic() - last_data > idle_timeout:
                     return
                 time.sleep(0.1)
-
-
-def read_serial_lines(port: str, baudrate: int = 115200,
-                      idle_timeout: float | None = None,
-                      trigger: str | None = None,
-                      cmd_file: Path | None = None,
-                      serial_factory=None):
-    """Read the unchanged line protocol from the V5.1 DATA CDC interface.
-
-    CDC ACM ignores the nominal baud rate, but pyserial requires one.  Opening
-    the port asserts DTR; V5.1 firmware intentionally waits for that event
-    before emitting ``CFG_BOOT``, so the first configuration identity cannot
-    be lost.  The second CDC interface is SMP and must never be passed here.
-    """
-    if serial_factory is None:
-        try:
-            import serial
-        except ImportError as exc:
-            raise SystemExit(
-                "USB 串口采集需要 pyserial>=3.5;请重新执行 pip install -e ."
-            ) from exc
-        serial_factory = serial.Serial
-
-    trigger_command = "START" if trigger == "FRESH_START" else trigger
-    trigger_bytes = (
-        (trigger_command.rstrip("\r\n") + "\n").encode("ascii")
-        if trigger_command else None
-    )
-    trigger_pending = trigger_bytes is not None
-    resends = 0
-    warned_unacked = False
-    last_trigger_at = 0.0
-    last_cmd_poll = 0.0
-    cmd_pos = 0
-    buf = b""
-    last_data = time.monotonic()
-
-    try:
-        stream_context = serial_factory(
-            port=port, baudrate=baudrate, timeout=0.1, write_timeout=1.0
-        )
-    except Exception as exc:
-        raise SystemExit(f"打不开 V5.1 DATA CDC {port}: {exc}") from exc
-
-    print(f"[collect] 已打开 V5.1 DATA CDC {port}(DTR=1)", file=sys.stderr)
-    with stream_context as stream:
-        # A persistent V5.1 app emits CELL_V while no host owns DATA.  macOS can
-        # hand the new reader the tail of that already-started line.  Sending
-        # START immediately used to concatenate that tail with IT_START, hide
-        # the anchored marker, and provoke a duplicate START/restart.  Discard
-        # exactly the first physical line, preserving any complete following
-        # lines already delivered in the same USB packet.
-        sync_deadline = time.monotonic() + 2.0
-        while b"\n" not in buf and time.monotonic() < sync_deadline:
-            try:
-                chunk = stream.read(4096)
-            except Exception as exc:
-                raise SystemExit(f"V5.1 DATA CDC 读取失败:{exc}") from exc
-            if chunk:
-                buf += chunk
-                last_data = time.monotonic()
-        if b"\n" in buf:
-            _discarded, buf = buf.split(b"\n", 1)
-            print("[collect] DATA CDC 已对齐到完整行边界", file=sys.stderr)
-        else:
-            buf = b""
-            print("[collect] ⚠️ DATA CDC 2s 内无可对齐行",
-                  file=sys.stderr)
-
-        # Make every acquisition self-describing.  GET/STATUS are read-only
-        # and are queued before START, so CFG_APPLIED/DERIVED/CONFIRMED and a
-        # fresh STATUS1 audit are captured in the same raw log as the samples.
-        preamble = b"GET\nSTATUS\n" + (trigger_bytes or b"")
-        stream.write(preamble)
-        stream.flush()
-        if trigger_pending:
-            resends = 1
-            last_trigger_at = time.monotonic()
-
-        while True:
-            now = time.monotonic()
-            if cmd_file is not None and now - last_cmd_poll >= CMD_POLL_INTERVAL_S:
-                last_cmd_poll = now
-                try:
-                    if cmd_file.exists():
-                        with cmd_file.open("r", encoding="utf-8") as fh:
-                            fh.seek(cmd_pos)
-                            fresh = fh.read()
-                            cmd_pos = fh.tell()
-                        for raw_cmd in fresh.splitlines():
-                            raw_cmd = raw_cmd.strip()
-                            if not raw_cmd or raw_cmd.startswith("#"):
-                                continue
-                            stream.write((raw_cmd + "\n").encode("ascii"))
-                            stream.flush()
-                            print(f"[collect] 已经 DATA CDC 转发命令:{raw_cmd}",
-                                  file=sys.stderr)
-                except OSError as exc:
-                    print(f"[collect] ⚠️ 读命令文件失败:{exc}", file=sys.stderr)
-
-            if trigger_pending and \
-                    now - last_trigger_at >= SERIAL_TRIGGER_RESEND_INTERVAL_S:
-                if resends < TRIGGER_MAX_RESENDS:
-                    stream.write(trigger_bytes)
-                    stream.flush()
-                    resends += 1
-                    last_trigger_at = now
-                elif not warned_unacked:
-                    warned_unacked = True
-                    print(f"[collect] 🔴 DATA CDC 重发 {resends} 次仍未收到干净的 "
-                          f"IT_START/CV_START", file=sys.stderr)
-
-            try:
-                chunk = stream.read(4096)
-            except Exception as exc:
-                raise SystemExit(f"V5.1 DATA CDC 读取失败:{exc}") from exc
-            if chunk:
-                last_data = time.monotonic()
-                buf += chunk
-                while b"\n" in buf:
-                    raw, buf = buf.split(b"\n", 1)
-                    line = raw.decode("utf-8", "replace")
-                    start_seen = (
-                        parse_it_start(line) is not None
-                        or parse_cv_start(line) is not None
-                    )
-                    if trigger_pending and start_seen:
-                        trigger_pending = False
-                        print(f"[collect] 固件已确认 {trigger_command}"
-                              f"(DATA CDC 重发 {resends} 次)", file=sys.stderr)
-                    yield line
-            elif idle_timeout is not None and \
-                    time.monotonic() - last_data > idle_timeout:
-                return
 
 
 # --------------------------------------------------------------------------
@@ -653,64 +677,83 @@ def parse_audit(line: str) -> dict[str, object] | None:
     return event
 
 
-# `cfg_events.csv` 的列 = 每个 epoch 一行宽表(给分析脚本按 epoch join 电流 CSV 用)。
+# `cfg_events.csv` 的列 = 每个已确认快照一行宽表。同一 epoch 的 GET 回读
+# 会用 req 区分，既可按 epoch join 电流 CSV，也不会被开机快照吞掉。
 # 只收 CFG_APPLIED + CFG_DERIVED 的字段,其余事件只进 audit.jsonl。
 CFG_EVENT_COLUMNS = (
     "host_unix_s", "ep", "src", "nlines", "forced", "perturbs_cell", "nregs",
     "skipped",
     "fsr", "off", "conv", "conv_src", "period", "sysper", "clk40", "ioc",
-    "e_mv", "vwe_mv", "idle", "cellv", "chop", "rs", "ios", "sel", "amps",
+    "e_mv", "vwe_mv", "idle", "cellv", "chop", "rs", "ios", "satpct",
+    "sel", "amps",
     "fsr_pa", "off_pa", "bits", "conv_ms", "period_ms", "idle_ppm",
     "lsb_frame_fa", "lsb_eff_fa", "rej50_db_x10", "rej50_worst_db_x10",
     "conv_alt", "red_max_pa", "ox_max_pa", "sat_margin", "sat_margin_pa",
     "sysbudget_ms", "sysper_ms", "daca", "dacb",
     "idle_warn", "headroom_warn", "sig_warn",
-    "status1", "invalid_cfg", "confirmed",
+    "status1", "invalid_cfg", "vdd_oor", "verify_ok", "req", "confirmed",
 )
 
 
 class CfgEventAccumulator:
-    """把同一个 epoch 的 APPLIED/DERIVED/CONFIRMED 三行合成一行宽表。
+    """把同一 (epoch, req) 的 APPLIED/DERIVED/CONFIRMED 合成宽表。
 
-    ⚠️ 只在 `CFG_CONFIRMED`(或该 epoch 结束)时才落盘 —— 未确认的 epoch 不该
+    ⚠️ 只在 `CFG_CONFIRMED` 时才落盘 —— 未确认的 epoch 不该
     出现在宽表里,否则分析脚本会把一个被回滚掉的配置当成生效过的配置。
     未确认的行仍在 audit.jsonl 里,不丢信息。
     """
 
     def __init__(self) -> None:
-        self.pending: dict[int, dict[str, object]] = {}
+        self.pending: dict[tuple[int, str | None], dict[str, object]] = {}
         self.rows: list[list[str]] = []
-        self._done: set[int] = set()
+        self._done: set[tuple[int, str | None]] = set()
+        self._faulted: set[tuple[int, str | None]] = set()
 
-    def feed(self, event: dict[str, object]) -> list[str] | None:
+    @staticmethod
+    def _key(event: dict[str, object]) -> tuple[int, str | None] | None:
         ep = event.get("ep")
         if not isinstance(ep, int):
             return None
+        request_id = event.get("req")
+        request_key = (
+            str(request_id) if request_id not in (None, "", "-") else None
+        )
+        return ep, request_key
+
+    def feed(self, event: dict[str, object]) -> list[str] | None:
+        key = self._key(event)
+        if key is None:
+            return None
+        ep, _request_id = key
         kind = event["kind"]
         if kind in ("CFG_APPLIED", "CFG_DERIVED"):
-            row = self.pending.setdefault(ep, {"ep": ep, "confirmed": 0})
+            row = self.pending.setdefault(key, {"ep": ep, "confirmed": 0})
             row.update({k: v for k, v in event.items()
                         if k not in ("kind", "raw")})
             return None
         if kind == "CFG_CONFIRMED":
-            row = self.pending.pop(ep, {"ep": ep})
+            row = self.pending.pop(key, {"ep": ep})
             row.update({k: v for k, v in event.items()
                         if k not in ("kind", "raw")})
+            if key in self._faulted or row.get("verify_ok") not in (None, 1):
+                self._done.add(key)
+                return None
             row["confirmed"] = 1
-            # 🔴 两道去重,否则宽表违反"每 epoch 一行"的契约:
+            # 🔴 两道去重,否则宽表会产生空壳或重复快照:
             #   ① 没有 CFG_DERIVED(没有 bits)的行是**空壳**——开机时
             #      CFG_BOOT+CFG_CONFIRMED 会先到,派生量还没来,落进去就是一行全空
-            #   ② 同一 epoch 只留第一条完整的(GET 重放会对同一 epoch 再报一次)
+            #   ② 同一 (epoch, req) 只留第一条完整快照
             if row.get("bits") in (None, ""):
                 return None
-            if ep in self._done:
+            if key in self._done:
                 return None
-            self._done.add(ep)
+            self._done.add(key)
             out = [str(row.get(c, "")) for c in CFG_EVENT_COLUMNS]
             self.rows.append(out)
             return out
         if kind in ("CFG_ROLLBACK", "CFG_FAULT"):
-            self.pending.pop(ep, None)  # 回滚掉的 epoch 不进宽表
+            self.pending.pop(key, None)
+            self._faulted.add(key)
         return None
 
 
@@ -765,7 +808,7 @@ def parse_cv_aborted(line: str) -> tuple[str, int, int] | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="从 RTT/USB CDC 实时收数并落盘 CSV")
+    ap = argparse.ArgumentParser(description="从 RTT 实时收数并落盘 CSV")
     ap.add_argument("--out", required=True, type=Path, help="输出 CSV 路径")
     ap.add_argument("--raw-log", type=Path,
                     help="可选:同时保存未解析的 RTT 原始行(含启动/标定日志)")
@@ -775,8 +818,8 @@ def main(argv: list[str] | None = None) -> int:
                          "所以必须独立成文件")
     ap.add_argument("--audit", type=Path,
                     help="配置变更审计 jsonl(默认 <out 的 stem>-audit.jsonl)。"
-                         "同时在旁边写 <...>-audit-cfg.csv:每个**已确认**的 epoch "
-                         "一行宽表,便于按 epoch 分段解释电流 CSV")
+                         "同时在旁边写 <...>-audit-cfg.csv:每个**已确认**"
+                         "的配置快照一行,便于按 epoch 分段解释电流 CSV")
 
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--start-jlink", action="store_true",
@@ -787,8 +830,6 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--socket", metavar="HOST:PORT",
                      help="连已在跑的 RTT telnet(如 127.0.0.1:19021)")
     src.add_argument("--tail", type=Path, help="跟读一个 RTT 日志文件")
-    src.add_argument("--serial", metavar="PORT",
-                     help="V5.1 DATA CDC,如 /dev/cu.usbmodemXXXX。不得填 SMP 口")
 
     ap.add_argument("--elf", type=Path, default=DEFAULT_ELF,
                     help=f"用于自动提取 RTT 控制块地址的 ELF(默认 {DEFAULT_ELF})")
@@ -819,7 +860,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="10Hz i-t 工作流:接受固件 AUTO 原生约8Hz样本,交由上位机重采样")
     ap.add_argument("--cv", action="store_true",
                     help="CV 工作流:等待 CV 标记并保存逐点电位、圈数与方向")
-    ap.add_argument("--trigger", default=None,
+    ap.add_argument("--trigger", default=None, type=_firmware_command_arg,
                     help="连接 RTT 后发送命令，并等待对应 IT_START 后再收数")
     args = ap.parse_args(argv)
 
@@ -839,10 +880,6 @@ def main(argv: list[str] | None = None) -> int:
                                   idle_timeout=args.idle_timeout,
                                   trigger=args.trigger,
                                   trigger_state=trigger_state)
-    elif args.serial:
-        lines = read_serial_lines(args.serial, cmd_file=args.cmd_file,
-                                  idle_timeout=args.idle_timeout,
-                                  trigger=args.trigger)
     else:
         lines = tail_lines(args.tail, args.idle_timeout)
 
@@ -895,8 +932,10 @@ def main(argv: list[str] | None = None) -> int:
     potential_fault: str | None = None
     aborted_reason: str | None = None
     acquisition_started = args.trigger is None
+    acquisition_duration = _AcquisitionDuration(args.duration)
+    if acquisition_started:
+        acquisition_duration.mark_started(time.monotonic())
     stop = False
-    t0 = time.monotonic()
     new_file = not args.out.exists() or args.out.stat().st_size == 0
 
     def _on_sigint(_sig, _frm):
@@ -905,11 +944,18 @@ def main(argv: list[str] | None = None) -> int:
         print("\n[collect] 收到 Ctrl-C,收尾…", file=sys.stderr)
 
     signal.signal(signal.SIGINT, _on_sigint)
-    # GUI 停止测量走 killpg(SIGTERM)。SIGTERM 的默认动作会立刻终止本进程,
-    # 下面的 finally 不执行 —— 探头仍会释放(进程一死,stdin 管道 EOF 就把
-    # JLinkExe 带走,2026-08-09 已实测),但 CSV 收尾与统计行不会写完。
-    # 接住它是为了让用户点「停止」时数据文件是完整收尾的。
-    signal.signal(signal.SIGTERM, _on_sigint)
+    # GUI 停止测量走 killpg(SIGTERM),Windows 走 taskkill(SIGBREAK)。
+    # 默认动作会立刻终止本进程,下面的 finally 不执行 —— 探头仍会释放
+    # (进程一死,stdin 管道 EOF 就把 JLinkExe 带走,2026-08-09 已实测),
+    # 但 CSV 收尾与统计行不会写完。接住它是为了让用户点「停止」时数据
+    # 文件是完整收尾的。
+    if _IS_WIN:
+        try:
+            signal.signal(signal.SIGBREAK, _on_sigint)  # type: ignore[attr-defined]
+        except (ValueError, AttributeError):
+            pass
+    else:
+        signal.signal(signal.SIGTERM, _on_sigint)
 
     raw_out = args.raw_log.open("w", buffering=1) if args.raw_log else None
     # 电极电压独立 CSV,默认放在电流 CSV 旁边(<stem>-cellv.csv)。
@@ -923,7 +969,7 @@ def main(argv: list[str] | None = None) -> int:
         cell_v_out.write(",".join(CELL_V_COLUMNS) + "\n")
     # 配置变更审计。两份产物,用途不同:
     #   audit.jsonl   每行一个事件(含原始行)—— 复盘"当时到底发生了什么"
-    #   cfg_events.csv 每 epoch 一行宽表 —— 给分析脚本按 epoch join 电流 CSV
+    #   cfg_events.csv 每个已确认快照一行 —— 给分析脚本按 epoch join 电流 CSV
     audit_path = args.audit or args.out.with_name(args.out.stem + "-audit.jsonl")
     cfg_csv_path = audit_path.with_name(audit_path.stem + "-cfg.csv")
     audit_new = not cfg_csv_path.exists() or cfg_csv_path.stat().st_size == 0
@@ -938,15 +984,14 @@ def main(argv: list[str] | None = None) -> int:
             out_ref["cur"] = out
             if new_file:
                 method = "CV" if args.cv else "IT"
-                board = "V5.1" if args.serial else "V4.0"
-                out.write(f"# pA-Converter {board} {method} 实时采集\n")
+                out.write(f"# pA-Converter V4.0 {method} 实时采集\n")
                 out.write(f"# 起始 unix 时间: {time.time():.3f}\n")
                 out.write(",".join(CSV_COLUMNS) + "\n")
 
             for line in lines:
                 if stop:
                     break
-                if args.duration and time.monotonic() - t0 > args.duration:
+                if acquisition_duration.expired(time.monotonic()):
                     print(f"[collect] 到达 --duration {args.duration}s,停止",
                           file=sys.stderr)
                     break
@@ -958,6 +1003,8 @@ def main(argv: list[str] | None = None) -> int:
                 clean_line = ANSI_RE.sub("", line)
                 started = parse_it_start(clean_line)
                 if started is not None:
+                    if not acquisition_started:
+                        acquisition_duration.mark_started(time.monotonic())
                     acquisition_started = True
                     run_number, target_mv = started
                     print(f"[collect] 固件开始第 {run_number} 轮 IT:E={target_mv}mV",
@@ -965,6 +1012,8 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 cv_started = parse_cv_start(clean_line)
                 if cv_started is not None:
+                    if not acquisition_started:
+                        acquisition_duration.mark_started(time.monotonic())
                     acquisition_started = True
                     run_number, low_mv, high_mv, rate_mv_s, cycles = cv_started
                     print(f"[collect] 固件开始第 {run_number} 轮 CV:"
@@ -1064,7 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"CSV 里已插入 `# --- 固件复位` 标记行", file=sys.stderr)
         if audit_rows:
             print(f"[collect] 配置审计 {audit_rows} 条 → {audit_path}"
-                  f"({len(audit_acc.rows)} 个已确认 epoch → {cfg_csv_path})",
+                  f"({len(audit_acc.rows)} 个已确认快照 → {cfg_csv_path})",
                   file=sys.stderr)
         else:
             print("[collect] ⚠️ 未收到任何配置审计行 —— 固件版本可能早于 2026-08-10",
@@ -1096,16 +1145,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if not samples:
         print("⚠️ 一个样本都没收到。排查顺序:", file=sys.stderr)
-        if args.serial:
-            print("   1) 传入的是 DATA CDC 而不是 SMP CDC 吗", file=sys.stderr)
-            print("   2) CFG_BOOT/IT_READY 是否出现在 raw log", file=sys.stderr)
-            print("   3) USB-C 插头方向是否为当前硬件可枚举的方向", file=sys.stderr)
-        else:
+        if sys.platform == "darwin":
             print("   1) ioreg -p IOUSB -l -w 0 | grep J_Link   ← 探头还在 USB 上?",
                   file=sys.stderr)
-            print("   2) V8.80 的 JLinkExe 能 connect 吗(V9.46 一定不行)", file=sys.stderr)
-            print("   3) RTT 地址对吗:nm zephyr.elf | grep _SEGGER_RTT", file=sys.stderr)
-            print("   4) 固件真的在跑吗(halt 看 PC;空片是 0xFFFFFFFE)", file=sys.stderr)
+        elif sys.platform == "win32":
+            print("   1) 检查设备管理器 → 通用串行总线设备 → J-Link   ← 探头还在 USB 上?",
+                  file=sys.stderr)
+        else:
+            print("   1) lsusb | grep J-Link   ← 探头还在 USB 上?",
+                  file=sys.stderr)
+        print("   2) V8.80 的 JLinkExe 能 connect 吗(V9.46 一定不行)", file=sys.stderr)
+        print("   3) RTT 地址对吗:nm zephyr.elf | grep _SEGGER_RTT", file=sys.stderr)
+        print("   4) 固件真的在跑吗(halt 看 PC;空片是 0xFFFFFFFE)", file=sys.stderr)
         return 1
 
     rep = check_integrity(samples)

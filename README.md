@@ -1,8 +1,6 @@
 # SensUs Electrochemistry Workstation
 
-SensUs 是一套基于 MAX30131 与 nRF52833 的三电极电化学工作站软件。本仓库独立包含 Zephyr 固件、V4.0 RTT / V5.1 USB CDC 采集链路，以及面向实验人员的本地交互界面。
-
-V5.1 仅切换板级供电、启动和数据传输：MAX30131 寄存器配置、I-T/CV 状态机、FIFO/epoch/饱和判定、System ADC 电位审计和上位机解析都与 V4.0 共用同一份实现。V5.1 板级与安全启动说明见 [V5.1 board support](software/firmware/boards/senseus/pa_converter_v51/README.md)。
+SensUs 是一套基于 MAX30131 与 nRF52833 的三电极电化学工作站软件。本仓库独立包含 Zephyr 固件、RTT 采集链路，以及面向实验人员的本地交互界面。
 
 界面已经打通以下流程：
 
@@ -14,33 +12,20 @@ V5.1 仅切换板级供电、启动和数据传输：MAX30131 寄存器配置、
 - 未知样品浓度预测，以及可选的过渡期漂移 bias 校正
 - 按固定间隔自动测量，支持标定、稳定化和测试三种任务
 - 每轮原始数据、固定频率数据、摘要、图和实验索引自动落盘
+- 主机侧软件滤波：1--4 阶软件低通，支持自动/手动截止频率，以及仅显示或参与稳态分析/标定
 
 ## 一键启动
+
+### macOS
 
 macOS 上推荐使用原生悬浮窗口。首次构建一次：
 
 ```bash
 make app
-open "dist/SensUs Workstation.app"
+open “dist/SensUs Workstation.app”
 ```
 
-V5.1 使用独立 App；它走双 USB CDC、监听 8766，并与 V4 App 的 Bundle ID、
-窗口状态和日志目录隔离：
-
-```bash
-make app-v51
-open "dist/SensUs V5.1 Workstation.app"
-```
-
-V5.1 App 会按 USB 产品描述符和序列号锁定板卡；优先用只读状态流确认 DATA，
-空闲状态没有即时上行时则按本仓库 DTS 中 `CDC0=SMP、CDC1=DATA` 的声明核对
-macOS USB 接口布局。
-V5.1 当前 I-T 默认条件为 `-0.200 V / 150 s / 10 Hz 输出 / 末 20 s 拟合`，
-并保持 `2 µA FSR、10% offset、124 ms SENS_PERIOD、V_WE=1200 mV、idle=2`。
-界面可以在板卡未连接时启动，但“开始测量”会保持禁用；只有点击“应用条件并烧录硬件”
-时才会使用 SMP 进入 MCUboot 并上传签名固件。检测到多块 V5.1 板卡时会拒绝自动选择。
-
-App 同时提供完整工作站和迷你悬浮检测窗。点击主窗口标题栏的“画中画”按钮，或按
+App 同时提供完整工作站和迷你悬浮检测窗。点击主窗口标题栏的”画中画”按钮，或按
 `Command-Shift-O`，即可切换到悬浮模式；悬浮窗只保留实时电流、逐点曲线、进度、
 样品信息与开始/停止按钮，并可显示在 macOS 全屏视频上方。点击悬浮窗标题栏的
 “展开”按钮即可回到完整工作站。
@@ -63,26 +48,33 @@ make install
 make run
 ```
 
-V5.1 终端模式可让工作站自动识别 DATA/SMP：
-
-```bash
-PYTHONPATH=software/host .venv/bin/python3 -m pa_host.gui_server \
-  --transport v51 --port 8766 --open-browser
-```
-
-也可以明确传入 DATA CDC（不是 SMP CDC）：
-
-```bash
-PYTHONPATH=software/host .venv/bin/python3 -m pa_host.gui_server \
-  --transport serial --serial-port /dev/cu.usbmodemDATA --open-browser
-```
-
 构建并打开 macOS App：
 
 ```bash
 make app
-open "dist/SensUs Workstation.app"
+open “dist/SensUs Workstation.app”
 ```
+
+### Windows
+
+双击 **`Launch_Electrochem_Workstation.bat`** 即可启动。首次运行会自动创建
+Python 虚拟环境并安装依赖，然后打开浏览器进入工作站界面。
+
+或者使用命令行：
+
+```cmd
+make -f Makefile.win install
+make -f Makefile.win run
+```
+
+构建独立 Windows EXE（需要 PyInstaller）：
+
+```cmd
+windows\build_win.bat
+```
+
+详见 [windows/README.md](windows/README.md)。Windows 版本通过浏览器界面提供
+全部核心功能（I-T/CV 采集、标定、分析、预测），但不包含 macOS 的原生悬浮窗。
 
 App 直接加载本分支的完整工作站页面，并提供置顶主窗口和可选悬浮检测窗。
 DEBUG 分支与 App 外壳的边界、硬件换算约束和推荐配置见
@@ -105,6 +97,26 @@ CV 不进入 I-T 标定/浓度预测链。扫描结束后会生成原始 CSV、�
 `4 至 40 µA` 量程之间选择。
 
 测量不会自动跳到标定页。原始点在收到时就写入 `样品名称-已知浓度-raw.csv`；分析数据、摘要与图在一轮结束后立即生成。重复名称自动增加 `-r2`、`-r3`，不会覆盖历史数据。
+
+## 软件滤波
+
+“实时测量”和“硬件 DEBUG”页共用同一套主机侧滤波设置，点击“保存滤波设置”后
+立即用于图表和实时电流显示。实时预览与结束后的分析使用相同的重复一阶前后向
+算法和边界填充，因此同一组输入会得到一致结果。它不改写固件、MAX30131 的量程
+或恒电位环，也不会修改原始采集文件。
+
+- **关闭**：图表、实时读数和稳态统计都使用原始数据。
+- **仅显示**：图表和实时读数使用滤波派生值；稳态统计、标定点和预测仍使用原始数据。
+- **显示 + 稳态分析/标定**：图表和后端稳态统计使用同一套滤波；原始文件保留，
+  另写出 `resampled_10hz-filtered.csv`，导出到实验目录时对应文件名为 `*-filtered.csv`。
+
+低通支持 1--4 阶、自动或手动截止频率。滤波只作用于连续有效段，饱和点和 NaN
+不会把前后数据串在一起。设置保存在 `measurements/filter_settings.json`，每轮摘要
+也记录实际采样率、有效截止频率和提示信息。
+
+数字滤波必须满足奈奎斯特限制。当前 MAX30131 原生采样约 8.06 Hz，手动低通超出
+安全上限时软件会限制到奈奎斯特频率的 90% 并在面板提示。每轮实际使用的
+滤波配置会随摘要保存供审计；原始 CSV 始终保留，可以回溯或重新分析。
 
 ## 电位完整性
 

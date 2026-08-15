@@ -3,9 +3,8 @@
 The GUI deliberately uses only Python's standard library on the server side;
 the browser renders the plots with a small canvas-based frontend.  This keeps
 the one-click tool usable on the lab Mac without installing a desktop GUI
-toolkit. Hardware acquisition is delegated to ``pa_host.it_tool``. V4.0 uses
-RTT/J-Link; V5.1 uses its DATA USB CDC while retaining the same line protocol,
-parser and analysis pipeline.
+toolkit.  Hardware acquisition is still delegated to ``pa_host.it_tool`` so
+the tested RTT/J-Link path remains the single source of truth.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -36,6 +36,9 @@ from urllib.parse import parse_qs, urlparse
 from .it import (
     CalibrationPoint,
     CalibrationModel,
+    PlateauConfig,
+    evaluate_ap_score,
+    evaluate_platform,
     fit_calibration,
     load_calibration_points,
     load_model,
@@ -60,6 +63,19 @@ from .cv import (
     save_cv_summary,
     summarize_cv,
 )
+from .filtering import (
+    FILTER_DEFAULTS,
+    validate_filter_config,
+    write_filtered_csv,
+)
+from .live_metrics import (
+    PreparedLiveStage,
+    metrics_from_stage,
+    prepare_live_stage,
+)
+from .stability_eta import StabilityEtaEstimator
+
+_IS_WIN = sys.platform == "win32"
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -83,291 +99,143 @@ MEASUREMENT_DURATION_S = 180.0
 COLLECTOR_DURATION_S = 190.0
 TARGET_RATE_HZ = 10.0
 FIT_WINDOW_S = 20.0
-V51_IT_DURATION_S = 150.0
-FIRMWARE_ELF = PROJECT_DIR / "software" / "firmware" / "build" / "firmware" / "zephyr" / "zephyr.elf"
-FIRMWARE_HEX = PROJECT_DIR / "software" / "firmware" / "build" / "firmware" / "zephyr" / "zephyr.hex"
+MAX_PLATEAU_BACKFILL_WINDOWS = 32
+LIVE_ANALYSIS_REFRESH_S = 0.9
+CONFIG_GATE_GET_RETRY_S = 0.75
+CONFIG_GATE_LEGACY_PROBE_DELAY_S = 6.0
+FIRMWARE_BUILD_DIR = PROJECT_DIR / "software" / "firmware" / "build" / "firmware" / "zephyr"
+FIRMWARE_PREBUILT_DIR = PROJECT_DIR / "software" / "firmware" / "prebuilt"
 FIRMWARE_CONFIG = PROJECT_DIR / "software" / "firmware" / "src" / "measurement_config.h"
 SETTINGS_PATH = PROJECT_DIR / "measurements" / "gui_settings.json"
+FILTER_SETTINGS_PATH = PROJECT_DIR / "measurements" / "filter_settings.json"
+PLATEAU_SETTINGS_PATH = PROJECT_DIR / "measurements" / "plateau_settings.json"
 WORKFLOW_PATH = PROJECT_DIR / "measurements" / "gui_workflow.json"
 DEFAULT_SAVE_DIR = PROJECT_DIR / "measurements" / "experiment_data"
-JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "29734569")
-SERIAL_DATA_PORT = os.environ.get("SENSUS_SERIAL_PORT", "")
-SERIAL_SMP_PORT = os.environ.get("SENSUS_SMP_PORT", "")
-SERIAL_MCUBOOT_PORT = os.environ.get("SENSUS_MCUBOOT_PORT", SERIAL_SMP_PORT)
-SERIAL_DATA_EXPLICIT = bool(SERIAL_DATA_PORT)
-SERIAL_SMP_EXPLICIT = bool(SERIAL_SMP_PORT)
-SERIAL_MCUBOOT_EXPLICIT = bool(os.environ.get("SENSUS_MCUBOOT_PORT"))
-HARDWARE_TRANSPORT = os.environ.get(
-    "SENSUS_TRANSPORT", "serial" if SERIAL_DATA_PORT else "rtt"
-).lower()
-HARDWARE_AUTO_DISCOVERY = HARDWARE_TRANSPORT == "v51"
-NCS_VENV_ACTIVATE = Path(
-    os.environ.get("SENSUS_NCS_VENV_ACTIVATE", "~/ncs/.venv/bin/activate")
-).expanduser()
-SMPMGR_EXE = Path(
-    os.environ.get("SENSUS_SMPMGR")
-    or shutil.which("smpmgr")
-    or (Path(sys.executable).with_name("smpmgr")
-        if Path(sys.executable).with_name("smpmgr").exists() else "")
-    or "/tmp/smpvenv/bin/smpmgr"
-)
-V51_SIGNED_BIN = (
-    PROJECT_DIR / "software" / "firmware" / "build" / "firmware" /
-    "zephyr" / "zephyr.signed.bin"
-)
-
-V51_USB_VID = 0x2FE3
-V51_USB_PID = 0x0100
-V51_DATA_MARKERS = (
-    b"CFG_BOOT", b"IT_READY", b"CV_READY", b"AFE_STATUS",
-    b"CELL_V", b"POTENTIAL_AUDIT", b"STATUS1",
-)
-_V51_DISCOVERY_LOCK = threading.RLock()
-_V51_DISCOVERY: dict[str, Any] = {
-    "discovery": "not_started",
-    "serial_number": "",
-    "product": "",
-    "error": "",
-    "updated_at": 0.0,
-}
+JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "").strip()
 
 
-def _v51_port_infos() -> list[Any]:
-    """Return only V5.1 CDC devices reported by the operating system.
+def _escape_applescript(value: object) -> str:
+    """Escape a value for an AppleScript double-quoted string literal."""
+    return (str(value)
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\r", " ")
+            .replace("\n", " "))
 
-    Product string matching is primary.  The VID/PID fallback is retained for
-    early firmware builds whose USB product descriptor was not populated.
-    When macOS exposes both ``tty`` and ``cu`` aliases, only ``cu`` is used.
-    """
-    try:
-        from serial.tools import list_ports
-    except ImportError:
-        return []
-    infos = []
-    for info in list_ports.comports():
-        product = str(getattr(info, "product", "") or "")
-        description = str(getattr(info, "description", "") or "")
-        v51_named = "pA-Converter V5.1" in f"{product} {description}"
-        v51_id = (
-            getattr(info, "vid", None) == V51_USB_VID
-            and getattr(info, "pid", None) == V51_USB_PID
+
+def _send_system_notification(title: str, body: str) -> None:
+    """Send a best-effort native notification without invoking a shell."""
+    if sys.platform == "darwin":
+        executable = shutil.which("osascript") or "/usr/bin/osascript"
+        script = (
+            f'display notification "{_escape_applescript(body)}" '
+            f'with title "{_escape_applescript(title)}"'
         )
-        if v51_named or v51_id:
-            infos.append(info)
-    cu_infos = [info for info in infos if str(info.device).startswith("/dev/cu.")]
-    return cu_infos or infos
-
-
-def _probe_v51_data_port(device: str, timeout_s: float = 0.35) -> bool:
-    """Identify DATA CDC by reading its machine-readable status lines.
-
-    This probe sends no firmware command and performs no electrochemical
-    action.  Opening a CDC device asserts DTR so the DATA interface can emit
-    its existing status stream; SMP remains silent.
-    """
-    try:
-        import serial
-        with serial.Serial(device, 115200, timeout=0.1, write_timeout=0.1) as port:
-            port.dtr = True
-            deadline = time.monotonic() + timeout_s
-            received = bytearray()
-            while time.monotonic() < deadline and len(received) < 65536:
-                received.extend(port.read(4096))
-                if any(marker in received for marker in V51_DATA_MARKERS):
-                    return True
-    except (OSError, ValueError):
-        return False
-    except Exception as exc:
-        # pyserial raises backend-specific SerialException subclasses.
-        if exc.__class__.__module__.startswith("serial"):
-            return False
-        raise
-    return False
-
-
-def _verified_v51_macos_layout(app_infos: list[Any]) -> bool:
-    """Match Zephyr CDC0(SMP)/CDC1(DATA) to macOS data interfaces 1/3."""
-    if sys.platform != "darwin" or len(app_infos) != 2:
-        return False
-    suffixes = []
-    for info in app_infos:
-        match = re.search(r"(\d+)$", str(info.device))
-        if not match:
-            return False
-        suffixes.append(int(match.group(1)))
-    suffixes.sort()
-    # V5.1 DTS declares SMP first and DATA second.  Each CDC ACM function uses
-    # a control/data pair, so their macOS data-interface suffixes are N+1/N+3.
-    return suffixes[1] == suffixes[0] + 2
-
-
-def _choose_v51_ports(
-    infos: list[Any], probe: Any = _probe_v51_data_port,
-) -> dict[str, Any]:
-    """Choose one V5.1 board and distinguish DATA/SMP without writing to it."""
-    result: dict[str, Any] = {
-        "data_port": "", "smp_port": "", "mcuboot_port": "",
-        "serial_number": "", "product": "", "discovery": "not_found",
-        "error": "",
-    }
-    if not infos:
-        return result
-
-    def serial_key(info: Any) -> str:
-        return str(getattr(info, "serial_number", "") or "unknown")
-
-    groups: dict[str, list[Any]] = {}
-    for info in infos:
-        groups.setdefault(serial_key(info), []).append(info)
-    if len(groups) > 1:
-        result["discovery"] = "ambiguous"
-        result["error"] = "检测到多块 V5.1 板卡；请只连接待测板"
-        return result
-
-    board_infos = next(iter(groups.values()))
-    board_infos.sort(key=lambda info: str(info.device))
-    result["serial_number"] = serial_key(board_infos[0])
-    result["product"] = str(getattr(board_infos[0], "product", "") or "")
-    recovery = [
-        info for info in board_infos
-        if "MCUBOOT" in str(getattr(info, "product", "") or "").upper()
-        or "MCUBOOT" in str(getattr(info, "description", "") or "").upper()
-    ]
-    if recovery:
-        result["mcuboot_port"] = str(recovery[0].device)
-        result["product"] = str(getattr(recovery[0], "product", "") or "")
-        result["discovery"] = "mcuboot"
-        return result
-
-    app_infos = board_infos
-    if len(app_infos) < 2:
-        result["discovery"] = "partial"
-        result["error"] = "V5.1 应用模式应出现 DATA 与 SMP 两个 USB 端口"
-        return result
-
-    identified = []
-    # Probe the higher macOS suffix first because that is DATA on the verified
-    # V5.1 unit.  The decision still requires a status marker; if absent, the
-    # other interface is checked too.
-    for info in reversed(app_infos):
-        if probe(str(info.device)):
-            identified.append(info)
-            break
-    if len(identified) == 1:
-        data_info = identified[0]
-        smp_infos = [info for info in app_infos if info is not data_info]
-        if len(smp_infos) != 1:
-            result["discovery"] = "ambiguous"
-            result["error"] = "V5.1 USB 接口数量异常"
-            return result
-        result["data_port"] = str(data_info.device)
-        result["smp_port"] = str(smp_infos[0].device)
-        result["mcuboot_port"] = result["smp_port"]
-        result["discovery"] = "verified_status_stream"
-        return result
-
-    # The V5.1 DTS declares CDC0=SMP then CDC1=DATA.  macOS exposes their data
-    # interfaces in USB descriptor order (N+1 and N+3), so this layout is a
-    # deterministic board-definition check rather than an arbitrary port guess.
-    result["smp_port"] = str(app_infos[0].device)
-    result["data_port"] = str(app_infos[-1].device)
-    result["mcuboot_port"] = result["smp_port"]
-    if _verified_v51_macos_layout(app_infos):
-        result["discovery"] = "verified_usb_layout"
-    else:
-        result["discovery"] = "inferred_port_order"
-        result["error"] = "未读到 DATA 状态标记，端口顺序仅为推断"
-    return result
-
-
-def refresh_v51_ports(force: bool = False) -> dict[str, Any]:
-    """Refresh cached V5.1 paths while preserving explicitly configured paths."""
-    global SERIAL_DATA_PORT, SERIAL_SMP_PORT, SERIAL_MCUBOOT_PORT
-    with _V51_DISCOVERY_LOCK:
-        paths_present = (
-            SERIAL_DATA_PORT and Path(SERIAL_DATA_PORT).exists()
-            and SERIAL_SMP_PORT and Path(SERIAL_SMP_PORT).exists()
-        )
-        app = globals().get("APP")
-        measurement_running = bool(
-            app is not None and getattr(app.measurement, "state", "") == "running"
-        )
-        inferred_age = time.time() - float(_V51_DISCOVERY.get("updated_at") or 0)
-        retry_inference = (
-            _V51_DISCOVERY.get("discovery") == "inferred_port_order"
-            and inferred_age >= 5.0 and not measurement_running
-        )
-        if not force and paths_present and not retry_inference:
-            return hardware_status(refresh=False)
-
-        chosen = _choose_v51_ports(_v51_port_infos())
-        if not SERIAL_DATA_EXPLICIT:
-            SERIAL_DATA_PORT = str(chosen["data_port"])
-        if not SERIAL_SMP_EXPLICIT:
-            SERIAL_SMP_PORT = str(chosen["smp_port"])
-        if not SERIAL_MCUBOOT_EXPLICIT:
-            SERIAL_MCUBOOT_PORT = str(
-                chosen["mcuboot_port"] or SERIAL_SMP_PORT
+        try:
+            subprocess.run(
+                [executable, "-e", script],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
             )
-        _V51_DISCOVERY.update(chosen)
-        _V51_DISCOVERY["updated_at"] = time.time()
-        return hardware_status(refresh=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    elif sys.platform.startswith("linux"):
+        executable = shutil.which("notify-send")
+        if executable:
+            try:
+                subprocess.run(
+                    [executable, title, body],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
-def hardware_status(refresh: bool = True) -> dict[str, Any]:
-    """Return the transport and USB evidence shown by the App."""
-    if HARDWARE_TRANSPORT != "serial":
-        return {
-            "transport": "rtt", "board": "V4.0", "connected": True,
-            "data_port": "", "smp_port": "", "mcuboot_port": "",
-            "recovery": False, "serial_number": JLINK_SERIAL,
-            "product": "J-Link / MAX30131", "discovery": "configured",
-            "error": "",
-        }
-    if refresh:
-        return refresh_v51_ports(force=False)
-    recovery = bool(
-        _V51_DISCOVERY.get("discovery") == "mcuboot"
-        and _V51_DISCOVERY.get("mcuboot_port")
-        and Path(str(_V51_DISCOVERY["mcuboot_port"])).exists()
-    )
-    connected = bool(
-        SERIAL_DATA_PORT and SERIAL_SMP_PORT
-        and Path(SERIAL_DATA_PORT).exists() and Path(SERIAL_SMP_PORT).exists()
-    )
-    return {
-        "transport": "serial", "board": "V5.1", "connected": connected,
-        "data_port": SERIAL_DATA_PORT, "smp_port": SERIAL_SMP_PORT,
-        "mcuboot_port": str(_V51_DISCOVERY.get("mcuboot_port") or ""),
-        "recovery": recovery,
-        "serial_number": str(_V51_DISCOVERY.get("serial_number") or ""),
-        "product": str(_V51_DISCOVERY.get("product") or ""),
-        "discovery": str(_V51_DISCOVERY.get("discovery") or "not_started"),
-        "error": str(_V51_DISCOVERY.get("error") or ""),
-    }
+def _notify_measurement_completion(
+    run: dict[str, Any], result: dict[str, Any]
+) -> None:
+    """Turn every acquisition terminal state into one concise system notice."""
+    metadata = run.get("metadata") or {}
+    state = str(run.get("state") or result.get("state") or "")
+    sample = str(result.get("sample_name") or metadata.get("sample_name")
+                 or run.get("run_id") or "本轮测量")
+    debug = bool(metadata.get("debug"))
+    if state == "completed":
+        title = "电化学工作站 · Debug 完成" if debug else "电化学工作站 · 测试完成"
+        details = [sample]
+        steady = result.get("steady_current_nA")
+        if steady is not None:
+            try:
+                details.append(f"稳态电流 {float(steady):.3g} nA")
+            except (TypeError, ValueError):
+                pass
+        predicted = result.get("predicted_concentration_um")
+        if predicted is not None:
+            try:
+                details.append(f"预测浓度 {float(predicted):.3g} µM")
+            except (TypeError, ValueError):
+                pass
+        body = " · ".join(details)
+    elif state == "idle":
+        title = "电化学工作站 · 测试已停止"
+        body = f"{sample} · 本轮未完成，原始数据已保留"
+    else:
+        title = "电化学工作站 · 测试失败"
+        detail = str(run.get("error") or result.get("export_error") or "请查看工作站日志")
+        body = f"{sample} · {detail}"
+    _send_system_notification(title, body)
 
 
-def _require_v51_ports(require_smp: bool = False) -> dict[str, Any]:
-    status = refresh_v51_ports(force=True)
-    if status["recovery"]:
-        raise RuntimeError("V5.1 当前处于 MCUboot 恢复模式，请先完成或退出固件更新")
-    if not status["connected"] or not SERIAL_DATA_PORT:
-        detail = status.get("error") or "未识别到 V5.1 DATA/SMP 双 USB 端口"
-        raise RuntimeError(detail)
-    if require_smp and not SERIAL_SMP_PORT:
-        raise RuntimeError("未识别到 V5.1 SMP USB 端口，禁止烧录")
-    return status
+def _existing_toolchain_path(
+    configured: str | None, fallbacks: tuple[str, ...], marker: str
+) -> Path:
+    """Use a configured toolchain path when valid, then known legacy locations."""
+    candidates = ([configured] if configured else []) + list(fallbacks)
+    paths = [Path(value).expanduser() for value in candidates if value]
+    for path in paths:
+        if (path / marker).exists():
+            return path
+    return paths[0]
 
 
-def _wait_for_v51_mcuboot_port(timeout_s: float = 6.0) -> str:
-    """Wait for the single MCUboot CDC descriptor after an authenticated reset."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        chosen = _choose_v51_ports(_v51_port_infos(), probe=lambda _path: False)
-        if chosen["mcuboot_port"]:
-            return str(chosen["mcuboot_port"])
-        time.sleep(0.1)
-    raise RuntimeError("MCUboot CDC 未在 6 秒内出现")
+NCS_DIR = _existing_toolchain_path(
+    os.environ.get("SENSUS_NCS_DIR"),
+    ("~/sensus-toolchains/ncs", "~/ncs"),
+    "zephyr/zephyr-env.sh",
+)
+ZEPHYR_SDK_DIR = _existing_toolchain_path(
+    os.environ.get("SENSUS_ZEPHYR_SDK_DIR"),
+    ("~/sensus-toolchains/zephyr-sdk-1.0.1", "~/zephyr-sdk-1.0.1"),
+    "gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-gcc",
+)
+_configured_activate = os.environ.get("SENSUS_NCS_VENV_ACTIVATE")
+NCS_VENV_ACTIVATE = Path(_configured_activate).expanduser() if (
+    _configured_activate and Path(_configured_activate).expanduser().exists()
+) else NCS_DIR / ".venv/bin/activate"
+
+
+def _firmware_source() -> str:
+    try:
+        payload = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        source = str(payload.get("firmware_source") or "")
+        return source if source in {"build", "prebuilt"} else ""
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return ""
+
+
+def _firmware_artifact(name: str) -> Path:
+    built = FIRMWARE_BUILD_DIR / name
+    prebuilt = FIRMWARE_PREBUILT_DIR / name
+    if _firmware_source() == "prebuilt" and prebuilt.exists():
+        return prebuilt
+    if _firmware_source() == "build" and built.exists():
+        return built
+    return built if built.exists() else prebuilt
 
 # ── 两相测量:还原瞬态 → 过零 → 氧化稳态 ────────────────────────────────
 # 工作点 E=+200mV 驱动**氧化**,所以稳态电流走器件的原生方向(流出 WE),
@@ -450,13 +318,18 @@ def _transient_phase(times: list[float], currents: list[float],
 
 
 def ncs_venv_prefix() -> str:
-    """``source <ncs venv>/bin/activate && `` 前缀,venv 不存在时返回空串。
+    """返回激活 NCS venv 的 shell 前缀,venv 不存在时返回空串。
 
     west 不在系统 PATH 上而在 NCS 的 venv 内;返回空串是为了兼容 west 已在
     PATH 上的机器(以及 CI),此时让 west 自己去报错,而不是先报 activate 缺失。
+
+    Windows: 返回用于 cmd /c 的前缀;macOS/Linux: 返回 source ... && 前缀。
     """
     if not NCS_VENV_ACTIVATE.exists():
         return ""
+    if _IS_WIN:
+        # Windows: 在 cmd /c 里用 call 激活
+        return f"call {shlex.quote(str(NCS_VENV_ACTIVATE))} && "
     return f"source {shlex.quote(str(NCS_VENV_ACTIVATE))} && "
 FSR_OPTIONS = {
     50: "MAX30131_FSR_50NA",
@@ -530,8 +403,106 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _split_complete_lines(text: str, pending: str = "") -> tuple[list[str], str]:
+    """Split an append-only text stream without losing a partial final line."""
+    combined = pending + text
+    if not combined:
+        return [], ""
+    chunks = combined.splitlines(keepends=True)
+    if chunks and not chunks[-1].endswith(("\n", "\r")):
+        pending = chunks.pop()
+    else:
+        pending = ""
+    return [chunk.rstrip("\r\n") for chunk in chunks], pending
+
+
 def _now_id(prefix: str) -> str:
     return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
+
+
+class FilterController:
+    """Persist analysis/display filter choices independently of firmware."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.settings = dict(FILTER_DEFAULTS)
+        if FILTER_SETTINGS_PATH.exists():
+            try:
+                loaded = json.loads(FILTER_SETTINGS_PATH.read_text(encoding="utf-8"))
+                self.settings = validate_filter_config(
+                    loaded.get("settings", loaded) if isinstance(loaded, dict) else {}
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+
+    def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
+        settings = validate_filter_config(payload)
+        with self.lock:
+            self.settings = settings
+            FILTER_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            FILTER_SETTINGS_PATH.write_text(
+                json.dumps({"settings": settings}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return _json_safe({
+                "settings": dict(self.settings),
+                "scopes": {
+                    "off": "关闭",
+                    "display": "仅显示",
+                    "analysis": "显示并用于稳态分析/标定",
+                },
+            })
+
+
+class PlateauController:
+    """Persist host-side automatic-stop parameters independently of firmware."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.settings = PlateauConfig.validate(None)
+        if PLATEAU_SETTINGS_PATH.exists():
+            try:
+                loaded = json.loads(PLATEAU_SETTINGS_PATH.read_text(encoding="utf-8"))
+                raw = loaded.get("settings", loaded) if isinstance(loaded, dict) else {}
+                self.settings = PlateauConfig.validate(raw)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+
+    def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
+        settings = PlateauConfig.validate(payload)
+        with self.lock:
+            PLATEAU_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8",
+                    prefix=f".{PLATEAU_SETTINGS_PATH.name}.", suffix=".tmp",
+                    dir=PLATEAU_SETTINGS_PATH.parent, delete=False,
+                ) as handle:
+                    temporary_path = Path(handle.name)
+                    json.dump(
+                        {"settings": settings.to_dict()}, handle,
+                        indent=2, ensure_ascii=False,
+                    )
+                    handle.write("\n")
+                os.replace(temporary_path, PLATEAU_SETTINGS_PATH)
+                temporary_path = None
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+            self.settings = settings
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return _json_safe({
+                "settings": self.settings.to_dict(),
+                "window_duration_s": self.settings.window_duration_s,
+            })
 
 
 class SettingsController:
@@ -541,8 +512,10 @@ class SettingsController:
         "method": "it",
         "initial_potential_v": 0.2,
         "potential_v": 0.2,
+        "working_electrode_v": 1.2,
         "prestep_s": 0.0,
         "duration_s": 180.0,
+        "adaptive_stop": False,
         "target_rate_hz": 10.0,
         "sens_period_code": 0,
         "fit_window_s": 20.0,
@@ -557,22 +530,10 @@ class SettingsController:
         "cv_quiet_s": 2.0,
         "cv_eis_fsr_uA": 40,
     }
-    V51_DEFAULTS = {
-        **DEFAULTS,
-        "initial_potential_v": -0.2,
-        "potential_v": -0.2,
-        "prestep_s": 0.0,
-        "duration_s": V51_IT_DURATION_S,
-        "target_rate_hz": 10.0,
-        "sens_period_code": 0,
-        "fit_window_s": 20.0,
-        "fsr_nA": 2000,
-        "offset_nA": 200,
-        "offset_mode": "10pct",
-    }
 
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self.apply_lock = threading.Lock()
         self.settings = dict(self.DEFAULTS)
         loaded_saved = False
         firmware_verified = False
@@ -601,13 +562,122 @@ class SettingsController:
         self.error = ""
 
     @staticmethod
-    def _firmware_hash() -> str:
-        if not FIRMWARE_HEX.exists():
+    def _firmware_hash(firmware_hex: Path | None = None) -> str:
+        firmware_hex = firmware_hex or _firmware_artifact("zephyr.hex")
+        if not firmware_hex.exists():
             return ""
-        return hashlib.sha256(FIRMWARE_HEX.read_bytes()).hexdigest()
+        return hashlib.sha256(firmware_hex.read_bytes()).hexdigest()
 
     @staticmethod
-    def _flash_firmware() -> None:
+    def _run_build(command: list[str], timeout_s: float = 600) -> None:
+        """Run a build in its own process group and reclaim every descendant."""
+        process = subprocess.Popen(
+            command, cwd=PROJECT_DIR, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+            **(
+                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                if _IS_WIN else {"start_new_session": True}
+            ),
+        )
+        stdout = ""
+        stderr = ""
+
+        def remember_timeout(error: subprocess.TimeoutExpired) -> None:
+            nonlocal stdout, stderr
+
+            def output_text(value: Any) -> str:
+                if value is None:
+                    return ""
+                if isinstance(value, bytes):
+                    return value.decode(errors="replace")
+                return str(value)
+
+            if error.output is not None:
+                stdout = output_text(error.output)
+            if error.stderr is not None:
+                stderr = output_text(error.stderr)
+
+        def kill_windows_tree() -> None:
+            killed = False
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                killed = result.returncode == 0
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            if not killed:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+
+        def signal_posix_tree(signum: int) -> None:
+            try:
+                os.killpg(process.pid, signum)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    if signum == signal.SIGTERM:
+                        process.terminate()
+                    else:
+                        process.kill()
+                except OSError:
+                    pass
+
+        def close_pipes_and_reap() -> None:
+            # A descendant outside the process group can keep inherited pipe
+            # handles open after the build shell is dead. Never let that turn a
+            # timeout into an unbounded communicate().
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except (OSError, ValueError):
+                        pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            remember_timeout(exc)
+            if _IS_WIN:
+                kill_windows_tree()
+            else:
+                signal_posix_tree(signal.SIGTERM)
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired as graceful_timeout:
+                remember_timeout(graceful_timeout)
+                if _IS_WIN:
+                    kill_windows_tree()
+                else:
+                    signal_posix_tree(signal.SIGKILL)
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired as forced_timeout:
+                    remember_timeout(forced_timeout)
+                    close_pipes_and_reap()
+            raise subprocess.TimeoutExpired(
+                command, timeout_s, output=stdout, stderr=stderr,
+            ) from exc
+        if process.returncode:
+            raise subprocess.CalledProcessError(
+                process.returncode, command, output=stdout, stderr=stderr,
+            )
+
+    @staticmethod
+    def _flash_firmware(firmware_hex: Path | None = None) -> None:
         """用可用的 SWD 后端把 hex 烧进片子并校验。
 
         Homebrew 的默认 openocd 没有编入 jlink 驱动；本机的用户级
@@ -617,21 +687,29 @@ class SettingsController:
 
         两种后端都必须检查各自的写入和校验成功标记，不只看进程退出码。
         """
+        firmware_hex = firmware_hex or _firmware_artifact("zephyr.hex")
+        if not firmware_hex.exists():
+            raise RuntimeError(f"找不到固件: {firmware_hex}")
         if not JLINK_EXE.exists():
             if not OPENOCD_EXE.exists():
                 raise RuntimeError(
                     f"既找不到 JLinkExe({JLINK_EXE})，也找不到 OpenOCD"
                 )
+            command = [
+                str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+                "-f", "interface/jlink.cfg", "-c", "transport select swd",
+                "-f", "target/nrf52.cfg",
+            ]
+            if JLINK_SERIAL:
+                command += ["-c", f"adapter serial {JLINK_SERIAL}"]
+            command += [
+                "-c", f"adapter speed {JLINK_SPEED_KHZ}",
+                "-c", f"program {firmware_hex} verify reset exit",
+            ]
             done = subprocess.run(
-                [
-                    str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
-                    "-f", "interface/jlink.cfg", "-c", "transport select swd",
-                    "-f", "target/nrf52.cfg",
-                    "-c", f"adapter serial {JLINK_SERIAL}",
-                    "-c", f"adapter speed {JLINK_SPEED_KHZ}",
-                    "-c", f"program {FIRMWARE_HEX} verify reset exit",
-                ],
+                command,
                 cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+                timeout=120,
             )
             blob = f"{done.stdout}\n{done.stderr}"
             if "Programming Finished" not in blob or "Verified OK" not in blob:
@@ -639,22 +717,25 @@ class SettingsController:
                 raise RuntimeError("OpenOCD 烧录未确认成功:" + " | ".join(tail))
             return
 
-        script = f"loadfile {FIRMWARE_HEX}\nr\ng\nq\n"
+        script = f"loadfile {firmware_hex}\nr\ng\nq\n"
         with tempfile.NamedTemporaryFile(
             "w", suffix=".jlink", delete=False, encoding="utf-8"
         ) as handle:
             handle.write(script)
             script_path = Path(handle.name)
         try:
+            command = [
+                str(JLINK_EXE), "-device", JLINK_DEVICE, "-if", "SWD",
+                "-speed", str(JLINK_SPEED_KHZ), "-autoconnect", "1",
+                "-NoGui", "1", "-ExitOnError", "1",
+            ]
+            if JLINK_SERIAL:
+                command += ["-SelectEmuBySN", JLINK_SERIAL]
+            command += ["-CommanderScript", str(script_path)]
             done = subprocess.run(
-                [
-                    str(JLINK_EXE), "-device", JLINK_DEVICE, "-if", "SWD",
-                    "-speed", str(JLINK_SPEED_KHZ), "-autoconnect", "1",
-                    "-NoGui", "1", "-ExitOnError", "1",
-                    "-SelectEmuBySN", JLINK_SERIAL,
-                    "-CommanderScript", str(script_path),
-                ],
+                command,
                 cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+                timeout=120,
             )
         finally:
             script_path.unlink(missing_ok=True)
@@ -663,51 +744,29 @@ class SettingsController:
             tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
             raise RuntimeError("JLinkExe 烧录未确认成功:" + " | ".join(tail))
 
-    @staticmethod
-    def _upgrade_v51_firmware() -> None:
-        """Reset the V5.1 app over SMP, then upload its signed image to MCUboot.
-
-        DATA and SMP are deliberately separate CDC interfaces.  The board is
-        matched by its V5.1 USB descriptor and DATA is verified from its
-        machine-readable status stream before SMP is used.  No UICR or
-        MCUboot region is written by this path.
-        """
-        _require_v51_ports(require_smp=True)
-        if not SMPMGR_EXE.exists():
-            raise RuntimeError(f"找不到 smpmgr:{SMPMGR_EXE}")
-        if not V51_SIGNED_BIN.exists():
-            raise RuntimeError(f"找不到 V5.1 签名镜像:{V51_SIGNED_BIN}")
-
-        subprocess.run(
-            [str(SMPMGR_EXE), "--port", SERIAL_SMP_PORT, "--timeout", "5",
-             "os", "reset"],
-            check=True, capture_output=True, text=True,
-        )
-        boot_port = _wait_for_v51_mcuboot_port()
-        done = subprocess.run(
-            [str(SMPMGR_EXE), "--port", boot_port, "--timeout", "10",
-             "upgrade", str(V51_SIGNED_BIN)],
-            check=True, capture_output=True, text=True,
-        )
-        blob = f"{done.stdout}\n{done.stderr}"
-        if "Upgrade complete." not in blob:
-            tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
-            raise RuntimeError("V5.1 USB 更新未确认成功:" + " | ".join(tail))
-
-    @staticmethod
-    def same_analysis_protocol(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    @classmethod
+    def same_analysis_protocol(
+        cls, first: dict[str, Any], second: dict[str, Any]
+    ) -> bool:
         """Compare settings that determine sampled IT data and its analysis.
 
         Startup potential/hold are not sampled. They remain in run metadata for
         traceability but do not invalidate a curve whose sampled potential,
         duration, rate, fit window and current range are unchanged.
         """
-        if first.get("method", "it") != second.get("method", "it"):
+        try:
+            first = cls.validate(first)
+            second = cls.validate(second)
+        except (TypeError, ValueError):
+            return False
+        if first["method"] != second["method"]:
             return False
         ignored = {
             "initial_potential_v", "prestep_s", "cv_low_v", "cv_high_v",
             "cv_scan_rate_v_s", "cv_cycles", "cv_step_v", "cv_quiet_s",
         }
+        if first.get("adaptive_stop") and second.get("adaptive_stop"):
+            ignored.add("duration_s")
         return (
             {key: value for key, value in first.items() if key not in ignored}
             == {key: value for key, value in second.items() if key not in ignored}
@@ -715,23 +774,52 @@ class SettingsController:
 
     @classmethod
     def validate(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("检测条件必须是 JSON 对象")
         merged = {**cls.DEFAULTS, **payload}
         method = str(merged["method"]).lower()
+        raw_adaptive_stop = merged.get("adaptive_stop", False)
+        if isinstance(raw_adaptive_stop, bool):
+            adaptive_stop = raw_adaptive_stop
+        elif isinstance(raw_adaptive_stop, (int, float)) and raw_adaptive_stop in (0, 1):
+            adaptive_stop = bool(raw_adaptive_stop)
+        elif isinstance(raw_adaptive_stop, str) and raw_adaptive_stop.strip().lower() in {
+            "true", "1", "yes", "on", "false", "0", "no", "off",
+        }:
+            adaptive_stop = raw_adaptive_stop.strip().lower() in {"true", "1", "yes", "on"}
+        else:
+            raise ValueError("自动停止必须是开或关")
+        def integer(name: str) -> int:
+            try:
+                value = float(merged[name])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"检测条件 {name} 必须是整数") from exc
+            if not math.isfinite(value) or value != math.trunc(value):
+                raise ValueError(f"检测条件 {name} 必须是整数")
+            return int(value)
+
         initial_potential_v = float(merged["initial_potential_v"])
         potential_v = float(merged["potential_v"])
+        working_electrode_v = float(merged["working_electrode_v"])
         prestep_s = float(merged["prestep_s"])
         duration_s = float(merged["duration_s"])
         target_rate_hz = float(merged["target_rate_hz"])
-        sens_period_code = int(merged["sens_period_code"])
+        sens_period_code = integer("sens_period_code")
         fit_window_s = float(merged["fit_window_s"])
         cv_low_v = float(merged["cv_low_v"])
         cv_high_v = float(merged["cv_high_v"])
         cv_scan_rate_v_s = float(merged["cv_scan_rate_v_s"])
-        cv_cycles = int(merged["cv_cycles"])
+        cv_cycles = integer("cv_cycles")
         cv_step_v = float(merged["cv_step_v"])
         cv_quiet_s = float(merged["cv_quiet_s"])
-        cv_eis_fsr_uA = int(merged["cv_eis_fsr_uA"])
-        fsr_nA = int(merged["fsr_nA"])
+        cv_eis_fsr_uA = integer("cv_eis_fsr_uA")
+        fsr_nA = integer("fsr_nA")
+        if not all(math.isfinite(value) for value in (
+                initial_potential_v, potential_v, working_electrode_v,
+                prestep_s, duration_s, target_rate_hz, fit_window_s,
+                cv_low_v, cv_high_v, cv_scan_rate_v_s, cv_step_v, cv_quiet_s
+        )):
+            raise ValueError("检测条件不能包含 NaN 或无穷大")
         raw_offset_mode = payload.get("offset_mode")
         if raw_offset_mode in (None, ""):
             raw_offset_mode = (
@@ -746,11 +834,25 @@ class SettingsController:
                 raise ValueError("I-T 起始电位必须在 -0.4 至 +0.4 V 之间")
             if not -0.4 <= potential_v <= 0.4:
                 raise ValueError("I-T 测试电位必须在 -0.4 至 +0.4 V 之间")
+            if not 0.25 <= working_electrode_v <= 1.535:
+                raise ValueError("I-T 的 WE 电位必须在 0.25 至 1.535 V 之间")
+            for label, value in (
+                ("起始", initial_potential_v), ("测试", potential_v)
+            ):
+                reference_electrode_v = working_electrode_v - value
+                if not 0.008 <= reference_electrode_v <= 1.535:
+                    raise ValueError(
+                        f"{label}电位对应的 RE={reference_electrode_v:.3f} V，"
+                        "超出 DAC 可实现范围 0.008 至 1.535 V；请调整 WE 电位"
+                    )
             if not 0 <= prestep_s <= 300:
                 raise ValueError("阶跃前保持时间必须在 0 至 300 秒之间")
-            if not 10 <= duration_s <= 3600:
+            if not 0 < duration_s <= 3600:
+                raise ValueError("I-T 时长必须在 0 秒以上且不超过 3600 秒")
+            if not adaptive_stop and not 10 <= duration_s <= 3600:
                 raise ValueError("I-T 时长必须在 10 至 3600 秒之间")
         else:
+            adaptive_stop = False
             if not -0.6 <= cv_low_v < cv_high_v <= 0.6:
                 raise ValueError("CV 电位范围必须在 -0.6 至 +0.6 V 内，且下限小于上限")
             if not 0.01 <= cv_scan_rate_v_s <= 0.1:
@@ -771,8 +873,11 @@ class SettingsController:
             raise ValueError("输出采样频率必须在 0.5 至 10 Hz 之间")
         if sens_period_code not in SENS_PERIOD_MS:
             raise ValueError("不支持该硬件采样周期")
-        if method == "it" and not 1 <= fit_window_s <= duration_s:
-            raise ValueError("拟合窗口必须在 1 秒与测量时长之间")
+        if method == "it" and not 1 <= fit_window_s <= (
+            3600.0 if adaptive_stop else duration_s
+        ):
+            limit = "3600 秒" if adaptive_stop else "测量时长"
+            raise ValueError(f"拟合窗口必须在 1 秒与{limit}之间")
         if method == "it" and fit_window_s * target_rate_hz < 3:
             raise ValueError("拟合窗口内至少需要 3 个输出采样点")
         if fsr_nA not in FSR_OPTIONS and fsr_nA not in IT_WIDE_FSR_OPTIONS:
@@ -790,8 +895,10 @@ class SettingsController:
             "method": method,
             "initial_potential_v": round(initial_potential_v, 4),
             "potential_v": round(potential_v, 4),
+            "working_electrode_v": round(working_electrode_v, 4),
             "prestep_s": round(prestep_s, 3),
             "duration_s": round(duration_s, 3),
+            "adaptive_stop": adaptive_stop,
             "target_rate_hz": round(target_rate_hz, 3),
             "sens_period_code": sens_period_code,
             "fit_window_s": round(fit_window_s, 3),
@@ -809,19 +916,55 @@ class SettingsController:
 
     @staticmethod
     def working_electrode_mv(settings: dict[str, Any]) -> int:
-        """Use the debug branch's verified DC common mode."""
-        return 1200
+        return int(round(float(settings["working_electrode_v"]) * 1000))
+
+    @classmethod
+    def runtime_afe_contract(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        """Return the complete persistent AFE state expected after flashing."""
+        settings = cls.validate(payload)
+        fsr_codes = {50: 0, 100: 1, 250: 2, 500: 3, 1000: 4, 2000: 5}
+        offset_codes = {
+            "10pct": 1, "20pct": 2, "50pct": 3, "9nA": 4,
+            "19nA": 5, "40nA": 6, "80nA": 7,
+        }
+        # Wide-range IT uses the EIS ADC for samples, but the persistent DC AFE
+        # baseline still boots at 2 uA and must not inherit Debug changes.
+        fsr_nA = settings["fsr_nA"]
+        return {
+            "fsr": fsr_codes.get(fsr_nA, 5),
+            "off": offset_codes[settings["offset_mode"]],
+            "conv_src": "auto",
+            "period": settings["sens_period_code"],
+            "sysper": 3,
+            "clk40": 0,
+            "ioc": 0,
+            "e_mv": int(round(settings["potential_v"] * 1000)),
+            "vwe_mv": cls.working_electrode_mv(settings),
+            "idle": 2,
+            "cellv": 1,
+            "chop": 1,
+            "rs": 0,
+            "ios": 1,
+            "satpct": 5,
+            "sel": 1,
+            "amps": 1,
+        }
 
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.apply_lock.acquire(blocking=False):
+            raise RuntimeError("已有另一项参数应用正在进行，请等待完成")
+        try:
+            return self._apply_locked(payload)
+        finally:
+            self.apply_lock.release()
+
+    def _apply_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         settings = self.validate(payload)
-        if HARDWARE_TRANSPORT == "serial":
-            # Fail before touching the generated config or spending time on a
-            # build if the exact V5.1 DATA/SMP pair is not present.
-            _require_v51_ports(require_smp=True)
         with self.lock:
             self.state = "applying"
             self.message = "正在编译并写入硬件参数"
             self.error = ""
+            self.applied = False
         potential_mv = int(round(settings["potential_v"] * 1000))
         initial_potential_mv = int(round(settings["initial_potential_v"] * 1000))
         prestep_ms = int(round(settings["prestep_s"] * 1000))
@@ -845,6 +988,7 @@ class SettingsController:
             f"#define GUI_IT_USE_EIS {1 if settings['fsr_nA'] in IT_WIDE_FSR_OPTIONS else 0}\n"
             f"#define GUI_IT_EIS_FSR {IT_WIDE_FSR_OPTIONS.get(settings['fsr_nA'], 'MAX30131_EIS_FSR_40UA')}\n"
             f"#define GUI_IT_SAMPLE_INTERVAL_MS {it_sample_interval_ms}U\n"
+            f"#define GUI_IT_ADAPTIVE_STOP {1 if settings['adaptive_stop'] else 0}\n"
             f"#define GUI_WP_START_E_MV {initial_potential_mv}\n"
             f"#define GUI_WP_E_MV {potential_mv}\n"
             f"#define GUI_PRESTEP_DURATION_MS {prestep_ms}U\n"
@@ -863,51 +1007,87 @@ class SettingsController:
         )
         try:
             _release_stale_measurement_bridge()
+            firmware_source = "build"
+            prebuilt_metadata = FIRMWARE_PREBUILT_DIR / "firmware.json"
+            try:
+                prebuilt_settings = self.validate(json.loads(
+                    prebuilt_metadata.read_text(encoding="utf-8")
+                )["settings"])
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                prebuilt_settings = None
+            if settings == prebuilt_settings:
+                firmware_source = "prebuilt"
+                FIRMWARE_CONFIG.write_text(header)
+                firmware_hex = FIRMWARE_PREBUILT_DIR / "zephyr.hex"
+                self._flash_firmware(firmware_hex)
+                SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                SETTINGS_PATH.write_text(json.dumps({
+                    "settings": settings,
+                    "firmware_source": firmware_source,
+                    "firmware_sha256": self._firmware_hash(firmware_hex),
+                }, indent=2, ensure_ascii=False))
+                with self.lock:
+                    self.settings = settings
+                    self.applied = True
+                    self.state = "applied"
+                    self.message = "推荐条件已使用随包固件应用到硬件"
+                    self.error = ""
+                return self.snapshot()
+            if (not _IS_WIN and (
+                not (NCS_DIR / "zephyr/zephyr-env.sh").exists()
+                or not NCS_VENV_ACTIVATE.exists()
+                or not (ZEPHYR_SDK_DIR / (
+                    "gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-gcc"
+                )).exists()
+            )):
+                raise RuntimeError(
+                    "当前条件与随包固件不同；请先双击“03-安装固件工具链.command”"
+                )
             FIRMWARE_CONFIG.write_text(header)
             # 🔴 west 装在 NCS 自己的 venv 里(默认 ~/ncs/.venv/bin/west)。
             #    `zephyr-env.sh` 只把 $ZEPHYR_BASE/scripts 塞进 PATH,**不激活该 venv**
             #    ⇒ 不先激活就是 `zsh:1: command not found: west`,按钮看起来"没反应"
             #    (失败 <1s,label 闪一下就弹回去)。2026-08-09 实测确认。
             #    只在这个子 shell 里激活:NCS venv 与本工作站 venv 依赖冲突,不可合并。
-            if HARDWARE_TRANSPORT == "serial":
+            if _IS_WIN:
+                # Windows: 使用 cmd /c 执行构建。需要先把 zephyr-env.cmd 跑通再调 west。
+                # %CD% 在 cmd /c 里自动随 cwd 设定。
                 build = (
                     f"{ncs_venv_prefix()}"
-                    "source ~/ncs/zephyr/zephyr-env.sh && "
-                    "west build -p always -b pa_converter_v51 "
-                    "-d software/firmware/build software/firmware -- "
-                    "-DSB_CONFIG_BOOTLOADER_MCUBOOT=y "
-                    "-DBOARD_ROOT=$PWD/software/firmware "
-                    "-DDTS_ROOT=$PWD/software/firmware"
+                    f"call {shlex.quote(str(NCS_DIR / 'zephyr/zephyr-env.cmd'))} && "
+                    "west build -b pa_converter_v40 -d software/firmware/build "
+                    "software/firmware -- -DBOARD_ROOT=%CD%/software/firmware "
+                    "-DDTS_ROOT=%CD%/software/firmware"
                 )
+                self._run_build(["cmd", "/c", build])
             else:
                 build = (
                     f"{ncs_venv_prefix()}"
-                    "source ~/ncs/zephyr/zephyr-env.sh && "
-                    "west build -p always -b pa_converter_v40 "
-                    "-d software/firmware/build software/firmware -- "
-                    "-DBOARD_ROOT=$PWD/software/firmware "
+                    f"export ZEPHYR_TOOLCHAIN_VARIANT=zephyr && "
+                    f"export ZEPHYR_SDK_INSTALL_DIR={shlex.quote(str(ZEPHYR_SDK_DIR))} && "
+                    f"source {shlex.quote(str(NCS_DIR / 'zephyr/zephyr-env.sh'))} && "
+                    "west build -b pa_converter_v40 -d software/firmware/build "
+                    "software/firmware -- -DBOARD_ROOT=$PWD/software/firmware "
                     "-DDTS_ROOT=$PWD/software/firmware"
                 )
-            subprocess.run(
-                ["/bin/zsh", "-lc", build], cwd=PROJECT_DIR,
-                check=True, capture_output=True, text=True,
-            )
-            if HARDWARE_TRANSPORT == "serial":
-                self._upgrade_v51_firmware()
-            else:
-                self._flash_firmware()
+                self._run_build(["/bin/zsh", "-lc", build])
+            firmware_hex = FIRMWARE_BUILD_DIR / "zephyr.hex"
+            self._flash_firmware(firmware_hex)
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps({
                 "settings": settings,
-                "firmware_sha256": self._firmware_hash(),
+                "firmware_source": firmware_source,
+                "firmware_sha256": self._firmware_hash(firmware_hex),
             }, indent=2, ensure_ascii=False))
         # RuntimeError:_flash_firmware() 的「exit 0 但没烧成」判据会抛它,
         # 不接住的话会变成未处理 500,state 停在 "applying",前端只能看到通用错误。
-        except (subprocess.CalledProcessError, OSError, RuntimeError) as exc:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                OSError, RuntimeError) as exc:
             output = getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or str(exc)
             detail = output.strip().splitlines()
             with self.lock:
                 self.state = "error"
+                self.applied = False
                 self.error = detail[-1] if detail else "固件编译或烧录失败"
                 self.message = "参数应用失败"
             raise RuntimeError(self.error) from exc
@@ -940,8 +1120,11 @@ class SettingsController:
                               * self.settings["cv_scan_rate_v_s"]
                               / self.settings["cv_step_v"]))
                     if self.settings["method"] == "cv"
-                    else int(round(self.settings["duration_s"]
-                                   * self.settings["target_rate_hz"]))
+                    else (
+                        None if self.settings["adaptive_stop"]
+                        else int(round(self.settings["duration_s"]
+                                       * self.settings["target_rate_hz"]))
+                    )
                 ),
                 "cv_segments": self.settings["cv_cycles"] * 2,
             })
@@ -960,6 +1143,8 @@ class MeasurementController:
         self.raw_path: Path | None = None
         self.raw_log: Path | None = None
         self.resampled_path: Path | None = None
+        self.filtered_path: Path | None = None
+        self.filter_meta: dict[str, Any] = {}
         self.summary_path: Path | None = None
         self.plot_path: Path | None = None
         self.started_at: float | None = None
@@ -971,18 +1156,22 @@ class MeasurementController:
         # DEBUG 页的增量读状态。全部按"读位置 + 累积列表"做 ⇒ 1Hz 刷新不随
         # 文件增长变慢(一轮 180s 就上千行,全量重读会明显卡)。
         self._audit_pos = 0
+        self._audit_pending = ""
         self._auto_get_at = 0.0
         self._audit_cache: list[dict[str, Any]] = []
         self._cfg_live: dict[str, Any] = {}
+        self._cfg_epochs: dict[tuple[int, str | None], dict[str, Any]] = {}
         self._afe_status: dict[str, Any] = {}
         self._last_reject: dict[str, Any] = {}
         self._phase: dict[str, Any] = {}
         self._dbg_cur_pos = 0
         self._dbg_cur: list[dict[str, Any]] = []
         self._dbg_cur_hdr: list[str] | None = None
+        self._dbg_cur_pending = ""
         self._dbg_cv_pos = 0
         self._dbg_cv: list[dict[str, Any]] = []
         self._dbg_cv_hdr: list[str] | None = None
+        self._dbg_cv_pending = ""
         # 方案 C:运行时档位真值。**不能用 SettingsController 的值代替** ——
         # 那是"最后一次烧录进去的编译期默认",而 RANGE 命令会在运行中改掉它,
         # 两者可以不一致。唯一权威来源是固件回的 RANGE_APPLIED 行。
@@ -990,6 +1179,7 @@ class MeasurementController:
             "pending": None, "applied": None, "rejected": None, "at": None,
         }
         self._rtt_pos = 0
+        self._rtt_pending = ""
         # 两相测量:过零并稳定后切到测量档。默认**手动** —— 自动切档会往数据里
         # 注入一个跨档直流台阶(§13b 实测 +22.9nA),这一步该由人点。
         self.auto_switch_meas = False
@@ -1001,10 +1191,172 @@ class MeasurementController:
         self.on_complete: Any = None
         self.completion_hook: Any = None
         self.settings = dict(SettingsController.DEFAULTS)
+        self.filter_config = dict(FILTER_DEFAULTS)
+        self.plateau_config = PlateauConfig.validate(None)
         self.bridge_process: subprocess.Popen[str] | None = None
         self.bridge_log_handle: Any = None
         self.user_stop_requested = False
+        self.auto_stop_requested = False
+        self._auto_stop_evidence: dict[str, Any] | None = None
+        self._plateau_last_segment = 0
+        self._plateau_consecutive_passes = 0
+        self._plateau_evaluation: dict[str, Any] | None = None
+        self._plateau_progress: dict[str, Any] = {}
+        self._plateau_cfg_epoch: int | None = None
+        self._plateau_context_epoch: int | None = None
+        self._plateau_expected_epoch: int | None = None
+        self._plateau_context_pending = False
+        self._plateau_context_start_s = 0.0
+        self._plateau_minimum_gate_until_s = 0.0
+        self.debug_waiting_for_start = False
+        self._debug_pending_cfg: dict[str, Any] | None = None
+        self._config_gate: dict[str, Any] = {"state": "idle"}
+        self._config_gate_event = threading.Event()
+        self._prestart_gate_failed = False
+        # 只能拿本次 RTT 会话里收到的 CFG_CONFIRMED 作为下发依据。
+        # OpenOCD 重建连接时可能会让 MCU 重启；上一轮的 cfg 缓存在那之后
+        # 已不再代表硬件现状。
+        self._cfg_confirmed_this_session = False
+        self._cfg_live_epoch: int | None = None
+        self._hardware_taint: dict[str, Any] | None = None
+        self._stability_eta_estimator = StabilityEtaEstimator()
+        self._prepared_live_stage: PreparedLiveStage | None = None
+        self._rolling_metrics: dict[str, Any] = {}
+        self._stability_eta: dict[str, Any] = {}
+        self._last_complete_rolling_metrics: dict[str, Any] | None = None
+        self._last_complete_rolling_epoch: object = None
+        self._stop_requested_rolling_metrics: dict[str, Any] | None = None
+        self._rolling_metrics_frozen: dict[str, Any] | None = None
+        self._stability_eta_frozen: dict[str, Any] | None = None
+        self._live_analysis_last_refresh = 0.0
+        self._reset_live_analysis_locked()
         self._reset_data_cache()
+
+    @staticmethod
+    def _empty_rolling_metrics(
+        status: str = "idle", reason: str = "等待测量",
+    ) -> dict[str, Any]:
+        return {
+            "status": status,
+            "reason": reason,
+            "window_s": None,
+            "coverage_s": 0.0,
+            "native_point_count": 0,
+            "valid_native_point_count": 0,
+            "expected_native_point_count": None,
+            "window_point_count": 0,
+            "progress_percent": 0.0,
+            "steady_current_nA": None,
+            "noise_nA": None,
+            "slope_nA_per_s": None,
+            "trend_state": "insufficient",
+            "tolerance_nA": None,
+            "robust_scatter_nA": None,
+            "slope_limit_nA_per_s": None,
+            "filter_effective": False,
+            "filter_meta": {},
+            "stage_key": None,
+            "stage_start_s": None,
+            "stage_end_s": None,
+            "stage_age_s": None,
+        }
+
+    @staticmethod
+    def _disabled_stability_eta(reason: str = "adaptive_stop_disabled") -> dict[str, Any]:
+        return {
+            "status": "disabled",
+            "display_text": "自动停止未启用",
+            "seconds": None,
+            "direction": "flat",
+            "confidence": None,
+            "tau_s": None,
+            "i_inf_nA": None,
+            "amplitude_nA": None,
+            "noise_sigma_nA": None,
+            "reason": reason,
+            "window_s": None,
+            "stage_age_s": None,
+            "minimum_stage_s": 45.0,
+            "history_window_s": 120.0,
+            "platform_window_s": None,
+            "reset_consecutive": False,
+            "suggested_stage_start_s": None,
+        }
+
+    def _reset_live_analysis_locked(self) -> None:
+        self._prepared_live_stage = None
+        self._rolling_metrics = self._empty_rolling_metrics()
+        self._last_complete_rolling_metrics = None
+        self._last_complete_rolling_epoch = None
+        self._stop_requested_rolling_metrics = None
+        if (
+            self.settings.get("method") == "it"
+            and self.settings.get("adaptive_stop")
+        ):
+            self._stability_eta = self._disabled_stability_eta(
+                "waiting_for_measurement"
+            )
+            self._stability_eta.update({
+                "status": "idle",
+                "display_text": "等待测量",
+                "platform_window_s": self.plateau_config.window_duration_s,
+            })
+        else:
+            self._stability_eta = self._disabled_stability_eta()
+        self._rolling_metrics_frozen = None
+        self._stability_eta_frozen = None
+        self._live_analysis_last_refresh = 0.0
+        self._stability_eta_estimator.reset()
+
+    def _invalidate_rolling_display_locked(self) -> None:
+        """Rebuild display/noise metrics without discarding ETA direction state."""
+
+        self._prepared_live_stage = None
+        self._rolling_metrics = self._empty_rolling_metrics(
+            "accumulating", "滤波显示设置已更新，正在重算",
+        )
+        if self._last_complete_rolling_metrics is not None:
+            # Display-only filtering changes noise, but the formal steady
+            # current and slope still use raw data. Preserve those scientific
+            # values for an immediate stop while invalidating filter evidence.
+            self._last_complete_rolling_metrics = {
+                **self._last_complete_rolling_metrics,
+                "noise_nA": None,
+                "filter_effective": False,
+                "filter_meta": {},
+            }
+        self._stop_requested_rolling_metrics = None
+        self._rolling_metrics_frozen = None
+        self._live_analysis_last_refresh = 0.0
+
+    @staticmethod
+    def _rolling_metric_is_complete(metrics: dict[str, Any] | None) -> bool:
+        if not isinstance(metrics, dict):
+            return False
+        value = metrics.get("steady_current_nA")
+        if isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    def _last_complete_with_bookkeeping_locked(
+        self, latest: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if not self._rolling_metric_is_complete(
+            self._last_complete_rolling_metrics
+        ):
+            return None
+        result = dict(self._last_complete_rolling_metrics or {})
+        if isinstance(latest, dict):
+            for field in (
+                "native_point_count", "valid_native_point_count",
+                "expected_native_point_count", "progress_percent",
+            ):
+                if field in latest:
+                    result[field] = latest[field]
+        return result
 
     def _reset_data_cache(self) -> None:
         self._data_cache_path: Path | None = None
@@ -1012,21 +1364,399 @@ class MeasurementController:
         self._data_cache_pending = ""
         self._data_cache_header: list[str] | None = None
         self._data_cache_first_dev_ms: float | None = None
+        self._data_last_dev_ms: float | None = None
         self._data_cache: dict[str, list[Any]] = {
-            "time_s": [], "current_nA": [], "valid": [],
+            "time_s": [], "current_nA": [], "valid": [], "epoch": [],
         }
+        self._data_context_reset_pending = False
+
+    def set_filter_config(self, config: dict[str, Any]) -> None:
+        normalized = validate_filter_config(config)
+        with self.lock:
+            if (
+                self.state == "running"
+                and (self.user_stop_requested or self.auto_stop_requested)
+            ):
+                return
+            before = self._analysis_filter_config()
+            previous = dict(self.filter_config)
+            self.filter_config = normalized
+            if self.state != "running":
+                return
+            if before != self._analysis_filter_config():
+                self._reset_plateau_monitor_locked(
+                    preserve_minimum_gate=True,
+                )
+            elif previous != self.filter_config:
+                self._invalidate_rolling_display_locked()
+
+    def set_plateau_config(self, config: PlateauConfig | dict[str, Any]) -> None:
+        normalized = PlateauConfig.validate(config)
+        with self.lock:
+            if (
+                self.state == "running"
+                and (self.user_stop_requested or self.auto_stop_requested)
+            ):
+                return
+            if normalized != self.plateau_config:
+                self.plateau_config = normalized
+                if self.state == "running":
+                    self._reset_plateau_monitor_locked()
+
+    def _reset_plateau_monitor_locked(
+        self, *, hardware_context_changed: bool = False,
+        expected_epoch: int | None = None, clock_reset: bool = False,
+        preserve_minimum_gate: bool = False,
+    ) -> None:
+        self._plateau_last_segment = 0
+        self._plateau_consecutive_passes = 0
+        self._plateau_evaluation = None
+        self._plateau_progress = {}
+        if not preserve_minimum_gate:
+            self._plateau_minimum_gate_until_s = 0.0
+        self._reset_live_analysis_locked()
+        if clock_reset:
+            self._plateau_context_start_s = 0.0
+            self._plateau_context_epoch = None
+            self._plateau_expected_epoch = None
+            self._plateau_context_pending = False
+        elif hardware_context_changed:
+            # The incremental cache can lag the collector file. Do not infer a
+            # boundary from its last timestamp: unread old-epoch rows would then
+            # be mistaken for post-change samples. The first matching CSV epoch
+            # establishes the boundary in _plateau_context_data_locked().
+            self._plateau_expected_epoch = expected_epoch
+            self._plateau_context_pending = True
+
+    def is_busy(self) -> bool:
+        """Return true until the acquisition watcher has finished callbacks."""
+        with self.lock:
+            return self.state == "running" or bool(
+                self.thread is not None and self.thread.is_alive()
+            )
+
+    def wait_for_completion(self) -> None:
+        """Wait until acquisition analysis, exports, and callbacks are complete."""
+        with self.lock:
+            watcher = self.thread
+        if (watcher is not None and watcher.is_alive()
+                and watcher is not threading.current_thread()):
+            watcher.join()
+
+    def _analysis_filter_config(self) -> dict[str, Any]:
+        config = dict(self.filter_config)
+        if config.get("mode") != "analysis":
+            # Display-only knobs must not participate in the formal-analysis
+            # identity; otherwise changing a preview cutoff resets the platform
+            # streak and ETA even though both still consume raw current.
+            return validate_filter_config({"mode": "off"})
+        return config
+
+    def _expected_native_rate_hz_locked(self) -> float | None:
+        if self.metadata.get("debug"):
+            period_ms = self._cfg_live.get("period_ms")
+            if isinstance(period_ms, (int, float)) and period_ms > 0:
+                return 1000.0 / float(period_ms)
+            return None
+        if self.settings.get("method") == "cv":
+            step = float(self.settings.get("cv_step_v") or 0.0)
+            scan_rate = float(self.settings.get("cv_scan_rate_v_s") or 0.0)
+            return scan_rate / step if step > 0 and scan_rate > 0 else None
+        if self.settings.get("fsr_nA") in IT_WIDE_FSR_OPTIONS:
+            rate = float(self.settings.get("target_rate_hz") or 0.0)
+            return rate if rate > 0 else None
+        period_code = self.settings.get("sens_period_code")
+        period_ms = SENS_PERIOD_MS.get(period_code)
+        return 1000.0 / period_ms if period_ms else None
+
+    @staticmethod
+    def _native_valid_count(data: dict[str, list[Any]]) -> int:
+        return sum(
+            bool(is_valid)
+            and math.isfinite(float(timestamp))
+            and math.isfinite(float(current))
+            for timestamp, current, is_valid in zip(
+                data.get("time_s", []),
+                data.get("current_nA", []),
+                data.get("valid", []),
+            )
+        )
+
+    def _cv_rolling_metrics_locked(
+        self, data: dict[str, list[Any]], *, completed: bool = False,
+    ) -> dict[str, Any]:
+        payload = self._empty_rolling_metrics(
+            "complete" if completed else "collecting",
+            "CV 指标保持实时电位与当前循环语义",
+        )
+        count = len(data.get("time_s", []))
+        valid_count = self._native_valid_count(data)
+        elapsed_s = float(data["time_s"][-1]) if count else 0.0
+        duration_s = float(self.settings.get("duration_s") or 0.0)
+        progress = (
+            100.0 if completed
+            else min(100.0, max(0.0, elapsed_s / duration_s * 100.0))
+            if duration_s > 0 else 0.0
+        )
+        native_rate = self._expected_native_rate_hz_locked()
+        payload.update({
+            "native_point_count": count,
+            "valid_native_point_count": valid_count,
+            "expected_native_point_count": (
+                int(round(duration_s * native_rate))
+                if native_rate is not None and duration_s > 0 else None
+            ),
+            "progress_percent": progress,
+            "stage_end_s": elapsed_s if count else None,
+            "stage_age_s": elapsed_s if count else None,
+        })
+        return payload
+
+    def _refresh_live_analysis_locked(
+        self, data: dict[str, list[Any]] | None = None, *, force: bool = False,
+    ) -> None:
+        if self._rolling_metrics_frozen is not None and not force:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and self._live_analysis_last_refresh > 0.0
+            and now - self._live_analysis_last_refresh < LIVE_ANALYSIS_REFRESH_S
+        ):
+            return
+        data = data if data is not None else self._data()
+        if self._data_context_reset_pending:
+            self._data_context_reset_pending = False
+            self._reset_plateau_monitor_locked(clock_reset=True)
+        if self.settings.get("method") == "cv":
+            completed = self.state == "completed"
+            self._rolling_metrics = self._cv_rolling_metrics_locked(
+                data, completed=completed,
+            )
+            self._stability_eta_estimator.reset()
+            self._stability_eta = self._disabled_stability_eta("cv_method")
+            self._prepared_live_stage = None
+            self._live_analysis_last_refresh = now
+            return
+
+        context_data = self._plateau_context_data_locked(
+            data, update_state=not force,
+        )
+        expected_rate = self._expected_native_rate_hz_locked()
+        elapsed_s = (
+            float(data["time_s"][-1]) if data.get("time_s") else 0.0
+        )
+        try:
+            stage = prepare_live_stage(
+                context_data.get("time_s", []),
+                context_data.get("current_nA", []),
+                context_data.get("valid", []),
+                context_data.get("epoch"),
+                fit_window_s=float(
+                    self.settings.get("fit_window_s") or FIT_WINDOW_S
+                ),
+                filter_config=self.filter_config,
+                plateau_config=self.plateau_config,
+                expected_sample_rate_hz=expected_rate,
+            )
+            metrics = metrics_from_stage(
+                stage,
+                run_state=self.state,
+                fixed_duration_s=(
+                    None if self.settings.get("adaptive_stop")
+                    else float(self.settings.get("duration_s") or 0.0)
+                ),
+                run_elapsed_s=elapsed_s,
+            )
+            metrics.update({
+                "native_point_count": len(data.get("time_s", [])),
+                "valid_native_point_count": self._native_valid_count(data),
+                "expected_native_point_count": (
+                    None if self.settings.get("adaptive_stop")
+                    or expected_rate is None
+                    else int(round(
+                        float(self.settings.get("duration_s") or 0.0)
+                        * expected_rate
+                    ))
+                ),
+                "timestamp_s": stage.stage_end_s,
+            })
+            stage_epoch = (
+                context_data.get("epoch", [])[-1]
+                if context_data.get("epoch") else None
+            )
+            if (
+                self._last_complete_rolling_metrics is not None
+                and stage_epoch != self._last_complete_rolling_epoch
+            ):
+                self._last_complete_rolling_metrics = None
+                self._last_complete_rolling_epoch = None
+            self._prepared_live_stage = stage
+            self._rolling_metrics = metrics
+            if stage.window_complete and self._rolling_metric_is_complete(metrics):
+                self._last_complete_rolling_metrics = dict(metrics)
+                self._last_complete_rolling_epoch = stage_epoch
+        except (TypeError, ValueError) as exc:
+            self._prepared_live_stage = None
+            self._rolling_metrics = self._empty_rolling_metrics(
+                "unavailable", f"实时指标不可用：{exc}",
+            )
+            self._rolling_metrics.update({
+                "native_point_count": len(data.get("time_s", [])),
+                "valid_native_point_count": self._native_valid_count(data),
+            })
+
+        adaptive_enabled = bool(
+            self.settings.get("adaptive_stop") and self.state == "running"
+        )
+        if adaptive_enabled:
+            minimum_gate_age_s = max(
+                self.plateau_config.window_duration_s,
+                float(self.settings.get("fit_window_s") or FIT_WINDOW_S),
+            )
+            eta = self._stability_eta_estimator.update(
+                stage=self._prepared_live_stage,
+                plateau_config=self.plateau_config,
+                filter_config=self.filter_config,
+                plateau_evaluation=self._plateau_evaluation,
+                consecutive_passes=self._plateau_consecutive_passes,
+                live_metrics=self._rolling_metrics,
+                minimum_gate_age_s=minimum_gate_age_s,
+                enabled=True,
+                force=force,
+                now_s=now,
+            )
+            stage_age = (
+                self._prepared_live_stage.stage_age_s
+                if self._prepared_live_stage is not None else None
+            )
+            eta.update({
+                "window_s": (
+                    min(
+                        float(stage_age),
+                        self._stability_eta_estimator.config.history_window_s,
+                    )
+                    if stage_age is not None else None
+                ),
+                "stage_age_s": stage_age,
+                "minimum_stage_s": (
+                    self._stability_eta_estimator.config.minimum_stage_s
+                ),
+                "history_window_s": (
+                    self._stability_eta_estimator.config.history_window_s
+                ),
+                "platform_window_s": (
+                    self.plateau_config.window_duration_s
+                ),
+            })
+            self._stability_eta = eta
+        else:
+            self._stability_eta_estimator.reset()
+            self._stability_eta = self._disabled_stability_eta()
+        self._live_analysis_last_refresh = now
+
+    def _freeze_live_analysis_locked(
+        self, data: dict[str, list[Any]], *, completed: bool,
+    ) -> None:
+        if self.settings.get("method") == "cv":
+            self._rolling_metrics = self._cv_rolling_metrics_locked(
+                data, completed=completed,
+            )
+            self._stability_eta_estimator.reset()
+            self._stability_eta = self._disabled_stability_eta("cv_method")
+            self._prepared_live_stage = None
+            self._live_analysis_last_refresh = time.monotonic()
+        elif (
+            self.auto_stop_requested
+            and isinstance(self._auto_stop_evidence, dict)
+            and isinstance(
+                self._auto_stop_evidence.get("rolling_metrics"), dict,
+            )
+        ):
+            self._rolling_metrics = dict(
+                self._auto_stop_evidence["rolling_metrics"]
+            )
+            trigger_eta = self._auto_stop_evidence.get("stability_eta")
+            if isinstance(trigger_eta, dict):
+                self._stability_eta = dict(trigger_eta)
+            self._prepared_live_stage = None
+            self._live_analysis_last_refresh = time.monotonic()
+        elif (
+            self.user_stop_requested
+            and self._stop_requested_rolling_metrics is not None
+        ):
+            self._rolling_metrics = dict(
+                self._stop_requested_rolling_metrics
+            )
+            self._prepared_live_stage = None
+            self._live_analysis_last_refresh = time.monotonic()
+        else:
+            self._refresh_live_analysis_locked(data, force=True)
+            if not self._rolling_metric_is_complete(self._rolling_metrics):
+                cached = self._last_complete_with_bookkeeping_locked(
+                    self._rolling_metrics
+                )
+                if cached is not None:
+                    self._rolling_metrics = cached
+        rolling = dict(self._rolling_metrics)
+        if completed and not self.settings.get("adaptive_stop"):
+            rolling["progress_percent"] = 100.0
+        if self.settings.get("method") == "cv":
+            rolling["status"] = "frozen"
+            rolling["reason"] = "CV 原生点数与进度已冻结"
+        elif rolling.get("steady_current_nA") is not None:
+            rolling["status"] = "frozen"
+            rolling["reason"] = "最后一个完整原生窗口已冻结"
+        else:
+            rolling["status"] = "frozen"
+            rolling["reason"] = (
+                "测量结束时无完整原生窗口："
+                f"{rolling.get('reason') or '数据不足'}"
+            )
+        self._rolling_metrics = rolling
+        self._rolling_metrics_frozen = dict(rolling)
+
+        if self.settings.get("adaptive_stop"):
+            eta = dict(self._stability_eta)
+            if (
+                self.auto_stop_requested
+                or self._plateau_consecutive_passes
+                >= self.plateau_config.required_consecutive_windows
+            ):
+                eta.update({
+                    "status": "complete",
+                    "display_text": "0 秒",
+                    "seconds": 0,
+                    "confidence": 1.0,
+                    "reason": "plateau_gate_complete",
+                })
+            eta["status"] = "frozen"
+            eta["reset_consecutive"] = False
+            self._stability_eta = eta
+            self._stability_eta_frozen = dict(eta)
+        else:
+            self._stability_eta = self._disabled_stability_eta()
+            self._stability_eta_frozen = dict(self._stability_eta)
 
     def start(self, metadata: dict[str, Any] | None = None,
               on_complete: Any = None,
-              settings: dict[str, Any] | None = None) -> dict[str, Any]:
-        if HARDWARE_TRANSPORT == "serial":
-            # Resolve the DATA path before creating a run directory.  A
-            # disconnected attempt therefore cannot look like an experiment.
-            _require_v51_ports(require_smp=False)
+              settings: dict[str, Any] | None = None,
+              trigger: str = "FRESH_START",
+              filter_config: dict[str, Any] | None = None,
+              plateau_config: PlateauConfig | dict[str, Any] | None = None,
+              verify_runtime_config: bool = False) -> dict[str, Any]:
         with self.lock:
-            if self.state == "running":
-                raise RuntimeError("已有测量正在运行")
+            if self.state == "running" or (
+                self.thread is not None and self.thread.is_alive()
+            ):
+                raise RuntimeError("已有测量正在运行或正在保存结果")
             self.settings = SettingsController.validate(settings or self.settings)
+            self.filter_config = validate_filter_config(filter_config or self.filter_config)
+            self.plateau_config = PlateauConfig.validate(
+                plateau_config if plateau_config is not None else self.plateau_config
+            )
+            if verify_runtime_config:
+                trigger = "ARMED"
             method = self.settings["method"]
             RUNS_DIR.mkdir(parents=True, exist_ok=True)
             self.run_id = _now_id(method)
@@ -1045,27 +1775,41 @@ class MeasurementController:
             # 🔴 新一轮必须清缓存与读位置 —— 不清会把上一轮的审计与曲线接在
             #    这一轮后面(文件换了,读位置却没归零 ⇒ 直接读到文件尾之外)。
             self._audit_pos = 0
+            self._audit_pending = ""
             self._auto_get_at = 0.0
             self._audit_cache = []
-            # 🔴 **不清 _cfg_live / _afe_status**:它们描述的是**设备**,不是某一轮。
-            #    清掉的后果是 DEBUG 面板在两轮之间没有任何设备真值可显示,控件只能
-            #    退回 HTML 默认值(FSR 50nA、E 空)——而那时按「应用」就会把**猜的值**
-            #    写进硬件。保留上次已知值,新一轮的 auto-GET 几秒内就会刷新它。
+            # OpenOCD 重建 RTT 连接可能会重启 MCU。上一轮缓存若仍是
+            # V_WE=250，而新开机的硬件已回到 1200，begin() 就会误判“已一致”
+            # 而只发 START。因此新会话必须清除硬件真值，等本轮 CFG_*
+            # 重新建立。前端在点击前已保留表单值，不会因此丢参数。
+            self._cfg_live = {}
+            self._cfg_live_epoch = None
+            self._cfg_epochs = {}
+            self._afe_status = {}
+            self._cfg_confirmed_this_session = False
+            self._hardware_taint = None
             self._last_reject = {}
             self._phase = {}          # 阶段是**本轮**的属性,新一轮必须清
             self._dbg_cur_pos = 0
             self._dbg_cur = []
             self._dbg_cur_hdr = None
+            self._dbg_cur_pending = ""
             self._dbg_cv_pos = 0
             self._dbg_cv = []
             self._dbg_cv_hdr = None
+            self._dbg_cv_pending = ""
             self.range_runtime = {"pending": None, "applied": None,
                                   "rejected": None, "at": None}
             self._rtt_pos = 0
+            self._rtt_pending = ""
             self._auto_switch_done = False
             self.resampled_path = self.run_dir / (
                 "cv.csv" if method == "cv" else "resampled_10hz.csv"
             )
+            self.filtered_path = self.run_dir / (
+                "cv-filtered.csv" if method == "cv" else "resampled_10hz-filtered.csv"
+            )
+            self.filter_meta = {}
             self.summary_path = self.run_dir / "summary.json"
             self.plot_path = self.run_dir / (
                 "cv_curve.png" if method == "cv" else "it_curve.png"
@@ -1076,14 +1820,45 @@ class MeasurementController:
             self.workflow_result = None
             self.error = ""
             self.user_stop_requested = False
+            self.auto_stop_requested = False
+            self._auto_stop_evidence = None
+            self._reset_plateau_monitor_locked()
+            self._plateau_context_start_s = 0.0
+            self._plateau_cfg_epoch = None
+            self._plateau_context_epoch = None
+            self._plateau_expected_epoch = None
+            self._plateau_context_pending = False
+            self.debug_waiting_for_start = trigger == "ARMED"
+            self._debug_pending_cfg = None
+            self._prestart_gate_failed = False
+            self._config_gate_event = threading.Event()
+            self._config_gate = (
+                {
+                    "state": "checking",
+                    "expected": SettingsController.runtime_afe_contract(self.settings),
+                    "actual": {},
+                    "mismatches": [],
+                    "started_at": time.time(),
+                    "verified_at": None,
+                    "verification_level": None,
+                    "request_id": hashlib.sha256(
+                        f"{self.run_id}:{time.time_ns()}".encode("ascii")
+                    ).hexdigest()[:12],
+                    "last_tagged_get_at": 0.0,
+                    "tagged_get_attempts": 0,
+                    "legacy_fallback_sent": False,
+                }
+                if verify_runtime_config else {"state": "idle"}
+            )
             self._reset_data_cache()
             self.state = "running"
-            transport_label = (
-                "V5.1 USB DATA" if HARDWARE_TRANSPORT == "serial" else "RTT"
-            )
-            self.message = (
-                f"已启动硬件 {method.upper()} 测量，等待 {transport_label} 数据"
-            )
+            if self.settings.get("adaptive_stop") and method == "it":
+                self._stability_eta.update({
+                    "status": "estimating",
+                    "display_text": "正在估计",
+                    "reason": "insufficient_data",
+                })
+            self.message = f"已启动硬件 {method.upper()} 测量，等待 RTT 数据"
             self.on_complete = on_complete
 
             env = os.environ.copy()
@@ -1094,6 +1869,13 @@ class MeasurementController:
                 "-m",
                 "pa_host.it_tool",
                 "measure",
+                # 让 collector 持有唯一的 RTT 桥:有 V8.80 时优先 JLinkExe;
+                #    CubeIDE 缺失时自动回退到启用 libjaylink 的 OpenOCD。
+                #    两者都负责指定 RTT 控制块，RTT 仍出在 telnet 19021,
+                #    并且 finally 里有 terminate/wait/kill 的完整回收(禁 pkill)。
+                "--start-jlink",
+                "--elf",
+                str(_firmware_artifact("zephyr.elf")),
                 # 方案 C:命令文件。外部另开 telnet 连接写下行**无效**
                 # (JLinkExe 只转发采集器持有的那个连接)⇒ 必须走这个文件。
                 "--cell-v",
@@ -1107,20 +1889,18 @@ class MeasurementController:
                 "--raw-log",
                 str(self.raw_log),
                 "--trigger",
-                "FRESH_START",
+                trigger,
                 "--duration",
-                str(self.settings["prestep_s"] + self.settings["duration_s"] + 5),
+                str(
+                    0
+                    if self.settings["method"] == "it" and self.settings["adaptive_stop"]
+                    else self.settings["prestep_s"] + self.settings["duration_s"] + 5
+                ),
                 "--idle-timeout",
                 "25",
             ]
-            if HARDWARE_TRANSPORT == "serial":
-                command += ["--serial", SERIAL_DATA_PORT]
-            else:
-                # collector 持有唯一 RTT 桥并负责完整回收。
-                command += [
-                    "--start-jlink", "--elf", str(FIRMWARE_ELF),
-                    "--probe-serial", JLINK_SERIAL,
-                ]
+            if JLINK_SERIAL:
+                command += ["--probe-serial", JLINK_SERIAL]
             if method == "cv":
                 command.append("--cv")
             log_handle = (self.run_dir / "collector.log").open("w", buffering=1)
@@ -1138,7 +1918,9 @@ class MeasurementController:
                     #    JLinkExe 都活下来,**并且不会因 idle-timeout 自愈**
                     #    (2026-08-09 实测:停止 60s 后两者仍在跑、19021 仍被占,
                     #    下一次烧录/测量就会撞上探头被占)。有了进程组才能整棵收掉。
-                    start_new_session=True,
+                    # Windows: CREATE_NEW_PROCESS_GROUP 代替 start_new_session。
+                    **(dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                       if _IS_WIN else dict(start_new_session=True)),
                 )
             except Exception:
                 log_handle.close()
@@ -1146,9 +1928,55 @@ class MeasurementController:
                 self.state = "error"
                 self.error = "无法启动采集进程"
                 raise
-            self.thread = threading.Thread(target=self._watch, args=(log_handle,), daemon=True)
+            if verify_runtime_config:
+                # ARMED keeps the firmware idle. GET is forwarded only after the
+                # collector owns the RTT downlink, and START is written later by
+                # the configuration gate after a complete confirmed snapshot.
+                if self._send_tagged_gate_get_locked():
+                    self.message = "正在回读并核对硬件配置"
+            # This thread owns analysis, exports, and completion callbacks after
+            # the collector exits. It must keep the process alive until those
+            # durable writes finish.
+            self.thread = threading.Thread(
+                target=self._watch, args=(log_handle,), daemon=False
+            )
             self.thread.start()
             return self.snapshot()
+
+    def start_verified(self, metadata: dict[str, Any] | None = None,
+                       on_complete: Any = None,
+                       settings: dict[str, Any] | None = None,
+                       filter_config: dict[str, Any] | None = None,
+                       plateau_config: PlateauConfig | dict[str, Any] | None = None,
+                       timeout_s: float = 30.0) -> dict[str, Any]:
+        """Start a formal run only after the MCU confirms the full AFE state."""
+        self.start(
+            metadata=metadata,
+            on_complete=on_complete,
+            settings=settings,
+            trigger="ARMED",
+            filter_config=filter_config,
+            plateau_config=plateau_config,
+            verify_runtime_config=True,
+        )
+        if not self._config_gate_event.wait(timeout_s):
+            self._fail_config_gate("timeout", "硬件配置回读超时，测量未启动")
+        with self.lock:
+            gate = dict(self._config_gate)
+        if gate.get("state") != "matched":
+            if gate.get("state") != "mismatch":
+                raise RuntimeError(
+                    str(gate.get("message") or "硬件配置回读失败，测量未启动")
+                )
+            details = "、".join(
+                str(item.get("field")) for item in gate.get("mismatches", [])
+            )
+            suffix = f"：{details}" if details else ""
+            raise RuntimeError(
+                f"硬件当前配置与实时页条件不一致{suffix}。"
+                "请重新点击“应用条件并烧录硬件”后再测量"
+            )
+        return self.snapshot()
 
     def _stop_bridge(self) -> None:
         """收掉硬件桥子进程。
@@ -1172,22 +2000,65 @@ class MeasurementController:
 
     def stop(self) -> dict[str, Any]:
         with self.lock:
-            process = self.process
-            if self.state != "running" or process is None:
-                return self.snapshot()
+            self._request_stop_locked(automatic=False)
+            return self.snapshot()
+
+    def _request_stop_locked(self, *, automatic: bool) -> bool:
+        process = self.process
+        if self.state != "running" or process is None:
+            return False
+        if self.user_stop_requested or self.auto_stop_requested:
+            return False
+        if self._config_gate.get("state") == "checking":
+            self._fail_config_gate("aborted", "配置核对期间测量已取消")
+            return True
+        if automatic:
+            self.auto_stop_requested = True
+            self._auto_stop_evidence = _json_safe({
+                "requested_at": time.time(),
+                "consecutive_passes": self._plateau_consecutive_passes,
+                "required_consecutive_windows": (
+                    self.plateau_config.required_consecutive_windows
+                ),
+                "evaluation": self._plateau_evaluation,
+                "context_start_s": self._plateau_context_start_s,
+                "minimum_gate_until_s": self._plateau_minimum_gate_until_s,
+                "rolling_stage_key": self._rolling_metrics.get("stage_key"),
+                "rolling_stage_end_s": self._rolling_metrics.get("stage_end_s"),
+                "rolling_metrics": self._rolling_metrics,
+                "stability_eta": self._stability_eta,
+                "filter_config": self.filter_config,
+                "plateau_config": self.plateau_config.to_dict(),
+            })
+            self.message = "已检测到稳定平台，正在结束测量"
+        else:
+            self._stop_requested_rolling_metrics = (
+                dict(self._rolling_metrics)
+                if self._rolling_metric_is_complete(self._rolling_metrics)
+                else self._last_complete_with_bookkeeping_locked(
+                    self._rolling_metrics
+                )
+            )
             self.user_stop_requested = True
             self.message = "正在停止硬件测量"
-            try:
-                with socket.create_connection(("127.0.0.1", 19021), timeout=1) as conn:
-                    conn.sendall(b"STOP\n")
-            except OSError:
-                self._terminate_tree(process)
-            else:
-                threading.Thread(
-                    target=self._terminate_if_running,
-                    args=(process, 1.5), daemon=True,
-                ).start()
-            return self.snapshot()
+        # 顶部拒绝提示只代表“最近一次命令”；停止后它已不再可行动。
+        # 原始 CFG_REJECT 仍完整保留在 audit.jsonl 和界面审计列表中。
+        self._last_reject = {}
+        try:
+            if self.cmd_path is None:
+                raise OSError("采集命令文件尚未就绪")
+            # collector 持有唯一有效的 RTT 下行连接。另开 telnet 连接写 STOP
+            # 不会到达固件,只会让 host 杀掉进程而 MCU 继续处于 acquiring。
+            with self.cmd_path.open("a", encoding="utf-8") as fh:
+                fh.write("STOP\n")
+        except OSError:
+            self._terminate_tree(process)
+        else:
+            threading.Thread(
+                target=self._terminate_if_running,
+                args=(process, 1.5), daemon=True,
+            ).start()
+        return True
 
     def send_range(self, payload: dict[str, Any]) -> dict[str, Any]:
         """方案 C:测量进行中在线切换 FSR / offset 档,**不复位、不中断极化**。
@@ -1196,8 +2067,11 @@ class MeasurementController:
         那个连接的输入送进下行通道,另开连接写命令目标端收不到(2026-08-09 实测)。
         """
         with self.lock:
-            if self.state != "running" or self.cmd_path is None:
+            if (self.state != "running" or self.cmd_path is None
+                    or self.user_stop_requested or self.auto_stop_requested):
                 raise RuntimeError("只有测量进行中才能在线切档")
+            if self._config_gate.get("state") == "checking":
+                raise RuntimeError("硬件配置核对期间不能修改运行时参数")
             fsr = int(payload["fsr_code"])
             sel = int(payload["offset_sel"])
             if not (0 <= fsr <= 5) or not (0 <= sel <= 7):
@@ -1214,6 +2088,21 @@ class MeasurementController:
     # ------------------------------------------------------------------
     # 硬件 DEBUG 模式
     # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_command_line(line: str) -> str:
+        line = line.strip()
+        if not line:
+            raise ValueError("命令为空")
+        if "\n" in line or "\r" in line:
+            raise ValueError("一行一条命令,不许含换行")
+        try:
+            line.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("硬件命令只能包含 ASCII 字符") from exc
+        if len(line) >= 128:
+            raise ValueError(f"命令过长({len(line)} ≥ 128 字符)")
+        return line
+
     def send_command(self, line: str) -> dict[str, Any]:
         """下发任意一行命令。send_range() 是它的一个特例。
 
@@ -1221,17 +2110,16 @@ class MeasurementController:
         的那个连接**的输入送进下行通道,另开 telnet 写命令目标端收不到
         (2026-08-09 实测)。所以"没有测量在跑"时无处可发,只能拒绝。
         """
-        line = line.strip()
-        if not line:
-            raise ValueError("命令为空")
-        if "\n" in line or "\r" in line:
-            raise ValueError("一行一条命令,不许含换行")
-        if len(line) >= 128:
-            # 与固件 AFE_CFG_LINE_MAX 同口径:超长在固件侧只会被拒,不如在这里挡
-            raise ValueError(f"命令过长({len(line)} ≥ 128 字符)")
+        # 与固件 AFE_CFG_LINE_MAX 同口径:超长在固件侧只会被拒,不如在这里挡
+        line = self._validate_command_line(line)
         with self.lock:
-            if self.state != "running" or self.cmd_path is None:
+            if (self.state != "running" or self.cmd_path is None
+                    or self.user_stop_requested or self.auto_stop_requested):
                 raise RuntimeError("命令只能在测量进行中下发(RTT 下行通道由采集器持有)")
+            verb = line.split(None, 1)[0]
+            if (self._config_gate.get("state") == "checking"
+                    and verb not in {"GET", "STATUS", "PEEK"}):
+                raise RuntimeError("硬件配置核对期间不能修改运行时参数")
             with self.cmd_path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
             if line.startswith(("RANGE ", "SET ")):
@@ -1239,49 +2127,403 @@ class MeasurementController:
                                       "rejected": None, "at": time.time()}
             return _json_safe({"sent": line, "cmd_file": str(self.cmd_path)})
 
+    def require_debug_run(self) -> None:
+        """Reject Debug mutations unless the active acquisition is a Debug run."""
+        with self.lock:
+            if self.state != "running" or not self.metadata.get("debug"):
+                raise RuntimeError(
+                    "当前运行不是硬件 DEBUG 测量，拒绝 DEBUG 控制命令"
+                )
+
+    def begin_debug_measurement(self, line: str) -> dict[str, Any]:
+        """在 ARMED Debug 连接上应用配置；确认成功后才由 snapshot 发 START。"""
+        line = self._validate_command_line(line)
+        if not line.startswith("SET ") or "FORCE" in line.split():
+            raise ValueError("Debug 待机启动只允许不带 FORCE 的 SET 配置命令")
+        desired: dict[str, str] = {}
+        for token in line.split()[1:]:
+            key, sep, value = token.partition("=")
+            if not sep or not key or not value:
+                raise ValueError(f"无法解析 Debug 配置项：{token}")
+            desired[key] = value
+        with self.lock:
+            if (self.state != "running" or self.cmd_path is None
+                    or self.user_stop_requested or not self.debug_waiting_for_start):
+                raise RuntimeError("Debug 设备不在等待启动状态，请重新读取设备配置")
+            if not self._cfg_confirmed_this_session:
+                raise RuntimeError("Debug 尚未收到本次连接的配置确认，请等待设备状态读回")
+            current_ep = int(self._cfg_live.get("ep") or 0)
+            self._last_reject = {}
+            # 全部字段已经等于设备确认值时，固件只会回 CFG_NOOP（不会新建 epoch）。
+            # 此时现有 confirmed_ep 已足够证明配置，直接 START 即可。
+            if (int(self._cfg_live.get("confirmed_ep") or -1) == current_ep
+                    and self._debug_cfg_matches(desired, self._cfg_live)):
+                with self.cmd_path.open("a", encoding="utf-8") as fh:
+                    fh.write("START\n")
+                self.debug_waiting_for_start = False
+                self.message = "设备配置已一致，正在启动硬件测量"
+                return _json_safe({"sent": ["START"], "already_applied": True,
+                                   "cmd_file": str(self.cmd_path)})
+            self._debug_pending_cfg = {
+                "desired": desired,
+                "min_epoch": current_ep + 1,
+                "line": line,
+            }
+            # 这里只发 SET。必须等审计出现匹配的 CFG_CONFIRMED 后才能发 START；
+            # 否则整组 SET 被拒时仍会拿旧配置开跑，看起来像“被默认值覆盖”。
+            with self.cmd_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            self.message = "配置已下发，等待固件确认"
+            return _json_safe({"sent": [line], "waiting_for_confirmation": True,
+                               "cmd_file": str(self.cmd_path)})
+
+    @staticmethod
+    def _debug_cfg_matches(desired: dict[str, str], cfg: dict[str, Any]) -> bool:
+        fields = {
+            "fsr": "fsr", "off": "off", "period": "period", "e": "e_mv",
+            "vwe": "vwe_mv", "idle": "idle", "sysper": "sysper",
+            "cellv": "cellv", "ioc": "ioc",
+        }
+        for key, cfg_key in fields.items():
+            if key in desired and str(cfg.get(cfg_key)) != desired[key]:
+                return False
+        if "conv" in desired:
+            if desired["conv"] == "auto":
+                if cfg.get("conv_src") != "auto":
+                    return False
+            elif str(cfg.get("conv")) != desired["conv"]:
+                return False
+        return True
+
+    def _maybe_start_confirmed_debug(self) -> None:
+        pending = self._debug_pending_cfg
+        if not pending or self._last_reject:
+            return
+        cfg = self._cfg_live
+        try:
+            confirmed = int(cfg.get("confirmed_ep") or -1)
+            epoch = int(cfg.get("ep") or -1)
+            min_epoch = int(pending["min_epoch"])
+        except (TypeError, ValueError):
+            return
+        if (epoch < min_epoch or confirmed != epoch
+                or not self._debug_cfg_matches(pending["desired"], cfg)):
+            return
+        if self.cmd_path is None:
+            return
+        with self.cmd_path.open("a", encoding="utf-8") as fh:
+            fh.write("START\n")
+        self._debug_pending_cfg = None
+        self.debug_waiting_for_start = False
+        self.message = "配置已确认，正在启动硬件测量"
+
+    def _fail_config_gate(self, state: str, message: str,
+                          mismatches: list[dict[str, Any]] | None = None) -> None:
+        """Abort an ARMED formal run without ever queuing START."""
+        process: subprocess.Popen[str] | None = None
+        with self.lock:
+            if self._config_gate.get("state") != "checking":
+                self._config_gate_event.set()
+                return
+            self._config_gate.update({
+                "state": state,
+                "mismatches": list(mismatches or self._config_gate.get("mismatches", [])),
+                "verified_at": time.time(),
+                "message": message,
+            })
+            self._prestart_gate_failed = True
+            self.debug_waiting_for_start = False
+            self.user_stop_requested = True
+            self.message = message
+            self.error = message
+            process = self.process
+            self._config_gate_event.set()
+        if process is not None and process.poll() is None:
+            threading.Thread(
+                target=self._terminate_if_running,
+                args=(process, 0.0), daemon=True,
+            ).start()
+
+    def _write_config_gate_command_locked(self, line: str, failure: str) -> bool:
+        """Append one gate command or atomically fail and tear down the ARMED run."""
+        if self._config_gate.get("state") != "checking":
+            return False
+        try:
+            if self.cmd_path is None:
+                raise OSError("采集命令文件尚未就绪")
+            with self.cmd_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError as exc:
+            self._fail_config_gate("io_error", f"{failure}：{exc}")
+            return False
+        return True
+
+    def _send_tagged_gate_get_locked(self) -> bool:
+        """Send one replay request and remember it for bounded RTT-start retries."""
+        request_id = self._config_gate.get("request_id")
+        if not request_id:
+            self._fail_config_gate("internal_error", "硬件配置回读请求缺少标识")
+            return False
+        if not self._write_config_gate_command_locked(
+            f"GET req={request_id}", "无法下发硬件配置回读命令",
+        ):
+            return False
+        self._config_gate["last_tagged_get_at"] = time.time()
+        self._config_gate["tagged_get_attempts"] = (
+            int(self._config_gate.get("tagged_get_attempts") or 0) + 1
+        )
+        return True
+
+    def _maybe_retry_tagged_gate_get_locked(self) -> None:
+        """Retry the exact GET while J-Link may accept TCP before RTT downlink is ready."""
+        if (self._config_gate.get("state") != "checking"
+                or self._config_gate.get("legacy_fallback_sent")
+                or self.cmd_path is None or self.user_stop_requested):
+            return
+        now = time.time()
+        started_at = float(self._config_gate.get("started_at") or now)
+        last_sent = float(self._config_gate.get("last_tagged_get_at") or 0.0)
+        if (now - started_at >= CONFIG_GATE_LEGACY_PROBE_DELAY_S
+                or now - last_sent < CONFIG_GATE_GET_RETRY_S):
+            return
+        self._send_tagged_gate_get_locked()
+
+    @staticmethod
+    def _config_mismatches(expected: dict[str, Any],
+                           actual: dict[str, Any]) -> list[dict[str, Any]]:
+        mismatches: list[dict[str, Any]] = []
+        for field, wanted in expected.items():
+            got = actual.get(field)
+            if got != wanted:
+                mismatches.append({
+                    "field": field,
+                    "expected": wanted,
+                    "actual": got,
+                })
+        for field in ("invalid_cfg", "vdd_oor"):
+            if int(actual.get(field) or 0) != 0:
+                mismatches.append({
+                    "field": field, "expected": 0, "actual": actual.get(field),
+                })
+        if actual.get("verify_ok") != 1:
+            mismatches.append({
+                "field": "verify_ok", "expected": 1,
+                "actual": actual.get("verify_ok"),
+            })
+        return mismatches
+
+    def _advance_config_gate_locked(self) -> None:
+        if self._config_gate.get("state") != "checking":
+            return
+        exact_candidates: list[tuple[int, dict[str, Any]]] = []
+        legacy_candidates: list[tuple[int, dict[str, Any]]] = []
+        wanted_req = self._config_gate.get("request_id")
+        for (epoch, request_id), record in self._cfg_epochs.items():
+            if not {"CFG_APPLIED", "CFG_DERIVED", "CFG_CONFIRMED"}.issubset(
+                record["seen"]
+            ):
+                continue
+            if record.get("applied_src") != "get":
+                continue
+            # New firmware identifies the confirming replay as src=get. Older
+            # builds also do this; keeping it mandatory rejects boot fragments.
+            if record.get("confirmed_src") not in (None, "get"):
+                continue
+            if request_id == wanted_req:
+                exact_candidates.append((epoch, record))
+            elif (self._config_gate.get("legacy_fallback_sent")
+                  and request_id in (None, "", "-")):
+                legacy_candidates.append((epoch, record))
+        # A tagged response is unambiguous and must always beat a legacy replay,
+        # even if the latter carries a numerically newer epoch.
+        candidates = exact_candidates or legacy_candidates
+        if not candidates:
+            return
+        epoch, record = max(candidates, key=lambda item: item[0])
+        actual = dict(record["data"])
+        actual["ep"] = epoch
+        exact_physical_response = (
+            bool(exact_candidates) and record.get("confirmed_has_verify_ok") is True
+        )
+        self._config_gate.update({
+            "actual": actual,
+            "ep": epoch,
+            "mismatches": [],
+            "verification_level": (
+                "physical_registers" if exact_physical_response
+                else "reported_config"
+            ),
+        })
+        if not exact_physical_response:
+            self._fail_config_gate(
+                "unsupported_firmware",
+                "固件不支持完整物理配置核验，请重新应用条件并烧录硬件",
+            )
+            return
+        mismatches = self._config_mismatches(
+            self._config_gate["expected"], actual,
+        )
+        if record["faults"]:
+            mismatches.append({
+                "field": "config_integrity",
+                "expected": "confirmed",
+                "actual": record["faults"][-1].get("kind"),
+            })
+        self._config_gate["mismatches"] = mismatches
+        if mismatches:
+            fields = "、".join(str(item["field"]) for item in mismatches)
+            self._fail_config_gate(
+                "mismatch", f"硬件配置不一致（{fields}），未启动测量",
+                mismatches,
+            )
+            return
+        if (self.state != "running" or self.cmd_path is None
+                or self.user_stop_requested):
+            self._fail_config_gate("aborted", "配置核对期间测量已取消")
+            return
+        if not self._write_config_gate_command_locked(
+            "START", "硬件配置已匹配，但无法下发启动命令",
+        ):
+            return
+        self.debug_waiting_for_start = False
+        self._config_gate.update({
+            "state": "matched",
+            "verified_at": time.time(),
+            "message": "硬件配置已完整确认",
+        })
+        self.metadata["hardware_config"] = {
+            "expected": dict(self._config_gate["expected"]),
+            "actual": actual,
+            "epoch": epoch,
+            "verification_level": self._config_gate["verification_level"],
+            "verified_at": self._config_gate["verified_at"],
+        }
+        self.message = "硬件配置已确认，正在启动测量"
+        self._config_gate_event.set()
+
+    def _maybe_send_legacy_gate_get_locked(self) -> None:
+        """Fall back to bare GET for already-flashed firmware without req support."""
+        if (self._config_gate.get("state") != "checking"
+                or self._config_gate.get("legacy_fallback_sent")
+                or time.time() - float(self._config_gate.get("started_at") or 0)
+                < CONFIG_GATE_LEGACY_PROBE_DELAY_S
+                or self.cmd_path is None or self.user_stop_requested):
+            return
+        if not self._write_config_gate_command_locked(
+            "GET", "无法下发旧版固件兼容回读命令",
+        ):
+            return
+        # Anything already parsed predates this GET and cannot be its response.
+        # Keep tagged records so a late exact response can still win.
+        self._cfg_epochs = {
+            key: record for key, record in self._cfg_epochs.items()
+            if key[1] not in (None, "", "-")
+        }
+        self._config_gate["legacy_fallback_sent"] = True
+
     def _audit_events(self, limit: int = 60) -> list[dict[str, Any]]:
         """读 audit.jsonl 的尾部。增量读:只从上次位置往后追加,不全量重读。"""
-        path = self.audit_path
-        if path is None or not path.exists():
-            return []
-        try:
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
-                fh.seek(self._audit_pos)
-                fresh = fh.read()
-                self._audit_pos = fh.tell()
-        except OSError:
-            return self._audit_cache[-limit:]
-        for raw in fresh.splitlines():
-            raw = raw.strip()
-            if not raw:
-                continue
+        with self.lock:
+            path = self.audit_path
+            if path is None or not path.exists():
+                return []
             try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            self._audit_cache.append(event)
-            kind = event.get("kind")
-            if kind in ("CFG_APPLIED", "CFG_DERIVED", "CFG_BOOT"):
-                self._cfg_live.update({k: v for k, v in event.items()
-                                       if k not in ("raw", "kind")})
-            elif kind == "CFG_CONFIRMED":
-                self._cfg_live.update({k: v for k, v in event.items()
-                                       if k not in ("raw", "kind")})
-                self._cfg_live["confirmed_ep"] = event.get("ep")
-            elif kind == "AFE_STATUS":
-                self._afe_status = {k: v for k, v in event.items() if k != "kind"}
-            elif kind == "IT_PHASE":
-                self._phase = {k: v for k, v in event.items() if k != "kind"}
-            elif kind in ("CFG_REJECT", "CFG_FAULT", "CFG_ROLLBACK", "OCP_REJECT",
-                          "RANGE_REJECT"):
-                # 🔴 拒因必须摆到显眼处。埋在滚动日志尾部时,用户看到的是
-                #    "我点了下发,然后什么都没发生" —— 那和命令没送达同形。
-                self._last_reject = {k: v for k, v in event.items() if k != "kind"}
-                self._last_reject["kind"] = kind
-        # 只保留尾部,长跑不无限膨胀
-        if len(self._audit_cache) > 400:
-            del self._audit_cache[:-400]
-        return self._audit_cache[-limit:]
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(self._audit_pos)
+                    fresh = fh.read()
+                    self._audit_pos = fh.tell()
+            except OSError:
+                return self._audit_cache[-limit:]
+            lines, self._audit_pending = _split_complete_lines(
+                fresh, self._audit_pending
+            )
+            for raw in lines:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                self._audit_cache.append(event)
+                kind = event.get("kind")
+                epoch = event.get("ep")
+                if (isinstance(epoch, int)
+                        and kind in ("CFG_APPLIED", "CFG_DERIVED", "CFG_BOOT",
+                                     "CFG_CONFIRMED")):
+                    if epoch != self._cfg_live_epoch:
+                        self._cfg_live = {}
+                        self._cfg_live_epoch = epoch
+                        self._cfg_confirmed_this_session = False
+                    if (
+                        epoch != self._plateau_cfg_epoch
+                        and (
+                            self._plateau_cfg_epoch is not None
+                            or self._plateau_context_epoch is not None
+                        )
+                    ):
+                        self._reset_plateau_monitor_locked(
+                            hardware_context_changed=True,
+                            expected_epoch=epoch,
+                        )
+                    self._plateau_cfg_epoch = epoch
+                if isinstance(epoch, int) and str(kind).startswith("CFG_"):
+                    request_id = event.get("req")
+                    request_key = (
+                        str(request_id) if request_id not in (None, "") else None
+                    )
+                    record = self._cfg_epochs.setdefault((epoch, request_key), {
+                        "data": {}, "seen": set(), "faults": [],
+                        "applied_src": None, "confirmed_src": None,
+                        "confirmed_has_verify_ok": False,
+                    })
+                    record["seen"].add(kind)
+                    if kind in ("CFG_APPLIED", "CFG_DERIVED", "CFG_CONFIRMED"):
+                        record["data"].update({
+                            k: v for k, v in event.items()
+                            if k not in ("raw", "kind", "host_unix_s")
+                        })
+                    if kind == "CFG_APPLIED":
+                        record["applied_src"] = event.get("src")
+                    elif kind == "CFG_CONFIRMED":
+                        record["confirmed_src"] = event.get("src")
+                        record["confirmed_has_verify_ok"] = "verify_ok" in event
+                    elif kind in ("CFG_FAULT", "CFG_ROLLBACK"):
+                        record["faults"].append(dict(event))
+                if kind in ("CFG_APPLIED", "CFG_DERIVED", "CFG_BOOT"):
+                    self._cfg_live.update({k: v for k, v in event.items()
+                                           if k not in ("raw", "kind")})
+                elif kind == "CFG_CONFIRMED":
+                    self._cfg_live.update({k: v for k, v in event.items()
+                                           if k not in ("raw", "kind")})
+                    self._cfg_live["confirmed_ep"] = event.get("ep")
+                    self._cfg_confirmed_this_session = True
+                elif kind == "AFE_STATUS":
+                    self._afe_status = {k: v for k, v in event.items() if k != "kind"}
+                elif kind == "IT_PHASE":
+                    previous_phase = self._phase.get("phase")
+                    self._phase = {k: v for k, v in event.items() if k != "kind"}
+                    if (
+                        self._phase.get("phase") == "acquire"
+                        and previous_phase != "acquire"
+                    ):
+                        self._reset_plateau_monitor_locked(clock_reset=True)
+                elif kind == "IT_TAINTED":
+                    self._hardware_taint = {
+                        k: v for k, v in event.items() if k != "kind"
+                    }
+                    self._hardware_taint["kind"] = kind
+                elif kind in ("CFG_REJECT", "CFG_FAULT", "CFG_ROLLBACK", "OCP_REJECT",
+                              "RANGE_REJECT"):
+                    self._last_reject = {
+                        k: v for k, v in event.items() if k != "kind"
+                    }
+                    self._last_reject["kind"] = kind
+            self._advance_config_gate_locked()
+            # 只保留尾部,长跑不无限膨胀
+            if len(self._audit_cache) > 400:
+                del self._audit_cache[:-400]
+            return self._audit_cache[-limit:]
 
     def _read_kv_csv(self, path: Path | None, pos_attr: str, cache_attr: str,
                      wanted: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -1302,7 +2544,10 @@ class MeasurementController:
         except OSError:
             return cache
         header = getattr(self, cache_attr + "_hdr", None)
-        for raw in fresh.splitlines():
+        pending_attr = cache_attr + "_pending"
+        lines, pending = _split_complete_lines(fresh, getattr(self, pending_attr))
+        setattr(self, pending_attr, pending)
+        for raw in lines:
             raw = raw.strip()
             if not raw or raw.startswith("#"):
                 continue
@@ -1339,8 +2584,10 @@ class MeasurementController:
         轮询抖动。共用 dev_ms 后,t=0 = 两条流里最早的那个设备时刻,左右轴同轴。
         ⚠️ dev_ms 来自 LFRC(±500ppm),作**相对量**可信,不当绝对时间用。
         """
-        cur = self._read_kv_csv(self.raw_path, "_dbg_cur_pos", "_dbg_cur",
-                                ("dev_ms", "fa_fw", "sat", "epoch", "counts"))
+        cur = self._read_kv_csv(
+            self.raw_path, "_dbg_cur_pos", "_dbg_cur",
+            ("dev_ms", "fa_fw", "sat", "ovf", "epoch", "counts"),
+        )
         cv = self._read_kv_csv(self.cell_v_path, "_dbg_cv_pos", "_dbg_cv",
                                ("dev_ms", "e_mv", "we_mv", "re_mv", "epoch",
                                 "ocp", "we_code", "re_code"))
@@ -1351,7 +2598,11 @@ class MeasurementController:
             "current": {
                 "t": [(r.get("dev_ms", 0) - t0) / 1000.0 for r in cur],
                 "nA": [r.get("fa_fw", 0) / 1e6 for r in cur],
-                "valid": [not int(r.get("sat", 0) or 0) for r in cur],
+                "valid": [
+                    int(r.get("sat", 0) or 0) == 0
+                    and int(r.get("ovf", 0) or 0) == 0
+                    for r in cur
+                ],
                 "ep": [int(r.get("epoch", 0) or 0) for r in cur],
             },
             "cell_v": {
@@ -1365,6 +2616,8 @@ class MeasurementController:
 
     def debug_snapshot(self) -> dict[str, Any]:
         events = self._audit_events()
+        with self.lock:
+            self._maybe_start_confirmed_debug()
         # 🔴 自愈:开机那几行 CFG_BOOT/CFG_APPLIED/CFG_DERIVED 常常收不到 ——
         #   JLinkExe 的 `rtt start` 会把读指针对到当前写指针,**跳过缓冲里已有的
         #   字节**,而那几行在 rtt start 之前(复位后 ~300ms)就写完了。
@@ -1373,18 +2626,32 @@ class MeasurementController:
         # 判据必须用**只有 CFG_DERIVED 才带**的字段(bits)。用 `not self._cfg_live`
         # 不行:CFG_BOOT 只带 ep/ms/fw/reason,一到就让字典非空,GET 反而不发了
         # ——"有几个键"和"有没有派生量"是两件事。
-        if (self.state == "running" and self._cfg_live.get("bits") is None
+        live_epoch = self._cfg_live.get("ep")
+        live_complete = (
+            live_epoch is not None
+            and self._cfg_live.get("bits") is not None
+            and self._cfg_live.get("confirmed_ep") == live_epoch
+        )
+        if (self.state == "running" and not live_complete
                 and time.time() - self._auto_get_at > 3.0):
             self._auto_get_at = time.time()
             try:
                 self.send_command("GET")
             except (RuntimeError, ValueError):
                 pass
+        series = self._debug_series()
+        debug_run = bool(self.state == "running" and self.metadata.get("debug"))
         return _json_safe({
             "state": self.state,
+            "stop_requested": self.user_stop_requested and self.state == "running",
+            "waiting_for_start": self.debug_waiting_for_start,
+            "config_pending": self._debug_pending_cfg is not None,
+            "config_session_confirmed": self._cfg_confirmed_this_session,
             "message": self.message,
             "error": self.error,
             "run_id": self.run_id,
+            "debug_run": debug_run,
+            "mutations_allowed": debug_run and not self.user_stop_requested,
             "run_dir": str(self.run_dir) if self.run_dir else "",
             "raw_path": str(self.raw_path) if self.raw_path else "",
             "audit_path": str(self.audit_path) if self.audit_path else "",
@@ -1394,7 +2661,8 @@ class MeasurementController:
             "last_reject": self._last_reject or None,
             "phase": self._phase or None,
             "cell_v": self._cell_voltages(),
-            "series": self._debug_series(),
+            "series": series,
+            "adaptive_stop": self._plateau_payload(series),
             # 只送尾部,并且倒序 —— 界面上最新的在最上面
             "audit": list(reversed(events[-40:])),
             "audit_total": len(self._audit_cache),
@@ -1450,6 +2718,421 @@ class MeasurementController:
                 self.range_runtime = {**self.range_runtime,
                                       "rejected": f"自动切档失败:{exc}"}
 
+    def _plateau_context_data_locked(
+        self, data: dict[str, list[Any]], *, update_state: bool = True,
+    ) -> dict[str, list[Any]]:
+        """Return samples in the active epoch, optionally advancing gate state."""
+        times = data.get("time_s", [])
+        currents = data.get("current_nA", [])
+        validity = data.get("valid", [])
+        epochs = data.get("epoch", [])
+        empty = {"time_s": [], "current_nA": [], "valid": [], "epoch": []}
+        if not (len(times) == len(currents) == len(validity)):
+            return empty
+
+        parsed_epochs: list[int | None] = []
+        if len(epochs) == len(times):
+            for value in epochs:
+                try:
+                    parsed_epochs.append(
+                        None if value in (None, "") else int(value)
+                    )
+                except (TypeError, ValueError):
+                    parsed_epochs.append(None)
+        if not parsed_epochs or not any(value is not None for value in parsed_epochs):
+            # Legacy CSVs have no epoch. They remain usable until a live
+            # hardware change occurs; after that there is no defensible way to
+            # distinguish unread old samples from new-context samples.
+            return empty if self._plateau_context_pending else data
+
+        latest_epoch = next(
+            value for value in reversed(parsed_epochs) if value is not None
+        )
+        target_epoch = self._plateau_context_epoch
+        context_start_s = self._plateau_context_start_s
+        if self._plateau_context_pending:
+            expected = self._plateau_expected_epoch
+            if expected is not None:
+                if latest_epoch != expected:
+                    return empty
+                target_epoch = expected
+            else:
+                if target_epoch is not None and latest_epoch == target_epoch:
+                    return empty
+                target_epoch = latest_epoch
+        elif target_epoch is None:
+            expected = self._plateau_cfg_epoch
+            if expected is not None and latest_epoch != expected:
+                return empty
+            target_epoch = expected if expected is not None else latest_epoch
+        elif latest_epoch != target_epoch:
+            # Raw samples are also an epoch authority. This covers a dropped
+            # CFG_APPLIED audit line while still preventing cross-epoch mixing.
+            if update_state:
+                self._reset_plateau_monitor_locked()
+            target_epoch = latest_epoch
+            if update_state:
+                self._plateau_cfg_epoch = latest_epoch
+
+        indices = [
+            index for index, epoch in enumerate(parsed_epochs)
+            if epoch == target_epoch
+        ]
+        if not indices:
+            return empty
+        if (
+            self._plateau_context_pending
+            or self._plateau_context_epoch != target_epoch
+        ):
+            context_start_s = float(times[indices[0]])
+            if update_state:
+                self._plateau_context_epoch = target_epoch
+                self._plateau_context_start_s = context_start_s
+                self._plateau_expected_epoch = None
+                self._plateau_context_pending = False
+        indices = [
+            index for index in indices
+            if float(times[index]) >= context_start_s - 1e-12
+        ]
+        if not indices:
+            return empty
+        return {
+            "time_s": [times[index] for index in indices],
+            "current_nA": [currents[index] for index in indices],
+            "valid": [validity[index] for index in indices],
+            "epoch": [parsed_epochs[index] for index in indices],
+        }
+
+    def _maybe_auto_stop(self) -> None:
+        """Update platform telemetry and stop only eligible formal IT runs."""
+
+        with self.lock:
+            if (
+                self.state != "running"
+                or self.settings.get("method") != "it"
+                or self.user_stop_requested
+                or self.auto_stop_requested
+                or str(self.range_runtime.get("pending") or "").startswith(
+                    "RANGE "
+                )
+                or not (self.settings.get("adaptive_stop")
+                        or self.metadata.get("debug"))
+            ):
+                return
+            raw_data = self._data()
+            # Keep the formal gate self-contained for non-watcher callers. In
+            # production this is normally a throttled no-op because the watcher
+            # refreshed the same cache immediately before entering this method.
+            self._refresh_live_analysis_locked(raw_data)
+            self._apply_confirmed_reversal_to_plateau_locked()
+            data = self._plateau_context_data_locked(raw_data)
+            if not data["time_s"]:
+                self._plateau_progress = {
+                    "waiting_for_context": self._plateau_context_pending,
+                    "expected_epoch": self._plateau_expected_epoch,
+                }
+                return
+            elapsed_s = (
+                max(data["time_s"]) if data.get("time_s") else 0.0
+            )
+            segment_s = self.plateau_config.segment_duration_s
+            analysis_warmup_s = max(
+                self.plateau_config.window_duration_s,
+                float(self.settings.get("fit_window_s") or FIT_WINDOW_S),
+            )
+            latest_segment = int(math.floor(max(0.0, elapsed_s) / segment_s))
+            first_context_segment = max(
+                self.plateau_config.segment_count,
+                int(math.ceil(
+                    max(
+                        self._plateau_context_start_s + analysis_warmup_s,
+                        self._plateau_minimum_gate_until_s,
+                    ) / segment_s - 1e-12
+                )),
+            )
+            next_segment = max(
+                self._plateau_last_segment + 1, first_context_segment
+            )
+            pending_windows = max(0, latest_segment - next_segment + 1)
+            self._plateau_progress = {
+                "elapsed_s": elapsed_s,
+                "required_s": (
+                    max(
+                        self._plateau_context_start_s + analysis_warmup_s,
+                        self._plateau_minimum_gate_until_s,
+                    )
+                ),
+                "complete_segments": latest_segment,
+                "pending_windows": pending_windows,
+            }
+            expected_rate = self._expected_native_rate_hz_locked()
+            if pending_windows == 0:
+                return
+            allow_stop = (
+                bool(self.settings.get("adaptive_stop"))
+                and not self.metadata.get("debug")
+            )
+            rolling_ready = self._rolling_window_ready_for_stop_locked()
+            self._plateau_progress["rolling_window_ready"] = rolling_ready
+            stop_segment = min(
+                latest_segment,
+                next_segment + MAX_PLATEAU_BACKFILL_WINDOWS - 1,
+            )
+            for decision_segment in range(next_segment, stop_segment + 1):
+                try:
+                    evaluation = evaluate_platform(
+                        data["time_s"], data["current_nA"], data["valid"],
+                        self._analysis_filter_config(),
+                        expected_sample_rate_hz=expected_rate,
+                        config=self.plateau_config,
+                        decision_segment=decision_segment,
+                    )
+                except (TypeError, ValueError) as exc:
+                    self._plateau_consecutive_passes = 0
+                    self._plateau_evaluation = {
+                        "status": "invalid",
+                        "stable": False,
+                        "reason": f"平台判定失败：{exc}",
+                        "config": self.plateau_config.to_dict(),
+                    }
+                    return
+                if evaluation is None:
+                    break
+                self._plateau_last_segment = evaluation.complete_segment
+                self._plateau_evaluation = _json_safe(asdict(evaluation))
+                if evaluation.stable:
+                    self._plateau_consecutive_passes += 1
+                    if allow_stop and not rolling_ready:
+                        self._plateau_consecutive_passes = min(
+                            self._plateau_consecutive_passes,
+                            max(
+                                0,
+                                self.plateau_config.required_consecutive_windows
+                                - 1,
+                            ),
+                        )
+                        self._plateau_progress[
+                            "waiting_for_rolling_window"
+                        ] = True
+                else:
+                    self._plateau_consecutive_passes = 0
+                if (allow_stop and self._plateau_consecutive_passes
+                        >= self.plateau_config.required_consecutive_windows):
+                    self._request_stop_locked(automatic=True)
+                    break
+            self._plateau_progress["processed_segment"] = self._plateau_last_segment
+            self._plateau_progress["pending_windows"] = max(
+                0, latest_segment - self._plateau_last_segment
+            )
+
+    def _rolling_window_ready_for_stop_locked(self) -> bool:
+        stage = self._prepared_live_stage
+        if stage is None or not stage.window_complete:
+            return False
+        if self._rolling_metrics.get("stage_key") != stage.stage_key:
+            return False
+        value = self._rolling_metrics.get("steady_current_nA")
+        if isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    def _apply_confirmed_reversal_to_plateau_locked(self) -> None:
+        """Consume one confirmed reversal from the watcher-owned ETA cache."""
+
+        if not self._stability_eta.get("reset_consecutive"):
+            return
+        suggested_start = self._stability_eta.get("suggested_stage_start_s")
+        self._stability_eta["reset_consecutive"] = False
+        if (
+            isinstance(suggested_start, bool)
+            or not isinstance(suggested_start, (int, float))
+            or not math.isfinite(float(suggested_start))
+        ):
+            return
+        self._plateau_last_segment = 0
+        self._plateau_consecutive_passes = 0
+        self._plateau_evaluation = None
+        self._plateau_progress = {}
+        self._plateau_context_start_s = max(0.0, float(suggested_start))
+        self._prepared_live_stage = None
+        self._rolling_metrics = self._empty_rolling_metrics(
+            "accumulating", "已确认曲线反转，正在重新累积末端窗口",
+        )
+        self._last_complete_rolling_metrics = None
+        self._last_complete_rolling_epoch = None
+        self._stop_requested_rolling_metrics = None
+        self._plateau_minimum_gate_until_s = (
+            self._plateau_context_start_s
+            + self._stability_eta_estimator.config.minimum_stage_s
+        )
+        # The next watcher pass rebuilds rolling metrics from the new stage.
+        self._live_analysis_last_refresh = 0.0
+
+    def _plateau_payload(self, debug_series: dict[str, Any] | None = None) -> dict[str, Any]:
+        config = self.plateau_config.to_dict()
+        trigger_evidence = (
+            dict(self._auto_stop_evidence)
+            if self.auto_stop_requested
+            and isinstance(self._auto_stop_evidence, dict)
+            else None
+        )
+        source_evaluation = (
+            trigger_evidence.get("evaluation")
+            if trigger_evidence is not None
+            else self._plateau_evaluation
+        )
+        evaluation = (
+            dict(source_evaluation)
+            if isinstance(source_evaluation, dict) else None
+        )
+        if evaluation is not None:
+            means = list(evaluation.get("segment_means_nA") or [])
+            centres = list(evaluation.get("segment_centres_s") or [])
+            original_start = evaluation.get("window_start_s")
+            original_end = evaluation.get("window_end_s")
+            offset_s = 0.0
+            if debug_series is not None:
+                current_times = (debug_series.get("current") or {}).get("t") or []
+                if current_times:
+                    offset_s = float(current_times[0])
+            if isinstance(original_start, (int, float)):
+                evaluation["window_start_s"] = float(original_start) + offset_s
+            if isinstance(original_end, (int, float)):
+                evaluation["window_end_s"] = float(original_end) + offset_s
+            if (not centres and isinstance(original_start, (int, float))
+                    and isinstance(original_end, (int, float))):
+                segment_s = self.plateau_config.segment_duration_s
+                centres = [
+                    float(original_start) + (index + 0.5) * segment_s
+                    for index in range(self.plateau_config.segment_count)
+                ]
+            evaluation["segment_centres_s"] = [
+                float(value) + offset_s for value in centres
+            ]
+            if centres:
+                segment_s = self.plateau_config.segment_duration_s
+                evaluation["segments"] = [
+                    {
+                        "index": index + 1,
+                        "start_s": float(centre) - segment_s / 2 + offset_s,
+                        "end_s": float(centre) + segment_s / 2 + offset_s,
+                        "center_s": float(centre) + offset_s,
+                        "mean_nA": (
+                            float(means[index]) if index < len(means) else None
+                        ),
+                    }
+                    for index, centre in enumerate(centres)
+                ]
+            if len(means) == len(centres) and centres:
+                half = len(means) // 2
+                segment_s = self.plateau_config.segment_duration_s
+                if isinstance(original_start, (int, float)) and isinstance(
+                    original_end, (int, float)
+                ):
+                    slope = evaluation.get("slope_nA_per_s")
+                    intercept = evaluation.get("fit_intercept_nA")
+                    if isinstance(slope, (int, float)) and isinstance(
+                        intercept, (int, float)
+                    ):
+                        evaluation["trend_line"] = [
+                            {
+                                "time_s": float(original_start) + offset_s,
+                                "current_nA": float(slope) * float(original_start)
+                                + float(intercept),
+                            },
+                            {
+                                "time_s": float(original_end) + offset_s,
+                                "current_nA": float(slope) * float(original_end)
+                                + float(intercept),
+                            },
+                        ]
+                    split = float(original_start) + half * segment_s
+                    evaluation["half_lines"] = [
+                        {
+                            "start_s": float(original_start) + offset_s,
+                            "end_s": split + offset_s,
+                            "mean_nA": evaluation.get("first_half_mean_nA"),
+                        },
+                        {
+                            "start_s": split + offset_s,
+                            "end_s": float(original_end) + offset_s,
+                            "mean_nA": evaluation.get("second_half_mean_nA"),
+                        },
+                    ]
+        preview = None
+        elapsed = self._plateau_progress.get("elapsed_s")
+        if (
+            evaluation is None
+            and debug_series is not None
+            and isinstance(elapsed, (int, float))
+            and not isinstance(elapsed, bool)
+            and math.isfinite(float(elapsed))
+        ):
+            end_s = float(elapsed)
+            start_s = max(
+                self._plateau_context_start_s,
+                end_s - self.plateau_config.window_duration_s,
+            )
+            if end_s > start_s:
+                segment_s = self.plateau_config.segment_duration_s
+                first_segment = int(math.floor(start_s / segment_s))
+                last_segment = int(math.ceil(end_s / segment_s))
+                current_times = (
+                    (debug_series.get("current") or {}).get("t") or []
+                )
+                offset_s = float(current_times[0]) if current_times else 0.0
+                preview = {
+                    "window_start_s": start_s + offset_s,
+                    "window_end_s": end_s + offset_s,
+                    "segments": [
+                        {
+                            "index": segment_index + 1,
+                            "start_s": max(
+                                start_s, segment_index * segment_s,
+                            ) + offset_s,
+                            "end_s": min(
+                                end_s, (segment_index + 1) * segment_s,
+                            ) + offset_s,
+                            "center_s": (
+                                max(start_s, segment_index * segment_s)
+                                + min(end_s, (segment_index + 1) * segment_s)
+                            ) / 2 + offset_s,
+                            "mean_nA": None,
+                        }
+                        for segment_index in range(
+                            first_segment, last_segment
+                        )
+                        if min(
+                            end_s, (segment_index + 1) * segment_s,
+                        ) > max(start_s, segment_index * segment_s)
+                    ],
+                }
+        return _json_safe({
+            "enabled": bool(self.settings.get("adaptive_stop")),
+            "monitoring": bool(
+                self.settings.get("method") == "it"
+                and (self.settings.get("adaptive_stop") or self.metadata.get("debug"))
+            ),
+            "stop_enabled": bool(
+                self.settings.get("adaptive_stop") and not self.metadata.get("debug")
+            ),
+            "auto_stopped": self.auto_stop_requested,
+            "consecutive_passes": (
+                trigger_evidence.get("consecutive_passes")
+                if trigger_evidence is not None
+                else self._plateau_consecutive_passes
+            ),
+            "required_consecutive_windows": config["required_consecutive_windows"],
+            "config": config,
+            "progress": dict(self._plateau_progress),
+            "evaluation": evaluation,
+            "preview": preview,
+            "trigger_evidence": trigger_evidence,
+        })
+
     @staticmethod
     def _terminate_tree(process: subprocess.Popen[str]) -> None:
         """整棵进程组收掉,而不是只收第一层。
@@ -1457,45 +3140,120 @@ class MeasurementController:
         🔴 只 `process.terminate()` 收不干净:树是
         it_tool → pa_host.collect → JLinkExe,`terminate` 只打到 it_tool,
         collect 与 JLinkExe 会一直活着占住探头和 telnet 19021(实测 60s 不自愈)。
-        配合 Popen(start_new_session=True) 才能用 killpg 一次收完。
+
+        Windows: 用 taskkill /T 整棵收掉。
+        macOS/Linux: 配合 Popen(start_new_session=True) 才能用 killpg 一次收完。
         JLinkExe 本身**不理 SIGTERM**(实测),但它父进程 collect 一退、stdin 管道
         EOF,它就会自己退 —— 所以关键是让 collect 收到信号并跑完它的 finally。
         """
         if process.poll() is not None:
             return
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            process.terminate()
+        if _IS_WIN:
+            # Windows: taskkill /T 会杀掉整个进程树
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True, timeout=10,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                process.kill()
+        else:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                process.terminate()
 
     @classmethod
     def _terminate_if_running(cls, process: subprocess.Popen[str], delay_s: float) -> None:
         time.sleep(delay_s)
         if process.poll() is None:
             cls._terminate_tree(process)
+            try:
+                process.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                cls._kill_tree(process)
+
+    @staticmethod
+    def _kill_tree(process: subprocess.Popen[str]) -> None:
+        """Force a process group down after graceful shutdown timed out."""
+        if process.poll() is not None:
+            return
+        if _IS_WIN:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True, timeout=10,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                process.kill()
+        else:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                process.kill()
 
     def _watch(self, log_handle: Any) -> None:
         assert self.process is not None
         process = self.process
         while process.poll() is None:
+            self._audit_events()
+            with self.lock:
+                self._maybe_retry_tagged_gate_get_locked()
+                self._maybe_send_legacy_gate_get_locked()
             self._scan_range_events()
             self._maybe_auto_switch()
             with self.lock:
-                self.message = self._progress_message()
-            time.sleep(0.8)
-        self._scan_range_events()
+                self._refresh_live_analysis_locked()
+            self._maybe_auto_stop()
+            with self.lock:
+                if self._config_gate.get("state") != "checking":
+                    self.message = self._progress_message()
+            time.sleep(0.5)
         return_code = process.wait()
+        with self.lock:
+            gate_checking = self._config_gate.get("state") == "checking"
+        if gate_checking:
+            self._fail_config_gate(
+                "process_exit",
+                f"采集进程在配置核对完成前退出（退出码 {return_code}）",
+            )
+        self._audit_events()
+        self._scan_range_events()
         log_handle.close()
         self._stop_bridge()
         with self.lock:
             self.finished_at = time.time()
-            if return_code != 0:
-                if self.user_stop_requested and return_code in (3, -15):
-                    self.state = "idle"
-                    self.error = ""
-                    self.message = "测量已停止"
-                    self._notify_complete()
-                    return
+            self.debug_waiting_for_start = False
+            self._debug_pending_cfg = None
+            if self._prestart_gate_failed:
+                gate_state = self._config_gate.get("state")
+                self.state = "idle" if gate_state == "aborted" else "error"
+                self.message = str(
+                    self._config_gate.get("message") or "硬件配置核对失败"
+                )
+                self.error = "" if gate_state == "aborted" else self.message
+                return
+            terminal_data = self._data(update_monitor=False)
+            requested_stop_exit = return_code in (3, -15)
+            if self.user_stop_requested and requested_stop_exit:
+                self._freeze_live_analysis_locked(
+                    terminal_data, completed=False,
+                )
+                self.state = "idle"
+                self.error = ""
+                self.message = "测量已停止"
+                self._notify_complete()
+                return
+            adaptive_completion = self.auto_stop_requested and requested_stop_exit
+            natural_completion = (
+                return_code == 0
+                and not self.user_stop_requested
+                and not self.auto_stop_requested
+            )
+            if not natural_completion and not adaptive_completion:
+                self._freeze_live_analysis_locked(
+                    terminal_data, completed=False,
+                )
                 self.state = "error"
                 self.error = (
                     f"采集进程退出码 {return_code}。请查看 {self.run_dir / 'collector.log'}"
@@ -1503,6 +3261,19 @@ class MeasurementController:
                 self.message = "测量失败"
                 self._notify_complete()
                 return
+            if self._hardware_taint is not None and not self.metadata.get("debug"):
+                self._freeze_live_analysis_locked(
+                    terminal_data, completed=False,
+                )
+                reason = str(self._hardware_taint.get("reason") or "unknown")
+                self.state = "error"
+                self.error = f"硬件报告 IT_TAINTED（{reason}），本轮结果已隔离"
+                self.message = "测量受到运行时配置干扰，原始数据已保留"
+                self._notify_complete()
+                return
+            self._freeze_live_analysis_locked(
+                terminal_data, completed=True,
+            )
             try:
                 assert self.raw_path and self.resampled_path and self.summary_path
                 if self.settings["method"] == "cv":
@@ -1515,15 +3286,98 @@ class MeasurementController:
                 else:
                     resample_run_10hz(
                         self.raw_path, self.resampled_path,
-                        duration_s=self.settings["duration_s"],
+                        duration_s=(
+                            None if self.settings["adaptive_stop"]
+                            else self.settings["duration_s"]
+                        ),
                         target_rate_hz=self.settings["target_rate_hz"],
                     )
+                    analysis_path = self.resampled_path
+                    analysis_filter = self._analysis_filter_config()
+                    if analysis_filter.get("mode") == "analysis":
+                        self.filter_meta = write_filtered_csv(
+                            self.resampled_path, self.filtered_path, analysis_filter
+                        )
+                        if self.filter_meta.get("applied"):
+                            analysis_path = self.filtered_path
                     summary = summarize_run(
-                        self.resampled_path, window_s=self.settings["fit_window_s"]
+                        analysis_path, window_s=self.settings["fit_window_s"]
                     )
                     save_summary(summary, self.summary_path)
                     self.message = "测量完成，已生成 10 Hz 数据和末段汇总"
                 self.summary = _json_safe(asdict(summary))
+                if self.settings["method"] != "cv":
+                    legacy_steady = self.summary.get("steady_current_nA")
+                    rolling_steady = self._rolling_metrics.get(
+                        "steady_current_nA"
+                    )
+                    self.summary["legacy_resampled_steady_current_nA"] = (
+                        legacy_steady
+                    )
+                    # Calibration and prediction consume this field. Keep it
+                    # identical to the final native rolling metric, including
+                    # an explicit null when no complete native window exists.
+                    self.summary["steady_current_nA"] = rolling_steady
+                    self.summary["steady_current_source"] = (
+                        "native_rolling_window"
+                        if rolling_steady is not None
+                        else "native_rolling_window_unavailable"
+                    )
+                    self.summary["steady_current_reason"] = (
+                        self._rolling_metrics.get("reason")
+                    )
+                self.summary["rolling_metrics"] = _json_safe(
+                    self._rolling_metrics
+                )
+                self.summary["stability_eta"] = _json_safe(
+                    self._stability_eta
+                )
+                self.summary["filter"] = {
+                    "config": self.filter_config,
+                    "analysis_config": (
+                        analysis_filter if self.settings["method"] != "cv" else None
+                    ),
+                    "effective": self.filter_meta,
+                    "rolling_effective": self._rolling_metrics.get(
+                        "filter_meta"
+                    ),
+                    "analysis_source": str(analysis_path) if self.settings["method"] != "cv" else "raw",
+                    "rolling_source": (
+                        str(self.raw_path)
+                        if self.settings["method"] != "cv" else "raw"
+                    ),
+                }
+                trigger_evidence = (
+                    dict(self._auto_stop_evidence)
+                    if self.auto_stop_requested
+                    and isinstance(self._auto_stop_evidence, dict)
+                    else None
+                )
+                self.summary["adaptive_stop"] = {
+                    "enabled": bool(self.settings.get("adaptive_stop")),
+                    "auto_stopped": self.auto_stop_requested,
+                    "consecutive_passes": (
+                        trigger_evidence.get("consecutive_passes")
+                        if trigger_evidence is not None
+                        else self._plateau_consecutive_passes
+                    ),
+                    "required_consecutive_windows": (
+                        self.plateau_config.required_consecutive_windows
+                    ),
+                    "config": self.plateau_config.to_dict(),
+                    "evaluation": (
+                        trigger_evidence.get("evaluation")
+                        if trigger_evidence is not None
+                        else self._plateau_evaluation
+                    ),
+                    "trigger_evidence": trigger_evidence,
+                }
+                self.summary["hardware_config"] = self.metadata.get("hardware_config")
+                if self.summary_path is not None:
+                    self.summary_path.write_text(
+                        json.dumps(self.summary, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
                 self.state = "completed"
             except Exception as exc:  # keep the raw run even if analysis fails
                 self.state = "error"
@@ -1547,8 +3401,31 @@ class MeasurementController:
                 self._rtt_pos = fh.tell()
         except OSError:
             return
-        for line in fresh.splitlines():
+        lines, self._rtt_pending = _split_complete_lines(fresh, self._rtt_pending)
+        for line in lines:
             line = line.strip()
+            taint: dict[str, Any] | None = None
+            if "IT_TAINTED" in line:
+                marker = line[line.index("IT_TAINTED"):]
+                taint = {"kind": "IT_TAINTED", "raw": marker}
+                for token in marker.split()[1:]:
+                    key, separator, value = token.partition("=")
+                    if not separator:
+                        continue
+                    try:
+                        taint[key] = int(value)
+                    except ValueError:
+                        taint[key] = value
+            elif "IT_DONE" in line and re.search(r"\btainted=1(?:\s|$)", line):
+                taint = {
+                    "kind": "IT_DONE",
+                    "reason": "firmware_final_marker",
+                    "tainted": 1,
+                    "raw": line[line.index("IT_DONE"):],
+                }
+            if taint is not None:
+                with self.lock:
+                    self._hardware_taint = taint
             if "RANGE_APPLIED" in line:
                 kv: dict[str, Any] = {}
                 for tok in line[line.index("RANGE_APPLIED"):].split()[1:]:
@@ -1559,6 +3436,26 @@ class MeasurementController:
                         except ValueError:
                             kv[k] = v
                 with self.lock:
+                    range_matches_live = (
+                        kv.get("fsr_code") == self._cfg_live.get("fsr")
+                        and kv.get("offset_sel") == self._cfg_live.get("off")
+                    )
+                    context_already_observed = (
+                        self._plateau_cfg_epoch is not None
+                        and self._plateau_context_epoch == self._plateau_cfg_epoch
+                        and range_matches_live
+                    )
+                    if not context_already_observed:
+                        expected_epoch = (
+                            self._plateau_cfg_epoch
+                            if self._plateau_cfg_epoch
+                            != self._plateau_context_epoch
+                            else None
+                        )
+                        self._reset_plateau_monitor_locked(
+                            hardware_context_changed=True,
+                            expected_epoch=expected_epoch,
+                        )
                     self.range_runtime = {"pending": None, "applied": kv,
                                           "rejected": None, "at": time.time()}
             elif "RANGE_REJECT" in line:
@@ -1568,12 +3465,13 @@ class MeasurementController:
                                           "at": time.time()}
 
     def _notify_complete(self) -> None:
-        snapshot = self.snapshot()
         callbacks = (self.completion_hook, self.on_complete)
         for callback in callbacks:
             if callback is not None:
                 try:
-                    callback(snapshot)
+                    # The workflow hook records export results on the controller.
+                    # Refresh before the schedule hook so it can see export errors.
+                    callback(self.snapshot())
                 except Exception:
                     pass
 
@@ -1586,11 +3484,23 @@ class MeasurementController:
 
     def _progress_message(self) -> str:
         count = len(self._data()["time_s"])
+        if self.auto_stop_requested:
+            return "已检测到稳定平台，正在结束测量"
+        if self.user_stop_requested:
+            return "正在停止硬件测量"
+        if self.settings.get("method") == "it" and self.settings.get("adaptive_stop"):
+            eta_text = str(
+                self._stability_eta.get("display_text") or "正在估计"
+            )
+            return f"正在采集：已收到 {count} 个原生点；{eta_text}"
         return f"正在采集：已收到 {count} 个原生点"
 
-    def _data(self) -> dict[str, Any]:
+    def _data(self, *, update_monitor: bool = True) -> dict[str, Any]:
         if not self.raw_path or not self.raw_path.exists():
-            return {"time_s": [], "current_nA": [], "valid": []}
+            return {"time_s": [], "current_nA": [], "valid": [], "epoch": []}
+        if update_monitor and self._data_context_reset_pending:
+            self._data_context_reset_pending = False
+            self._reset_plateau_monitor_locked(clock_reset=True)
         if self._data_cache_path != self.raw_path:
             self._reset_data_cache()
             self._data_cache_path = self.raw_path
@@ -1602,6 +3512,10 @@ class MeasurementController:
             if self.raw_path.stat().st_size < self._data_cache_position:
                 self._reset_data_cache()
                 self._data_cache_path = self.raw_path
+                if update_monitor:
+                    self._reset_plateau_monitor_locked(clock_reset=True)
+                else:
+                    self._data_context_reset_pending = True
                 if self.settings["method"] == "cv":
                     self._data_cache.update({
                         "potential_v": [], "cycle": [], "direction": [],
@@ -1629,25 +3543,47 @@ class MeasurementController:
                     continue
                 row = dict(zip(self._data_cache_header, values, strict=False))
                 dev_ms = float(row["dev_ms"])
+                current_nA = float(row["fa_fw"]) / 1_000_000
+                if not math.isfinite(dev_ms) or not math.isfinite(current_nA):
+                    continue
+                if (self._data_last_dev_ms is not None
+                        and dev_ms < self._data_last_dev_ms):
+                    # A target reset can leave a short tail from the previous
+                    # uptime in the same file. Keep the live chart monotonic,
+                    # matching the offline loader's final-segment policy.
+                    for values in self._data_cache.values():
+                        values.clear()
+                    self._data_cache_first_dev_ms = None
+                    if update_monitor:
+                        self._reset_plateau_monitor_locked(clock_reset=True)
+                    else:
+                        self._data_context_reset_pending = True
                 first_dev_ms = (
                     dev_ms if self._data_cache_first_dev_ms is None
                     else self._data_cache_first_dev_ms
                 )
-                current_nA = float(row["fa_fw"]) / 1_000_000
                 valid = (
                     int(row.get("sat") or 0) == 0
                     and int(row.get("ovf") or 0) == 0
                 )
+                raw_epoch = row.get("epoch")
+                sample_epoch = (
+                    None if raw_epoch in (None, "") else int(raw_epoch)
+                )
                 if self.settings["method"] == "cv":
                     potential_v = float(row["potential_mv"]) / 1000
+                    if not math.isfinite(potential_v):
+                        continue
                     cycle = int(row["cycle"])
                     direction = int(row["direction"])
                 self._data_cache_first_dev_ms = first_dev_ms
+                self._data_last_dev_ms = dev_ms
                 self._data_cache["time_s"].append(
                     (dev_ms - first_dev_ms) / 1000
                 )
                 self._data_cache["current_nA"].append(current_nA)
                 self._data_cache["valid"].append(valid)
+                self._data_cache["epoch"].append(sample_epoch)
                 if self.settings["method"] == "cv":
                     self._data_cache["potential_v"].append(potential_v)
                     self._data_cache["cycle"].append(cycle)
@@ -1730,7 +3666,7 @@ class MeasurementController:
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            data = self._data()
+            data = self._data(update_monitor=False)
             latest_sample = None
             if data["time_s"]:
                 index = len(data["time_s"]) - 1
@@ -1748,6 +3684,9 @@ class MeasurementController:
                     })
             payload = {
                 "state": self.state,
+                "busy": self.state == "running" or bool(
+                    self.thread is not None and self.thread.is_alive()
+                ),
                 "message": self.message,
                 "error": self.error,
                 # 方案 C:运行时档位。**与 settings 里的 fsr_nA/offset_nA 不是一回事** ——
@@ -1762,17 +3701,27 @@ class MeasurementController:
                     "target": {"fsr_code": MEAS_FSR_CODE,
                                "offset_sel": MEAS_OFFSET_SEL},
                 },
+                "adaptive_stop": self._plateau_payload(),
+                "rolling_metrics": dict(self._rolling_metrics),
+                "stability_eta": dict(self._stability_eta),
+                "config_gate": dict(self._config_gate),
                 "run_id": self.run_id,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
                 "run_dir": str(self.run_dir) if self.run_dir else "",
                 "raw_path": str(self.raw_path) if self.raw_path else "",
                 "resampled_path": str(self.resampled_path) if self.resampled_path else "",
+                "filtered_path": str(self.filtered_path) if self.filtered_path else "",
                 "summary_path": str(self.summary_path) if self.summary_path else "",
                 "plot_path": str(self.plot_path) if self.plot_path else "",
                 "summary": self.summary,
+                "filter": {
+                    "config": self.filter_config,
+                    "effective": self.filter_meta,
+                },
                 "workflow_result": self.workflow_result,
                 "metadata": self.metadata,
+                "hardware_taint": self._hardware_taint,
                 "data": data,
                 "latest_sample": latest_sample,
                 "settings": {
@@ -1802,7 +3751,9 @@ class ScheduleController:
         self.max_runs = 0
         self.total_minutes = 0.0
         self.stop_at: float | None = None
+        self.attempted_runs = 0
         self.completed_runs = 0
+        self.failed_runs = 0
         self.next_run_at: float | None = None
         self.sample_prefix = "自动样品"
         self.known_concentration_um: float | None = None
@@ -1812,13 +3763,29 @@ class ScheduleController:
         self.history: list[dict[str, Any]] = []
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.generation = 0
         self.settings = dict(SettingsController.DEFAULTS)
+        self.filter_config = dict(FILTER_DEFAULTS)
+        self.plateau_config = PlateauConfig.validate(None)
         self.metadata_hook: Any = None
 
+    def set_filter_config(self, config: dict[str, Any]) -> None:
+        normalized = validate_filter_config(config)
+        with self.lock:
+            self.filter_config = normalized
+
+    def set_plateau_config(self, config: PlateauConfig | dict[str, Any]) -> None:
+        normalized = PlateauConfig.validate(config)
+        with self.lock:
+            self.plateau_config = normalized
+
     def start(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if HARDWARE_TRANSPORT == "serial":
-            _require_v51_ports(require_smp=False)
         interval_minutes = float(payload.get("interval_minutes", 5))
+        total_minutes = float(payload.get("total_minutes", 0))
+        if not math.isfinite(interval_minutes) or interval_minutes <= 0:
+            raise ValueError("自动任务间隔必须是有限的正数")
+        if not math.isfinite(total_minutes) or total_minutes < 0:
+            raise ValueError("自动任务总时长必须是有限的非负数")
         settings = SettingsController.validate(payload.get("settings", {}))
         sample_role = (
             "cv" if settings["method"] == "cv"
@@ -1828,11 +3795,26 @@ class ScheduleController:
         known_concentration = (
             None if raw_concentration in (None, "") else float(raw_concentration)
         )
+        if known_concentration is not None and not math.isfinite(known_concentration):
+            raise ValueError("浓度必须是有限数字")
+        if known_concentration is not None and known_concentration < 0:
+            raise ValueError("浓度不能为负数")
         if sample_role not in {"calibration", "stabilization", "test", "cv"}:
             raise ValueError("自动任务类型必须是标定、稳定化、测试或 CV")
         if sample_role == "calibration" and known_concentration is None:
             raise ValueError("自动标定任务必须填写已知浓度")
-        minimum_interval_s = settings["prestep_s"] + settings["duration_s"] + 10
+        minimum_interval_s = (
+            settings["prestep_s"]
+            + max(
+                self.plateau_config.window_duration_s,
+                settings["fit_window_s"],
+            )
+            + (self.plateau_config.required_consecutive_windows - 1)
+            * self.plateau_config.segment_duration_s
+            + 10
+            if settings.get("adaptive_stop")
+            else settings["prestep_s"] + settings["duration_s"] + 10
+        )
         if interval_minutes * 60 < minimum_interval_s:
             raise ValueError(
                 f"当前测量条件要求间隔至少 {minimum_interval_s / 60:.2f} 分钟"
@@ -1840,13 +3822,18 @@ class ScheduleController:
         with self.lock:
             if self.active:
                 raise RuntimeError("自动测量已经在运行")
-            if self.measurement.state == "running":
-                raise RuntimeError("请等待当前手动测量结束")
+        if self.measurement.is_busy():
+            raise RuntimeError("请等待当前手动测量结束")
+        with self.lock:
+            if self.active:
+                raise RuntimeError("自动测量已经在运行")
             self.active = True
             self.interval_s = interval_minutes * 60
             self.max_runs = max(0, int(payload.get("max_runs", 0)))
-            self.total_minutes = max(0.0, float(payload.get("total_minutes", 0)))
+            self.total_minutes = total_minutes
+            self.attempted_runs = 0
             self.completed_runs = 0
+            self.failed_runs = 0
             self.sample_prefix = str(payload.get("sample_prefix") or "自动样品")
             self.known_concentration_um = known_concentration
             self.sample_role = sample_role
@@ -1859,8 +3846,12 @@ class ScheduleController:
             )
             self.next_run_at = started_at if payload.get("start_now", True) else started_at + self.interval_s
             self.message = "自动测量已启动"
-            self.stop_event.clear()
-            self.thread = threading.Thread(target=self._loop, daemon=True)
+            self.stop_event = threading.Event()
+            self.generation += 1
+            generation = self.generation
+            self.thread = threading.Thread(
+                target=self._loop, args=(self.stop_event, generation), daemon=True
+            )
             self.thread.start()
             return self.snapshot()
 
@@ -1873,32 +3864,35 @@ class ScheduleController:
             self.stop_event.set()
             return self.snapshot()
 
-    def _loop(self) -> None:
-        while not self.stop_event.wait(0.25):
+    def _loop(self, stop_event: threading.Event, generation: int) -> None:
+        while not stop_event.wait(0.25):
             with self.lock:
-                if not self.active:
+                if (generation != self.generation
+                        or stop_event is not self.stop_event or not self.active):
                     return
                 if self.stop_at is not None and time.time() >= self.stop_at:
                     self.active = False
                     self.next_run_at = None
                     self.message = f"稳定化阶段已结束，共完成 {self.completed_runs} 次测量"
-                    self.stop_event.set()
+                    stop_event.set()
                     return
                 due = self.next_run_at is not None and time.time() >= self.next_run_at
             if not due:
                 continue
-            if self.measurement.state == "running":
+            if self.measurement.is_busy():
                 continue
             with self.lock:
                 if (self.stop_at is not None
+                        and not self.settings.get("adaptive_stop")
                         and time.time() + self.settings["prestep_s"]
                         + self.settings["duration_s"] + 5 > self.stop_at):
                     self.active = False
                     self.next_run_at = None
                     self.message = f"计划时段已结束，共完成 {self.completed_runs} 次测量"
-                    self.stop_event.set()
+                    stop_event.set()
                     return
-                run_number = self.completed_runs + 1
+                run_number = self.attempted_runs + 1
+                self.attempted_runs = run_number
                 scheduled_at = self.next_run_at or time.time()
                 self.next_run_at = scheduled_at + self.interval_s
                 metadata = {
@@ -1909,35 +3903,69 @@ class ScheduleController:
                     "save_dir": self.save_dir,
                     "scheduled_at": scheduled_at,
                 }
+                filter_config = dict(self.filter_config)
+                plateau_config = self.plateau_config
                 self.message = f"正在执行第 {run_number} 次自动测量"
             try:
                 if self.metadata_hook is not None:
                     metadata = self.metadata_hook(metadata)
-                self.measurement.start(
-                    metadata=metadata, on_complete=self._completed,
+                if stop_event.is_set() or stop_event is not self.stop_event:
+                    return
+                self.measurement.start_verified(
+                    metadata=metadata,
+                    on_complete=lambda run, run_generation=generation: self._completed(
+                        run, run_generation
+                    ),
                     settings=self.settings,
+                    filter_config=filter_config,
+                    plateau_config=plateau_config,
                 )
-            except RuntimeError:
-                continue
             except Exception as exc:
                 with self.lock:
                     self.message = f"自动测量启动失败：{exc}"
                     self.active = False
+                    self.next_run_at = None
+                    self.stop_at = None
+                    self.failed_runs += 1
+                    self.stop_event.set()
                 return
 
-    def _completed(self, run: dict[str, Any]) -> None:
+    def _completed(
+        self, run: dict[str, Any], generation: int | None = None
+    ) -> None:
         with self.lock:
-            self.completed_runs += 1
+            if generation is not None and generation != self.generation:
+                return
+            workflow_result = run.get("workflow_result") or {}
+            export_error = (
+                workflow_result.get("export_error")
+                if isinstance(workflow_result, dict) else None
+            )
+            succeeded = run.get("state") == "completed" and not export_error
+            if succeeded:
+                self.completed_runs += 1
+            else:
+                self.failed_runs += 1
             self.history.insert(0, {
                 "run_id": run.get("run_id"),
                 "finished_at": run.get("finished_at"),
-                "state": run.get("state"),
+                "state": "error" if export_error else run.get("state"),
+                "error": export_error or run.get("error"),
                 "summary": run.get("summary"),
                 "metadata": run.get("metadata"),
                 "run_dir": run.get("run_dir"),
             })
             self.history = self.history[:100]
-            if self.max_runs and self.completed_runs >= self.max_runs:
+            if not succeeded:
+                self.active = False
+                self.next_run_at = None
+                self.stop_at = None
+                self.message = (
+                    f"第 {self.attempted_runs} 次自动测量失败，任务已暂停："
+                    f"{export_error or run.get('error') or run.get('state') or '未知错误'}"
+                )
+                self.stop_event.set()
+            elif self.max_runs and self.completed_runs >= self.max_runs:
                 self.active = False
                 self.next_run_at = None
                 self.stop_at = None
@@ -1954,7 +3982,9 @@ class ScheduleController:
                 "max_runs": self.max_runs,
                 "total_minutes": self.total_minutes,
                 "stop_at": self.stop_at,
+                "attempted_runs": self.attempted_runs,
                 "completed_runs": self.completed_runs,
+                "failed_runs": self.failed_runs,
                 "next_run_at": self.next_run_at,
                 "sample_prefix": self.sample_prefix,
                 "known_concentration_um": self.known_concentration_um,
@@ -1963,6 +3993,7 @@ class ScheduleController:
                 "message": self.message,
                 "history": self.history,
                 "settings": self.settings,
+                "plateau_config": self.plateau_config.to_dict(),
             })
 
 
@@ -1985,20 +4016,31 @@ class AppState:
 
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self.operation_lock = threading.RLock()
         self.settings = SettingsController()
+        self.filter = FilterController()
+        self.plateau = PlateauController()
         self.measurement = MeasurementController()
         self.schedule = ScheduleController(self.measurement)
         self.measurement.settings = self.settings.snapshot()["settings"]
+        self.measurement.set_plateau_config(self.plateau.settings)
+        with self.measurement.lock:
+            self.measurement._reset_live_analysis_locked()
+        self.schedule.set_plateau_config(self.plateau.settings)
         self.save_dir = DEFAULT_SAVE_DIR
         self.model: CalibrationModel | None = None
         self.model_path: Path | None = None
         self.model_settings: dict[str, Any] | None = None
+        self.model_plateau: dict[str, Any] | None = None
+        self.calibration_filter: dict[str, Any] | None = None
         self.calibration_settings: dict[str, Any] | None = None
+        self.calibration_plateau: dict[str, Any] | None = None
         self.points: list[CalibrationPoint] = []
         self.point_records: list[dict[str, Any]] = []
         self.selected_point_ids: list[str] = []
         self.model_created_at: float | None = None
         self.records: list[dict[str, Any]] = []
+        self.validation_overrides: dict[str, dict[str, Any]] = {}
         self.drift = self._empty_drift()
         self.latest_workflow_result: dict[str, Any] | None = None
         if WORKFLOW_PATH.exists():
@@ -2029,14 +4071,18 @@ class AppState:
     def _concentration_token(value: Any) -> str:
         if value in (None, ""):
             return "unknown"
-        return f"{float(value):g}uM"
+        numeric = float(value)
+        return "unknown" if not math.isfinite(numeric) else f"{numeric:g}uM"
 
     def _workspace_paths(self) -> dict[str, Path]:
         return {
             "points": self.save_dir / "calibration-points.csv",
             "model": self.save_dir / "calibration-model.json",
             "settings": self.save_dir / "calibration-settings.json",
+            "plateau": self.save_dir / "calibration-plateau.json",
+            "filter": self.save_dir / "calibration-filter.json",
             "selection": self.save_dir / "calibration-selection.json",
+            "validation": self.save_dir / "calibration-validation.json",
             "index": self.save_dir / "measurement-index.csv",
             "drift": self.save_dir / "calibration-drift.json",
         }
@@ -2051,6 +4097,77 @@ class AppState:
             for record in self.point_records
         ]
 
+    @staticmethod
+    def _filter_signature(config: dict[str, Any] | None) -> dict[str, Any]:
+        """Normalize a filter config for legacy workspace metadata.
+
+        Filter settings are retained for audit/history only.  They are not a
+        compatibility gate: calibration candidates may intentionally combine
+        different display or analysis filters.
+        """
+        normalized = validate_filter_config(config or FILTER_DEFAULTS)
+        return normalized if normalized["mode"] == "analysis" else {"mode": "off"}
+
+    @staticmethod
+    def _uses_plateau_protocol(settings: dict[str, Any] | None) -> bool:
+        return bool(
+            settings
+            and settings.get("method") == "it"
+            and settings.get("adaptive_stop")
+        )
+
+    @staticmethod
+    def _plateau_signature(
+        config: PlateauConfig | dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if config is None:
+            return None
+        return PlateauConfig.validate(config).to_dict()
+
+    @classmethod
+    def _same_calibration_protocol(
+        cls,
+        first_settings: dict[str, Any],
+        first_plateau: dict[str, Any] | None,
+        second_settings: dict[str, Any],
+        second_plateau: PlateauConfig | dict[str, Any] | None,
+    ) -> bool:
+        if not SettingsController.same_analysis_protocol(
+            first_settings, second_settings
+        ):
+            return False
+        if not (
+            cls._uses_plateau_protocol(first_settings)
+            or cls._uses_plateau_protocol(second_settings)
+        ):
+            return True
+        try:
+            normalized_first = cls._plateau_signature(first_plateau)
+            normalized_second = cls._plateau_signature(second_plateau)
+        except (TypeError, ValueError):
+            return False
+        return (
+            normalized_first is not None
+            and normalized_second is not None
+            and normalized_first == normalized_second
+        )
+
+    @classmethod
+    def _run_plateau_signature(
+        cls, run: dict[str, Any], settings: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if not cls._uses_plateau_protocol(settings):
+            return None
+        summary = run.get("summary")
+        adaptive = summary.get("adaptive_stop") if isinstance(summary, dict) else None
+        config = adaptive.get("config") if isinstance(adaptive, dict) else None
+        signature = cls._plateau_signature(config)
+        if signature is None:
+            raise ValueError(
+                "自动停止标定缺少平台参数元数据，本次结果不能加入标定点"
+            )
+        return signature
+
     def _load_workspace(self) -> None:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         paths = self._workspace_paths()
@@ -2059,11 +4176,15 @@ class AppState:
             self.model = None
             self.model_path = None
             self.model_settings = None
+            self.model_plateau = None
             self.calibration_settings = None
+            self.calibration_plateau = None
+            self.calibration_filter = None
             self.point_records = []
             self.selected_point_ids = []
             self.model_created_at = None
             self.records = []
+            self.validation_overrides = {}
             self.drift = self._empty_drift()
             self.latest_workflow_result = None
             if paths["points"].exists():
@@ -2099,11 +4220,37 @@ class AppState:
                     )
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     self.calibration_settings = None
+            if (
+                self._uses_plateau_protocol(self.calibration_settings)
+                and paths["plateau"].exists()
+            ):
+                try:
+                    saved_plateau = json.loads(paths["plateau"].read_text())
+                    raw_plateau = (
+                        saved_plateau.get("settings", saved_plateau)
+                        if isinstance(saved_plateau, dict) else None
+                    )
+                    self.calibration_plateau = self._plateau_signature(raw_plateau)
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    self.calibration_plateau = None
+            if paths["filter"].exists():
+                try:
+                    saved_filter = json.loads(paths["filter"].read_text())
+                    self.calibration_filter = self._filter_signature(
+                        saved_filter.get("settings", saved_filter)
+                        if isinstance(saved_filter, dict) else None
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    self.calibration_filter = None
             if paths["model"].exists() and self.calibration_settings is not None:
                 try:
                     self.model = load_model(paths["model"])
                     self.model_path = paths["model"]
                     self.model_settings = dict(self.calibration_settings)
+                    self.model_plateau = (
+                        dict(self.calibration_plateau)
+                        if self.calibration_plateau is not None else None
+                    )
                 except (OSError, ValueError, json.JSONDecodeError):
                     self.model = None
             if self.model is not None:
@@ -2128,8 +4275,10 @@ class AppState:
                     ]
             if paths["index"].exists():
                 try:
-                    with paths["index"].open(newline="") as handle:
-                        self.records = list(csv.DictReader(handle))[-100:]
+                    with paths["index"].open(
+                        newline="", encoding="utf-8"
+                    ) as handle:
+                        self.records = list(csv.DictReader(handle))
                 except OSError:
                     self.records = []
             if paths["drift"].exists():
@@ -2139,16 +4288,32 @@ class AppState:
                         self.drift = {**self._empty_drift(), **saved_drift}
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     self.drift = self._empty_drift()
+            if paths["validation"].exists():
+                try:
+                    saved_validation = json.loads(paths["validation"].read_text())
+                    raw_points = (saved_validation.get("points", saved_validation)
+                                  if isinstance(saved_validation, dict) else {})
+                    if isinstance(raw_points, dict):
+                        self.validation_overrides = {
+                            str(point_id): dict(values)
+                            for point_id, values in raw_points.items()
+                            if isinstance(values, dict)
+                        }
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    self.validation_overrides = {}
 
     def configure_workflow(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.measurement.state == "running" or self.schedule.snapshot()["active"]:
+        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
             raise RuntimeError("测量或自动任务运行期间不能切换工作目录")
         path = self._resolve_save_dir(str(payload.get("save_dir", "")))
         try:
             path.mkdir(parents=True, exist_ok=True)
-            probe = path / ".sensus-write-test"
-            probe.write_text("ok")
-            probe.unlink()
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix=".sensus-write-test-",
+                dir=path, delete=True,
+            ) as probe:
+                probe.write("ok")
+                probe.flush()
         except OSError as exc:
             raise ValueError(f"保存目录不可写：{exc}") from exc
         with self.lock:
@@ -2161,19 +4326,26 @@ class AppState:
 
     def workflow_snapshot(self) -> dict[str, Any]:
         current_settings = self.settings.snapshot()["settings"]
+        current_plateau = self.plateau.settings
         is_it = current_settings.get("method", "it") == "it"
         settings_match = (
             self.calibration_settings is None
-            or SettingsController.same_analysis_protocol(
-                self.calibration_settings, current_settings
+            or self._same_calibration_protocol(
+                self.calibration_settings,
+                self.calibration_plateau,
+                current_settings,
+                current_plateau,
             )
         )
         calibration_ready = (
             is_it
             and self.model is not None
             and self.model_settings is not None
-            and SettingsController.same_analysis_protocol(
-                self.model_settings, current_settings
+            and self._same_calibration_protocol(
+                self.model_settings,
+                self.model_plateau,
+                current_settings,
+                current_plateau,
             )
         )
         distinct = len({float(point.concentration_um) for point in self.points})
@@ -2217,14 +4389,17 @@ class AppState:
         concentration = (
             None if raw_concentration in (None, "") else float(raw_concentration)
         )
+        if concentration is not None and not math.isfinite(concentration):
+            raise ValueError("浓度必须是有限数字")
         if concentration is not None and concentration < 0:
             raise ValueError("浓度不能为负数")
         if role == "calibration" and concentration is None:
             raise ValueError("标定样品必须填写已知浓度")
-        if (role == "calibration" and self.points and self.calibration_settings is not None
-                and not SettingsController.same_analysis_protocol(
-                    self.calibration_settings, current_settings
-                )):
+        if (
+            role == "calibration"
+            and self.points
+            and not self.workflow_snapshot()["settings_match"]
+        ):
             raise RuntimeError("当前 IT 条件与该目录中的标定点不同，请选择新的保存目录")
         if role in {"stabilization", "test"} and not self.workflow_snapshot()["calibration_ready"]:
             raise RuntimeError("请先选择标定点并生成当前 IT 条件下的测试曲线")
@@ -2237,7 +4412,11 @@ class AppState:
             "source": payload.get("source") or "manual_gui",
         }
         metadata = self._prepare_export_metadata(metadata)
-        return self.measurement.start(metadata=metadata, settings=current_settings)
+        return self.measurement.start_verified(
+            metadata=metadata, settings=current_settings,
+            filter_config=self.filter.snapshot()["settings"],
+            plateau_config=self.plateau.settings,
+        )
 
     def start_debug_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         """硬件 DEBUG 模式的「一次 I-t 测量」。
@@ -2252,7 +4431,7 @@ class AppState:
         """
         if self.schedule.snapshot()["active"]:
             raise RuntimeError("自动测量运行期间不能起硬件 DEBUG 轮(探头只有一支)")
-        if self.measurement.snapshot()["state"] == "running":
+        if self.measurement.is_busy():
             raise RuntimeError("已有测量正在运行")
         # 🔴 刻意**不**要求 settings.applied。
         #   正式测量要求它,是因为标定/拟合假设固件的 E 与时长跟 settings 一致;
@@ -2267,8 +4446,33 @@ class AppState:
             "sample_role": "test",
             "source": "debug_gui",
         }
+        probe_only = bool(payload.get("probe_only"))
+        current_settings = self.settings.snapshot()["settings"]
+        if current_settings.get("method") == "cv":
+            # CV validation aliases its low potential and quiet time into the
+            # generic acquisition fields. Those values are not valid IT
+            # settings, so Debug needs a clean IT timing/potential baseline.
+            current_settings = {
+                **current_settings,
+                **{
+                    key: SettingsController.DEFAULTS[key]
+                    for key in (
+                        "initial_potential_v", "potential_v", "prestep_s",
+                        "duration_s", "fit_window_s", "adaptive_stop",
+                    )
+                },
+            }
+        debug_settings = SettingsController.validate({
+            **current_settings,
+            "method": "it",
+        })
         return self.measurement.start(
-            metadata=metadata, settings=self.settings.snapshot()["settings"])
+            metadata=metadata,
+            settings=debug_settings,
+            filter_config=self.filter.snapshot()["settings"],
+            plateau_config=self.plateau.settings,
+            trigger="ARMED" if probe_only else "FRESH_START",
+        )
 
     def _prepare_export_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
         prepared = dict(metadata)
@@ -2288,7 +4492,7 @@ class AppState:
         candidate = root
         number = 2
         while any((self.save_dir / f"{candidate}{suffix}").exists()
-                  for suffix in (".csv", "-raw.csv", "-summary.json", ".png")):
+                  for suffix in (".csv", "-raw.csv", "-filtered.csv", "-summary.json", ".png")):
             candidate = f"{root}-r{number}"
             number += 1
         return candidate
@@ -2309,29 +4513,130 @@ class AppState:
                     "selected": int(record["point_id"] in selected),
                 })
 
+    @staticmethod
+    def _ensure_measurement_index_schema(
+        path: Path, required_fields: list[str]
+    ) -> tuple[list[str], bool]:
+        """Add new index columns without corrupting rows written by older releases."""
+        if not path.exists() or path.stat().st_size == 0:
+            return list(required_fields), False
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            existing_fields = list(reader.fieldnames or [])
+            missing = [field for field in required_fields if field not in existing_fields]
+            if not missing:
+                return existing_fields, False
+            rows = list(reader)
+
+        migrated_fields = [*existing_fields, *missing]
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="", prefix=f".{path.name}.",
+                suffix=".tmp", dir=path.parent, delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                writer = csv.DictWriter(handle, fieldnames=migrated_fields)
+                writer.writeheader()
+                for row in rows:
+                    overflow_values = row.get(None)
+                    if isinstance(overflow_values, list):
+                        for field, value in zip(missing, overflow_values):
+                            if row.get(field) in (None, ""):
+                                row[field] = value
+                    writer.writerow({field: row.get(field, "") for field in migrated_fields})
+            os.replace(temporary_path, path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        return migrated_fields, True
+
     def _append_record(self, result: dict[str, Any]) -> None:
         path = self._workspace_paths()["index"]
-        fields = [
+        required_fields = [
             "finished_at", "run_id", "sample_name", "sample_role",
             "known_concentration_um", "steady_current_nA",
             "predicted_concentration_um", "state", "data_path", "raw_path",
+            "measurement_settings_json",
         ]
+        fields, migrated = self._ensure_measurement_index_schema(path, required_fields)
+        if migrated:
+            with path.open(newline="", encoding="utf-8") as handle:
+                self.records = list(csv.DictReader(handle))
         row = {key: result.get(key, "") for key in fields}
+        measurement_settings = result.get("measurement_settings")
+        row["measurement_settings_json"] = (
+            json.dumps(measurement_settings, ensure_ascii=False, sort_keys=True)
+            if isinstance(measurement_settings, dict) else ""
+        )
         new_file = not path.exists() or path.stat().st_size == 0
-        with path.open("a", newline="") as handle:
+        with path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             if new_file:
                 writer.writeheader()
             writer.writerow(row)
-        self.records.append({key: str(row.get(key, "")) for key in fields})
-        self.records = self.records[-100:]
+        self.records.append({
+            key: str(row.get(key, "")) for key in required_fields
+        })
 
     def _save_drift(self) -> None:
         self._workspace_paths()["drift"].write_text(
             json.dumps(_json_safe(self.drift), indent=2, ensure_ascii=False)
         )
 
+    def _save_validation_overrides(self) -> None:
+        self._workspace_paths()["validation"].write_text(
+            json.dumps({"points": self.validation_overrides}, indent=2,
+                       ensure_ascii=False)
+        )
+
+    def update_validation_points(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist user edits to completed test rows without rewriting raw runs."""
+        raw_points = payload.get("points", [])
+        if not isinstance(raw_points, list):
+            raise ValueError("测试点必须是数组")
+        available = {
+            str(row.get("run_id") or f"validation-{index:04d}")
+            for index, row in enumerate(self.records, 1)
+            if row.get("sample_role") == "test" and row.get("state") == "completed"
+        }
+        overrides: dict[str, dict[str, Any]] = {}
+        for item in raw_points:
+            if not isinstance(item, dict):
+                raise ValueError("测试点必须是对象")
+            point_id = str(item.get("point_id") or "")
+            if not point_id or point_id not in available:
+                raise ValueError("测试点记录不存在")
+            try:
+                current = float(item["current_nA"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("测试点电流必须是数字") from exc
+            if not math.isfinite(current):
+                raise ValueError("测试点电流必须是有限数字")
+            raw_concentration = item.get("concentration_um")
+            if raw_concentration in (None, ""):
+                concentration = None
+            else:
+                try:
+                    concentration = float(raw_concentration)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("测试点浓度必须是数字") from exc
+                if not math.isfinite(concentration) or concentration < 0:
+                    raise ValueError("测试点浓度必须是非负有限数字")
+            overrides[point_id] = {
+                "sample_name": str(item.get("sample_name") or "").strip(),
+                "concentration_um": concentration,
+                "current_nA": current,
+            }
+        with self.lock:
+            self.validation_overrides = overrides
+            self._save_validation_overrides()
+        return self.model_payload()
+
     def _stabilization_records(self) -> list[dict[str, Any]]:
+        if self.model_created_at is None or self.model_settings is None:
+            return []
         records: list[dict[str, Any]] = []
         selected = set(self.drift.get("record_ids") or [])
         for row in self.records:
@@ -2342,6 +4647,18 @@ class AppState:
                 finished_at = float(row["finished_at"])
             except (KeyError, TypeError, ValueError):
                 continue
+            if (not math.isfinite(current) or not math.isfinite(finished_at)
+                    or finished_at <= self.model_created_at):
+                continue
+            try:
+                record_settings = json.loads(str(row["measurement_settings_json"]))
+                if (not isinstance(record_settings, dict)
+                        or not SettingsController.same_analysis_protocol(
+                            record_settings, self.model_settings
+                        )):
+                    continue
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
             run_id = str(row.get("run_id") or "")
             raw_concentration = row.get("known_concentration_um")
             try:
@@ -2349,7 +4666,10 @@ class AppState:
                     None if raw_concentration in (None, "") else float(raw_concentration)
                 )
             except (TypeError, ValueError):
-                concentration = None
+                continue
+            if (concentration is None or not math.isfinite(concentration)
+                    or concentration < 0):
+                continue
             records.append({
                 "run_id": run_id,
                 "sample_name": str(row.get("sample_name") or run_id),
@@ -2372,6 +4692,14 @@ class AppState:
         return float(self.drift.get("bias_nA") or 0.0) if self.drift.get("enabled") else 0.0
 
     def calculate_drift(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_concentration = payload.get("known_concentration_um")
+        if raw_concentration in (None, ""):
+            raise ValueError("请填写稳定化溶液浓度")
+        concentration = float(raw_concentration)
+        if not math.isfinite(concentration):
+            raise ValueError("稳定化溶液浓度必须是有限数字")
+        if concentration < 0:
+            raise ValueError("稳定化溶液浓度不能为负数")
         candidates = self._stabilization_records()
         if len(candidates) < 2:
             raise ValueError("至少需要两次已完成的稳定化 IT 才能计算漂移")
@@ -2389,6 +4717,11 @@ class AppState:
             records = candidates[start_index:end_index + 1]
         if len(records) < 2:
             raise ValueError("漂移范围至少要包含两次稳定化 IT")
+        if any(not math.isclose(
+            float(record["known_concentration_um"]), concentration,
+            rel_tol=1e-9, abs_tol=1e-9,
+        ) for record in records):
+            raise ValueError("漂移范围只能包含与填写浓度一致的稳定化记录")
 
         t0 = records[0]["finished_at"]
         x = [(record["finished_at"] - t0) / 3600.0 for record in records]
@@ -2400,12 +4733,6 @@ class AppState:
             sum((xv - mean_x) * (yv - mean_y) for xv, yv in zip(x, y)) / denominator
             if denominator > 0 else None
         )
-        raw_concentration = payload.get("known_concentration_um")
-        concentration = (
-            None if raw_concentration in (None, "") else float(raw_concentration)
-        )
-        if concentration is not None and concentration < 0:
-            raise ValueError("稳定化溶液浓度不能为负数")
         with self.lock:
             self.drift = {
                 "enabled": bool(payload.get("enabled", self.drift.get("enabled", False))),
@@ -2439,7 +4766,7 @@ class AppState:
         #    要到下次拟合曲线时才会暴露出来 —— 那时已经分不清哪几行是调试轮。
         #    刻意**不新增第四个 sample_role**:那要串改 5 处调用点却买不到任何东西。
         if metadata.get("debug"):
-            self.measurement.set_workflow_result({
+            result = {
                 "finished_at": run.get("finished_at"),
                 "run_id": run.get("run_id"),
                 "debug": True,
@@ -2447,7 +4774,28 @@ class AppState:
                 "note": "硬件 DEBUG 轮:原始数据保留在 run_dir,不进标定工作区",
                 "run_dir": run.get("run_dir"),
                 "raw_path": run.get("raw_path"),
-            })
+            }
+            self.measurement.set_workflow_result(result)
+            _notify_measurement_completion(run, result)
+            return
+        hardware_taint = run.get("hardware_taint")
+        if hardware_taint:
+            result = {
+                "finished_at": run.get("finished_at"),
+                "run_id": run.get("run_id"),
+                "sample_name": str(
+                    metadata.get("sample_name") or run.get("run_id") or "sample"
+                ),
+                "sample_role": str(metadata.get("sample_role") or "test"),
+                "state": "error",
+                "tainted": True,
+                "hardware_taint": hardware_taint,
+                "note": "硬件报告 IT_TAINTED：原始数据保留，但不进入标定、预测或测量索引",
+                "run_dir": run.get("run_dir"),
+                "raw_path": run.get("raw_path"),
+            }
+            self.measurement.set_workflow_result(result)
+            _notify_measurement_completion(run, result)
             return
         sample_name = str(metadata.get("sample_name") or run.get("run_id") or "sample")
         concentration = metadata.get("known_concentration_um")
@@ -2461,6 +4809,7 @@ class AppState:
             "state": run.get("state"),
             "steady_current_nA": (run.get("summary") or {}).get("steady_current_nA"),
             "predicted_concentration_um": None,
+            "measurement_settings": run.get("settings"),
         }
         try:
             with self.lock:
@@ -2473,8 +4822,10 @@ class AppState:
                     stem = self._reserve_export_stem(sample_name, concentration)
                 raw_source = Path(str(run.get("raw_path") or ""))
                 data_source = Path(str(run.get("resampled_path") or ""))
+                filtered_source = Path(str(run.get("filtered_path") or ""))
                 raw_target = self.save_dir / f"{stem}-raw.csv"
                 data_target = self.save_dir / f"{stem}.csv"
+                filtered_target = self.save_dir / f"{stem}-filtered.csv"
                 summary_target = self.save_dir / f"{stem}-summary.json"
                 plot_target = self.save_dir / f"{stem}.png"
                 if raw_source.exists():
@@ -2503,17 +4854,54 @@ class AppState:
                 else:
                     result["data_path"] = ""
                     result["plot_path"] = ""
+                if filtered_source.exists():
+                    shutil.copy2(filtered_source, filtered_target)
+                    result["filtered_data_path"] = str(filtered_target)
+                else:
+                    result["filtered_data_path"] = ""
 
                 steady = result["steady_current_nA"]
                 if run.get("state") == "completed" and steady is not None:
                     if role == "calibration" and concentration is not None:
+                        run_settings = SettingsController.validate(dict(run["settings"]))
+                        run_plateau = self._run_plateau_signature(run, run_settings)
                         if self.calibration_settings is None:
-                            self.calibration_settings = SettingsController.validate(
-                                dict(run["settings"])
-                            )
+                            self.calibration_settings = run_settings
+                            self.calibration_plateau = run_plateau
                             self._workspace_paths()["settings"].write_text(
                                 json.dumps(self.calibration_settings, indent=2,
                                            ensure_ascii=False)
+                            )
+                            if run_plateau is not None:
+                                self._workspace_paths()["plateau"].write_text(
+                                    json.dumps(
+                                        {"settings": run_plateau},
+                                        indent=2,
+                                        ensure_ascii=False,
+                                    )
+                                )
+                            else:
+                                self._workspace_paths()["plateau"].unlink(
+                                    missing_ok=True
+                                )
+                        elif not self._same_calibration_protocol(
+                            self.calibration_settings,
+                            self.calibration_plateau,
+                            run_settings,
+                            run_plateau,
+                        ):
+                            raise ValueError(
+                                "本次 IT 或自动停止参数与已有标定点不一致，"
+                                "结果未加入标定"
+                            )
+                        if self.calibration_filter is None:
+                            self.calibration_filter = self._filter_signature(
+                                (run.get("filter") or {}).get("config")
+                                if isinstance(run.get("filter"), dict) else None
+                            )
+                            self._workspace_paths()["filter"].write_text(
+                                json.dumps({"settings": self.calibration_filter},
+                                           indent=2, ensure_ascii=False)
                             )
                         point_id = str(run.get("run_id") or f"point-{time.time_ns()}")
                         existing_ids = {item["point_id"] for item in self.point_records}
@@ -2532,18 +4920,21 @@ class AppState:
                         self._save_calibration_points()
                         result["calibration_points"] = len(self.points)
                         result["candidate_added"] = True
-                        result["calibration_ready"] = (
-                            self.model is not None
-                            and self.model_settings is not None
-                            and SettingsController.same_analysis_protocol(
-                                self.model_settings, self.settings.snapshot()["settings"]
-                            )
-                        )
+                        result["calibration_ready"] = self.workflow_snapshot()[
+                            "calibration_ready"
+                        ]
                     elif role == "test" and self.model is not None:
                         effective_current = float(steady) - self._effective_bias_nA()
-                        result["predicted_concentration_um"] = float(
-                            self.model.predict_concentration(effective_current)
-                        )
+                        try:
+                            result["predicted_concentration_um"] = float(
+                                self.model.predict_concentration(effective_current)
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            # Outlying polynomial currents may have no inverse
+                            # in the calibrated range. The completed run must
+                            # still be indexed and score Grey rather than being
+                            # discarded by the export transaction.
+                            result["predicted_concentration_um"] = None
 
                 exported_summary = {
                     **(run.get("summary") or {}),
@@ -2554,6 +4945,7 @@ class AppState:
                     "measurement_settings": run.get("settings"),
                     "source_run_dir": run.get("run_dir"),
                     "saved_data_path": result.get("data_path", ""),
+                    "saved_filtered_data_path": result.get("filtered_data_path", ""),
                     "saved_raw_path": result.get("raw_path", ""),
                     "calibration_model_path": (
                         str(self.model_path) if self.model_path else ""
@@ -2574,14 +4966,18 @@ class AppState:
             result["export_error"] = str(exc)
             self.latest_workflow_result = dict(result)
         self.measurement.set_workflow_result(result)
+        _notify_measurement_completion(run, result)
 
     def reset_calibration(self) -> dict[str, Any]:
-        if self.measurement.state == "running" or self.schedule.snapshot()["active"]:
+        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
             raise RuntimeError("测量或自动任务运行期间不能重置标定")
-        stamp = time.strftime("%Y%m%d_%H%M%S")
+        stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1_000_000:06d}"
         paths = self._workspace_paths()
         with self.lock:
-            for key in ("points", "model", "settings", "selection", "drift"):
+            for key in (
+                "points", "model", "settings", "plateau", "filter", "selection",
+                "validation", "drift",
+            ):
                 path = paths[key]
                 if path.exists():
                     archived = path.with_name(f"{path.stem}-{stamp}{path.suffix}")
@@ -2592,20 +4988,30 @@ class AppState:
             self.model = None
             self.model_path = None
             self.model_settings = None
+            self.model_plateau = None
             self.calibration_settings = None
+            self.calibration_plateau = None
+            self.calibration_filter = None
             self.model_created_at = None
+            self.validation_overrides = {}
             self.latest_workflow_result = None
             self.drift = self._empty_drift()
         return self.workflow_snapshot()
 
     def fit(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.measurement.state == "running" or self.schedule.snapshot()["active"]:
+        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
             raise RuntimeError("请等待当前测量或自动任务结束后再生成测试曲线")
         raw_points = payload.get("points", [])
+        if not isinstance(raw_points, list):
+            raise ValueError("标定点必须是数组")
         degree = int(payload.get("degree", 1))
+        if degree not in (1, 2):
+            raise ValueError("上位机标定仅支持线性或二次模型")
         records: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         for index, row in enumerate(raw_points, 1):
+            if not isinstance(row, dict):
+                raise ValueError("标定点必须是对象")
             point_id = str(row.get("point_id") or f"manual-{index:04d}")
             if point_id in seen_ids:
                 point_id = f"{point_id}-{index}"
@@ -2637,19 +5043,41 @@ class AppState:
             )
             for record in selected_records
         ]
+        model_settings = self.settings.snapshot()["settings"]
+        model_plateau = (
+            self._plateau_signature(self.plateau.settings)
+            if self._uses_plateau_protocol(model_settings) else None
+        )
+        if (
+            self.calibration_settings is not None
+            and not self._same_calibration_protocol(
+                self.calibration_settings,
+                self.calibration_plateau,
+                model_settings,
+                model_plateau,
+            )
+        ):
+            raise ValueError("当前 IT 条件与候选标定点不一致，不能生成测试曲线")
         model = fit_calibration(selected_points, degree=degree)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         paths = self._workspace_paths()
         path = paths["model"]
-        model_settings = self.settings.snapshot()["settings"]
-        if (self.calibration_settings is not None
-                and not SettingsController.same_analysis_protocol(
-                    self.calibration_settings, model_settings
-                )):
-            raise ValueError("当前 IT 条件与候选标定点不一致，不能生成测试曲线")
+        current_filter = self._filter_signature(self.filter.snapshot()["settings"])
         save_model(model, path)
         paths["settings"].write_text(
             json.dumps(model_settings, indent=2, ensure_ascii=False)
+        )
+        if model_plateau is not None:
+            paths["plateau"].write_text(json.dumps(
+                {"settings": model_plateau}, indent=2, ensure_ascii=False
+            ))
+        else:
+            paths["plateau"].unlink(missing_ok=True)
+        paths["filter"].write_text(
+            json.dumps({
+                "settings": current_filter,
+                "policy": "mixed_filters_allowed",
+            }, indent=2, ensure_ascii=False)
         )
         created_at = time.time()
         paths["selection"].write_text(json.dumps({
@@ -2669,7 +5097,14 @@ class AppState:
             self.model = model
             self.model_path = path
             self.model_settings = model_settings
+            self.model_plateau = (
+                dict(model_plateau) if model_plateau is not None else None
+            )
             self.calibration_settings = dict(model_settings)
+            self.calibration_plateau = (
+                dict(model_plateau) if model_plateau is not None else None
+            )
+            self.calibration_filter = current_filter
             self.model_created_at = created_at
             self._save_calibration_points()
         return self.model_payload()
@@ -2699,14 +5134,19 @@ class AppState:
             model_compatible = (
                 self.model is not None
                 and self.model_settings is not None
-                and SettingsController.same_analysis_protocol(
-                    self.model_settings, self.settings.snapshot()["settings"]
+                and self._same_calibration_protocol(
+                    self.model_settings,
+                    self.model_plateau,
+                    self.settings.snapshot()["settings"],
+                    self.plateau.settings,
                 )
             )
             if self.model is None:
                 return {
                     "model": None,
                     "points": self.points_payload()["points"],
+                    "validation_points": [],
+                    "ap_score": evaluate_ap_score([]),
                     "selected_point_ids": self.selected_point_ids,
                     "model_created_at": self.model_created_at,
                     "drift_bias_nA": bias_nA,
@@ -2719,17 +5159,116 @@ class AppState:
                 for i in range(200)
             ]
             ys = [float(model.current_from_concentration(x)) + bias_nA for x in xs]
+            validation_points = self._validation_points_payload(model, bias_nA)
+            ap_score = evaluate_ap_score(validation_points)
+            scored_details = {
+                int(detail["sequence"]): detail for detail in ap_score["points"]
+            }
+            for index, point in enumerate(validation_points, 1):
+                detail = scored_details.get(index)
+                if detail is not None:
+                    point.update({
+                        "zone": detail["zone"], "sample_score": detail["score"],
+                        "absolute_error_um": detail["absolute_error_um"],
+                        "error_percent": detail["error_percent"],
+                    })
+                else:
+                    point.update({"zone": None, "sample_score": None,
+                                 "absolute_error_um": None, "error_percent": None})
             return {
                 "model": _json_safe(model.to_json()),
                 "model_path": str(self.model_path) if self.model_path else "",
                 "points": self.points_payload()["points"],
                 "curve": {"concentration_um": xs, "current_nA": ys},
+                "validation_points": validation_points,
+                "ap_score": ap_score,
                 "measurement_settings": self.model_settings,
                 "selected_point_ids": self.selected_point_ids,
                 "model_created_at": self.model_created_at,
                 "drift_bias_nA": bias_nA,
                 "model_compatible": model_compatible,
             }
+
+    def _validation_points_payload(
+        self, model: CalibrationModel, bias_nA: float = 0.0
+    ) -> list[dict[str, Any]]:
+        """Build test points for the calibration chart without refitting the model.
+
+        Only completed test runs acquired after the current model was created,
+        with a finite steady current, can be placed on its chart. A missing
+        known concentration is kept editable but excluded from AP scoring until
+        the user fills it in. Starting a new calibration or regenerating the
+        model therefore starts an empty validation set without deleting the
+        historical measurement index. The measured current stays untouched;
+        the model's optional drift bias is applied only when calculating the
+        expected current and predicted concentration.
+        """
+        if self.model_created_at is None:
+            return []
+        validation_points: list[dict[str, Any]] = []
+        for index, row in enumerate(self.records, 1):
+            if row.get("sample_role") != "test" or row.get("state") != "completed":
+                continue
+            point_id = str(row.get("run_id") or f"validation-{index:04d}")
+            override = self.validation_overrides.get(point_id, {})
+            try:
+                measured_current = float(override.get("current_nA", row["steady_current_nA"]))
+                finished_at = float(row.get("finished_at") or 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(measured_current):
+                continue
+            if finished_at <= self.model_created_at:
+                continue
+            raw_concentration = override.get(
+                "concentration_um", row.get("known_concentration_um")
+            )
+            try:
+                concentration = (
+                    None if raw_concentration in (None, "")
+                    else float(raw_concentration)
+                )
+            except (TypeError, ValueError):
+                concentration = None
+            if concentration is not None and (
+                not math.isfinite(concentration) or concentration < 0
+            ):
+                concentration = None
+            expected_current = (
+                float(model.current_from_concentration(concentration)) + bias_nA
+                if concentration is not None else None
+            )
+            try:
+                predicted_concentration = float(
+                    model.predict_concentration(measured_current - bias_nA)
+                )
+            except (TypeError, ValueError, OverflowError):
+                # A quadratic model may have no real inverse for an outlying
+                # test current. Keep the measured point and current error on
+                # the chart, while leaving concentration error unavailable.
+                predicted_concentration = None
+            validation_points.append({
+                "point_id": point_id,
+                "run_id": point_id,
+                "sample_name": str(override.get("sample_name") or row.get("sample_name") or point_id or "测试样品"),
+                "finished_at": finished_at,
+                "concentration_um": concentration,
+                "current_nA": measured_current,
+                "expected_current_nA": expected_current,
+                "predicted_concentration_um": predicted_concentration,
+                "error_nA": (
+                    measured_current - expected_current
+                    if expected_current is not None else None
+                ),
+                "error_um": (
+                    predicted_concentration - concentration
+                    if predicted_concentration is not None
+                    and concentration is not None else None
+                ),
+                "data_path": str(row.get("data_path") or ""),
+                "edited": bool(override),
+            })
+        return validation_points
 
     def points_payload(self) -> dict[str, Any]:
         return {
@@ -2748,8 +5287,12 @@ class AppState:
             raise ValueError("尚未拟合标定曲线")
         if not payload.get("model_path") and self.model_settings is not None:
             current_settings = self.settings.snapshot()["settings"]
-            if not SettingsController.same_analysis_protocol(
-                    current_settings, self.model_settings):
+            if not self._same_calibration_protocol(
+                self.model_settings,
+                self.model_plateau,
+                current_settings,
+                self.plateau.settings,
+            ):
                 raise ValueError("当前 IT 条件与标定模型不一致，请在当前条件下重新标定")
         current = payload.get("current_nA")
         if current is None or current == "":
@@ -2771,21 +5314,6 @@ class AppState:
 
 
 APP = AppState()
-
-
-def _activate_v51_profile() -> None:
-    """Select V5.1 method defaults and keep its App state separate from V4."""
-    global APP, RUNS_DIR, SETTINGS_PATH, WORKFLOW_PATH, DEFAULT_SAVE_DIR
-    profile_dir = PROJECT_DIR / "measurements" / "v51"
-    RUNS_DIR = profile_dir / "gui_runs"
-    SETTINGS_PATH = profile_dir / "gui_settings.json"
-    WORKFLOW_PATH = profile_dir / "gui_workflow.json"
-    DEFAULT_SAVE_DIR = profile_dir / "experiment_data"
-    SettingsController.DEFAULTS = dict(SettingsController.V51_DEFAULTS)
-    # The module-level AppState is created before CLI arguments are parsed.
-    # Recreate it once, before serving requests, so all controllers and paths
-    # use the V5.1 profile without changing the V4 process defaults.
-    APP = AppState()
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -2813,8 +5341,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _body(self) -> dict[str, Any]:
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("控制接口只接受 application/json")
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed_origin = urlparse(origin)
+            if parsed_origin.netloc != self.headers.get("Host", ""):
+                raise ValueError("拒绝跨站控制请求")
         length = int(self.headers.get("Content-Length", "0"))
-        if length > 2_000_000:
+        if length < 0 or length > 2_000_000:
             raise ValueError("请求体过大")
         raw = self.rfile.read(length)
         if not raw:
@@ -2827,7 +5363,15 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            self._send_bytes((GUI_DIR / "index.html").read_bytes(), "text/html; charset=utf-8")
+            # Keep the workstation usable in embedded browsers that may drop an
+            # external stylesheet after handing the tab back to the user.
+            html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+            css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+            html = re.sub(
+                r'<link rel="stylesheet" href="/assets/styles\.css[^"]*">',
+                f"<style>\n{css}\n</style>", html, count=1,
+            )
+            self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
             return
         if parsed.path == "/compact":
             self._send_bytes(
@@ -2837,9 +5381,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             self._send_json(APP.measurement.snapshot())
             return
-        if parsed.path == "/api/hardware":
-            self._send_json(hardware_status())
-            return
         if parsed.path == "/api/calibration":
             self._send_json(APP.model_payload())
             return
@@ -2848,6 +5389,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/settings":
             self._send_json(APP.settings.snapshot())
+            return
+        if parsed.path == "/api/filter":
+            self._send_json(APP.filter.snapshot())
+            return
+        if parsed.path == "/api/plateau":
+            self._send_json(APP.plateau.snapshot())
             return
         if parsed.path == "/api/workflow":
             self._send_json(APP.workflow_snapshot())
@@ -2864,15 +5411,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
         if parsed.path == "/api/health":
-            self._send_json({
-                "ok": True,
-                "project": str(PROJECT_DIR),
-                "transport": HARDWARE_TRANSPORT,
-                # Health checks must stay fast while USB discovery is running
-                # in another request; otherwise the native App watchdog can
-                # mistake enumeration latency for a crashed backend.
-                "hardware": hardware_status(refresh=False),
-            })
+            self._send_json({"ok": True, "project": str(PROJECT_DIR)})
             return
         if parsed.path.startswith("/assets/"):
             name = Path(parsed.path.removeprefix("/assets/")).name
@@ -2887,11 +5426,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             payload = self._body()
             if self.path == "/api/measurement/start":
-                if APP.schedule.snapshot()["active"]:
-                    raise RuntimeError("自动测量运行期间不能插入手动测量")
-                if not APP.settings.snapshot()["applied"]:
-                    raise RuntimeError("请先将当前检测条件应用到硬件")
-                result = APP.start_measurement(payload)
+                with APP.operation_lock:
+                    if APP.schedule.snapshot()["active"]:
+                        raise RuntimeError("自动测量运行期间不能插入手动测量")
+                    if not APP.settings.snapshot()["applied"]:
+                        raise RuntimeError("请先将当前检测条件应用到硬件")
+                    result = APP.start_measurement(payload)
             elif self.path == "/api/range":
                 result = APP.measurement.send_range(payload)
             elif self.path == "/api/range/measurement":
@@ -2904,15 +5444,29 @@ class RequestHandler(BaseHTTPRequestHandler):
             # 复用 MeasurementController(它本来就是"一次 I-t 测量"这个抽象),
             # 只是打上 debug 标记并**不传 live_raw_path** ⇒ raw 留在 run_dir。
             elif self.path == "/api/debug/start":
-                result = APP.start_debug_run(payload)
+                with APP.operation_lock:
+                    result = APP.start_debug_run(payload)
             elif self.path == "/api/debug/stop":
-                result = APP.measurement.stop()
+                with APP.measurement.lock:
+                    APP.measurement.require_debug_run()
+                    result = APP.measurement.stop()
+            elif self.path == "/api/debug/begin":
+                with APP.measurement.lock:
+                    APP.measurement.require_debug_run()
+                    result = APP.measurement.begin_debug_measurement(
+                        str(payload.get("line", "")))
             elif self.path == "/api/debug/cmd":
-                result = APP.measurement.send_command(str(payload.get("line", "")))
+                with APP.measurement.lock:
+                    APP.measurement.require_debug_run()
+                    result = APP.measurement.send_command(
+                        str(payload.get("line", ""))
+                    )
             elif self.path == "/api/calibration/load":
                 result = APP.load_points(str(payload["path"]))
             elif self.path == "/api/calibration/fit":
                 result = APP.fit(payload)
+            elif self.path == "/api/calibration/validation":
+                result = APP.update_validation_points(payload)
             elif self.path == "/api/drift/calculate":
                 result = APP.calculate_drift(payload)
             elif self.path == "/api/drift/toggle":
@@ -2920,31 +5474,73 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/predict":
                 result = APP.predict(payload)
             elif self.path == "/api/schedule/start":
-                if not APP.settings.snapshot()["applied"]:
-                    raise RuntimeError("请先将当前检测条件应用到硬件")
-                role = str(payload.get("sample_role") or "test")
-                workflow = APP.workflow_snapshot()
-                is_it = APP.settings.snapshot()["settings"].get("method") == "it"
-                if is_it and role in {"stabilization", "test"} and not workflow["calibration_ready"]:
-                    raise RuntimeError("请先选择标定点并生成测试曲线")
-                if (role == "calibration" and workflow["points_count"]
-                        and not workflow["settings_match"]):
-                    raise RuntimeError("当前 IT 条件与已有标定点不同，请新建标定")
-                payload["settings"] = APP.settings.snapshot()["settings"]
-                payload["save_dir"] = str(APP.save_dir)
-                result = APP.schedule.start(payload)
+                with APP.operation_lock:
+                    if not APP.settings.snapshot()["applied"]:
+                        raise RuntimeError("请先将当前检测条件应用到硬件")
+                    role = str(payload.get("sample_role") or "test")
+                    workflow = APP.workflow_snapshot()
+                    is_it = APP.settings.snapshot()["settings"].get("method") == "it"
+                    if (is_it and role in {"stabilization", "test"}
+                            and not workflow["calibration_ready"]):
+                        raise RuntimeError("请先选择标定点并生成测试曲线")
+                    if (role == "calibration" and workflow["points_count"]
+                            and not workflow["settings_match"]):
+                        raise RuntimeError("当前 IT 条件与已有标定点不同，请新建标定")
+                    payload["settings"] = APP.settings.snapshot()["settings"]
+                    payload["save_dir"] = str(APP.save_dir)
+                    APP.schedule.set_filter_config(APP.filter.snapshot()["settings"])
+                    APP.schedule.set_plateau_config(APP.plateau.settings)
+                    result = APP.schedule.start(payload)
             elif self.path == "/api/schedule/stop":
                 result = APP.schedule.stop()
             elif self.path == "/api/settings/apply":
-                if (APP.measurement.snapshot()["state"] == "running"
-                        or APP.schedule.snapshot()["active"]):
-                    raise RuntimeError("测量或自动任务运行期间不能修改硬件参数")
-                result = APP.settings.apply(payload)
-                APP.measurement.settings = dict(result["settings"])
+                with APP.operation_lock:
+                    if (APP.measurement.is_busy()
+                            or APP.schedule.snapshot()["active"]):
+                        raise RuntimeError("测量或自动任务运行期间不能修改硬件参数")
+                    result = APP.settings.apply(payload)
+                    with APP.measurement.lock:
+                        APP.measurement.settings = dict(result["settings"])
+                        if APP.measurement._rolling_metrics_frozen is None:
+                            APP.measurement._reset_live_analysis_locked()
+            elif self.path == "/api/filter/apply":
+                result = APP.filter.apply(payload)
+                APP.schedule.set_filter_config(result["settings"])
+                # A filter is host-side and can be changed during acquisition.
+                # Keep the run's eventual analysis and the live display on the
+                # same configuration; raw acquisition remains untouched.
+                if APP.measurement.snapshot()["state"] == "running":
+                    APP.measurement.set_filter_config(result["settings"])
+            elif self.path == "/api/plateau/apply":
+                with APP.operation_lock, APP.measurement.lock:
+                    if APP.schedule.snapshot()["active"]:
+                        raise RuntimeError(
+                            "自动任务运行期间不能修改自动停止参数"
+                        )
+                    if (
+                        APP.measurement.state == "running"
+                        and (
+                            APP.measurement.user_stop_requested
+                            or APP.measurement.auto_stop_requested
+                        )
+                    ):
+                        raise RuntimeError(
+                            "测量正在停止，不能修改自动停止参数"
+                        )
+                    if (APP.measurement.state == "running"
+                            and not APP.measurement.metadata.get("debug")):
+                        raise RuntimeError(
+                            "正式测量运行期间不能修改自动停止参数"
+                        )
+                    result = APP.plateau.apply(payload)
+                    APP.schedule.set_plateau_config(result["settings"])
+                    APP.measurement.set_plateau_config(result["settings"])
             elif self.path == "/api/workflow/config":
-                result = APP.configure_workflow(payload)
+                with APP.operation_lock:
+                    result = APP.configure_workflow(payload)
             elif self.path == "/api/workflow/reset-calibration":
-                result = APP.reset_calibration()
+                with APP.operation_lock:
+                    result = APP.reset_calibration()
             else:
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 return
@@ -2962,19 +5558,21 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
     print(f"i-t GUI: {url}", flush=True)
     if open_browser:
         threading.Timer(0.35, lambda: webbrowser.open(url)).start()
-    # 🔴 必须接 SIGTERM。Python 对 SIGTERM 的默认动作是**立刻退出、不跑 finally**
-    #    ⇒ `pkill -f gui_server` 之后,它起的 collector 与 JLinkExe 会活下来、
-    #    继续占着探头和 telnet 19021,下一次启动的 run 连不上就带 traceback 死。
-    #    2026-08-10 实测踩到:一个孤儿 collector 让新 run 直接
-    #    ConnectionResetError,而现场看起来像"探头坏了"。
+    # 🔴 必须接 SIGTERM(SIGBREAK on Windows)。Python 对 SIGTERM 的默认动作
+    #    是**立刻退出、不跑 finally** ⇒ `pkill -f gui_server` 之后,它起的
+    #    collector 与 JLinkExe 会活下来、继续占着探头和 telnet 19021,下一次
+    #    启动的 run 连不上就带 traceback 死。2026-08-10 实测踩到:一个孤儿
+    #    collector 让新 run 直接 ConnectionResetError,而现场看起来像"探头坏了"。
+    #    Windows 没有 SIGTERM,用 CTRL_BREAK_EVENT 代替(taskkill 会发这个)。
     def _graceful(_sig, _frm):
         threading.Thread(target=server.shutdown, daemon=True).start()
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    _signals = (signal.SIGBREAK, signal.SIGINT) if _IS_WIN else (signal.SIGTERM, signal.SIGINT)  # type: ignore[attr-defined]
+    for sig in _signals:
         try:
             signal.signal(sig, _graceful)
-        except ValueError:
-            pass   # 非主线程时不给注册,忽略
+        except (ValueError, AttributeError):
+            pass   # 非主线程时不给注册,或平台不支持时忽略
 
     try:
         server.serve_forever()
@@ -2990,35 +5588,18 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
             try:
                 proc.wait(timeout=6)
             except subprocess.TimeoutExpired:
-                pass
+                MeasurementController._kill_tree(proc)
+        APP.measurement.wait_for_completion()
         server.server_close()
         print("i-t GUI 已退出(采集子进程与 J-Link 已收回)", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
-    global HARDWARE_TRANSPORT, HARDWARE_AUTO_DISCOVERY
-    global SERIAL_DATA_PORT, SERIAL_DATA_EXPLICIT
     parser = argparse.ArgumentParser(description="本地 i-t 电化学检测 GUI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--open-browser", action="store_true")
-    parser.add_argument("--transport", choices=("rtt", "serial", "v51"),
-                        default=HARDWARE_TRANSPORT,
-                        help="V4.0 用 rtt;V5.1 App 用 v51 自动识别或 serial 显式指定")
-    parser.add_argument("--serial-port", default=SERIAL_DATA_PORT,
-                        help="V5.1 DATA CDC 路径;不得填 SMP 口")
     args = parser.parse_args(argv)
-    HARDWARE_AUTO_DISCOVERY = args.transport == "v51"
-    HARDWARE_TRANSPORT = "serial" if args.transport == "v51" else args.transport
-    SERIAL_DATA_PORT = args.serial_port
-    SERIAL_DATA_EXPLICIT = bool(args.serial_port)
-    if HARDWARE_TRANSPORT == "serial":
-        _activate_v51_profile()
-    if HARDWARE_TRANSPORT == "serial" and not SERIAL_DATA_PORT:
-        if HARDWARE_AUTO_DISCOVERY:
-            refresh_v51_ports(force=True)
-        else:
-            parser.error("--transport serial 必须同时给 --serial-port")
     serve(args.host, args.port, args.open_browser)
     return 0
 

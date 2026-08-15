@@ -95,11 +95,16 @@ function renderMeasurement(payload) {
     $('liveMeta').textContent = '尚无实时数据';
   }
 
-  const duration = Number(settings.duration_s || 1);
-  const elapsed = Number(latest?.time_s || 0);
-  const progress = complete ? 100 : Math.min(100, Math.max(0, elapsed / duration * 100));
+  const metrics = payload.rolling_metrics || {};
+  const adaptive = !cv && Boolean(settings.adaptive_stop);
+  const progress = Number.isFinite(Number(metrics.progress_percent))
+    ? Math.min(100, Math.max(0, Number(metrics.progress_percent))) : 0;
+  const nativePoints = Number.isFinite(Number(metrics.native_point_count))
+    ? Number(metrics.native_point_count) : 0;
   $('progressBar').style.width = progress + '%';
-  $('progressText').textContent = Math.round(progress) + '%';
+  $('progressText').textContent = adaptive
+    ? String(payload.stability_eta?.display_text || '正在估计') + ` · ${nativePoints}点`
+    : `${Math.round(progress)}% · ${nativePoints}点`;
 
   const result = payload.workflow_result;
   if (result?.predicted_concentration_um !== null && result?.predicted_concentration_um !== undefined) {

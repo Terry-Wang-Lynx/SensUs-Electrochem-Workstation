@@ -1,9 +1,8 @@
-"""10 Hz i-t workflow: steady-current extraction, calibration and prediction.
+"""I-T workflow: platform detection, steady-current extraction and calibration.
 
-The firmware emits timestamped native samples at about 8.06 Hz for the current
-180 s run; the host can resample that trace to exactly 10 Hz/1800 rows.  This
-module keeps the
-scientific workflow deliberately small and explicit:
+The firmware emits timestamped native samples at about 8.06 Hz and the host can
+resample that trace to a fixed output rate.  This module keeps the scientific
+workflow deliberately small and explicit:
 
 1. discard rows marked saturated/invalid;
 2. average the final 20 s of a run to obtain one steady-current point;
@@ -20,16 +19,127 @@ from __future__ import annotations
 import csv
 import json
 import math
+import warnings
 from dataclasses import asdict, dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import numpy as np
 
+from .filtering import apply_filter
+
 
 DEFAULT_WINDOW_S = 20.0
 DEFAULT_DURATION_S = 180.0
 DEFAULT_SAMPLE_RATE_HZ = 10.0
+
+
+@dataclass(frozen=True)
+class PlateauConfig:
+    """Validated parameters for automatic platform detection."""
+
+    segment_duration_s: float = 5.0
+    segment_count: int = 6
+    absolute_tolerance_nA: float = 0.10
+    relative_tolerance: float = 0.01
+    scatter_multiplier: float = 3.0
+    minimum_coverage_ratio: float = 0.60
+    maximum_gap_periods: float = 2.5
+    required_consecutive_windows: int = 2
+    spike_scale_multiplier: float = 7.0
+    spike_neighbor_multiplier: float = 3.0
+
+    def __post_init__(self) -> None:
+        numeric_ranges = {
+            "segment_duration_s": (0.5, 60.0, True),
+            "absolute_tolerance_nA": (0.0, 1000.0, True),
+            "relative_tolerance": (0.0, 1.0, True),
+            "scatter_multiplier": (0.0, 100.0, True),
+            "minimum_coverage_ratio": (0.0, 1.0, False),
+            "maximum_gap_periods": (0.0, 100.0, False),
+            "spike_scale_multiplier": (0.0, 1000.0, False),
+            "spike_neighbor_multiplier": (0.0, 1000.0, False),
+        }
+        for name, (lower, upper, include_lower) in numeric_ranges.items():
+            raw = getattr(self, name)
+            if isinstance(raw, bool) or not isinstance(raw, Real):
+                raise ValueError(f"平台参数 {name} 必须是数值")
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError(f"平台参数 {name} 必须是有限数")
+            in_range = lower <= value <= upper if include_lower else lower < value <= upper
+            if not in_range:
+                opening = "[" if include_lower else "("
+                raise ValueError(
+                    f"平台参数 {name} 必须在 {opening}{lower:g}, {upper:g}] 范围内"
+                )
+            object.__setattr__(self, name, value)
+
+        for name, lower, upper in (
+            ("segment_count", 2, 60),
+            ("required_consecutive_windows", 1, 100),
+        ):
+            raw = getattr(self, name)
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, Real)
+                or not math.isfinite(float(raw))
+                or float(raw) != math.trunc(float(raw))
+            ):
+                raise ValueError(f"平台参数 {name} 必须是整数")
+            value = int(raw)
+            if not lower <= value <= upper:
+                raise ValueError(
+                    f"平台参数 {name} 必须在 [{lower}, {upper}] 范围内"
+                )
+            object.__setattr__(self, name, value)
+
+        if self.segment_count % 2:
+            raise ValueError("平台参数 segment_count 必须是偶数")
+        if self.minimum_stop_duration_s + 1e-12 < DEFAULT_WINDOW_S:
+            raise ValueError(
+                f"自动停止最短数据时长不得少于末段拟合窗口 "
+                f"{DEFAULT_WINDOW_S:g} 秒；请增大分段时长、分段数量或连续通过窗"
+            )
+
+    @property
+    def window_duration_s(self) -> float:
+        return self.segment_duration_s * self.segment_count
+
+    @property
+    def minimum_stop_duration_s(self) -> float:
+        return self.window_duration_s + (
+            self.required_consecutive_windows - 1
+        ) * self.segment_duration_s
+
+    def to_dict(self) -> dict[str, float | int]:
+        return asdict(self)
+
+    @classmethod
+    def validate(
+        cls, value: PlateauConfig | dict[str, object] | None = None,
+    ) -> PlateauConfig:
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("平台参数必须是 JSON 对象")
+        allowed = set(cls.__dataclass_fields__)
+        unknown = set(value) - allowed
+        if unknown:
+            names = ", ".join(sorted(str(name) for name in unknown))
+            raise ValueError(f"未知平台参数: {names}")
+        return cls(**value)
+
+
+# Compatibility constants for callers that still import the historical names.
+PLATEAU_SEGMENT_S = PlateauConfig.segment_duration_s
+PLATEAU_SEGMENTS = PlateauConfig.segment_count
+PLATEAU_WINDOW_S = PLATEAU_SEGMENT_S * PLATEAU_SEGMENTS
+PLATEAU_ABSOLUTE_TOLERANCE_NA = PlateauConfig.absolute_tolerance_nA
+PLATEAU_RELATIVE_TOLERANCE = PlateauConfig.relative_tolerance
 
 
 @dataclass(frozen=True)
@@ -53,6 +163,34 @@ class RunSummary:
     first_fit_time_s: float | None
     last_fit_time_s: float | None
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlateauEvaluation:
+    """One completed platform decision window."""
+
+    complete_segment: int
+    window_start_s: float
+    window_end_s: float
+    stable: bool
+    reason: str
+    segment_means_nA: tuple[float, ...] = ()
+    slope_nA_per_s: float | None = None
+    delta_30s_nA: float | None = None
+    delta_half_nA: float | None = None
+    median_current_nA: float | None = None
+    segment_scatter_nA: float | None = None
+    tolerance_nA: float | None = None
+    isolated_spikes_removed: int = 0
+    filter_meta: dict[str, object] | None = None
+    status: str = "unstable"
+    fit_intercept_nA: float | None = None
+    trend_delta_nA: float | None = None
+    first_half_mean_nA: float | None = None
+    second_half_mean_nA: float | None = None
+    half_delta_signed_nA: float | None = None
+    segment_centres_s: tuple[float, ...] = ()
+    config: PlateauConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -94,17 +232,38 @@ class CalibrationModel:
                 raise ValueError("calibration slope is zero; prediction is undefined")
             return float(-coeff[1] / coeff[0])
 
-        roots = np.roots(coeff)
         lo, hi = self.concentration_min_um, self.concentration_max_um
-        candidates = [float(r.real) for r in roots
-                      if abs(float(r.imag)) < 1e-8 and lo - 1e-9 <= r.real <= hi + 1e-9]
+        if self.degree == 2 and len(coeff) == 3:
+            a, b, c = (float(value) for value in coeff)
+            if abs(a) < 1e-15:
+                roots = [] if abs(b) < 1e-15 else [-c / b]
+            else:
+                discriminant = b * b - 4.0 * a * c
+                roots = (
+                    [] if discriminant < 0.0
+                    else [
+                        (-b + math.sqrt(discriminant)) / (2.0 * a),
+                        (-b - math.sqrt(discriminant)) / (2.0 * a),
+                    ]
+                )
+            candidates = [
+                float(root) for root in roots
+                if lo - 1e-9 <= root <= hi + 1e-9
+            ]
+        else:
+            roots = np.roots(coeff)
+            candidates = [
+                float(root.real) for root in roots
+                if abs(float(root.imag)) < 1e-8
+                and lo - 1e-9 <= root.real <= hi + 1e-9
+            ]
         if not candidates:
             raise ValueError(
                 f"current {current:g} nA has no real concentration root in "
                 f"[{lo:g}, {hi:g}] umol/L"
             )
         centre = (lo + hi) / 2.0
-        return min(candidates, key=lambda value: abs(value - centre))
+        return min(candidates, key=lambda value: (abs(value - centre), -value))
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -135,6 +294,139 @@ class CalibrationModel:
         )
 
 
+AP_SAMPLE_COUNT = 24
+AP_STREAK_THRESHOLDS = (
+    (24.0, 10.0), (21.0, 8.0), (18.0, 6.0), (15.0, 4.5),
+    (12.0, 3.0), (10.0, 2.0), (8.0, 1.5), (6.0, 1.0),
+    (4.0, 0.5),
+)
+
+
+def _ap_point_score(true_um: float, measured_um: float) -> dict[str, float | str | None]:
+    """Classify one ETE sample and return its score details.
+
+    Green-zone points receive a linear score from 1 at the Blue boundary to
+    0 at the Green boundary.  The ETE specification defines the endpoints and
+    ordering, but not a different interpolation rule.
+    """
+    if true_um < 10.0:
+        error = abs(measured_um - true_um)
+        blue_limit, green_limit = 2.0, 4.0
+        in_green = max(0.0, true_um - green_limit) <= measured_um <= true_um + green_limit
+        relative_error = None if true_um == 0 else error / true_um * 100.0
+    else:
+        relative = abs(measured_um - true_um) / true_um
+        error = abs(measured_um - true_um)
+        blue_limit, green_limit = 0.20, 0.40
+        in_green = 0.60 * true_um <= measured_um <= 1.40 * true_um
+        relative_error = relative * 100.0
+
+    if (true_um < 10.0 and error <= blue_limit) or (
+        true_um >= 10.0 and error / true_um <= blue_limit
+    ):
+        zone, score = "blue", 1.0
+    elif in_green:
+        distance = error if true_um < 10.0 else error / true_um
+        score = max(0.0, min(1.0, 1.0 - (distance - blue_limit) / (green_limit - blue_limit)))
+        zone = "green"
+    else:
+        zone, score = "grey", 0.0
+
+    return {
+        "zone": zone,
+        "score": float(score),
+        "absolute_error_um": float(error),
+        "error_percent": relative_error,
+    }
+
+
+def evaluate_ap_score(points: Sequence[dict[str, object]],
+                      sample_count: int = AP_SAMPLE_COUNT) -> dict[str, object]:
+    """Calculate the July IP ETE score for ordered test points.
+
+    The denominator for MS is always 24, even when fewer samples have been
+    measured.  Points beyond the first 24 remain useful for the chart/statistics
+    but do not change the ETE score.
+    """
+    if sample_count <= 0:
+        raise ValueError("AP 样品总数必须为正数")
+    prepared: list[dict[str, object]] = []
+    for index, point in enumerate(points, 1):
+        try:
+            true_um = float(point.get("concentration_um"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not math.isfinite(true_um) or true_um < 0:
+            continue
+        try:
+            measured_value = point.get(
+                "predicted_concentration_um",
+                point.get("measured_concentration_um"),
+            )
+            measured_um = float(measured_value)
+        except (AttributeError, TypeError, ValueError):
+            measured_um = math.nan
+        if math.isfinite(measured_um):
+            detail = _ap_point_score(true_um, measured_um)
+            prepared.append({"sequence": index, "concentration_um": true_um,
+                             "measured_concentration_um": measured_um, **detail})
+        else:
+            # A completed sample with no real inverse (for example, an
+            # outlying quadratic current) is still a measured sample. It
+            # scores zero and breaks serial consistency rather than silently
+            # disappearing from the 24-sample sequence.
+            prepared.append({"sequence": index, "concentration_um": true_um,
+                             "measured_concentration_um": None, "zone": "grey",
+                             "score": 0.0, "absolute_error_um": None,
+                             "error_percent": None})
+
+    scoring_points = prepared[:sample_count]
+    score_sum = sum(float(point["score"]) for point in scoring_points)
+    current_streak = 0.0
+    longest_streak = 0.0
+    for point in scoring_points:
+        weight = 1.0 if point["zone"] == "blue" else 0.5 if point["zone"] == "green" else 0.0
+        if weight == 0.0:
+            current_streak = 0.0
+        else:
+            current_streak += weight
+            longest_streak = max(longest_streak, current_streak)
+    serial_score = next((score for threshold, score in AP_STREAK_THRESHOLDS
+                         if longest_streak >= threshold), 0.0)
+
+    abs_errors = [float(point["absolute_error_um"]) for point in prepared
+                  if point["absolute_error_um"] is not None]
+    percent_errors = [float(point["error_percent"]) for point in prepared
+                      if point["error_percent"] is not None]
+    signed_errors = [float(point["measured_concentration_um"])
+                     - float(point["concentration_um"]) for point in prepared
+                     if point["measured_concentration_um"] is not None]
+    stats = {
+        "measured_count": len(prepared),
+        "scored_count": len(scoring_points),
+        "blue_count": sum(point["zone"] == "blue" for point in prepared),
+        "green_count": sum(point["zone"] == "green" for point in prepared),
+        "grey_count": sum(point["zone"] == "grey" for point in prepared),
+        "mean_absolute_error_um": sum(abs_errors) / len(abs_errors) if abs_errors else None,
+        "rmse_um": math.sqrt(sum(error * error for error in abs_errors) / len(abs_errors)) if abs_errors else None,
+        "mean_absolute_error_percent": sum(percent_errors) / len(percent_errors) if percent_errors else None,
+        "max_absolute_error_um": max(abs_errors) if abs_errors else None,
+        "max_absolute_error_percent": max(percent_errors) if percent_errors else None,
+        "mean_signed_error_um": sum(signed_errors) / len(signed_errors) if signed_errors else None,
+    }
+    ms = 10.0 * score_sum / sample_count
+    final_score = 100.0 + 5.0 * (ms + serial_score)
+    return {
+        "sample_count": sample_count,
+        "points": prepared,
+        "stats": stats,
+        "longest_weighted_streak": longest_streak,
+        "ms": ms,
+        "sc": serial_score,
+        "final_score": final_score,
+    }
+
+
 def _finite(value: str | float | int | None) -> float | None:
     if value is None or value == "":
         return None
@@ -152,8 +444,11 @@ def _pick(row: dict[str, str], names: Iterable[str]) -> str | None:
     return None
 
 
-def detect_isolated_spikes(current_nA: Sequence[float],
-                           valid: Sequence[bool]) -> np.ndarray:
+def detect_isolated_spikes(
+    current_nA: Sequence[float], valid: Sequence[bool],
+    spike_scale_multiplier: float = 7.0,
+    spike_neighbor_multiplier: float = 3.0,
+) -> np.ndarray:
     """Return a conservative mask for isolated one-sample current impulses.
 
     A point is flagged only when it is far from both neighbours on a robust,
@@ -161,6 +456,18 @@ def detect_isolated_spikes(current_nA: Sequence[float],
     each other.  A sustained physical step therefore remains valid.  The raw
     CSV is never modified; this mask is analysis metadata only.
     """
+
+    for name, raw in (
+        ("spike_scale_multiplier", spike_scale_multiplier),
+        ("spike_neighbor_multiplier", spike_neighbor_multiplier),
+    ):
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, Real)
+            or not math.isfinite(float(raw))
+            or not 0.0 < float(raw) <= 1000.0
+        ):
+            raise ValueError(f"平台参数 {name} 必须是 (0, 1000] 内的有限数")
 
     current = np.asarray(current_nA, dtype=float)
     usable = np.asarray(valid, dtype=bool) & np.isfinite(current)
@@ -182,11 +489,215 @@ def detect_isolated_spikes(current_nA: Sequence[float],
     neighbour_gap = np.abs(current[2:] - current[:-2])
     local_spike = (
         neighbours_valid
-        & (residual > 7.0 * robust_scale)
-        & (residual > 3.0 * (neighbour_gap + robust_scale))
+        & (residual > float(spike_scale_multiplier) * robust_scale)
+        & (
+            residual
+            > float(spike_neighbor_multiplier) * (neighbour_gap + robust_scale)
+        )
     )
     flagged[1:-1] = local_spike
     return flagged
+
+
+def evaluate_platform(
+    time_s: Sequence[float], current_nA: Sequence[float], valid: Sequence[bool],
+    filter_config: dict[str, object] | None = None,
+    expected_sample_rate_hz: float | None = None,
+    config: PlateauConfig | dict[str, object] | None = None,
+    decision_segment: int | None = None,
+) -> PlateauEvaluation | None:
+    """Evaluate one complete configured platform window.
+
+    By default the newest complete window is used. ``decision_segment`` lets a
+    polling caller replay missed windows in order without exposing later data
+    to an earlier decision. ``None`` means the requested window is unavailable.
+    Saturated or otherwise invalid samples reject the whole decision window.
+    Isolated one-sample impulses are removed conservatively before filtering
+    and do not by themselves reject an otherwise healthy window.
+    """
+
+    plateau_config = PlateauConfig.validate(config)
+    t = np.asarray(time_s, dtype=float)
+    current = np.asarray(current_nA, dtype=float)
+    valid_arr = np.asarray(valid, dtype=bool)
+    if any(array.ndim != 1 for array in (t, current, valid_arr)):
+        raise ValueError("平台判定输入必须是一维序列")
+    if len({len(t), len(current), len(valid_arr)}) != 1:
+        raise ValueError("平台判定输入 time/current/valid 长度不一致")
+    if expected_sample_rate_hz is not None:
+        expected_sample_rate_hz = float(expected_sample_rate_hz)
+        if not math.isfinite(expected_sample_rate_hz) or expected_sample_rate_hz <= 0:
+            raise ValueError("平台判定额定采样率必须是正的有限数")
+    finite = np.isfinite(t) & np.isfinite(current)
+    if not np.any(finite):
+        return None
+
+    segment_duration_s = plateau_config.segment_duration_s
+    segment_count = plateau_config.segment_count
+    window_duration_s = plateau_config.window_duration_s
+    latest_complete_segment = int(math.floor(
+        float(np.max(t[finite])) / segment_duration_s
+    ))
+    if decision_segment is None:
+        complete_segment = latest_complete_segment
+    else:
+        if (
+            isinstance(decision_segment, bool)
+            or not isinstance(decision_segment, Real)
+            or not math.isfinite(float(decision_segment))
+            or float(decision_segment) != math.trunc(float(decision_segment))
+            or int(decision_segment) < 0
+        ):
+            raise ValueError("平台判定 decision_segment 必须是非负整数")
+        complete_segment = int(decision_segment)
+        if complete_segment > latest_complete_segment:
+            return None
+    window_end = (
+        complete_segment * segment_duration_s
+    )
+    if window_end < window_duration_s:
+        return None
+    window_start = window_end - window_duration_s
+    in_window = finite & (t >= window_start) & (t < window_end)
+    if not np.any(in_window):
+        return PlateauEvaluation(
+            complete_segment, window_start, window_end, False,
+            "判定窗口内没有数据", config=plateau_config,
+        )
+    if np.any(in_window & ~valid_arr):
+        return PlateauEvaluation(
+            complete_segment, window_start, window_end, False,
+            "判定窗口含饱和或无效点", config=plateau_config,
+        )
+
+    # A completed decision window must have one deterministic result. The
+    # zero-phase analysis filter and robust spike scale may use earlier history,
+    # but must never see samples after this window's end; otherwise scheduler
+    # jitter changes an already-completed window retroactively.
+    history = finite & (t < window_end)
+    history_t = t[history]
+    history_current = current[history]
+    history_valid = valid_arr[history]
+    history_in_window = history_t >= window_start
+    nominal_rate_hz = expected_sample_rate_hz
+    if nominal_rate_hz is None:
+        ordered_times = np.sort(history_t)
+        positive_intervals = np.diff(ordered_times)
+        positive_intervals = positive_intervals[positive_intervals > 0]
+        if len(positive_intervals):
+            nominal_rate_hz = 1.0 / float(np.median(positive_intervals))
+
+    spike_mask = detect_isolated_spikes(
+        history_current, history_valid,
+        plateau_config.spike_scale_multiplier,
+        plateau_config.spike_neighbor_multiplier,
+    )
+    analysis_valid = history_valid & ~spike_mask
+    filtered, filter_meta = apply_filter(
+        history_t, history_current, analysis_valid, filter_config,
+    )
+    spikes_removed = int((spike_mask & history_in_window).sum())
+    minimum_segment_samples = (
+        max(1, int(math.ceil(
+            segment_duration_s
+            * nominal_rate_hz
+            * plateau_config.minimum_coverage_ratio
+        )))
+        if nominal_rate_hz is not None else 2
+    )
+    maximum_interval_s = (
+        plateau_config.maximum_gap_periods / nominal_rate_hz
+        if nominal_rate_hz is not None else None
+    )
+    segment_means: list[float] = []
+    for index in range(segment_count):
+        start = window_start + index * segment_duration_s
+        stop = start + segment_duration_s
+        selected = analysis_valid & (history_t >= start) & (history_t < stop)
+        selected_count = int(selected.sum())
+        if selected_count < minimum_segment_samples:
+            return PlateauEvaluation(
+                complete_segment, window_start, window_end, False,
+                f"第 {index + 1} 个 {segment_duration_s:g} 秒段有效点不足（"
+                f"{selected_count}/{minimum_segment_samples}）",
+                isolated_spikes_removed=spikes_removed,
+                filter_meta=filter_meta,
+                config=plateau_config,
+            )
+        if maximum_interval_s is not None and selected_count >= 2:
+            selected_times = np.sort(history_t[selected])
+            largest_interval = float(np.max(np.diff(selected_times)))
+            if largest_interval > maximum_interval_s + 1e-12:
+                return PlateauEvaluation(
+                    complete_segment, window_start, window_end, False,
+                    f"第 {index + 1} 个 {segment_duration_s:g} 秒段采样间隔过大（"
+                    f"{largest_interval:.4g} s > {maximum_interval_s:.4g} s）",
+                    isolated_spikes_removed=spikes_removed,
+                    filter_meta=filter_meta,
+                    config=plateau_config,
+                )
+        segment_means.append(float(np.mean(filtered[selected])))
+
+    if maximum_interval_s is not None:
+        window_times = np.sort(history_t[analysis_valid & history_in_window])
+        largest_interval = float(np.max(np.diff(window_times)))
+        if largest_interval > maximum_interval_s + 1e-12:
+            return PlateauEvaluation(
+                complete_segment, window_start, window_end, False,
+                f"判定窗口采样间隔过大（{largest_interval:.4g} s > "
+                f"{maximum_interval_s:.4g} s）",
+                isolated_spikes_removed=spikes_removed,
+                filter_meta=filter_meta,
+                config=plateau_config,
+            )
+
+    means = np.asarray(segment_means, dtype=float)
+    centres = (
+        window_start
+        + (np.arange(segment_count) + 0.5) * segment_duration_s
+    )
+    slope, intercept = np.polyfit(centres, means, 1)
+    residuals = means - (slope * centres + intercept)
+    residual_centre = float(np.median(residuals))
+    scatter = 1.4826 * float(np.median(np.abs(residuals - residual_centre)))
+    median_current = float(np.median(means))
+    tolerance = max(
+        plateau_config.absolute_tolerance_nA,
+        abs(median_current) * plateau_config.relative_tolerance,
+        plateau_config.scatter_multiplier * scatter,
+    )
+    trend_delta = float(slope) * window_duration_s
+    half_index = segment_count // 2
+    first_half_mean = float(np.mean(means[:half_index]))
+    second_half_mean = float(np.mean(means[half_index:]))
+    half_delta_signed = second_half_mean - first_half_mean
+    delta_30s = abs(trend_delta)
+    delta_half = abs(half_delta_signed)
+    stable = delta_30s <= tolerance and delta_half <= tolerance
+    return PlateauEvaluation(
+        complete_segment=complete_segment,
+        window_start_s=window_start,
+        window_end_s=window_end,
+        stable=stable,
+        reason="平台判定通过" if stable else "末段仍有趋势",
+        status="stable" if stable else "unstable",
+        segment_means_nA=tuple(segment_means),
+        slope_nA_per_s=float(slope),
+        delta_30s_nA=delta_30s,
+        delta_half_nA=delta_half,
+        median_current_nA=median_current,
+        segment_scatter_nA=scatter,
+        tolerance_nA=tolerance,
+        isolated_spikes_removed=spikes_removed,
+        filter_meta=filter_meta,
+        fit_intercept_nA=float(intercept),
+        trend_delta_nA=trend_delta,
+        first_half_mean_nA=first_half_mean,
+        second_half_mean_nA=second_half_mean,
+        half_delta_signed_nA=half_delta_signed,
+        segment_centres_s=tuple(float(value) for value in centres),
+        config=plateau_config,
+    )
 
 
 def _load_run_csv_with_quality(
@@ -194,8 +705,8 @@ def _load_run_csv_with_quality(
     """Load ``time_s``, signed current in nA, and validity from a run CSV.
 
     Accepted current columns are ``current_nA``, ``reduction_current_nA`` and
-    firmware ``fa_fw`` (fA).  The latter is converted to nA.  ``sat != 0`` or
-    an explicit ``valid == 0`` excludes a row.
+    firmware ``fa_fw`` (fA).  The latter is converted to nA.  ``sat != 0``,
+    ``ovf != 0`` or an explicit ``valid == 0`` excludes a row.
     """
 
     path = Path(path)
@@ -221,10 +732,11 @@ def _load_run_csv_with_quality(
         if current is None:
             continue
         sat = int(float(row.get("sat", "0") or 0))
+        ovf = int(float(row.get("ovf", "0") or 0))
         row_valid = int(float(row.get("valid", "1") or 1)) != 0
         times.append(t)
         currents.append(current)
-        valid.append(row_valid and sat == 0)
+        valid.append(row_valid and sat == 0 and ovf == 0)
         try:
             sequence.append(int(float(row["seq"])))
         except (KeyError, TypeError, ValueError):
@@ -265,7 +777,7 @@ def load_run_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def resample_run_10hz(path: str | Path, output: str | Path,
-                      duration_s: float = DEFAULT_DURATION_S,
+                      duration_s: float | None = DEFAULT_DURATION_S,
                       target_rate_hz: float = DEFAULT_SAMPLE_RATE_HZ) -> Path:
     """Resample a native run to a fixed-rate CSV for the requested workflow.
 
@@ -275,10 +787,18 @@ def resample_run_10hz(path: str | Path, output: str | Path,
     ``duration_s * target_rate_hz`` rows.  Saturated source rows remain marked
     invalid; the output is never silently promoted to a valid calibration point.
     """
-    if duration_s <= 0 or target_rate_hz <= 0:
+    if (duration_s is not None and duration_s <= 0) or target_rate_hz <= 0:
         raise ValueError("duration_s and target_rate_hz must be positive")
-    t, current, valid, _ = _load_run_csv_with_quality(path)
-    n = int(round(duration_s * target_rate_hz))
+    source_path = Path(path)
+    output_path = Path(output)
+    if source_path.resolve() == output_path.resolve():
+        raise ValueError("重采样输出必须是新文件，不能覆盖原始采集文件")
+    t, current, valid, _ = _load_run_csv_with_quality(source_path)
+    n = (
+        int(round(duration_s * target_rate_hz))
+        if duration_s is not None
+        else max(3, int(math.floor(float(t[-1]) * target_rate_hz)) + 1)
+    )
     target_t = np.arange(n, dtype=float) / target_rate_hz
     source_rate = 1.0 / float(np.median(np.diff(t))) if len(t) > 1 else 0.0
 
@@ -310,9 +830,8 @@ def resample_run_10hz(path: str | Path, output: str | Path,
     else:
         valid_domain = np.zeros(n, dtype=bool)
 
-    output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="") as handle:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="") as handle:
         handle.write("# Fixed-rate host resampling; native hardware timestamps retained in source run\n")
         handle.write(f"# source_rate_hz: {source_rate:.9f}\n")
         handle.write(f"# target_rate_hz: {target_rate_hz:.9f}\n")
@@ -321,7 +840,7 @@ def resample_run_10hz(path: str | Path, output: str | Path,
         for ti, yi, ok in zip(target_t, resampled_current, valid_domain):
             writer.writerow([f"{ti:.9f}", f"{yi:.12g}", int(ok), 0 if ok else 3,
                              f"{source_rate:.9f}"])
-    return output
+    return output_path
 
 
 def summarize_run(path: str | Path, window_s: float = DEFAULT_WINDOW_S,
@@ -392,17 +911,71 @@ def load_calibration_points(path: str | Path) -> list[CalibrationPoint]:
 
 
 def fit_calibration(points: Sequence[CalibrationPoint], degree: int = 1) -> CalibrationModel:
-    if degree < 1:
-        raise ValueError("degree must be at least 1")
+    if not 1 <= degree <= 10:
+        raise ValueError("degree must be between 1 and 10")
     if len(points) < degree + 1:
         raise ValueError(f"degree {degree} needs at least {degree + 1} points")
     x = np.asarray([p.concentration_um for p in points], dtype=float)
     y = np.asarray([p.current_nA for p in points], dtype=float)
     if not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
         raise ValueError("calibration data must be finite")
+    if np.any(x < 0):
+        raise ValueError("calibration concentrations must be non-negative")
     if np.ptp(x) <= 0:
         raise ValueError("calibration concentrations must span a nonzero range")
-    coeff = np.polyfit(x, y, degree)
+    if len(np.unique(x)) < degree + 1:
+        raise ValueError(
+            f"degree {degree} needs at least {degree + 1} distinct concentrations"
+        )
+    response_scale = max(1.0, float(np.max(np.abs(y))))
+    if float(np.ptp(y)) <= 1e-12 * response_scale:
+        raise ValueError("calibration current response is too small to invert reliably")
+
+    rank_warning = getattr(getattr(np, "exceptions", np), "RankWarning", None)
+    if rank_warning is None:  # NumPy < 2.0
+        rank_warning = np.RankWarning
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", rank_warning)
+            coeff = np.polyfit(x, y, degree)
+    except rank_warning as exc:
+        raise ValueError(
+            "calibration fit is rank-deficient or poorly conditioned"
+        ) from exc
+
+    if degree >= 2:
+        lo, hi = float(np.min(x)), float(np.max(x))
+        boundary_tolerance = max(1.0, abs(lo), abs(hi)) * 1e-10
+        derivative_roots = np.roots(np.polyder(coeff))
+        critical = [lo]
+        critical.extend(sorted(
+            float(root.real) for root in derivative_roots
+            if abs(float(root.imag)) < 1e-8
+            and lo + boundary_tolerance < root.real < hi - boundary_tolerance
+        ))
+        critical.append(hi)
+        distinct_critical = [critical[0]]
+        for value in critical[1:]:
+            if abs(value - distinct_critical[-1]) > boundary_tolerance:
+                distinct_critical.append(value)
+        critical_response = np.polyval(coeff, distinct_critical)
+        response_deltas = np.diff(critical_response)
+        monotonic_tolerance = max(
+            1.0, float(np.max(np.abs(critical_response)))
+        ) * 1e-12
+        meaningful_deltas = response_deltas[
+            np.abs(response_deltas) > monotonic_tolerance
+        ]
+        if not (
+            len(meaningful_deltas)
+            and (
+                np.all(meaningful_deltas > 0)
+                or np.all(meaningful_deltas < 0)
+            )
+        ):
+            raise ValueError(
+                "calibration curve must be monotonic over the calibration range"
+            )
     prediction = np.polyval(coeff, x)
     residual = y - prediction
     ss_tot = float(np.sum((y - np.mean(y)) ** 2))

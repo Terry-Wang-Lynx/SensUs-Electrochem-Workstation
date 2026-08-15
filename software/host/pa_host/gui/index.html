@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SensUs 电化学工作站</title>
-  <link rel="stylesheet" href="/assets/styles.css">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260815-live-metrics-1">
 </head>
 <body>
   <div class="app-shell">
@@ -17,7 +17,7 @@
         <button class="nav-item" data-view="debug"><span>⚙</span>硬件 DEBUG</button>
       </nav>
       <div class="sidebar-footer">
-        <div class="device-row"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small id="deviceTransport">正在识别硬件</small></div></div>
+        <div class="device-row"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small>J-Link · MAX30131</small></div></div>
         <div class="firmware-note" id="firmwareNote">+0.2 V · 500 nA FSR</div>
       </div>
     </aside>
@@ -39,13 +39,25 @@
         </section>
         <div class="workspace-grid">
           <section class="panel chart-panel">
-            <div class="panel-head"><div><h2 id="chartTitle">I-T 计时电流曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small id="liveCurrentUnit">nA</small><em id="liveCurrentTime">尚无数据</em></div><div class="segmented" id="chartWindow"><button data-window="all">全程</button><button data-window="20">20 s</button><button class="active" data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
+            <div class="panel-head"><div><h2 id="chartTitle">I-T 计时电流曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small id="liveCurrentUnit">nA</small><em id="liveCurrentTime">尚无数据</em></div><div class="segmented" id="chartWindow"><button class="active" data-window="300">300 s</button><button data-window="20">20 s</button><button data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
             <div class="chart-wrap"><canvas id="itChart" aria-label="IT 电流时间曲线"></canvas><div class="chart-legend"><span><i class="valid-point"></i>有效点</span><span><i class="invalid-point"></i>异常点</span></div><div class="empty-chart" id="chartEmpty">开始测量后显示实时电流</div></div>
             <div class="metric-strip">
-              <div><span id="metricPrimaryLabel">稳态电流</span><strong id="steadyCurrent">--</strong><small id="metricPrimaryUnit">nA</small></div>
-              <div><span id="metricSecondaryLabel">标准差</span><strong id="steadySd">--</strong><small id="metricSecondaryUnit">nA</small></div>
-              <div><span>显示原生点</span><strong id="validCount">--</strong><small>/ ≈ 1452</small></div>
-              <div><span>进度</span><strong id="progressValue">0</strong><small>%</small></div>
+              <div><span id="metricPrimaryLabel">稳态电流</span><strong id="steadyCurrent">--</strong><small id="metricPrimaryUnit">nA</small><em class="metric-note" id="metricPrimaryNote">等待测量</em></div>
+              <div><span id="metricSecondaryLabel">噪声水平</span><strong id="steadySd">--</strong><small id="metricSecondaryUnit">nA</small><em class="metric-note" id="metricSecondaryNote">等待测量</em></div>
+              <div><span id="metricTertiaryLabel">斜率</span><strong id="metricTertiaryValue">--</strong><small id="metricTertiaryUnit">nA/s</small><em class="metric-note metric-trend trend-insufficient" id="metricTrendState" title="平稳仅代表斜率进入阈值，不代表自动停止全部门禁通过" aria-live="polite">· 等待测量</em></div>
+              <div><span id="metricQuaternaryLabel">进度 / ETA</span><strong id="metricQuaternaryValue">--</strong><small id="metricQuaternaryUnit"></small><em class="metric-note" id="metricProgressDetail">0 个原生点</em></div>
+            </div>
+            <div class="filter-panel" data-filter-panel>
+              <div class="filter-panel-head"><div><strong>软件滤波</strong><small data-filter-status>未读取设置</small></div></div>
+              <div class="filter-form">
+                <label>作用范围<select data-filter-key="mode"><option value="off">关闭</option><option value="display">仅显示</option><option value="analysis">显示 + 分析/标定</option></select></label>
+                <label class="filter-check"><input type="checkbox" data-filter-key="lowpass_enabled"><span>低通</span></label>
+                <label>截止设置<select data-filter-key="lowpass_auto"><option value="true">自动</option><option value="false">手动</option></select></label>
+                <label>截止频率<div class="input-unit"><input type="text" inputmode="decimal" autocomplete="off" data-filter-key="lowpass_cutoff_hz"><span>Hz</span></div></label>
+                <label>阶数<select data-filter-key="lowpass_order"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option></select></label>
+                <label class="filter-check"><input type="checkbox" data-show-raw><span>显示原数据</span></label>
+                <button class="secondary" data-filter-apply>保存设置</button>
+              </div>
             </div>
           </section>
 
@@ -80,12 +92,30 @@
                 <div id="itSettings">
                   <div class="field-pair">
                     <label>测试电位<div class="input-unit"><input id="potentialV" type="number" min="-0.4" max="0.39" step="0.01" value="0.2"><span>V</span></div></label>
-                    <label>测量时长<div class="input-unit"><input id="durationS" type="number" min="10" max="3600" step="1" value="180"><span>s</span></div></label>
-                  </div>
-                  <div class="field-pair">
+                    <label>WE 电位<div class="input-unit"><input id="workingElectrodeV" type="number" min="0.25" max="1.535" step="0.01" value="1.2"><span>V</span></div></label>
                     <label>输出采样频率<div class="input-unit"><input id="sampleRateHz" type="number" min="0.5" max="10" step="0.5" value="10"><span>Hz</span></div></label>
-                    <label>末段拟合窗口<div class="input-unit"><input id="fitWindowS" type="number" min="1" step="1" value="20"><span>s</span></div></label>
                   </div>
+                  <div class="adaptive-row">
+                    <label class="inline-toggle adaptive-stop"><input type="checkbox" id="adaptiveStop"><span>自动停止</span></label>
+                    <label id="durationField">测量时长<div class="input-unit"><input id="durationS" type="number" min="10" max="3600" step="1" value="180"><span>s</span></div></label>
+                    <label id="fitWindowField">末段拟合窗口<div class="input-unit"><input id="fitWindowS" type="number" min="1" step="1" value="20"><span>s</span></div></label>
+                  </div>
+                  <details class="plateau-settings" data-plateau-panel>
+                    <summary><span>自动停止判定参数</span><small>判定窗 <b data-plateau-window>30 s</b></small></summary>
+                    <div class="plateau-form">
+                      <label>分段时长<div class="input-unit"><input type="number" min="0.5" max="60" step="0.1" data-plateau-key="segment_duration_s"><span>s</span></div></label>
+                      <label>分段数量<input type="number" min="2" max="60" step="2" data-plateau-key="segment_count"></label>
+                      <label>绝对容差<div class="input-unit"><input type="number" min="0" max="1000" step="0.01" data-plateau-key="absolute_tolerance_nA"><span>nA</span></div></label>
+                      <label>相对容差（1%=0.01）<input type="number" min="0" max="1" step="0.001" data-plateau-key="relative_tolerance"></label>
+                      <label>残差散差倍数<input type="number" min="0" max="100" step="0.1" data-plateau-key="scatter_multiplier"></label>
+                      <label>最小数据覆盖率<input type="number" min="0.01" max="1" step="0.01" data-plateau-key="minimum_coverage_ratio"></label>
+                      <label>最大采样间隔<div class="input-unit"><input type="number" min="0.1" max="100" step="0.1" data-plateau-key="maximum_gap_periods"><span>周期</span></div></label>
+                      <label>连续通过窗<input type="number" min="1" max="100" step="1" data-plateau-key="required_consecutive_windows"></label>
+                      <label>尖峰尺度倍数<input type="number" min="0.1" max="1000" step="0.1" data-plateau-key="spike_scale_multiplier"></label>
+                      <label>尖峰邻点倍数<input type="number" min="0.1" max="1000" step="0.1" data-plateau-key="spike_neighbor_multiplier"></label>
+                    </div>
+                    <div class="plateau-form-actions"><small data-plateau-status>未读取设置</small><button class="secondary" type="button" data-plateau-apply>保存判定参数</button></div>
+                  </details>
                 </div>
                 <div id="cvSettings" hidden>
                   <div class="field-pair"><label>电位下限<div class="input-unit"><input id="cvLowV" type="number" min="-0.6" max="0.59" step="0.01" value="-0.6"><span>V</span></div></label><label>电位上限<div class="input-unit"><input id="cvHighV" type="number" min="-0.59" max="0.6" step="0.01" value="0.6"><span>V</span></div></label></div>
@@ -93,7 +123,7 @@
                   <div class="field-pair"><label>扫描前静置<div class="input-unit"><input id="cvQuietS" type="number" min="0" max="300" step="1" value="2"><span>s</span></div></label><label>CV 电流量程<select id="cvEisFsrUA"><option value="4">4 µA</option><option value="8">8 µA</option><option value="20">20 µA</option><option value="40" selected>40 µA</option></select></label></div>
                 </div>
                 <div class="field-pair">
-                  <label id="dcSamplingField">硬件采样频率<select id="sensPeriodCode"><option value="0">8.06 Hz</option><option value="1">4.13 Hz</option><option value="2">2.10 Hz</option><option value="3">1.06 Hz</option><option value="4">0.53 Hz</option><option value="5">0.27 Hz</option></select></label>
+                <label id="dcSamplingField">硬件采样频率<select id="sensPeriodCode"><option value="0">8.06 Hz</option><option value="1">4.13 Hz</option><option value="2">2.10 Hz</option><option value="3">1.06 Hz</option><option value="4">0.53 Hz</option><option value="5">0.27 Hz</option></select></label>
                   <label id="dcRangeField">电流量程<select id="fsrNA"><optgroup label="DC ADC"><option value="50">50 nA</option><option value="100">100 nA</option><option value="250">250 nA</option><option value="500">500 nA</option><option value="1000">1 µA</option><option value="2000" selected>2 µA</option></optgroup><optgroup label="宽量程 EIS ADC"><option value="4000">4 µA</option><option value="8000">8 µA</option><option value="20000">20 µA</option><option value="40000">40 µA</option></optgroup></select></label>
                 </div>
                 <label id="dcOffsetField">偏置电流<select id="offsetNA"><option value="9nA">9 nA</option><option value="19nA">19 nA</option><option value="40nA">40 nA</option><option value="80nA">80 nA</option><option value="10pct" data-pct="10" selected>10% FSR</option><option value="20pct" data-pct="20">20% FSR</option><option value="50pct" data-pct="50">50% FSR</option></select></label>
@@ -149,8 +179,20 @@
           <section class="panel calibration-panel">
             <div class="panel-head"><div><h2>当前测试曲线</h2><p id="calibrationStatus">先采集标定点，再选择范围</p></div></div>
             <div class="chart-wrap calibration-chart"><canvas id="calibrationChart"></canvas><div class="empty-chart" id="calibrationEmpty">添加数据后拟合曲线</div></div>
+            <div class="calibration-legend" aria-label="标定曲线图例"><span><i class="legend-swatch fit"></i>拟合曲线</span><label class="legend-toggle"><input id="showCalibrationPoints" type="checkbox" checked><span><i class="legend-swatch calibration"></i>标定点</span></label><label class="legend-toggle"><input id="showTestPoints" type="checkbox" checked><span><i class="legend-swatch validation"></i>测试点</span></label></div>
             <div class="model-metrics"><div><span>R²</span><strong id="modelR2">--</strong></div><div><span>RMSE</span><strong id="modelRmse">--</strong></div><div><span>灵敏度</span><strong id="modelSlope">--</strong></div></div>
             <div class="model-path" id="modelPath">尚未生成测试曲线</div>
+          </section>
+          <section class="panel validation-panel">
+            <div class="panel-head"><div><h2>测试点与误差</h2><p>真实浓度、电流和样品名可修改；原始测量文件不会被覆盖</p></div><div class="validation-actions"><span class="live-badge" id="validationEditBadge">未保存修改</span><button class="primary" id="saveValidation" disabled>保存测试点修改</button></div></div>
+            <div class="table-wrap validation-table-wrap"><table><thead><tr><th>#</th><th>样品</th><th>真实浓度 / µM</th><th>测量电流 / nA</th><th>理论电流 / nA</th><th>电流误差 / nA</th><th>预测浓度 / µM</th><th>绝对误差 / µM</th><th>误差 / %</th><th>区域</th><th>点分</th></tr></thead><tbody id="validationBody"></tbody></table><div class="empty-history" id="validationEmpty">生成测试曲线后，已完成的测试记录会出现在这里；真实浓度可随后补填</div></div>
+            <div class="validation-summary" id="validationSummary">暂无测试点统计</div>
+          </section>
+          <section class="panel ap-panel">
+            <div class="panel-head"><div><h2>AP 评分区间</h2><p>ETE July IP 算法：蓝区满分，绿区按边界线性插值，灰区 0 分；按测试顺序计算连续稳定性</p></div><div class="ap-score-badge" id="apFinalBadge">Final -- / 200</div></div>
+            <div class="chart-wrap ap-chart"><canvas id="apScoreChart" aria-label="AP 评分区间坐标图，横纵轴 0 至 50 微摩尔每升"></canvas></div>
+            <div class="ap-legend"><span><i class="ap-swatch blue"></i>Blue 满分区</span><span><i class="ap-swatch green"></i>Green 部分分区</span><span><i class="ap-swatch grey"></i>Grey 0 分</span><span><i class="ap-dot"></i>已测点</span><span><i class="ap-missing">?</i>无法反解</span></div>
+            <div class="ap-metrics"><div><span>MS</span><strong id="apMs">--</strong><small>/ 10</small></div><div><span>SC</span><strong id="apSc">--</strong><small>/ 10</small></div><div><span>最长加权连续</span><strong id="apStreak">--</strong><small>点</small></div><div><span>已测 / 24</span><strong id="apMeasured">--</strong><small>样品</small></div><div><span>Blue / Green / Grey</span><strong id="apZones">--</strong><small>点</small></div><div><span>平均绝对误差</span><strong id="apMae">--</strong><small>µM</small></div><div><span>平均误差百分比</span><strong id="apMape">--</strong><small>%</small></div><div><span>RMSE</span><strong id="apRmse">--</strong><small>µM</small></div></div>
           </section>
           <section class="panel drift-panel">
             <div class="panel-head"><div><h2>过渡期漂移校正</h2><p id="driftStatus">稳定化 IT 完成后可计算电流漂移</p></div><label class="inline-toggle"><input id="applyDrift" type="checkbox"><span>将 bias 加入测试曲线</span></label></div>
@@ -206,21 +248,21 @@
         <!-- 上下布局:图在上、控制在下。参数面板需要横向空间,挤在右侧窄栏里读不动。 -->
         <section class="panel chart-panel dbg-chart">
           <div class="panel-head">
-            <div><h2>电流 / 电位 双轴</h2><p id="dbgChartMsg">左轴电流 nA · 右轴 E = V_WE − V_RE (mV)</p></div>
+            <div><h2>电流与平台判定</h2><p id="dbgChartMsg">左轴电流 nA · 右轴 E = V_WE − V_RE (mV)</p></div>
             <div class="chart-actions">
               <div class="live-current" id="dbgLiveIBox"><span>实时电流</span><strong id="dbgLiveI">--</strong><small>nA</small><em id="dbgLiveIAt">尚无数据</em></div>
               <div class="live-current" id="dbgLiveBox"><span>E (V_WE−V_RE)</span><strong id="dbgLiveE">--</strong><small>mV</small><em id="dbgLiveEAt">尚无数据</em></div>
-              <div class="segmented" id="dbgChartWindow"><button class="active" data-window="all">全程</button><button data-window="20">20 s</button><button data-window="5">5 s</button></div>
+              <div class="segmented" id="dbgChartWindow"><button class="active" data-window="all">全程</button><button data-window="plateau">判定窗</button><button data-window="20">20 s</button><button data-window="5">5 s</button></div>
               <div class="live-badge" id="dbgBadge">待机</div>
             </div>
           </div>
           <div class="chart-wrap"><canvas id="dbgChart" aria-label="电流与电极电位双轴曲线"></canvas>
-            <div class="chart-legend"><span><i class="valid-point"></i>电流(左轴)</span><span><i class="dbg-e-point"></i>E(右轴)</span><span><i class="invalid-point"></i>饱和/削顶</span></div>
+            <div class="chart-legend dbg-chart-legend"><span><i class="valid-point"></i>电流（常显）</span><label><input id="dbgShowPotential" type="checkbox" checked><i class="dbg-e-point"></i>显示电位</label><label><input id="dbgShowPlateau" type="checkbox" checked><i class="dbg-plateau-line"></i>显示平台判定</label><span><i class="invalid-point"></i>饱和/削顶</span></div>
             <div class="empty-chart" id="dbgChartEmpty">点「应用并开始一次 I-t」后显示</div>
           </div>
           <div class="metric-strip">
-            <div><span>末 20 点中位</span><strong id="dbgIMed">--</strong><small>nA</small></div>
-            <div><span>末 20 点 σ</span><strong id="dbgISd">--</strong><small>nA</small></div>
+            <div><span>末 20 有效点中位</span><strong id="dbgIMed">--</strong><small>nA</small></div>
+            <div><span>末 20 有效点 σ</span><strong id="dbgISd">--</strong><small>nA</small></div>
             <div><span>有效台阶</span><strong id="dbgCounts">--</strong><small id="dbgCountsNote">原始码</small></div>
             <div><span>点数 / 饱和</span><strong id="dbgN">--</strong><small id="dbgSat">sat 0</small></div>
             <div><span>V_WE</span><strong id="dbgWe">--</strong><small>mV</small></div>
@@ -230,6 +272,26 @@
             <!-- VDD 实测(tag 0xE0)。它给出 V_WE 窗口的上限 VDD−1.1V ——
                  在此之前上限只能靠编译期假定的 3000mV。 -->
             <div><span>VDD（V_WE 窗口）</span><strong id="dbgVdd">--</strong><small id="dbgVddNote">mV</small></div>
+          </div>
+          <div class="plateau-diagnostics" aria-live="polite">
+            <div class="plateau-diagnostic-head"><span>平台判定诊断</span><strong id="dbgPlateauStatus">等待数据</strong><small id="dbgPlateauPasses">0 / -- 连续窗</small></div>
+            <div><span>斜率</span><strong id="dbgPlateauSlope">--</strong><small>nA/s</small></div>
+            <div><span>整窗变化</span><strong id="dbgPlateauTrend">--</strong><small>nA</small></div>
+            <div><span>前 / 后均值差</span><strong id="dbgPlateauHalf">--</strong><small id="dbgPlateauHalfMeans">-- / -- nA</small></div>
+            <div><span>残差散差 / 容差</span><strong id="dbgPlateauScatter">-- / --</strong><small>nA</small></div>
+            <div class="plateau-segments"><span>各段均值</span><strong id="dbgPlateauSegments">等待完整判定窗</strong></div>
+          </div>
+          <div class="filter-panel" data-filter-panel>
+            <div class="filter-panel-head"><div><strong>软件滤波</strong><small data-filter-status>与实时测量共用设置</small></div></div>
+            <div class="filter-form filter-form-compact">
+              <label>作用范围<select data-filter-key="mode"><option value="off">关闭</option><option value="display">仅显示</option><option value="analysis">显示 + 分析</option></select></label>
+              <label class="filter-check"><input type="checkbox" data-filter-key="lowpass_enabled"><span>低通</span></label>
+              <label>截止设置<select data-filter-key="lowpass_auto"><option value="true">自动</option><option value="false">手动</option></select></label>
+              <label>截止频率<div class="input-unit"><input type="text" inputmode="decimal" autocomplete="off" data-filter-key="lowpass_cutoff_hz"><span>Hz</span></div></label>
+              <label>阶数<select data-filter-key="lowpass_order"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label>
+              <label class="filter-check"><input type="checkbox" data-show-raw><span>显示原数据</span></label>
+              <button class="secondary" data-filter-apply>保存设置</button>
+            </div>
           </div>
           <div class="dbg-codes" id="dbgCodes">原始 12-bit code:等待数据</div>
         </section>
@@ -250,6 +312,23 @@
               <div class="live-badge" id="dbgStatusBadge">未连接</div>
             </div>
           </div>
+
+          <details class="plateau-settings dbg-plateau-settings" data-plateau-panel>
+            <summary><span>自动停止判定参数</span><small>判定窗 <b data-plateau-window>30 s</b></small></summary>
+            <div class="plateau-form">
+              <label>分段时长<div class="input-unit"><input type="number" min="0.5" max="60" step="0.1" data-plateau-key="segment_duration_s"><span>s</span></div></label>
+              <label>分段数量<input type="number" min="2" max="60" step="2" data-plateau-key="segment_count"></label>
+              <label>绝对容差<div class="input-unit"><input type="number" min="0" max="1000" step="0.01" data-plateau-key="absolute_tolerance_nA"><span>nA</span></div></label>
+              <label>相对容差（1%=0.01）<input type="number" min="0" max="1" step="0.001" data-plateau-key="relative_tolerance"></label>
+              <label>残差散差倍数<input type="number" min="0" max="100" step="0.1" data-plateau-key="scatter_multiplier"></label>
+              <label>最小数据覆盖率<input type="number" min="0.01" max="1" step="0.01" data-plateau-key="minimum_coverage_ratio"></label>
+              <label>最大采样间隔<div class="input-unit"><input type="number" min="0.1" max="100" step="0.1" data-plateau-key="maximum_gap_periods"><span>周期</span></div></label>
+              <label>连续通过窗<input type="number" min="1" max="100" step="1" data-plateau-key="required_consecutive_windows"></label>
+              <label>尖峰尺度倍数<input type="number" min="0.1" max="1000" step="0.1" data-plateau-key="spike_scale_multiplier"></label>
+              <label>尖峰邻点倍数<input type="number" min="0.1" max="1000" step="0.1" data-plateau-key="spike_neighbor_multiplier"></label>
+            </div>
+            <div class="plateau-form-actions"><small data-plateau-status>未读取设置</small><button class="secondary" type="button" data-plateau-apply>保存判定参数</button></div>
+          </details>
 
           <div class="dbg-form">
             <label>电流量程 FSR<select id="dbgFsr"><option value="0">50 nA</option><option value="1">100 nA</option><option value="2">250 nA</option><option value="3">500 nA</option><option value="4">1 µA</option><option value="5">2 µA</option></select></label>
@@ -294,6 +373,6 @@
     </main>
   </div>
   <div class="toast" id="toast"></div>
-  <script src="/assets/app.js"></script>
+  <script src="/assets/app.js?v=20260815-live-metrics-1"></script>
 </body>
 </html>

@@ -4,11 +4,30 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
+import signal
+import subprocess
 import tempfile
 from pathlib import Path
+from unittest.mock import Mock, patch
 
-from pa_host.gui_server import AppState, MeasurementController, SettingsController
+import numpy as np
+import pytest
+
+from pa_host.gui_server import (
+    AppState,
+    MeasurementController,
+    PlateauController,
+    RequestHandler,
+    SettingsController,
+    _escape_applescript,
+    _notify_measurement_completion,
+    _send_system_notification,
+    _existing_toolchain_path,
+    serve,
+)
+from pa_host.it import PlateauConfig
 
 
 def _point(point_id: str, concentration: float, current: float) -> dict[str, object]:
@@ -18,6 +37,71 @@ def _point(point_id: str, concentration: float, current: float) -> dict[str, obj
         "concentration_um": concentration,
         "current_nA": current,
     }
+
+
+def _complete_adaptive_calibration_point(
+    app: AppState,
+    *,
+    point_id: str,
+    concentration: float,
+    current: float,
+    plateau: PlateauConfig,
+) -> None:
+    settings = SettingsController.validate({"adaptive_stop": True})
+    with patch("pa_host.gui_server._send_system_notification"):
+        app._measurement_completed({
+            "run_id": point_id,
+            "state": "completed",
+            "finished_at": float(len(app.point_records) + 1),
+            "metadata": {
+                "sample_name": point_id,
+                "sample_role": "calibration",
+                "known_concentration_um": concentration,
+            },
+            "summary": {
+                "steady_current_nA": current,
+                "adaptive_stop": {
+                    "enabled": True,
+                    "config": plateau.to_dict(),
+                },
+            },
+            "settings": settings,
+            "raw_path": str(app.save_dir / f"missing-{point_id}-raw.csv"),
+            "resampled_path": str(app.save_dir / f"missing-{point_id}.csv"),
+            "filtered_path": str(app.save_dir / f"missing-{point_id}-filtered.csv"),
+        })
+
+
+def _fit_adaptive_workspace(workspace: Path, plateau: PlateauConfig) -> AppState:
+    app = AppState()
+    app.save_dir = workspace
+    app._load_workspace()
+    app.settings.settings = SettingsController.validate({"adaptive_stop": True})
+    app.plateau.settings = plateau
+    _complete_adaptive_calibration_point(
+        app, point_id="adaptive-zero", concentration=0, current=1, plateau=plateau
+    )
+    _complete_adaptive_calibration_point(
+        app, point_id="adaptive-ten", concentration=10, current=3, plateau=plateau
+    )
+    app.fit({"points": app.points_payload()["points"]})
+    return app
+
+
+def _request_body(
+    payload: bytes, *, content_type: str = "application/json",
+    host: str = "127.0.0.1:8769", origin: str | None = None,
+) -> dict[str, object]:
+    handler = RequestHandler.__new__(RequestHandler)
+    handler.headers = {
+        "Content-Type": content_type,
+        "Content-Length": str(len(payload)),
+        "Host": host,
+    }
+    if origin is not None:
+        handler.headers["Origin"] = origin
+    handler.rfile = io.BytesIO(payload)
+    return handler._body()
 
 
 def test_workspace_keeps_all_candidates_but_fits_only_selected_range() -> None:
@@ -63,7 +147,6 @@ def test_switching_workspace_loads_an_independent_model() -> None:
         second._load_workspace()
         assert second.model is None
         assert second.point_records == []
-
         reloaded = AppState()
         reloaded.save_dir = root / "first"
         reloaded._load_workspace()
@@ -71,6 +154,125 @@ def test_switching_workspace_loads_an_independent_model() -> None:
         assert reloaded.selected_point_ids == ["a", "b"]
         assert len(reloaded.point_records) == 2
 
+
+def test_adaptive_plateau_signature_persists_and_gates_the_calibration_model() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "adaptive-signature"
+        original = PlateauConfig()
+        changed = PlateauConfig(absolute_tolerance_nA=0.2)
+        app = _fit_adaptive_workspace(workspace, original)
+
+        signature_path = workspace / "calibration-plateau.json"
+        assert json.loads(signature_path.read_text())["settings"] == original.to_dict()
+        assert app.workflow_snapshot()["settings_match"] is True
+        assert app.workflow_snapshot()["calibration_ready"] is True
+
+        app.plateau.settings = changed
+        assert app.workflow_snapshot()["settings_match"] is False
+        assert app.workflow_snapshot()["calibration_ready"] is False
+        assert app.model_payload()["model_compatible"] is False
+        with pytest.raises(RuntimeError, match="标定点"):
+            app.start_measurement({
+                "sample_name": "new-calibration",
+                "sample_role": "calibration",
+                "known_concentration_um": 20,
+            })
+        with pytest.raises(RuntimeError, match="生成当前 IT 条件"):
+            app.start_measurement({"sample_name": "test", "sample_role": "test"})
+        with pytest.raises(ValueError, match="候选标定点不一致"):
+            app.fit({"points": app.points_payload()["points"]})
+        with pytest.raises(ValueError, match="标定模型不一致"):
+            app.predict({"current_nA": 2})
+
+        reloaded = AppState()
+        reloaded.settings.settings = SettingsController.validate({"adaptive_stop": True})
+        reloaded.plateau.settings = original
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        assert reloaded.calibration_plateau == original.to_dict()
+        assert reloaded.model_plateau == original.to_dict()
+        assert reloaded.workflow_snapshot()["calibration_ready"] is True
+
+        reloaded.save_dir = Path(tmp) / "empty-workspace"
+        reloaded._load_workspace()
+        assert reloaded.calibration_plateau is None
+        assert reloaded.model_plateau is None
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        reloaded.reset_calibration()
+        assert reloaded.calibration_plateau is None
+        assert reloaded.model_plateau is None
+        assert not signature_path.exists()
+        assert list(workspace.glob("calibration-plateau-*.json"))
+
+
+def test_legacy_adaptive_model_without_plateau_signature_requires_recalibration() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "legacy-adaptive"
+        plateau = PlateauConfig()
+        app = _fit_adaptive_workspace(workspace, plateau)
+        (workspace / "calibration-plateau.json").unlink()
+
+        reloaded = AppState()
+        reloaded.settings.settings = SettingsController.validate({"adaptive_stop": True})
+        reloaded.plateau.settings = plateau
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+
+        assert reloaded.model is not None
+        assert reloaded.calibration_plateau is None
+        assert reloaded.workflow_snapshot()["settings_match"] is False
+        assert reloaded.workflow_snapshot()["calibration_ready"] is False
+        with pytest.raises(ValueError, match="候选标定点不一致"):
+            reloaded.fit({"points": reloaded.points_payload()["points"]})
+
+
+def test_nonadaptive_model_ignores_plateau_config_and_needs_no_signature() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "fixed-duration"
+        app = AppState()
+        app.save_dir = workspace
+        app._load_workspace()
+        app.settings.settings = SettingsController.validate({"adaptive_stop": False})
+        app.fit({"points": [_point("zero", 0, 1), _point("ten", 10, 3)]})
+
+        assert not (workspace / "calibration-plateau.json").exists()
+        app.plateau.settings = PlateauConfig(absolute_tolerance_nA=0.2)
+        assert app.workflow_snapshot()["settings_match"] is True
+        assert app.workflow_snapshot()["calibration_ready"] is True
+        assert app.model_payload()["model_compatible"] is True
+
+        reloaded = AppState()
+        reloaded.settings.settings = SettingsController.validate({"adaptive_stop": False})
+        reloaded.plateau.settings = PlateauConfig(scatter_multiplier=4)
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        assert reloaded.workflow_snapshot()["calibration_ready"] is True
+
+
+def test_calibration_allows_mixed_analysis_filters() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "filter-workspace"
+        app._load_workspace()
+        app.filter.settings = {
+            "mode": "analysis", "lowpass_enabled": True,
+            "lowpass_cutoff_hz": 0.8, "lowpass_auto": False,
+            "lowpass_order": 2,
+        }
+        app.fit({
+            "points": [_point("a", 0, 1), _point("b", 1, 3)],
+            "selected_point_ids": ["a", "b"],
+        })
+        assert app.workflow_snapshot()["calibration_ready"] is True
+        app.filter.settings["lowpass_cutoff_hz"] = 0.6
+        assert app.workflow_snapshot()["calibration_ready"] is True
+        assert app.model_payload()["model_compatible"] is True
+        refit = app.fit({
+            "points": [_point("a", 0, 1), _point("b", 1, 3)],
+            "selected_point_ids": ["a", "b"],
+        })
+        assert refit["model"]["n_points"] == 2
 
 def test_raw_points_are_targeted_to_the_workspace_during_acquisition() -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -117,18 +319,228 @@ def test_it_step_settings_keep_initial_and_target_potentials_distinct() -> None:
     assert SettingsController.same_analysis_protocol(settings, continuously_held)
 
 
-def test_it_uses_verified_1200mv_common_mode_across_supported_potentials() -> None:
+def test_analysis_protocol_ignores_snapshot_only_metadata() -> None:
+    settings = SettingsController.validate({"adaptive_stop": True})
+    snapshot_settings = {
+        **settings,
+        "native_rate_note": "MAX30131 原生采样说明",
+    }
+
+    assert SettingsController.same_analysis_protocol(settings, snapshot_settings)
+    assert not SettingsController.same_analysis_protocol(
+        settings, {**snapshot_settings, "potential_v": settings["potential_v"] - 0.1}
+    )
+
+
+def test_it_working_electrode_common_mode_is_configurable() -> None:
     legacy = SettingsController.validate({
         "initial_potential_v": 0.2,
         "potential_v": 0.2,
     })
-    near_rail = SettingsController.validate({
-        "initial_potential_v": 0.4,
-        "potential_v": 0.4,
+    configured = SettingsController.validate({
+        "initial_potential_v": -0.2,
+        "potential_v": -0.2,
+        "working_electrode_v": 0.25,
     })
 
     assert SettingsController.working_electrode_mv(legacy) == 1200
-    assert SettingsController.working_electrode_mv(near_rail) == 1200
+    assert configured["working_electrode_v"] == 0.25
+    assert SettingsController.working_electrode_mv(configured) == 250
+
+
+def test_toolchain_path_falls_back_when_configured_location_is_missing() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        legacy = root / "legacy"
+        (legacy / "zephyr").mkdir(parents=True)
+        (legacy / "zephyr/zephyr-env.sh").touch()
+
+        selected = _existing_toolchain_path(
+            str(root / "missing"), (str(legacy),), "zephyr/zephyr-env.sh"
+        )
+
+        assert selected == legacy
+
+
+def test_it_rejects_working_electrode_and_re_values_outside_dac_range() -> None:
+    for payload in (
+        {"working_electrode_v": 0.2},
+        {"working_electrode_v": 1.536},
+        {"working_electrode_v": 0.25, "potential_v": 0.3},
+        {"working_electrode_v": 1.4, "potential_v": -0.2},
+    ):
+        try:
+            SettingsController.validate(payload)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected invalid DAC combination: {payload}")
+
+
+def test_apply_writes_configured_working_electrode_to_firmware_header() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = root / "measurement_config.h"
+        settings_path = root / "gui_settings.json"
+        prebuilt_dir = root / "prebuilt"
+        prebuilt_dir.mkdir()
+        payload = {
+            "initial_potential_v": -0.2,
+            "potential_v": -0.2,
+            "working_electrode_v": 0.25,
+            "adaptive_stop": True,
+        }
+        (prebuilt_dir / "firmware.json").write_text(json.dumps({
+            "settings": SettingsController.validate(payload),
+        }))
+
+        with (
+            patch("pa_host.gui_server.FIRMWARE_CONFIG", config),
+            patch("pa_host.gui_server.SETTINGS_PATH", settings_path),
+            patch("pa_host.gui_server.FIRMWARE_PREBUILT_DIR", prebuilt_dir),
+            patch("pa_host.gui_server._release_stale_measurement_bridge"),
+            patch.object(SettingsController, "_flash_firmware"),
+            patch.object(SettingsController, "_firmware_hash", return_value="test-hash"),
+        ):
+            result = SettingsController().apply(payload)
+
+        header = config.read_text()
+        assert "#define GUI_WP_V_WE_MV 250\n" in header
+        assert "#define GUI_IT_ADAPTIVE_STOP 1\n" in header
+        assert result["settings"]["working_electrode_v"] == 0.25
+
+
+def test_custom_apply_uses_the_new_build_after_a_prebuilt_run() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = root / "measurement_config.h"
+        settings_path = root / "gui_settings.json"
+        prebuilt_dir = root / "prebuilt"
+        build_dir = root / "build"
+        prebuilt_dir.mkdir()
+        build_dir.mkdir()
+        default_settings = SettingsController.validate({})
+        custom_payload = {"potential_v": 0.1}
+        (prebuilt_dir / "firmware.json").write_text(json.dumps({
+            "settings": default_settings,
+        }))
+        (prebuilt_dir / "zephyr.hex").write_text("prebuilt")
+        built_hex = build_dir / "zephyr.hex"
+        built_hex.write_text("custom")
+        settings_path.write_text(json.dumps({
+            "settings": default_settings, "firmware_source": "prebuilt",
+        }))
+
+        with (
+            patch("pa_host.gui_server.FIRMWARE_CONFIG", config),
+            patch("pa_host.gui_server.SETTINGS_PATH", settings_path),
+            patch("pa_host.gui_server.FIRMWARE_PREBUILT_DIR", prebuilt_dir),
+            patch("pa_host.gui_server.FIRMWARE_BUILD_DIR", build_dir),
+            patch("pa_host.gui_server._IS_WIN", True),
+            patch("pa_host.gui_server._release_stale_measurement_bridge"),
+            patch.object(SettingsController, "_run_build"),
+            patch.object(SettingsController, "_flash_firmware") as flash,
+            patch.object(SettingsController, "_firmware_hash", return_value="build-hash"),
+        ):
+            result = SettingsController().apply(custom_payload)
+
+        flash.assert_called_once_with(built_hex)
+        saved = json.loads(settings_path.read_text())
+        assert saved["firmware_source"] == "build"
+        assert saved["firmware_sha256"] == "build-hash"
+        assert result["applied"] is True
+
+
+def test_failed_flash_revokes_the_previous_applied_state() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = root / "measurement_config.h"
+        settings_path = root / "gui_settings.json"
+        prebuilt_dir = root / "prebuilt"
+        prebuilt_dir.mkdir()
+        payload = SettingsController.validate({})
+        (prebuilt_dir / "firmware.json").write_text(json.dumps({"settings": payload}))
+        (prebuilt_dir / "zephyr.hex").write_text("prebuilt")
+        old_settings = {"settings": payload, "firmware_source": "prebuilt"}
+        settings_path.write_text(json.dumps(old_settings))
+
+        with (
+            patch("pa_host.gui_server.FIRMWARE_CONFIG", config),
+            patch("pa_host.gui_server.SETTINGS_PATH", settings_path),
+            patch("pa_host.gui_server.FIRMWARE_PREBUILT_DIR", prebuilt_dir),
+            patch("pa_host.gui_server._release_stale_measurement_bridge"),
+            patch.object(SettingsController, "_flash_firmware",
+                         side_effect=RuntimeError("verify failed")),
+        ):
+            controller = SettingsController()
+            controller.applied = True
+            with pytest.raises(RuntimeError, match="verify failed"):
+                controller.apply(payload)
+
+        assert controller.applied is False
+        assert controller.state == "error"
+        assert json.loads(settings_path.read_text()) == old_settings
+
+
+def test_build_timeout_terminates_the_complete_process_group() -> None:
+    process = Mock(pid=4321, returncode=None)
+    process.communicate.side_effect = [
+        subprocess.TimeoutExpired(["build"], 0.01),
+        ("partial output", "partial error"),
+    ]
+
+    with (
+        patch("pa_host.gui_server._IS_WIN", False),
+        patch("pa_host.gui_server.subprocess.Popen", return_value=process),
+        patch("pa_host.gui_server.os.killpg") as kill_group,
+        pytest.raises(subprocess.TimeoutExpired),
+    ):
+        SettingsController._run_build(["build"], timeout_s=0.01)
+
+    kill_group.assert_called_once_with(4321, signal.SIGTERM)
+
+
+def test_windows_build_timeout_is_bounded_when_taskkill_fails() -> None:
+    process = Mock(pid=4321, returncode=None)
+    process.communicate.side_effect = [
+        subprocess.TimeoutExpired(["build"], 0.01, output="started"),
+        subprocess.TimeoutExpired(["build"], 5, output="still running"),
+        subprocess.TimeoutExpired(
+            ["build"], 5, output="forced", stderr="pipe still open",
+        ),
+    ]
+    process.wait.side_effect = [
+        subprocess.TimeoutExpired(["build"], 2),
+        1,
+    ]
+    taskkill_failure = subprocess.CompletedProcess(
+        ["taskkill"], returncode=1, stderr="Access is denied",
+    )
+
+    with (
+        patch("pa_host.gui_server._IS_WIN", True),
+        patch(
+            "pa_host.gui_server.subprocess.CREATE_NEW_PROCESS_GROUP", 0x200,
+            create=True,
+        ),
+        patch("pa_host.gui_server.subprocess.Popen", return_value=process),
+        patch(
+            "pa_host.gui_server.subprocess.run", return_value=taskkill_failure,
+        ) as taskkill,
+        pytest.raises(subprocess.TimeoutExpired) as exc_info,
+    ):
+        SettingsController._run_build(["build"], timeout_s=0.01)
+
+    assert taskkill.call_count == 2
+    assert process.kill.call_count == 3
+    assert [call.kwargs["timeout"] for call in process.communicate.call_args_list] == [
+        0.01, 5, 5,
+    ]
+    assert [call.kwargs["timeout"] for call in process.wait.call_args_list] == [2, 2]
+    process.stdout.close.assert_called_once_with()
+    process.stderr.close.assert_called_once_with()
+    assert exc_info.value.output == "forced"
+    assert exc_info.value.stderr == "pipe still open"
 
 
 def test_default_it_method_matches_archived_180_second_protocol() -> None:
@@ -136,23 +548,10 @@ def test_default_it_method_matches_archived_180_second_protocol() -> None:
 
     assert settings["method"] == "it"
     assert settings["potential_v"] == 0.2
+    assert settings["working_electrode_v"] == 1.2
     assert settings["duration_s"] == 180.0
+    assert settings["adaptive_stop"] is False
     assert settings["target_rate_hz"] == 10.0
-    assert settings["fit_window_s"] == 20.0
-    assert settings["fsr_nA"] == 2000
-    assert settings["offset_mode"] == "10pct"
-    assert settings["offset_nA"] == 200
-
-
-def test_v51_it_profile_uses_requested_negative_200mv_150_second_method() -> None:
-    settings = SettingsController.validate(SettingsController.V51_DEFAULTS)
-
-    assert settings["method"] == "it"
-    assert settings["initial_potential_v"] == -0.2
-    assert settings["potential_v"] == -0.2
-    assert settings["duration_s"] == 150.0
-    assert settings["target_rate_hz"] == 10.0
-    assert settings["sens_period_code"] == 0
     assert settings["fit_window_s"] == 20.0
     assert settings["fsr_nA"] == 2000
     assert settings["offset_mode"] == "10pct"
@@ -188,6 +587,25 @@ def test_live_cv_data_reader_only_appends_new_complete_rows() -> None:
         assert second["valid"] == [True, True, False]
 
 
+def test_live_data_reader_skips_non_finite_hardware_rows() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = Path(tmp) / "live.csv"
+        raw.write_text(
+            "dev_ms,fa_fw,sat,ovf\n"
+            "nan,1000000,0,0\n"
+            "1000,nan,0,0\n"
+            "1100,2000000,0,0\n",
+            encoding="utf-8",
+        )
+        controller = MeasurementController()
+        controller.raw_path = raw
+
+        data = controller._data()
+
+        assert data["time_s"] == [0.0]
+        assert data["current_nA"] == [2.0]
+
+
 def test_drift_bias_shifts_curve_and_prediction_only_when_enabled() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         app = AppState()
@@ -197,16 +615,20 @@ def test_drift_bias_shifts_curve_and_prediction_only_when_enabled() -> None:
             "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
             "selected_point_ids": ["zero", "ten"],
         })
+        created_at = float(app.model_created_at or 0)
+        settings_json = json.dumps(app.measurement.snapshot()["settings"])
         app.records = [
             {
-                "finished_at": "1000", "run_id": "s1", "sample_name": "transition 1",
+                "finished_at": str(created_at + 1000), "run_id": "s1", "sample_name": "transition 1",
                 "sample_role": "stabilization", "known_concentration_um": "5",
                 "steady_current_nA": "20", "state": "completed",
+                "measurement_settings_json": settings_json,
             },
             {
-                "finished_at": "4600", "run_id": "s2", "sample_name": "transition 2",
+                "finished_at": str(created_at + 4600), "run_id": "s2", "sample_name": "transition 2",
                 "sample_role": "stabilization", "known_concentration_um": "5",
                 "steady_current_nA": "24", "state": "completed",
+                "measurement_settings_json": settings_json,
             },
         ]
         drift = app.calculate_drift({
@@ -226,6 +648,386 @@ def test_drift_bias_shifts_curve_and_prediction_only_when_enabled() -> None:
         app.toggle_drift({"enabled": False})
         prediction = app.predict({"current_nA": 24})
         assert abs(prediction["predicted_concentration_um"] - 7) < 1e-9
+
+
+def test_drift_rejects_mixed_concentrations_and_old_protocol_records() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "drift-guard"
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        created_at = float(app.model_created_at or 0)
+        settings_json = json.dumps(app.model_settings)
+        app.records = [
+            {"finished_at": str(created_at + 1), "run_id": "s1",
+             "sample_name": "zero", "sample_role": "stabilization",
+             "known_concentration_um": "0", "steady_current_nA": "10",
+             "state": "completed", "measurement_settings_json": settings_json},
+            {"finished_at": str(created_at + 2), "run_id": "s2",
+             "sample_name": "ten", "sample_role": "stabilization",
+             "known_concentration_um": "10", "steady_current_nA": "30",
+             "state": "completed", "measurement_settings_json": settings_json},
+            {"finished_at": str(created_at - 1), "run_id": "old",
+             "sample_name": "old", "sample_role": "stabilization",
+             "known_concentration_um": "0", "steady_current_nA": "9",
+             "state": "completed", "measurement_settings_json": settings_json},
+        ]
+
+        assert [record["run_id"] for record in app._stabilization_records()] == ["s1", "s2"]
+        with pytest.raises(ValueError, match="填写浓度一致"):
+            app.calculate_drift({
+                "known_concentration_um": 0,
+                "start_run_id": "s1", "end_run_id": "s2",
+            })
+
+
+def test_completed_known_concentration_tests_are_charted_without_refitting() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "validation"
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        model_created_at = float(app.model_created_at or 0)
+        app.records = [
+            {
+                "finished_at": str(model_created_at + 10), "run_id": "test-1", "sample_name": "验证样品",
+                "sample_role": "test", "known_concentration_um": "5",
+                "steady_current_nA": "22", "state": "completed",
+            },
+            {
+                "finished_at": str(model_created_at + 20), "run_id": "test-unknown", "sample_name": "未知样品",
+                "sample_role": "test", "known_concentration_um": "",
+                "steady_current_nA": "20", "state": "completed",
+            },
+            {
+                "finished_at": str(model_created_at + 30), "run_id": "test-running", "sample_name": "未完成",
+                "sample_role": "test", "known_concentration_um": "5",
+                "steady_current_nA": "22", "state": "running",
+            },
+            {
+                "finished_at": str(model_created_at + 40), "run_id": "cal-1", "sample_name": "标定样品",
+                "sample_role": "calibration", "known_concentration_um": "5",
+                "steady_current_nA": "20", "state": "completed",
+            },
+            {
+                "finished_at": str(model_created_at - 10), "run_id": "test-before-model",
+                "sample_name": "上一轮测试", "sample_role": "test",
+                "known_concentration_um": "5", "steady_current_nA": "22",
+                "state": "completed",
+            },
+        ]
+
+        payload = app.model_payload()
+        assert len(payload["points"]) == 2
+        assert [point["run_id"] for point in payload["validation_points"]] == [
+            "test-1", "test-unknown",
+        ]
+        point = payload["validation_points"][0]
+        assert point["concentration_um"] == 5
+        assert point["current_nA"] == 22
+        assert point["expected_current_nA"] == pytest.approx(20)
+        assert point["predicted_concentration_um"] == pytest.approx(6)
+        assert point["error_nA"] == pytest.approx(2)
+        assert point["error_um"] == pytest.approx(1)
+        unknown = payload["validation_points"][1]
+        assert unknown["concentration_um"] is None
+        assert unknown["current_nA"] == 20
+        assert unknown["predicted_concentration_um"] == pytest.approx(5)
+        assert unknown["expected_current_nA"] is None
+        assert unknown["error_nA"] is None
+        assert unknown["error_um"] is None
+        assert unknown["zone"] is None
+        assert payload["ap_score"]["stats"]["measured_count"] == 1
+
+        app.drift = {**app._empty_drift(), "enabled": True, "bias_nA": 4}
+        biased = app.model_payload()["validation_points"][0]
+        assert biased["expected_current_nA"] == pytest.approx(24)
+        assert biased["predicted_concentration_um"] == pytest.approx(4)
+        assert biased["error_nA"] == pytest.approx(-2)
+        assert biased["error_um"] == pytest.approx(-1)
+
+
+def test_unknown_validation_concentration_can_be_saved_then_filled() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "unknown-validation"
+        app = AppState()
+        app.save_dir = workspace
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        app._append_record({
+            "finished_at": float(app.model_created_at or 0) + 10,
+            "run_id": "test-unknown", "sample_name": "待补浓度",
+            "sample_role": "test", "known_concentration_um": None,
+            "steady_current_nA": 20, "predicted_concentration_um": 5,
+            "state": "completed", "data_path": "test.csv", "raw_path": "test-raw.csv",
+        })
+
+        unfilled = app.update_validation_points({"points": [{
+            "point_id": "test-unknown", "sample_name": "待补浓度",
+            "concentration_um": None, "current_nA": 20,
+        }]})
+        assert unfilled["validation_points"][0]["concentration_um"] is None
+        assert unfilled["ap_score"]["stats"]["measured_count"] == 0
+
+        reloaded = AppState()
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        restored = reloaded.model_payload()["validation_points"][0]
+        assert restored["concentration_um"] is None
+        assert restored["predicted_concentration_um"] == pytest.approx(5)
+
+        filled = reloaded.update_validation_points({"points": [{
+            "point_id": "test-unknown", "sample_name": "已补浓度",
+            "concentration_um": 5, "current_nA": 20,
+        }]})
+        point = filled["validation_points"][0]
+        assert point["concentration_um"] == 5
+        assert point["predicted_concentration_um"] == pytest.approx(5)
+        assert point["zone"] == "blue"
+        assert point["sample_score"] == 1
+        assert filled["ap_score"]["stats"]["measured_count"] == 1
+        assert filled["ap_score"]["stats"]["blue_count"] == 1
+
+
+def test_validation_edits_persist_without_rewriting_the_measurement_index() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "validation-edits"
+        app = AppState()
+        app.save_dir = workspace
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        app._append_record({
+            "finished_at": float(app.model_created_at or 0) + 10,
+            "run_id": "test-edit", "sample_name": "原始样品",
+            "sample_role": "test", "known_concentration_um": 5,
+            "steady_current_nA": 22, "predicted_concentration_um": 6,
+            "state": "completed", "data_path": "test.csv", "raw_path": "test-raw.csv",
+        })
+        index_path = workspace / "measurement-index.csv"
+        original_index = index_path.read_text(encoding="utf-8")
+
+        payload = app.update_validation_points({"points": [{
+            "point_id": "test-edit", "sample_name": "修改后样品",
+            "concentration_um": 6, "current_nA": 24,
+        }]})
+
+        point = payload["validation_points"][0]
+        assert point["sample_name"] == "修改后样品"
+        assert point["concentration_um"] == 6
+        assert point["current_nA"] == 24
+        assert point["edited"] is True
+        assert app.records[0]["known_concentration_um"] == "5"
+        assert app.records[0]["steady_current_nA"] == "22"
+        assert index_path.read_text(encoding="utf-8") == original_index
+
+        reloaded = AppState()
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        restored = reloaded.model_payload()["validation_points"][0]
+        assert restored["sample_name"] == "修改后样品"
+        assert restored["concentration_um"] == 6
+        assert restored["current_nA"] == 24
+
+
+def test_ap_scoring_keeps_the_complete_index_beyond_one_hundred_rows() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "complete-index"
+        app = AppState()
+        app.save_dir = workspace
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        created_at = float(app.model_created_at or 0)
+        settings = app.settings.snapshot()["settings"]
+        for index in range(101):
+            is_test = index < 25
+            app._append_record({
+                "finished_at": created_at + index + 1,
+                "run_id": f"run-{index:03d}",
+                "sample_name": f"sample-{index:03d}",
+                "sample_role": "test" if is_test else "stabilization",
+                "known_concentration_um": 5,
+                "steady_current_nA": 100 if index == 0 else 20,
+                "state": "completed",
+                "measurement_settings": settings,
+            })
+
+        reloaded = AppState()
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        score = reloaded.model_payload()["ap_score"]
+
+        assert len(reloaded.records) == 101
+        assert score["stats"]["grey_count"] == 1
+        assert score["stats"]["blue_count"] == 24
+        assert score["final_score"] < 200
+
+
+def test_appending_to_a_legacy_measurement_index_migrates_its_header() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "legacy-index"
+        workspace.mkdir()
+        index_path = workspace / "measurement-index.csv"
+        legacy_fields = [
+            "finished_at", "run_id", "sample_name", "sample_role",
+            "known_concentration_um", "steady_current_nA",
+            "predicted_concentration_um", "state", "data_path", "raw_path",
+        ]
+        recovered_settings = SettingsController.validate({})
+        with index_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=legacy_fields)
+            writer.writeheader()
+            writer.writerow({
+                "finished_at": "1", "run_id": "legacy", "sample_name": "旧记录",
+                "sample_role": "test", "known_concentration_um": "5",
+                "steady_current_nA": "20", "predicted_concentration_um": "5",
+                "state": "completed", "data_path": "legacy.csv", "raw_path": "",
+            })
+            csv.writer(handle).writerow([
+                "1.5", "partially-migrated", "中断升级记录", "stabilization",
+                "5", "20.5", "", "completed", "partial.csv", "",
+                json.dumps(recovered_settings),
+            ])
+
+        app = AppState()
+        app.save_dir = workspace
+        app._load_workspace()
+        settings = app.settings.snapshot()["settings"]
+        app._append_record({
+            "finished_at": 2, "run_id": "new", "sample_name": "新记录",
+            "sample_role": "stabilization", "known_concentration_um": 5,
+            "steady_current_nA": 21, "predicted_concentration_um": None,
+            "state": "completed", "data_path": "new.csv", "raw_path": "",
+            "measurement_settings": settings,
+        })
+
+        with index_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+        assert reader.fieldnames == [*legacy_fields, "measurement_settings_json"]
+        assert len(rows) == 3
+        assert all(None not in row for row in rows)
+        assert json.loads(rows[1]["measurement_settings_json"])["method"] == "it"
+        assert json.loads(rows[2]["measurement_settings_json"])["method"] == "it"
+        assert len(app.records) == 3
+        assert all(None not in row for row in app.records)
+        assert json.loads(app.records[1]["measurement_settings_json"])["method"] == "it"
+
+        reloaded = AppState()
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        assert len(reloaded.records) == 3
+        assert "measurement_settings_json" in reloaded.records[-1]
+
+
+def test_outlying_quadratic_test_still_has_a_chart_point_when_not_invertible() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "quadratic-validation"
+        app._load_workspace()
+        app.fit({
+            "points": [_point("p0", 0, 0), _point("p1", 1, 1), _point("p2", 2, 4)],
+            "selected_point_ids": ["p0", "p1", "p2"],
+            "degree": 2,
+        })
+        app.records = [{
+            "finished_at": str(float(app.model_created_at or 0) + 1),
+            "run_id": "test-outlier", "sample_name": "异常验证",
+            "sample_role": "test", "known_concentration_um": "1",
+            "steady_current_nA": "10", "state": "completed",
+        }]
+
+        point = app.model_payload()["validation_points"][0]
+        assert point["current_nA"] == 10
+        assert point["expected_current_nA"] == pytest.approx(1)
+        assert point["predicted_concentration_um"] is None
+        assert point["error_um"] is None
+        assert point["error_nA"] == pytest.approx(9)
+
+
+def test_completed_quadratic_outlier_is_indexed_when_prediction_has_no_inverse() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        app = AppState()
+        app.save_dir = root / "quadratic-completion"
+        app._load_workspace()
+        app.fit({
+            "points": [_point("p0", 0, 0), _point("p1", 1, 1), _point("p2", 2, 4)],
+            "selected_point_ids": ["p0", "p1", "p2"],
+            "degree": 2,
+        })
+        finished_at = float(app.model_created_at or 0) + 1
+
+        with patch("pa_host.gui_server._send_system_notification"):
+            app._measurement_completed({
+                "finished_at": finished_at,
+                "run_id": "test-outlier-completed",
+                "state": "completed",
+                "metadata": {
+                    "sample_name": "完成异常点", "sample_role": "test",
+                    "known_concentration_um": 1,
+                },
+                "summary": {"steady_current_nA": 10},
+                "settings": app.settings.snapshot()["settings"],
+                "raw_path": str(root / "missing-raw.csv"),
+                "resampled_path": str(root / "missing-data.csv"),
+                "filtered_path": str(root / "missing-filtered.csv"),
+            })
+
+        result = app.measurement.snapshot()["workflow_result"]
+        assert result is not None
+        assert "export_error" not in result
+        assert result["predicted_concentration_um"] is None
+        assert len(app.records) == 1
+        assert app.records[0]["run_id"] == "test-outlier-completed"
+        assert app.records[0]["predicted_concentration_um"] == "None"
+        index_rows = list(csv.DictReader(
+            (app.save_dir / "measurement-index.csv").open(newline="")
+        ))
+        assert len(index_rows) == 1
+        assert index_rows[0]["run_id"] == "test-outlier-completed"
+
+        payload = app.model_payload()
+        point = payload["validation_points"][0]
+        assert point["predicted_concentration_um"] is None
+        assert point["zone"] == "grey"
+        assert point["sample_score"] == 0
+        assert payload["ap_score"]["stats"]["grey_count"] == 1
+
+
+def test_new_calibration_batch_starts_with_no_previous_validation_points() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "new-batch"
+        app._load_workspace()
+        points = [_point("zero", 0, 10), _point("ten", 10, 30)]
+        with patch("pa_host.gui_server.time.time", side_effect=[1000.0, 2000.0]):
+            app.fit({"points": points, "selected_point_ids": ["zero", "ten"]})
+            app.records = [{
+                "finished_at": "1500", "run_id": "old-test", "sample_name": "上一轮测试",
+                "sample_role": "test", "known_concentration_um": "5",
+                "steady_current_nA": "22", "state": "completed",
+            }]
+            assert len(app.model_payload()["validation_points"]) == 1
+
+            app.reset_calibration()
+            assert app.model_payload()["validation_points"] == []
+            app.fit({"points": points, "selected_point_ids": ["zero", "ten"]})
+            assert app.model_payload()["validation_points"] == []
 
 
 if __name__ == "__main__":
@@ -255,13 +1057,15 @@ def test_debug_run_never_touches_the_calibration_workspace() -> None:
         before = sorted(p.name for p in app.save_dir.glob("*")) \
             if app.save_dir.exists() else []
 
-        app._measurement_completed({
-            "run_id": "it_debug", "state": "completed",
-            "finished_at": 1.0, "run_dir": "/tmp/x", "raw_path": "/tmp/x/raw.csv",
-            "metadata": {"debug": True, "sample_name": "hw-debug",
-                         "sample_role": "test"},
-            "summary": {"steady_current_nA": -8.6},
-        })
+        with patch("pa_host.gui_server._send_system_notification") as notify:
+            app._measurement_completed({
+                "run_id": "it_debug", "state": "completed",
+                "finished_at": 1.0, "run_dir": "/tmp/x", "raw_path": "/tmp/x/raw.csv",
+                "metadata": {"debug": True, "sample_name": "hw-debug",
+                             "sample_role": "test"},
+                "summary": {"steady_current_nA": -8.6},
+            })
+        notify.assert_called_once()
 
         after = sorted(p.name for p in app.save_dir.glob("*")) \
             if app.save_dir.exists() else []
@@ -270,6 +1074,38 @@ def test_debug_run_never_touches_the_calibration_workspace() -> None:
         result = app.measurement.snapshot()["workflow_result"]
         assert result is not None and result["debug"] is True
         assert result.get("predicted_concentration_um") is None
+
+
+def test_system_notification_escapes_applescript_and_uses_argument_vector() -> None:
+    assert _escape_applescript('a\\b"c\n') == 'a\\\\b\\"c '
+    with (
+        patch("pa_host.gui_server.sys.platform", "darwin"),
+        patch("pa_host.gui_server.shutil.which", return_value="/usr/bin/osascript"),
+        patch("pa_host.gui_server.subprocess.run") as run,
+    ):
+        _send_system_notification('title "quoted"', 'body\\path\nnext')
+
+    command = run.call_args.args[0]
+    assert command[:2] == ["/usr/bin/osascript", "-e"]
+    assert 'display notification "body\\\\path next"' in command[2]
+    assert 'with title "title \\"quoted\\""' in command[2]
+
+
+def test_completed_measurement_notification_contains_result_details() -> None:
+    with patch("pa_host.gui_server._send_system_notification") as notify:
+        _notify_measurement_completion({
+            "run_id": "run-1", "state": "completed",
+            "metadata": {"sample_name": 'sample "A"'},
+        }, {
+            "sample_name": 'sample "A"', "state": "completed",
+            "steady_current_nA": 12.5,
+            "predicted_concentration_um": 3.25,
+        })
+    notify.assert_called_once()
+    title, body = notify.call_args.args
+    assert "测试完成" in title
+    assert 'sample "A"' in body
+    assert "12.5" in body and "3.25" in body
 
 
 def test_debug_command_line_is_validated_before_reaching_the_firmware() -> None:
@@ -288,3 +1124,1792 @@ def test_debug_command_line_is_validated_before_reaching_the_firmware() -> None:
         raise AssertionError(f"应当拒绝:{bad[:30]!r}")
     # 拒绝的命令一条都不许落进命令文件(否则固件会真的执行它)
     assert ctrl.cmd_path.read_text(encoding="utf-8") == "SET fsr=2 off=4\n"
+
+
+def test_stop_is_forwarded_through_the_collectors_command_file() -> None:
+    """STOP 必须走 collector 已持有的 RTT 连接，不能另开无效 telnet 连接。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.process = Mock()
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl._last_reject = {"kind": "CFG_REJECT", "reason": "perturb_during_run"}
+
+        with patch("pa_host.gui_server.threading.Thread") as thread_cls:
+            first = ctrl.stop()
+            second = ctrl.stop()
+
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "STOP\n"
+        assert first["state"] == "running"
+        assert ctrl.user_stop_requested is True
+        assert ctrl._last_reject == {}
+        assert second["state"] == "running"
+        thread_cls.assert_called_once_with(
+            target=ctrl._terminate_if_running,
+            args=(ctrl.process, 1.5), daemon=True,
+        )
+        thread_cls.return_value.start.assert_called_once_with()
+
+
+def test_adaptive_platform_requires_two_new_windows_before_stop() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.settings = SettingsController.validate({"adaptive_stop": True})
+        ctrl.state = "running"
+        ctrl.process = Mock()
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.metadata = {}
+        first_t = np.arange(0.0, 34.9, 0.1)
+        second_t = np.arange(0.0, 39.9, 0.1)
+        traces = iter([
+            {"time_s": first_t.tolist(), "current_nA": np.full(len(first_t), 4.0).tolist(),
+             "valid": np.ones(len(first_t), dtype=bool).tolist()},
+            {"time_s": second_t.tolist(), "current_nA": np.full(len(second_t), 4.0).tolist(),
+             "valid": np.ones(len(second_t), dtype=bool).tolist()},
+        ])
+
+        with patch.object(ctrl, "_data", side_effect=lambda: next(traces)), \
+                patch("pa_host.gui_server.threading.Thread") as thread_cls:
+            ctrl._maybe_auto_stop()
+            assert ctrl._plateau_consecutive_passes == 1
+            assert not ctrl.cmd_path.exists()
+            ctrl._maybe_auto_stop()
+
+        assert ctrl.auto_stop_requested is True
+        assert ctrl.user_stop_requested is False
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "STOP\n"
+        thread_cls.assert_called_once()
+
+
+def test_adaptive_platform_backfills_skipped_windows_in_order() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.settings = SettingsController.validate({"adaptive_stop": True})
+        ctrl.state = "running"
+        ctrl.process = Mock()
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.metadata = {}
+        first_t = np.arange(0.0, 30.1, 0.1)
+        skipped_t = np.arange(0.0, 45.1, 0.1)
+        traces = iter([
+            {
+                "time_s": first_t.tolist(),
+                "current_nA": np.full(len(first_t), 4.0).tolist(),
+                "valid": np.ones(len(first_t), dtype=bool).tolist(),
+            },
+            {
+                "time_s": skipped_t.tolist(),
+                "current_nA": np.full(len(skipped_t), 4.0).tolist(),
+                "valid": np.ones(len(skipped_t), dtype=bool).tolist(),
+            },
+        ])
+
+        with patch.object(ctrl, "_data", side_effect=lambda: next(traces)), \
+                patch("pa_host.gui_server.threading.Thread") as thread_cls:
+            ctrl._maybe_auto_stop()
+            assert ctrl._plateau_last_segment == 6
+            assert ctrl._plateau_consecutive_passes == 1
+            ctrl._maybe_auto_stop()
+
+        assert ctrl._plateau_last_segment == 7
+        assert ctrl._plateau_consecutive_passes == 2
+        assert ctrl.auto_stop_requested is True
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "STOP\n"
+        thread_cls.assert_called_once()
+
+
+def test_half_second_segments_can_accumulate_within_one_watcher_poll() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.settings = SettingsController.validate({"adaptive_stop": True})
+        ctrl.plateau_config = PlateauConfig(
+            segment_duration_s=0.5,
+            segment_count=40,
+            required_consecutive_windows=4,
+        )
+        ctrl.state = "running"
+        ctrl.process = Mock()
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.metadata = {}
+        time_s = np.arange(0.0, 22.0, 0.1)
+        trace = {
+            "time_s": time_s.tolist(),
+            "current_nA": np.full(len(time_s), 4.0).tolist(),
+            "valid": np.ones(len(time_s), dtype=bool).tolist(),
+        }
+
+        with patch.object(ctrl, "_data", return_value=trace), \
+                patch("pa_host.gui_server.threading.Thread") as thread_cls:
+            ctrl._maybe_auto_stop()
+
+        assert ctrl._plateau_last_segment == 43
+        assert ctrl._plateau_consecutive_passes == 4
+        assert ctrl.auto_stop_requested is True
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "STOP\n"
+        thread_cls.assert_called_once()
+
+
+def test_adaptive_settings_ignore_fixed_duration_and_keep_final_window() -> None:
+    settings = SettingsController.validate({
+        "adaptive_stop": True,
+        "duration_s": 1,
+        "fit_window_s": 1,
+    })
+
+    assert settings["adaptive_stop"] is True
+    assert settings["duration_s"] == 1
+    assert settings["fit_window_s"] == 1
+
+
+def test_display_only_filter_is_excluded_from_platform_analysis() -> None:
+    ctrl = MeasurementController()
+    ctrl.settings = SettingsController.validate({"adaptive_stop": True})
+    ctrl.state = "running"
+    ctrl.metadata = {}
+    ctrl.filter_config = {
+        **ctrl.filter_config,
+        "mode": "display", "lowpass_enabled": True,
+    }
+    time_s = np.arange(0.0, 30.1, 0.1)
+    data = {
+        "time_s": time_s.tolist(),
+        "current_nA": np.ones(len(time_s)).tolist(),
+        "valid": np.ones(len(time_s), dtype=bool).tolist(),
+    }
+
+    with patch.object(ctrl, "_data", return_value=data), \
+            patch("pa_host.gui_server.evaluate_platform", return_value=None) as evaluate:
+        ctrl._maybe_auto_stop()
+
+    assert evaluate.call_args.args[3]["mode"] == "off"
+
+
+@pytest.mark.parametrize("next_mode", ["display", "off"])
+def test_display_filter_changes_preserve_formal_state_and_raw_window(
+    next_mode: str,
+) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.filter_config = {
+        **ctrl.filter_config,
+        "mode": "display", "lowpass_enabled": True,
+        "lowpass_auto": False, "lowpass_cutoff_hz": 0.5,
+    }
+    ctrl._plateau_consecutive_passes = 1
+    ctrl._stability_eta = {"status": "ready", "seconds": 12}
+    ctrl._last_complete_rolling_metrics = {
+        **ctrl._empty_rolling_metrics("ready", "末端窗口指标已就绪"),
+        "steady_current_nA": 4.25,
+        "noise_nA": 0.12,
+        "filter_effective": True,
+        "filter_meta": {"mode": "display", "applied": True},
+    }
+
+    with patch.object(ctrl, "_reset_plateau_monitor_locked") as reset:
+        ctrl.set_filter_config({
+            **ctrl.filter_config,
+            "mode": next_mode,
+            "lowpass_cutoff_hz": 0.8,
+        })
+
+    reset.assert_not_called()
+    assert ctrl._plateau_consecutive_passes == 1
+    assert ctrl._stability_eta == {"status": "ready", "seconds": 12}
+    assert ctrl._last_complete_rolling_metrics["steady_current_nA"] == 4.25
+    assert ctrl._last_complete_rolling_metrics["noise_nA"] is None
+    assert ctrl._last_complete_rolling_metrics["filter_effective"] is False
+    assert ctrl._last_complete_rolling_metrics["filter_meta"] == {}
+
+
+def test_new_measurement_waits_for_previous_watcher_callbacks() -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "completed"
+    ctrl.thread = Mock()
+    ctrl.thread.is_alive.return_value = True
+
+    assert ctrl.is_busy() is True
+    with pytest.raises(RuntimeError, match="正在保存结果"):
+        ctrl.start()
+
+
+def test_failed_scheduled_run_does_not_consume_the_success_target() -> None:
+    app = AppState()
+    schedule = app.schedule
+    schedule.active = True
+    schedule.max_runs = 1
+    schedule.attempted_runs = 1
+
+    schedule._completed({
+        "run_id": "failed-1", "state": "error", "error": "probe disconnected",
+    })
+
+    assert schedule.completed_runs == 0
+    assert schedule.failed_runs == 1
+    assert schedule.active is False
+    assert "失败" in schedule.message
+
+
+def test_failed_export_does_not_consume_the_schedule_success_target() -> None:
+    app = AppState()
+    schedule = app.schedule
+    schedule.active = True
+    schedule.max_runs = 1
+    schedule.attempted_runs = 1
+
+    schedule._completed({
+        "run_id": "export-failed", "state": "completed",
+        "workflow_result": {"export_error": "disk full"},
+    })
+
+    assert schedule.completed_runs == 0
+    assert schedule.failed_runs == 1
+    assert schedule.history[0]["state"] == "error"
+    assert "disk full" in schedule.message
+
+
+def test_stale_schedule_callback_cannot_stop_a_new_generation() -> None:
+    app = AppState()
+    schedule = app.schedule
+    schedule.active = True
+    schedule.generation = 2
+
+    schedule._completed({"state": "completed", "run_id": "old"}, generation=1)
+
+    assert schedule.active is True
+    assert schedule.completed_runs == 0
+    assert schedule.history == []
+
+
+def test_workflow_write_probe_never_replaces_a_user_file() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        existing = workspace / ".sensus-write-test"
+        existing.write_text("user data", encoding="utf-8")
+        app = AppState()
+
+        with patch("pa_host.gui_server.WORKFLOW_PATH", root / "workflow.json"):
+            app.configure_workflow({"save_dir": str(workspace)})
+
+        assert existing.read_text(encoding="utf-8") == "user data"
+
+
+def test_control_api_requires_json_and_rejects_cross_origin_posts() -> None:
+    assert _request_body(
+        b'{"enabled":true}', origin="http://127.0.0.1:8769"
+    ) == {"enabled": True}
+    with pytest.raises(ValueError, match="application/json"):
+        _request_body(b"enabled=true", content_type="text/plain")
+    with pytest.raises(ValueError, match="跨站"):
+        _request_body(b"{}", origin="http://malicious.example")
+
+
+def test_filter_apply_updates_future_scheduled_run_configuration() -> None:
+    app = AppState()
+    updated = {
+        "mode": "analysis", "lowpass_enabled": True,
+        "lowpass_cutoff_hz": 0.5, "lowpass_auto": False,
+        "lowpass_order": 3,
+    }
+    app.schedule.active = True
+    app.schedule.filter_config = {**updated, "mode": "off"}
+    handler = RequestHandler.__new__(RequestHandler)
+    handler.path = "/api/filter/apply"
+    handler._body = Mock(return_value=updated)
+    handler._send_json = Mock()
+
+    with (
+        patch("pa_host.gui_server.APP", app),
+        patch.object(app.filter, "apply", return_value={"settings": updated}),
+        patch.object(app.measurement, "snapshot", return_value={"state": "idle"}),
+    ):
+        handler.do_POST()
+
+    assert app.schedule.filter_config == updated
+    handler._send_json.assert_called_once_with({"settings": updated})
+
+
+def test_debug_command_rejects_non_ascii_before_reaching_collector() -> None:
+    with pytest.raises(ValueError, match="ASCII"):
+        MeasurementController._validate_command_line("SET 量程=1")
+
+
+@pytest.mark.parametrize(
+    ("return_code", "auto_stop_requested"),
+    [(0, False), (3, True), (-15, True)],
+)
+def test_measurement_accepts_natural_or_known_adaptive_stop_exits(
+    return_code: int, auto_stop_requested: bool,
+) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ctrl = MeasurementController()
+        ctrl.settings = SettingsController.validate({"adaptive_stop": True})
+        ctrl.filter_config = {**ctrl.filter_config, "mode": "off"}
+        ctrl.state = "running"
+        ctrl.auto_stop_requested = auto_stop_requested
+        ctrl._plateau_consecutive_passes = 2
+        ctrl._plateau_evaluation = {"stable": True, "window_end_s": 35.0}
+        ctrl.run_dir = root
+        ctrl.raw_path = root / "raw.csv"
+        ctrl.resampled_path = root / "resampled.csv"
+        ctrl.filtered_path = root / "filtered.csv"
+        ctrl.summary_path = root / "summary.json"
+        ctrl.process = Mock()
+        ctrl.process.poll.return_value = return_code
+        ctrl.process.wait.return_value = return_code
+        with ctrl.raw_path.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["seq", "dev_ms", "fa_fw", "sat", "ovf"])
+            for index in range(351):
+                writer.writerow([index, index * 100, 4_000_000, 0, 0])
+
+        log_handle = Mock()
+        ctrl._watch(log_handle)
+
+        assert ctrl.state == "completed"
+        assert ctrl.summary is not None
+        assert ctrl.summary["steady_current_nA"] == pytest.approx(4.0)
+        assert ctrl.summary["adaptive_stop"]["auto_stopped"] is auto_stop_requested
+        assert (
+            json.loads(ctrl.summary_path.read_text())["adaptive_stop"]["auto_stopped"]
+            is auto_stop_requested
+        )
+        log_handle.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("return_code", [0, 1, 2])
+def test_adaptive_stop_rejects_unexpected_exit(return_code: int) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.auto_stop_requested = True
+    ctrl.run_dir = Path("failed-run")
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = return_code
+    ctrl.process.wait.return_value = return_code
+    completed: list[dict[str, object]] = []
+    ctrl.on_complete = completed.append
+
+    log_handle = Mock()
+    ctrl._watch(log_handle)
+
+    assert ctrl.state == "error"
+    assert ctrl.summary is None
+    assert completed and completed[0]["state"] == "error"
+    assert str(return_code) in ctrl.error
+    log_handle.close.assert_called_once_with()
+
+
+def test_manual_known_stop_is_not_promoted_to_a_completed_measurement() -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.user_stop_requested = True
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = 3
+    ctrl.process.wait.return_value = 3
+    completed: list[dict[str, object]] = []
+    ctrl.on_complete = completed.append
+
+    log_handle = Mock()
+    ctrl._watch(log_handle)
+
+    assert ctrl.state == "idle"
+    assert ctrl.summary is None
+    assert completed and completed[0]["state"] == "idle"
+    log_handle.close.assert_called_once_with()
+
+
+def test_natural_finish_falls_back_to_last_complete_rolling_window() -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl._last_complete_rolling_metrics = {
+        **ctrl._empty_rolling_metrics("ready", "末端窗口指标已就绪"),
+        "steady_current_nA": 4.25,
+        "native_point_count": 100,
+        "valid_native_point_count": 100,
+        "stage_key": "epoch-1@0",
+    }
+    ctrl._last_complete_rolling_epoch = 1
+    terminal_metrics = {
+        **ctrl._empty_rolling_metrics("accumulating", "孤立尖峰后等待新数据"),
+        "native_point_count": 105,
+        "valid_native_point_count": 104,
+        "progress_percent": 99.5,
+    }
+
+    def refresh_terminal(_data: dict[str, list[Any]], *, force: bool) -> None:
+        assert force is True
+        ctrl._rolling_metrics = dict(terminal_metrics)
+
+    with patch.object(
+        ctrl, "_refresh_live_analysis_locked", side_effect=refresh_terminal,
+    ):
+        ctrl._freeze_live_analysis_locked(
+            {"time_s": [], "current_nA": [], "valid": [], "epoch": []},
+            completed=True,
+        )
+
+    assert ctrl._rolling_metrics["steady_current_nA"] == pytest.approx(4.25)
+    assert ctrl._rolling_metrics["native_point_count"] == 105
+    assert ctrl._rolling_metrics["valid_native_point_count"] == 104
+    assert ctrl._rolling_metrics["progress_percent"] == 100.0
+    assert ctrl._rolling_metrics["status"] == "frozen"
+
+
+def test_manual_stop_freezes_complete_window_at_request_time(tmp_path: Path) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl._rolling_metrics = {
+        **ctrl._empty_rolling_metrics("accumulating", "新阶段正在累积"),
+        "native_point_count": 105,
+        "valid_native_point_count": 104,
+    }
+    ctrl._last_complete_rolling_metrics = {
+        **ctrl._empty_rolling_metrics("ready", "末端窗口指标已就绪"),
+        "steady_current_nA": 4.25,
+        "native_point_count": 100,
+        "valid_native_point_count": 100,
+    }
+
+    assert ctrl._request_stop_locked(automatic=False)
+    ctrl._rolling_metrics["steady_current_nA"] = 99.0
+    ctrl._last_complete_rolling_metrics["steady_current_nA"] = 88.0
+
+    with patch.object(ctrl, "_refresh_live_analysis_locked") as refresh:
+        ctrl._freeze_live_analysis_locked(
+            {"time_s": [], "current_nA": [], "valid": [], "epoch": []},
+            completed=False,
+        )
+
+    refresh.assert_not_called()
+    assert ctrl._rolling_metrics["steady_current_nA"] == pytest.approx(4.25)
+    assert ctrl._rolling_metrics["native_point_count"] == 105
+    assert ctrl._rolling_metrics["status"] == "frozen"
+
+
+def test_automatic_stop_freeze_prefers_trigger_evidence() -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.auto_stop_requested = True
+    ctrl._rolling_metrics = {
+        **ctrl._empty_rolling_metrics("ready", "后续刷新"),
+        "steady_current_nA": 99.0,
+    }
+    ctrl._last_complete_rolling_metrics = {
+        **ctrl._empty_rolling_metrics("ready", "最近完整窗口"),
+        "steady_current_nA": 88.0,
+    }
+    ctrl._stop_requested_rolling_metrics = {
+        **ctrl._empty_rolling_metrics("ready", "手动停止快照"),
+        "steady_current_nA": 77.0,
+    }
+    ctrl._auto_stop_evidence = {
+        "rolling_metrics": {
+            **ctrl._empty_rolling_metrics("ready", "自动停止触发证据"),
+            "steady_current_nA": 4.25,
+        },
+        "stability_eta": {"status": "ready", "seconds": 0},
+    }
+
+    ctrl._freeze_live_analysis_locked(
+        {"time_s": [], "current_nA": [], "valid": [], "epoch": []},
+        completed=True,
+    )
+
+    assert ctrl._rolling_metrics["steady_current_nA"] == pytest.approx(4.25)
+    assert ctrl._rolling_metrics["status"] == "frozen"
+
+
+def test_live_analysis_reset_clears_terminal_window_caches() -> None:
+    ctrl = MeasurementController()
+    ctrl._last_complete_rolling_metrics = {"steady_current_nA": 4.25}
+    ctrl._last_complete_rolling_epoch = 3
+    ctrl._stop_requested_rolling_metrics = {"steady_current_nA": 4.25}
+
+    ctrl._reset_plateau_monitor_locked(hardware_context_changed=True)
+
+    assert ctrl._last_complete_rolling_metrics is None
+    assert ctrl._last_complete_rolling_epoch is None
+    assert ctrl._stop_requested_rolling_metrics is None
+
+    ctrl.settings["method"] = "cv"
+    ctrl._last_complete_rolling_metrics = {"steady_current_nA": 8.5}
+    ctrl._last_complete_rolling_epoch = 4
+    ctrl._data_context_reset_pending = True
+    ctrl._refresh_live_analysis_locked(
+        {"time_s": [], "current_nA": [], "valid": [], "epoch": []},
+        force=True,
+    )
+
+    assert ctrl._data_context_reset_pending is False
+    assert ctrl._last_complete_rolling_metrics is None
+    assert ctrl._last_complete_rolling_epoch is None
+
+
+def test_confirmed_reversal_invalidates_current_window_before_manual_stop(
+    tmp_path: Path,
+) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl._prepared_live_stage = Mock()
+    ctrl._rolling_metrics = {
+        **ctrl._empty_rolling_metrics("ready", "反转前窗口"),
+        "steady_current_nA": 4.25,
+    }
+    ctrl._last_complete_rolling_metrics = dict(ctrl._rolling_metrics)
+    ctrl._last_complete_rolling_epoch = 3
+    ctrl._stability_eta = {
+        "reset_consecutive": True,
+        "suggested_stage_start_s": 42.0,
+    }
+
+    ctrl._apply_confirmed_reversal_to_plateau_locked()
+
+    assert ctrl._prepared_live_stage is None
+    assert ctrl._rolling_metrics["status"] == "accumulating"
+    assert ctrl._rolling_metrics["steady_current_nA"] is None
+    assert ctrl._last_complete_rolling_metrics is None
+    with patch("pa_host.gui_server.threading.Thread"):
+        assert ctrl._request_stop_locked(automatic=False)
+    assert ctrl._stop_requested_rolling_metrics is None
+
+
+def test_measurement_watcher_is_non_daemon(tmp_path: Path) -> None:
+    ctrl = MeasurementController()
+    process = Mock()
+    watcher = Mock()
+    watcher.is_alive.return_value = False
+
+    with (
+        patch("pa_host.gui_server.RUNS_DIR", tmp_path),
+        patch("pa_host.gui_server.subprocess.Popen", return_value=process),
+        patch("pa_host.gui_server.threading.Thread", return_value=watcher) as thread_cls,
+    ):
+        ctrl.start()
+
+    assert thread_cls.call_args.kwargs["daemon"] is False
+    watcher.start.assert_called_once_with()
+    thread_cls.call_args.kwargs["args"][0].close()
+
+
+def test_wait_for_completion_joins_watcher_without_a_deadline() -> None:
+    ctrl = MeasurementController()
+    watcher = Mock()
+    watcher.is_alive.return_value = True
+    ctrl.thread = watcher
+
+    with patch("pa_host.gui_server.threading.current_thread", return_value=object()):
+        ctrl.wait_for_completion()
+
+    watcher.join.assert_called_once_with()
+
+
+def test_server_shutdown_waits_for_measurement_finalization() -> None:
+    server = Mock(server_port=8769)
+    app = Mock()
+    app.measurement.process = None
+
+    with (
+        patch("pa_host.gui_server.ThreadingHTTPServer", return_value=server),
+        patch("pa_host.gui_server.APP", app),
+        patch("pa_host.gui_server.signal.signal"),
+    ):
+        serve(port=8769)
+
+    app.schedule.stop.assert_called_once_with()
+    app.measurement.stop.assert_called_once_with()
+    app.measurement.wait_for_completion.assert_called_once_with()
+    server.server_close.assert_called_once_with()
+
+
+def test_debug_probe_arms_rtt_without_starting_and_begin_queues_set_first() -> None:
+    app = AppState()
+    line = "SET fsr=2 off=4 conv=auto period=4 e=200 vwe=1200 idle=2 sysper=2 cellv=1 ioc=0"
+    with patch.object(app.schedule, "snapshot", return_value={"active": False}), \
+            patch.object(app.measurement, "snapshot", return_value={"state": "idle"}), \
+            patch.object(app.measurement, "start", return_value={"state": "running"}) as start:
+        app.start_debug_run({"note": "probe", "probe_only": True})
+    assert start.call_args.kwargs["trigger"] == "ARMED"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.process = Mock()
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.debug_waiting_for_start = True
+        ctrl._cfg_confirmed_this_session = True
+        result = ctrl.begin_debug_measurement(line)
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == f"{line}\n"
+        assert result["sent"] == [line]
+        assert ctrl.debug_waiting_for_start is True
+
+        ctrl._cfg_live = {
+            "ep": 2, "confirmed_ep": 2, "fsr": 2, "off": 4,
+            "conv": 4, "conv_src": "auto", "period": 4,
+            "e_mv": 200, "vwe_mv": 1200, "idle": 2, "sysper": 2,
+            "cellv": 1, "ioc": 0,
+        }
+        ctrl._maybe_start_confirmed_debug()
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == f"{line}\nSTART\n"
+        assert ctrl.debug_waiting_for_start is False
+
+
+def test_rejected_debug_config_never_starts_with_the_old_values() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.process = Mock()
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.debug_waiting_for_start = True
+        ctrl._cfg_confirmed_this_session = True
+        ctrl._cfg_live = {"ep": 1, "confirmed_ep": 1, "fsr": 0, "off": 2,
+                          "conv": 0, "conv_src": "auto", "period": 0,
+                          "e_mv": -200, "vwe_mv": 1200, "idle": 2,
+                          "sysper": 3, "cellv": 1, "ioc": 0}
+        bad = "SET fsr=0 off=7 conv=auto period=0 e=-200 vwe=250 idle=2 sysper=3 cellv=1 ioc=0"
+        ctrl.begin_debug_measurement(bad)
+        ctrl._last_reject = {"kind": "CFG_REJECT", "reason": "offset_gt_fsr"}
+        ctrl._maybe_start_confirmed_debug()
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == bad + "\n"
+        assert ctrl.debug_waiting_for_start is True
+
+
+def test_debug_config_already_confirmed_starts_without_waiting_for_new_epoch() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.process = Mock()
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.debug_waiting_for_start = True
+        ctrl._cfg_confirmed_this_session = True
+        ctrl._cfg_live = {"ep": 2, "confirmed_ep": 2, "fsr": 0, "off": 6,
+                          "conv": 0, "conv_src": "auto", "period": 0,
+                          "e_mv": -200, "vwe_mv": 250, "idle": 2,
+                          "sysper": 3, "cellv": 1, "ioc": 0}
+        line = "SET fsr=0 off=6 conv=auto period=0 e=-200 vwe=250 idle=2 sysper=3 cellv=1 ioc=0"
+        result = ctrl.begin_debug_measurement(line)
+        assert result["already_applied"] is True
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "START\n"
+        assert ctrl.debug_waiting_for_start is False
+
+
+def test_previous_run_confirmation_cannot_skip_set_after_reconnect() -> None:
+    """Stop -> reconnect may reboot the MCU; cached V_WE=250 must not authorize START."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.process = Mock()
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.debug_waiting_for_start = True
+        # This is deliberately a stale snapshot from the previous RTT session.
+        ctrl._cfg_live = {"ep": 2, "confirmed_ep": 2, "fsr": 0, "off": 6,
+                          "conv": 0, "conv_src": "auto", "period": 0,
+                          "e_mv": -200, "vwe_mv": 250, "idle": 2,
+                          "sysper": 3, "cellv": 1, "ioc": 0}
+        ctrl._cfg_confirmed_this_session = False
+        line = "SET fsr=0 off=6 conv=auto period=0 e=-200 vwe=250 idle=2 sysper=3 cellv=1 ioc=0"
+
+        try:
+            ctrl.begin_debug_measurement(line)
+        except RuntimeError as exc:
+            assert "本次连接" in str(exc)
+        else:
+            raise AssertionError("上一轮的 CFG_CONFIRMED 不应允许本轮直接 START")
+        assert not ctrl.cmd_path.exists()
+
+
+def test_debug_incremental_read_keeps_partial_jsonl_and_csv_lines() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ctrl = MeasurementController()
+        ctrl.audit_path = root / "audit.jsonl"
+        ctrl.raw_path = root / "current.csv"
+        ctrl.cell_v_path = root / "cellv.csv"
+        ctrl.audit_path.write_text('{"kind":"CFG_BOOT",', encoding="utf-8")
+        ctrl.raw_path.write_text("dev_ms,fa_fw,sat,epoch\n100,1000000,0,1\n", encoding="utf-8")
+        ctrl.cell_v_path.write_text("dev_ms,e_mv,we_mv,re_mv,epoch,we_code,re_code\n", encoding="utf-8")
+
+        assert ctrl._audit_events() == []
+        assert len(ctrl._debug_series()["current"]["t"]) == 1
+        with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write('"ms":1}\n')
+        with ctrl.raw_path.open("a", encoding="utf-8") as handle:
+            handle.write("200,2000000,0,1")
+        assert ctrl._audit_events()[-1]["kind"] == "CFG_BOOT"
+        assert len(ctrl._debug_series()["current"]["t"]) == 1
+        with ctrl.raw_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n")
+        assert len(ctrl._debug_series()["current"]["t"]) == 2
+
+
+def test_live_data_device_clock_rollback_resets_platform_monitor() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.raw_path = Path(tmp) / "raw.csv"
+        ctrl.raw_path.write_text(
+            "dev_ms,fa_fw,sat,ovf\n1000,1000000,0,0\n",
+            encoding="utf-8",
+        )
+        ctrl._data()
+        ctrl._plateau_last_segment = 8
+        ctrl._plateau_consecutive_passes = 2
+        ctrl._plateau_evaluation = {"stable": True}
+        ctrl._plateau_progress = {"elapsed_s": 40.0}
+
+        with ctrl.raw_path.open("a", encoding="utf-8") as handle:
+            handle.write("500,2000000,0,0\n")
+        data = ctrl._data()
+
+        assert data["time_s"] == [0.0]
+        assert ctrl._plateau_last_segment == 0
+        assert ctrl._plateau_consecutive_passes == 0
+        assert ctrl._plateau_evaluation is None
+        assert ctrl._plateau_progress == {}
+
+
+def test_new_cfg_epoch_resets_platform_monitor_only_once() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.audit_path = Path(tmp) / "audit.jsonl"
+        ctrl.audit_path.write_text(
+            json.dumps({"kind": "CFG_APPLIED", "ep": 3}) + "\n",
+            encoding="utf-8",
+        )
+        ctrl._audit_events()
+        ctrl._plateau_last_segment = 6
+        ctrl._plateau_consecutive_passes = 2
+        ctrl._plateau_evaluation = {"stable": True}
+        ctrl._plateau_progress = {"elapsed_s": 30.0}
+
+        with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"kind": "CFG_DERIVED", "ep": 3}) + "\n")
+            handle.write(json.dumps({"kind": "CFG_CONFIRMED", "ep": 3}) + "\n")
+        ctrl._audit_events()
+
+        assert ctrl._plateau_last_segment == 6
+        assert ctrl._plateau_consecutive_passes == 2
+        assert ctrl._plateau_evaluation == {"stable": True}
+        assert ctrl._plateau_progress == {"elapsed_s": 30.0}
+
+        with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"kind": "CFG_APPLIED", "ep": 4}) + "\n")
+        ctrl._audit_events()
+
+        assert ctrl._plateau_cfg_epoch == 4
+        assert ctrl._plateau_last_segment == 0
+        assert ctrl._plateau_consecutive_passes == 0
+        assert ctrl._plateau_evaluation is None
+        assert ctrl._plateau_progress == {}
+
+
+def test_new_cfg_epoch_excludes_unread_old_epoch_tail_from_platform() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ctrl = MeasurementController()
+        ctrl.settings = SettingsController.validate({"adaptive_stop": True})
+        ctrl.state = "running"
+        ctrl.metadata = {}
+        ctrl.process = Mock()
+        ctrl.cmd_path = root / "cmd.txt"
+        ctrl.audit_path = root / "audit.jsonl"
+        ctrl.raw_path = root / "raw.csv"
+        ctrl.audit_path.write_text(
+            json.dumps({"kind": "CFG_APPLIED", "ep": 1}) + "\n",
+            encoding="utf-8",
+        )
+        initial = np.arange(0.0, 10.01, 0.1)
+        ctrl.raw_path.write_text(
+            "dev_ms,fa_fw,sat,ovf,epoch\n" + "".join(
+                f"{round(value * 1000)},99000000,0,0,1\n" for value in initial
+            ),
+            encoding="utf-8",
+        )
+        ctrl._audit_events()
+        ctrl._maybe_auto_stop()
+        assert ctrl._plateau_context_epoch == 1
+        assert max(ctrl._data_cache["time_s"]) == pytest.approx(10.0)
+
+        # The cache still ends at 10.0 s. Rows through 10.7 s were produced by
+        # the old hardware context but have not been parsed when ep=2 arrives.
+        old_tail = np.arange(10.1, 10.71, 0.1)
+        new_context = np.arange(10.8, 45.11, 0.1)
+        with ctrl.raw_path.open("a", encoding="utf-8") as handle:
+            handle.write("".join(
+                f"{round(value * 1000)},99000000,0,0,1\n" for value in old_tail
+            ))
+            handle.write("".join(
+                f"{round(value * 1000)},4000000,0,0,2\n"
+                for value in new_context
+            ))
+        with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"kind": "CFG_APPLIED", "ep": 2}) + "\n")
+        ctrl._audit_events()
+
+        with patch(
+            "pa_host.gui_server.evaluate_platform",
+            wraps=__import__("pa_host.it", fromlist=["evaluate_platform"]).evaluate_platform,
+        ) as evaluate:
+            ctrl._maybe_auto_stop()
+
+        assert evaluate.called
+        evaluated_times, evaluated_currents = evaluate.call_args.args[:2]
+        assert min(evaluated_times) == pytest.approx(10.8)
+        assert set(evaluated_currents) == {4.0}
+        assert ctrl._plateau_context_epoch == 2
+        assert ctrl._plateau_context_start_s == pytest.approx(10.8)
+        assert ctrl._data_cache["epoch"][-1] == 2
+
+
+def test_new_cfg_epoch_clears_stale_derived_fields_and_requests_replay() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        root = Path(tmp)
+        ctrl.audit_path = root / "audit.jsonl"
+        ctrl.cmd_path = root / "cmd.txt"
+        ctrl.audit_path.write_text(
+            "".join(json.dumps(event) + "\n" for event in (
+                {"kind": "CFG_APPLIED", "ep": 3, "period": 4},
+                {"kind": "CFG_DERIVED", "ep": 3, "bits": 18,
+                 "period_ms": 124},
+                {"kind": "CFG_CONFIRMED", "ep": 3, "verify_ok": 1},
+            )),
+            encoding="utf-8",
+        )
+        ctrl._audit_events()
+        assert ctrl._cfg_live["bits"] == 18
+        assert ctrl._cfg_live["confirmed_ep"] == 3
+
+        with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "kind": "CFG_APPLIED", "ep": 4, "period": 5,
+            }) + "\n")
+        ctrl._audit_events()
+
+        assert ctrl._cfg_live["ep"] == 4
+        assert ctrl._cfg_live["period"] == 5
+        assert "bits" not in ctrl._cfg_live
+        assert "period_ms" not in ctrl._cfg_live
+        assert "confirmed_ep" not in ctrl._cfg_live
+        assert ctrl._cfg_confirmed_this_session is False
+
+        ctrl.state = "running"
+        ctrl.metadata = {"debug": True}
+        ctrl._auto_get_at = 0.0
+        ctrl.debug_snapshot()
+
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "GET\n"
+
+
+def test_range_applied_resets_platform_monitor() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.raw_log = Path(tmp) / "rtt.log"
+        ctrl.raw_log.write_text(
+            "RANGE_APPLIED fsr_pa=250000 off_pa=9000\n", encoding="utf-8"
+        )
+        ctrl._plateau_last_segment = 6
+        ctrl._plateau_consecutive_passes = 2
+        ctrl._plateau_evaluation = {"stable": True}
+        ctrl._plateau_progress = {"elapsed_s": 30.0}
+
+        ctrl._scan_range_events()
+
+        assert ctrl.range_runtime["applied"]["fsr_pa"] == 250000
+        assert ctrl._plateau_last_segment == 0
+        assert ctrl._plateau_consecutive_passes == 0
+        assert ctrl._plateau_evaluation is None
+        assert ctrl._plateau_progress == {}
+        assert ctrl._plateau_context_pending is True
+
+
+def test_range_applied_boundary_waits_for_first_new_epoch_sample() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ctrl = MeasurementController()
+        ctrl.raw_path = root / "raw.csv"
+        ctrl.raw_log = root / "rtt.log"
+        initial = np.arange(0.0, 10.01, 0.1)
+        ctrl.raw_path.write_text(
+            "dev_ms,fa_fw,sat,ovf,epoch\n" + "".join(
+                f"{round(value * 1000)},99000000,0,0,1\n" for value in initial
+            ),
+            encoding="utf-8",
+        )
+        ctrl._plateau_cfg_epoch = 1
+        with ctrl.lock:
+            first = ctrl._plateau_context_data_locked(ctrl._data())
+        assert first["epoch"][-1] == 1
+
+        with ctrl.raw_path.open("a", encoding="utf-8") as handle:
+            handle.write("10100,99000000,0,0,1\n10700,99000000,0,0,1\n")
+            handle.write("10800,4000000,0,0,2\n10900,4000000,0,0,2\n")
+        ctrl._cfg_live = {"fsr": 2, "off": 4}
+        ctrl.raw_log.write_text(
+            "RANGE_APPLIED fsr_code=1 offset_sel=4\n", encoding="utf-8"
+        )
+        ctrl._scan_range_events()
+        with ctrl.lock:
+            current = ctrl._plateau_context_data_locked(ctrl._data())
+
+        assert current["time_s"] == pytest.approx([10.8, 10.9])
+        assert current["current_nA"] == [4.0, 4.0]
+        assert current["epoch"] == [2, 2]
+        assert ctrl._plateau_context_epoch == 2
+        assert ctrl._plateau_context_pending is False
+
+
+def test_debug_series_rejects_saturated_and_overflow_samples() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.raw_path = Path(tmp) / "raw.csv"
+        ctrl.raw_path.write_text(
+            "dev_ms,fa_fw,sat,ovf,epoch\n"
+            "100,1000000,0,0,1\n"
+            "200,2000000,1,0,1\n"
+            "300,3000000,0,1,1\n",
+            encoding="utf-8",
+        )
+
+        assert ctrl._debug_series()["current"]["valid"] == [True, False, False]
+
+
+@pytest.mark.parametrize(
+    ("path", "method_name", "payload"),
+    [
+        ("/api/debug/stop", "stop", {}),
+        ("/api/debug/begin", "begin_debug_measurement", {"line": "SET fsr=2"}),
+        ("/api/debug/cmd", "send_command", {"line": "SET fsr=2 FORCE"}),
+    ],
+)
+def test_debug_mutation_endpoints_reject_formal_measurement(
+    path: str, method_name: str, payload: dict[str, object],
+) -> None:
+    app = AppState()
+    app.measurement.state = "running"
+    app.measurement.metadata = {"debug": False}
+    handler = RequestHandler.__new__(RequestHandler)
+    handler.path = path
+    handler._body = Mock(return_value=payload)
+    handler._send_json = Mock()
+
+    with patch("pa_host.gui_server.APP", app), \
+            patch.object(app.measurement, method_name) as mutation:
+        handler.do_POST()
+
+    mutation.assert_not_called()
+    response, status = handler._send_json.call_args.args
+    assert "不是硬件 DEBUG 测量" in response["error"]
+    assert status == 409
+
+
+@pytest.mark.parametrize(
+    ("path", "method_name", "payload"),
+    [
+        ("/api/debug/stop", "stop", {}),
+        ("/api/debug/begin", "begin_debug_measurement", {"line": "SET fsr=2"}),
+        ("/api/debug/cmd", "send_command", {"line": "GET"}),
+    ],
+)
+def test_debug_mutation_endpoints_allow_debug_measurement(
+    path: str, method_name: str, payload: dict[str, object],
+) -> None:
+    app = AppState()
+    app.measurement.state = "running"
+    app.measurement.metadata = {"debug": True}
+    handler = RequestHandler.__new__(RequestHandler)
+    handler.path = path
+    handler._body = Mock(return_value=payload)
+    handler._send_json = Mock()
+    expected = {"sent": path}
+
+    with patch("pa_host.gui_server.APP", app), \
+            patch.object(app.measurement, method_name, return_value=expected) as mutation:
+        handler.do_POST()
+
+    mutation.assert_called_once()
+    handler._send_json.assert_called_once_with(expected)
+
+
+def test_debug_snapshot_exposes_read_only_formal_run_state() -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.metadata = {"debug": False}
+
+    snapshot = ctrl.debug_snapshot()
+
+    assert snapshot["debug_run"] is False
+    assert snapshot["mutations_allowed"] is False
+
+
+def test_it_tainted_audit_marks_formal_run_error_before_analysis() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.metadata = {"debug": False}
+        ctrl.audit_path = Path(tmp) / "audit.jsonl"
+        ctrl.audit_path.write_text(
+            json.dumps({
+                "kind": "IT_TAINTED", "ep": 4,
+                "reason": "perturb_during_run",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        ctrl.process = Mock()
+        ctrl.process.poll.return_value = 0
+        ctrl.process.wait.return_value = 0
+        completed: list[dict[str, object]] = []
+        ctrl.on_complete = completed.append
+        log_handle = Mock()
+
+        ctrl._watch(log_handle)
+
+        assert ctrl.state == "error"
+        assert ctrl.summary is None
+        assert ctrl._hardware_taint is not None
+        assert ctrl._hardware_taint["reason"] == "perturb_during_run"
+        assert completed[0]["hardware_taint"]["kind"] == "IT_TAINTED"
+        assert "IT_TAINTED" in ctrl.error
+        log_handle.close.assert_called_once_with()
+
+
+def test_it_done_final_marker_recovers_a_dropped_taint_event() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.raw_log = Path(tmp) / "rtt.log"
+        ctrl.raw_log.write_text(
+            "IT_DONE native=240 expected=240 elapsed_ms=30000 ep=4 tainted=1\n",
+            encoding="utf-8",
+        )
+
+        ctrl._scan_range_events()
+
+        assert ctrl._hardware_taint is not None
+        assert ctrl._hardware_taint["kind"] == "IT_DONE"
+        assert ctrl._hardware_taint["tainted"] == 1
+        assert ctrl._hardware_taint["reason"] == "firmware_final_marker"
+
+
+def test_tainted_formal_run_never_enters_calibration_or_measurement_index() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "workspace"
+        app._load_workspace()
+        raw_path = Path(tmp) / "tainted-raw.csv"
+        raw_path.write_text("dev_ms,fa_fw,sat,ovf\n", encoding="utf-8")
+        run = {
+            "run_id": "tainted-run",
+            "state": "error",
+            "finished_at": 123.0,
+            "run_dir": str(Path(tmp) / "run"),
+            "raw_path": str(raw_path),
+            "hardware_taint": {
+                "kind": "IT_TAINTED", "reason": "perturb_during_run",
+            },
+            "metadata": {
+                "sample_name": "bad-calibration",
+                "sample_role": "calibration",
+                "known_concentration_um": 10.0,
+            },
+        }
+
+        with patch("pa_host.gui_server._notify_measurement_completion"):
+            app._measurement_completed(run)
+
+        result = app.measurement.snapshot()["workflow_result"]
+        assert result["tainted"] is True
+        assert result["state"] == "error"
+        assert app.points == []
+        assert app.records == []
+        assert not (app.save_dir / "measurement-index.csv").exists()
+        assert not (app.save_dir / "calibration-points.csv").exists()
+
+
+def _cfg_gate_events(expected: dict[str, object], *, request_id: str,
+                     epoch: int = 7, **overrides: object) -> list[dict[str, object]]:
+    actual = {**expected, **overrides}
+    applied_keys = {
+        "fsr", "off", "conv_src", "period", "sysper", "clk40", "ioc",
+        "e_mv", "vwe_mv", "idle", "cellv", "chop", "rs", "ios", "satpct",
+        "sel", "amps",
+    }
+    applied = {key: actual[key] for key in applied_keys}
+    return [
+        {"kind": "CFG_APPLIED", "ep": epoch, "src": "get", "req": request_id,
+         **applied},
+        {"kind": "CFG_DERIVED", "ep": epoch, "req": request_id, "bits": 18},
+        {"kind": "CFG_CONFIRMED", "ep": epoch, "src": "get", "req": request_id,
+         "verify_ok": actual.get("verify_ok", 1),
+         "invalid_cfg": actual.get("invalid_cfg", 0),
+         "vdd_oor": actual.get("vdd_oor", 0)},
+    ]
+
+
+def _legacy_cfg_gate_events(
+    expected: dict[str, object], *, epoch: int = 7, **overrides: object,
+) -> list[dict[str, object]]:
+    events = _cfg_gate_events(
+        expected, request_id="", epoch=epoch, **overrides,
+    )
+    for event in events:
+        event.pop("req", None)
+    events[-1].pop("verify_ok", None)
+    return events
+
+
+def test_formal_config_gate_requires_one_confirmed_request_snapshot() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.audit_path = Path(tmp) / "audit.jsonl"
+        expected = SettingsController.runtime_afe_contract({})
+        ctrl._config_gate = {
+            "state": "checking", "expected": expected, "request_id": "abc123",
+            "legacy_fallback_sent": False, "mismatches": [],
+        }
+        events = _cfg_gate_events(expected, request_id="abc123")
+        ctrl.audit_path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+        )
+
+        ctrl._audit_events()
+
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "START\n"
+        assert ctrl._config_gate["state"] == "matched"
+        assert ctrl.metadata["hardware_config"]["epoch"] == 7
+        assert ctrl.metadata["hardware_config"]["verification_level"] == "physical_registers"
+
+
+def test_formal_config_gate_never_mixes_epochs_or_request_ids() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.audit_path = Path(tmp) / "audit.jsonl"
+        expected = SettingsController.runtime_afe_contract({})
+        ctrl._config_gate = {
+            "state": "checking", "expected": expected, "request_id": "fresh",
+            "legacy_fallback_sent": False, "mismatches": [],
+        }
+        old = _cfg_gate_events(expected, request_id="old", epoch=2)
+        split = _cfg_gate_events(expected, request_id="fresh", epoch=3)
+        # The requested APPLIED cannot borrow DERIVED/CONFIRMED from another req.
+        events = old + [split[0], {**split[1], "req": "other"}, {**split[2], "req": "other"}]
+        ctrl.audit_path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+        )
+
+        ctrl._audit_events()
+
+        assert not ctrl.cmd_path.exists()
+        assert ctrl._config_gate["state"] == "checking"
+
+
+def test_formal_config_gate_blocks_every_runtime_mismatch() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.audit_path = Path(tmp) / "audit.jsonl"
+        expected = SettingsController.runtime_afe_contract({})
+        ctrl._config_gate = {
+            "state": "checking", "expected": expected, "request_id": "gate1",
+            "legacy_fallback_sent": False, "mismatches": [],
+        }
+        events = _cfg_gate_events(
+            expected, request_id="gate1", idle=1, sysper=2, ioc=1,
+            cellv=0, conv_src="pin", sel=0, amps=0,
+        )
+        ctrl.audit_path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+        )
+
+        ctrl._audit_events()
+
+        assert not ctrl.cmd_path.exists()
+        assert ctrl._config_gate["state"] == "mismatch"
+        assert {item["field"] for item in ctrl._config_gate["mismatches"]} == {
+            "conv_src", "sysper", "ioc", "idle", "cellv", "sel", "amps",
+        }
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload"),
+    [
+        ("range", {"fsr_code": 2, "offset_sel": 4}),
+        ("command", "SET idle=1"),
+        ("command", "POKE 0x68 0 FORCE"),
+        ("command", "OCP 1000"),
+    ],
+)
+def test_formal_config_gate_rejects_runtime_mutations_before_start(
+    tmp_path: Path, operation: str, payload: object,
+) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl._config_gate = {"state": "checking", "mismatches": []}
+
+    with pytest.raises(RuntimeError, match="配置核对期间"):
+        if operation == "range":
+            assert isinstance(payload, dict)
+            ctrl.send_range(payload)
+        else:
+            assert isinstance(payload, str)
+            ctrl.send_command(payload)
+
+    assert not ctrl.cmd_path.exists()
+
+
+def test_formal_config_gate_allows_read_only_diagnostics(tmp_path: Path) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl._config_gate = {"state": "checking", "mismatches": []}
+
+    for line in ("GET", "STATUS", "PEEK 0x23"):
+        ctrl.send_command(line)
+
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+        "GET\nSTATUS\nPEEK 0x23\n"
+    )
+
+
+def test_stop_during_config_gate_wakes_waiter_without_completion_callback() -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = None
+    ctrl._config_gate = {"state": "checking", "mismatches": []}
+    completed: list[dict[str, object]] = []
+    ctrl.on_complete = completed.append
+
+    with patch("pa_host.gui_server.threading.Thread") as thread_cls:
+        ctrl.stop()
+
+    assert ctrl._config_gate_event.wait(0)
+    assert ctrl._config_gate["state"] == "aborted"
+    assert ctrl.user_stop_requested is True
+    thread_cls.assert_called_once_with(
+        target=ctrl._terminate_if_running,
+        args=(ctrl.process, 0.0), daemon=True,
+    )
+
+    ctrl.process.poll.return_value = 3
+    ctrl.process.wait.return_value = 3
+    log_handle = Mock()
+    ctrl._watch(log_handle)
+    assert ctrl.state == "idle"
+    assert completed == []
+    log_handle.close.assert_called_once_with()
+
+
+def test_process_exit_during_config_gate_wakes_waiter_without_callback() -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = 1
+    ctrl.process.wait.return_value = 1
+    ctrl._config_gate = {"state": "checking", "mismatches": []}
+    completed: list[dict[str, object]] = []
+    ctrl.on_complete = completed.append
+
+    log_handle = Mock()
+    ctrl._watch(log_handle)
+
+    assert ctrl._config_gate_event.wait(0)
+    assert ctrl._config_gate["state"] == "process_exit"
+    assert ctrl.state == "error"
+    assert completed == []
+    log_handle.close.assert_called_once_with()
+
+
+def test_initial_gate_get_write_failure_still_starts_cleanup_watcher(
+    tmp_path: Path,
+) -> None:
+    ctrl = MeasurementController()
+    process = Mock()
+    process.poll.return_value = None
+    terminator = Mock()
+    watcher = Mock()
+    real_open = Path.open
+
+    def fail_command_append(path: Path, mode: str = "r", *args, **kwargs):
+        if path.name == "cmd.txt" and "a" in mode:
+            raise OSError("injected command write failure")
+        return real_open(path, mode, *args, **kwargs)
+
+    with (
+        patch("pa_host.gui_server.RUNS_DIR", tmp_path),
+        patch("pa_host.gui_server.subprocess.Popen", return_value=process) as popen,
+        patch("pa_host.gui_server.Path.open", autospec=True,
+              side_effect=fail_command_append),
+        patch("pa_host.gui_server.threading.Thread",
+              side_effect=[terminator, watcher]) as thread_cls,
+        pytest.raises(RuntimeError, match="无法下发硬件配置回读命令"),
+    ):
+        ctrl.start_verified()
+
+    assert ctrl._config_gate_event.wait(0)
+    assert ctrl._config_gate["state"] == "io_error"
+    assert thread_cls.call_args_list[0].kwargs == {
+        "target": ctrl._terminate_if_running,
+        "args": (process, 0.0),
+        "daemon": True,
+    }
+    assert thread_cls.call_args_list[1].kwargs["target"] == ctrl._watch
+    terminator.start.assert_called_once_with()
+    watcher.start.assert_called_once_with()
+    popen.call_args.kwargs["stdout"].close()
+
+
+def test_tagged_gate_get_retries_before_legacy_probe(tmp_path: Path) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.cmd_path.write_text("GET req=retry1\n", encoding="utf-8")
+    ctrl._config_gate = {
+        "state": "checking", "request_id": "retry1", "started_at": 100.0,
+        "last_tagged_get_at": 100.0, "tagged_get_attempts": 1,
+        "legacy_fallback_sent": False, "mismatches": [],
+    }
+
+    with patch("pa_host.gui_server.time.time", return_value=100.5):
+        ctrl._maybe_retry_tagged_gate_get_locked()
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == "GET req=retry1\n"
+
+    with patch("pa_host.gui_server.time.time", return_value=100.8):
+        ctrl._maybe_retry_tagged_gate_get_locked()
+    assert ctrl._config_gate["tagged_get_attempts"] == 2
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+        "GET req=retry1\nGET req=retry1\n"
+    )
+
+    with patch("pa_host.gui_server.time.time", return_value=106.1):
+        ctrl._maybe_retry_tagged_gate_get_locked()
+        ctrl._maybe_send_legacy_gate_get_locked()
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+        "GET req=retry1\nGET req=retry1\nGET\n"
+    )
+    assert ctrl._config_gate["legacy_fallback_sent"] is True
+
+
+def test_start_write_failure_fails_gate_without_escaping_audit_poll(
+    tmp_path: Path,
+) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = None
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.cmd_path.mkdir()
+    ctrl.audit_path = tmp_path / "audit.jsonl"
+    expected = SettingsController.runtime_afe_contract({})
+    ctrl._config_gate = {
+        "state": "checking", "expected": expected, "request_id": "gate-start",
+        "legacy_fallback_sent": False, "mismatches": [],
+    }
+    ctrl.audit_path.write_text("".join(
+        json.dumps(event) + "\n"
+        for event in _cfg_gate_events(expected, request_id="gate-start")
+    ), encoding="utf-8")
+
+    with patch("pa_host.gui_server.threading.Thread") as thread_cls:
+        ctrl._audit_events()
+
+    assert ctrl._config_gate_event.wait(0)
+    assert ctrl._config_gate["state"] == "io_error"
+    assert "hardware_config" not in ctrl.metadata
+    thread_cls.assert_called_once_with(
+        target=ctrl._terminate_if_running,
+        args=(ctrl.process, 0.0), daemon=True,
+    )
+
+
+def test_legacy_get_write_failure_fails_gate(tmp_path: Path) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = None
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.cmd_path.mkdir()
+    ctrl._config_gate = {
+        "state": "checking", "started_at": 0.0,
+        "legacy_fallback_sent": False, "mismatches": [],
+    }
+
+    with patch("pa_host.gui_server.threading.Thread") as thread_cls:
+        ctrl._maybe_send_legacy_gate_get_locked()
+
+    assert ctrl._config_gate_event.wait(0)
+    assert ctrl._config_gate["state"] == "io_error"
+    assert ctrl._config_gate["legacy_fallback_sent"] is False
+    thread_cls.assert_called_once_with(
+        target=ctrl._terminate_if_running,
+        args=(ctrl.process, 0.0), daemon=True,
+    )
+
+
+def test_legacy_fallback_rejects_a_new_no_req_snapshot(tmp_path: Path) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = None
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.audit_path = tmp_path / "audit.jsonl"
+    expected = SettingsController.runtime_afe_contract({})
+    ctrl._config_gate = {
+        "state": "checking", "expected": expected, "request_id": "fresh",
+        "started_at": 0.0, "legacy_fallback_sent": False, "mismatches": [],
+    }
+    stale = _legacy_cfg_gate_events(expected, epoch=5)
+    ctrl.audit_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in stale), encoding="utf-8",
+    )
+    ctrl._audit_events()
+    assert ctrl._config_gate["state"] == "checking"
+
+    ctrl._maybe_send_legacy_gate_get_locked()
+    ctrl._advance_config_gate_locked()
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == "GET\n"
+    assert ctrl._config_gate["state"] == "checking"
+
+    fresh = _legacy_cfg_gate_events(expected, epoch=5)
+    with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(json.dumps(event) + "\n" for event in fresh))
+    with patch("pa_host.gui_server.threading.Thread") as thread_cls:
+        ctrl._audit_events()
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == "GET\n"
+    assert ctrl._config_gate["state"] == "unsupported_firmware"
+    assert ctrl._config_gate["verification_level"] == "reported_config"
+    assert ctrl._config_gate_event.wait(0)
+    assert ctrl._config_gate["message"] == (
+        "固件不支持完整物理配置核验，请重新应用条件并烧录硬件"
+    )
+    thread_cls.assert_called_once_with(
+        target=ctrl._terminate_if_running,
+        args=(ctrl.process, 0.0), daemon=True,
+    )
+
+
+def test_exact_gate_response_without_verify_ok_is_unsupported(
+    tmp_path: Path,
+) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = None
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.audit_path = tmp_path / "audit.jsonl"
+    expected = SettingsController.runtime_afe_contract({})
+    ctrl._config_gate = {
+        "state": "checking", "expected": expected, "request_id": "exact-old",
+        "legacy_fallback_sent": False, "mismatches": [],
+    }
+    events = _cfg_gate_events(expected, request_id="exact-old", epoch=8)
+    events[-1].pop("verify_ok")
+    ctrl.audit_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8",
+    )
+
+    with patch("pa_host.gui_server.threading.Thread"):
+        ctrl._audit_events()
+
+    assert not ctrl.cmd_path.exists()
+    assert ctrl._config_gate["state"] == "unsupported_firmware"
+    assert ctrl._config_gate["verification_level"] == "reported_config"
+    assert ctrl._config_gate_event.wait(0)
+
+
+def test_exact_gate_response_beats_newer_legacy_candidate(tmp_path: Path) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = None
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.audit_path = tmp_path / "audit.jsonl"
+    ctrl.audit_path.write_text("", encoding="utf-8")
+    expected = SettingsController.runtime_afe_contract({})
+    ctrl._config_gate = {
+        "state": "checking", "expected": expected, "request_id": "exact",
+        "started_at": 0.0, "legacy_fallback_sent": False, "mismatches": [],
+    }
+    ctrl._maybe_send_legacy_gate_get_locked()
+    events = [
+        *_legacy_cfg_gate_events(expected, epoch=12, idle=1),
+        *_cfg_gate_events(expected, request_id="exact", epoch=7),
+    ]
+    ctrl.audit_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8",
+    )
+
+    ctrl._audit_events()
+
+    assert ctrl._config_gate["state"] == "matched"
+    assert ctrl._config_gate["ep"] == 7
+    assert ctrl._config_gate["verification_level"] == "physical_registers"
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == "GET\nSTART\n"
+
+
+def test_formal_gate_blocks_physical_verify_failure(tmp_path: Path) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.process.poll.return_value = None
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.audit_path = tmp_path / "audit.jsonl"
+    expected = SettingsController.runtime_afe_contract({})
+    ctrl._config_gate = {
+        "state": "checking", "expected": expected, "request_id": "bad-verify",
+        "legacy_fallback_sent": False, "mismatches": [],
+    }
+    events = [
+        {"kind": "CFG_FAULT", "ep": 7, "req": "bad-verify",
+         "cause": "verify_mismatch"},
+        *_cfg_gate_events(
+            expected, request_id="bad-verify", epoch=7, verify_ok=0,
+        ),
+    ]
+    ctrl.audit_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8",
+    )
+
+    with patch("pa_host.gui_server.threading.Thread"):
+        ctrl._audit_events()
+
+    assert ctrl._config_gate_event.wait(0)
+    assert ctrl._config_gate["state"] == "mismatch"
+    assert not ctrl.cmd_path.exists()
+    assert {item["field"] for item in ctrl._config_gate["mismatches"]} >= {
+        "verify_ok", "config_integrity",
+    }
+
+
+def test_debug_platform_monitor_uses_live_period_and_never_stops() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.settings = SettingsController.validate({"adaptive_stop": False})
+        ctrl.metadata = {"debug": True}
+        ctrl.state = "running"
+        ctrl.process = Mock()
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl._cfg_live = {"period_ms": 1882}
+        t = np.arange(0.0, 39.9, 0.1)
+        traces = iter([
+            {"time_s": t[:350].tolist(), "current_nA": np.full(350, 4.0).tolist(),
+             "valid": np.ones(350, dtype=bool).tolist()},
+            {"time_s": t.tolist(), "current_nA": np.full(len(t), 4.0).tolist(),
+             "valid": np.ones(len(t), dtype=bool).tolist()},
+        ])
+        with patch.object(ctrl, "_data", side_effect=lambda: next(traces)), \
+                patch("pa_host.gui_server.evaluate_platform", wraps=__import__(
+                    "pa_host.it", fromlist=["evaluate_platform"]
+                ).evaluate_platform) as evaluate:
+            ctrl._maybe_auto_stop()
+            ctrl._maybe_auto_stop()
+
+        assert ctrl._plateau_evaluation is not None
+        assert ctrl.auto_stop_requested is False
+        assert not ctrl.cmd_path.exists()
+        assert evaluate.call_args.kwargs["expected_sample_rate_hz"] == pytest.approx(
+            1000 / 1882
+        )
+
+
+def test_plateau_controller_persists_validated_settings() -> None:
+    with tempfile.TemporaryDirectory() as tmp, patch(
+        "pa_host.gui_server.PLATEAU_SETTINGS_PATH", Path(tmp) / "plateau.json"
+    ):
+        controller = PlateauController()
+        result = controller.apply({
+            **PlateauConfig().to_dict(),
+            "segment_duration_s": 4,
+            "segment_count": 8,
+            "required_consecutive_windows": 3,
+        })
+        restored = PlateauController().snapshot()
+
+        assert result["window_duration_s"] == 32
+        assert restored["settings"]["required_consecutive_windows"] == 3
+        assert restored["window_duration_s"] == 32
+
+
+def test_plateau_controller_write_failure_keeps_previous_settings() -> None:
+    with tempfile.TemporaryDirectory() as tmp, patch(
+        "pa_host.gui_server.PLATEAU_SETTINGS_PATH", Path(tmp) / "plateau.json"
+    ) as settings_path:
+        controller = PlateauController()
+        original = controller.settings
+        settings_path.write_text(
+            json.dumps({"settings": original.to_dict()}), encoding="utf-8",
+        )
+        changed = {
+            **original.to_dict(),
+            "segment_duration_s": 4,
+            "segment_count": 8,
+        }
+
+        with patch("pa_host.gui_server.os.replace", side_effect=OSError("disk full")), \
+                pytest.raises(OSError, match="disk full"):
+            controller.apply(changed)
+
+        assert controller.settings == original
+        assert json.loads(settings_path.read_text(encoding="utf-8")) == {
+            "settings": original.to_dict(),
+        }
+        assert list(Path(tmp).glob(".plateau.json.*.tmp")) == []
+
+
+def test_plateau_apply_rejects_formal_run_before_mutating_settings() -> None:
+    with tempfile.TemporaryDirectory() as tmp, patch(
+        "pa_host.gui_server.PLATEAU_SETTINGS_PATH", Path(tmp) / "plateau.json"
+    ) as settings_path:
+        app = AppState()
+        app.measurement.state = "running"
+        app.measurement.metadata = {"debug": False}
+        app.measurement._plateau_last_segment = 6
+        payload = {
+            **PlateauConfig().to_dict(),
+            "segment_duration_s": 4,
+            "segment_count": 8,
+        }
+        handler = RequestHandler.__new__(RequestHandler)
+        handler.path = "/api/plateau/apply"
+        handler._body = Mock(return_value=payload)
+        handler._send_json = Mock()
+
+        with patch("pa_host.gui_server.APP", app):
+            handler.do_POST()
+
+        assert app.plateau.settings == PlateauConfig()
+        assert app.schedule.plateau_config == PlateauConfig()
+        assert app.measurement.plateau_config == PlateauConfig()
+        assert app.measurement._plateau_last_segment == 6
+        assert not settings_path.exists()
+        response, status = handler._send_json.call_args.args
+        assert "正式测量" in response["error"]
+        assert status == 409
+
+
+def test_plateau_apply_updates_running_debug_and_resets_monitor() -> None:
+    with tempfile.TemporaryDirectory() as tmp, patch(
+        "pa_host.gui_server.PLATEAU_SETTINGS_PATH", Path(tmp) / "plateau.json"
+    ) as settings_path:
+        app = AppState()
+        app.measurement.state = "running"
+        app.measurement.metadata = {"debug": True}
+        app.measurement._plateau_last_segment = 6
+        app.measurement._plateau_consecutive_passes = 2
+        app.measurement._plateau_evaluation = {"stable": True}
+        app.measurement._plateau_progress = {"elapsed_s": 30.0}
+        payload = {
+            **PlateauConfig().to_dict(),
+            "segment_duration_s": 4,
+            "segment_count": 8,
+        }
+        handler = RequestHandler.__new__(RequestHandler)
+        handler.path = "/api/plateau/apply"
+        handler._body = Mock(return_value=payload)
+        handler._send_json = Mock()
+
+        with patch("pa_host.gui_server.APP", app):
+            handler.do_POST()
+
+        expected = PlateauConfig.validate(payload)
+        assert app.plateau.settings == expected
+        assert app.schedule.plateau_config == expected
+        assert app.measurement.plateau_config == expected
+        assert app.measurement._plateau_last_segment == 0
+        assert app.measurement._plateau_consecutive_passes == 0
+        assert app.measurement._plateau_evaluation is None
+        assert app.measurement._plateau_progress == {}
+        assert settings_path.exists()
+        handler._send_json.assert_called_once()
+
+
+@pytest.mark.parametrize("stop_flag", ["user_stop_requested", "auto_stop_requested"])
+def test_plateau_apply_rejects_stopping_debug_before_persisting(
+    stop_flag: str,
+) -> None:
+    with tempfile.TemporaryDirectory() as tmp, patch(
+        "pa_host.gui_server.PLATEAU_SETTINGS_PATH", Path(tmp) / "plateau.json"
+    ) as settings_path:
+        app = AppState()
+        app.measurement.state = "running"
+        app.measurement.metadata = {"debug": True}
+        setattr(app.measurement, stop_flag, True)
+        app.measurement._plateau_last_segment = 6
+        payload = {
+            **PlateauConfig().to_dict(),
+            "segment_duration_s": 4,
+            "segment_count": 8,
+        }
+        handler = RequestHandler.__new__(RequestHandler)
+        handler.path = "/api/plateau/apply"
+        handler._body = Mock(return_value=payload)
+        handler._send_json = Mock()
+
+        with patch("pa_host.gui_server.APP", app):
+            handler.do_POST()
+
+        assert app.plateau.settings == PlateauConfig()
+        assert app.schedule.plateau_config == PlateauConfig()
+        assert app.measurement.plateau_config == PlateauConfig()
+        assert app.measurement._plateau_last_segment == 6
+        assert not settings_path.exists()
+        response, status = handler._send_json.call_args.args
+        assert response["error"] == "测量正在停止，不能修改自动停止参数"
+        assert status == 409
+
+
+def test_plateau_apply_rejects_active_schedule_before_persisting() -> None:
+    with tempfile.TemporaryDirectory() as tmp, patch(
+        "pa_host.gui_server.PLATEAU_SETTINGS_PATH", Path(tmp) / "plateau.json"
+    ) as settings_path:
+        app = AppState()
+        app.schedule.active = True
+        payload = {
+            **PlateauConfig().to_dict(),
+            "segment_duration_s": 4,
+            "segment_count": 8,
+        }
+        handler = RequestHandler.__new__(RequestHandler)
+        handler.path = "/api/plateau/apply"
+        handler._body = Mock(return_value=payload)
+        handler._send_json = Mock()
+
+        with patch("pa_host.gui_server.APP", app):
+            handler.do_POST()
+
+        assert app.plateau.settings == PlateauConfig()
+        assert not settings_path.exists()
+        response, status = handler._send_json.call_args.args
+        assert "自动任务" in response["error"]
+        assert status == 409
+
+
+def test_debug_run_forces_it_settings_when_formal_method_is_cv() -> None:
+    app = AppState()
+    app.settings.settings = SettingsController.validate({"method": "cv"})
+    with patch.object(app.schedule, "snapshot", return_value={"active": False}), \
+            patch.object(app.measurement, "start", return_value={"state": "running"}) as start:
+        app.start_debug_run({"note": "cv-formal-settings", "probe_only": True})
+
+    assert start.call_args.kwargs["settings"]["method"] == "it"
+
+
+def test_settings_and_schedule_reject_non_finite_values() -> None:
+    with pytest.raises(ValueError, match="NaN"):
+        SettingsController.validate({"potential_v": float("nan")})
+    app = AppState()
+    with pytest.raises(ValueError, match="间隔"):
+        app.schedule.start({"interval_minutes": float("nan")})
+    with pytest.raises(ValueError, match="整数"):
+        SettingsController.validate({"cv_cycles": 1.5})

@@ -22,5 +22,9 @@ measurements/
 .env.*
 !.env.example
 **/.DS_Store
+**/Thumbs.db
 .history/
 .playwright-mcp/
+
+# Windows PyInstaller specs
+*.spec

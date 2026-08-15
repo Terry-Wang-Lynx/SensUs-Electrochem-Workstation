@@ -1025,6 +1025,38 @@ static void test_parse_patch_semantics(void)
 	CHECK_EQ(cmd.verb, AFE_VERB_NONE);
 }
 
+static void test_get_request_correlation(void)
+{
+	afe_cfg_t base = base_cfg();
+	afe_cmd_t cmd;
+	afe_reject_t why;
+
+	CHECK_TRUE(afe_cfg_parse("GET", &base, &cmd, &why));
+	CHECK_EQ(cmd.verb, AFE_VERB_GET);
+	CHECK_TRUE(cmd.req[0] == '\0');
+
+	CHECK_TRUE(afe_cfg_parse("GET req=Gate-20260815-A9", &base, &cmd, &why));
+	CHECK_TRUE(strcmp(cmd.req, "Gate-20260815-A9") == 0);
+	CHECK_TRUE(afe_cfg_parse("GET req=12345678901234567890123456789012", &base,
+				 &cmd, &why));
+	CHECK_EQ(strlen(cmd.req), AFE_CFG_REQ_MAX);
+
+	CHECK_FALSE(afe_cfg_parse("GET req=bad_value", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_VALUE);
+	CHECK_TRUE(strcmp(why.key, "req") == 0);
+	CHECK_FALSE(afe_cfg_parse("GET req=123456789012345678901234567890123", &base,
+				  &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_ARG);
+	CHECK_FALSE(afe_cfg_parse("GET req=a req=b", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_DUP_KEY);
+	CHECK_FALSE(afe_cfg_parse("GET fsr=2", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_ARG);
+	CHECK_FALSE(afe_cfg_parse("GET 1", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_ARG);
+	CHECK_FALSE(afe_cfg_parse("GET FORCE", &base, &cmd, &why));
+	CHECK_EQ(why.code, AFE_REJ_ARG);
+}
+
 /* 🔴 A3:每一类错都必须有名字,不能静默 */
 static void test_parse_rejects_every_bad_form(void)
 {
@@ -1290,6 +1322,98 @@ static void test_plan_preserves_sensor_selected(void)
 	}
 }
 
+static bool expected_value(const afe_plan_t *plan, uint8_t addr, uint8_t *value)
+{
+	for (uint8_t i = 0U; i < plan->n; i++) {
+		if (plan->w[i].addr == addr) {
+			*value = plan->w[i].val;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void test_expected_register_snapshot(void)
+{
+	afe_cfg_t c = base_cfg();
+	afe_cfg_t changed;
+	afe_derived_t d;
+	afe_derived_t d_changed;
+	afe_plan_t expected;
+	afe_plan_t changes;
+	uint8_t v = 0U;
+
+	afe_cfg_derive(&c, &d);
+	afe_cfg_expected_regs(&c, &expected);
+	CHECK_EQ(expected.n, 11);
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_SYSTEM_CONTROL, &v));
+	CHECK_EQ(v, max30131_enc_system_control(false, false, false, c.clk40));
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_S1_CONFIG1, &v));
+	CHECK_EQ(v, 0xC5);
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_S1_CONFIG4, &v));
+	CHECK_EQ(v, max30131_enc_s1_config4(c.fsr, c.off));
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_S1_CONFIG5, &v));
+	CHECK_EQ(v, max30131_enc_s1_config5(c.conv, true));
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_SYS_ADC_SETUP, &v));
+	CHECK_EQ(v, max30131_enc_sys_adc_setup(MAX30131_SYSADC_GAIN_1X,
+					       MAX30131_SYSADC_GAIN_0P25X));
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_SYS_ADC_IN_SEL1, &v));
+	CHECK_EQ(v, (1U << MAX30131_SYSADC_SYS_SELECT_Pos) |
+		    (1U << MAX30131_SYSADC_VDD_SEL_Pos));
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_CONVERT_SETUP2, &v));
+	CHECK_EQ(v, c.sysper);
+
+	/* 连采关闭时这四个字节的期望值必须唯一，不受启停历史影响。 */
+	c.cellv = false;
+	afe_cfg_expected_regs(&c, &expected);
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_SYS_ADC_SETUP, &v));
+	CHECK_EQ(v, 0);
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_SYS_ADC_IN_SEL1, &v));
+	CHECK_EQ(v, 0);
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_SYS_ADC_IN_SEL2, &v));
+	CHECK_EQ(v, 0);
+	CHECK_TRUE(expected_value(&expected, MAX30131_REG_CONVERT_SETUP2, &v));
+	CHECK_EQ(v, 0);
+
+	/* SET cellv 的写计划必须与 GET 快照同源，否则会自己写完自己报错。 */
+	changed = base_cfg();
+	changed.cellv = false;
+	afe_cfg_derive(&changed, &d_changed);
+	c = base_cfg();
+	afe_cfg_derive(&c, &d);
+	afe_cfg_plan(&c, &d, &changed, &d_changed, &changes);
+	CHECK_TRUE(expected_value(&changes, MAX30131_REG_SYS_ADC_SETUP, &v));
+	CHECK_EQ(v, 0);
+	CHECK_TRUE(expected_value(&changes, MAX30131_REG_SYS_ADC_IN_SEL1, &v));
+	CHECK_EQ(v, 0);
+	CHECK_TRUE(expected_value(&changes, MAX30131_REG_CONVERT_SETUP2, &v));
+	CHECK_EQ(v, 0);
+
+	/* clk40 不能只改 cfg_live；plan 必须真正写 0x14。 */
+	changed = c;
+	changed.clk40 = true;
+	changed.conv_pinned = true;
+	afe_cfg_derive(&changed, &d_changed);
+	afe_cfg_plan(&c, &d, &changed, &d_changed, &changes);
+	CHECK_TRUE(expected_value(&changes, MAX30131_REG_SYSTEM_CONTROL, &v));
+	CHECK_EQ(v, max30131_enc_system_control(false, false, false, true));
+}
+
+static void test_get_verify_rejects_stale_status_after_read_failure(void)
+{
+	/*
+	 * 前一次 STATUS1=0 只是旧快照。本次 GET 即使已读回全部配置
+	 * 寄存器，STATUS1 读取失败也必须拉低 verify_ok，不得复用旧的 0。
+	 */
+	uint8_t stale_status1 = 0U;
+
+	CHECK_EQ(stale_status1, 0U);
+	CHECK_FALSE(afe_cfg_verify_snapshot_ok(true, false, false));
+	CHECK_FALSE(afe_cfg_verify_snapshot_ok(false, true, false));
+	CHECK_FALSE(afe_cfg_verify_snapshot_ok(true, true, true));
+	CHECK_TRUE(afe_cfg_verify_snapshot_ok(true, true, false));
+}
+
 static void test_audit_line_formats(void)
 {
 	afe_cfg_t a = base_cfg(), b = base_cfg();
@@ -1301,6 +1425,7 @@ static void test_audit_line_formats(void)
 			     .a = 0, .b = 0 };
 
 	b.off = MAX30131_OFFSET_SEL4_9NA;
+	b.satpct = 7;
 	afe_cfg_derive(&a, &da);
 	afe_cfg_derive(&b, &db);
 	afe_cfg_plan(&a, &da, &b, &db, &plan);
@@ -1311,6 +1436,7 @@ static void test_audit_line_formats(void)
 	CHECK_TRUE(strstr(buf, "CFG_APPLIED ep=7") == buf);
 	CHECK_TRUE(strstr(buf, "off=4 off0=3") != NULL);
 	CHECK_TRUE(strstr(buf, "conv_src=auto") != NULL);
+	CHECK_TRUE(strstr(buf, "satpct=7 satpct0=5") != NULL);
 
 	n = afe_cfg_fmt_derived(7, &b, &db, buf, sizeof(buf));
 	CHECK_TRUE(n > 0);
@@ -1374,6 +1500,7 @@ int main(void)
 	RUN(test_sysadc_budget_and_sysper_rule);
 	RUN(test_polarization_write_order_avoids_unsafe_midstate);
 	RUN(test_parse_patch_semantics);
+	RUN(test_get_request_correlation);
 	RUN(test_parse_rejects_every_bad_form);
 	RUN(test_overlong_line_cannot_inject_command);
 	RUN(test_range_alias_equals_set);
@@ -1382,6 +1509,8 @@ int main(void)
 	RUN(test_write_order_never_invalid);
 	RUN(test_plan_skips_unchanged_and_marks_perturb);
 	RUN(test_plan_preserves_sensor_selected);
+	RUN(test_expected_register_snapshot);
+	RUN(test_get_verify_rejects_stale_status_after_read_failure);
 	RUN(test_audit_line_formats);
 	return mt_report();
 }

@@ -9,10 +9,10 @@ from pa_host.record import CSV_COLUMNS, Sample, sample_to_row
 
 def _write_raw(path: Path) -> None:
     samples = [
-        Sample(0, 1000, 31000, 1000000, 0, True, 0, 0, -600, 1, 1),
-        Sample(1, 1124, 30000, 2000000, 0, True, 0, 0, 0, 1, 1),
-        Sample(2, 1248, 29000, 3000000, 0, True, 0, 0, 600, 1, -1),
-        Sample(3, 1372, 28000, 4000000, 0, True, 0, 0, 0, 1, -1),
+        Sample(0, 1000, 31000, 1000000, 0, True, 0, 0, 0, -600, 1, 1),
+        Sample(1, 1124, 30000, 2000000, 0, True, 0, 0, 0, 0, 1, 1),
+        Sample(2, 1248, 29000, 3000000, 0, True, 0, 0, 0, 600, 1, -1),
+        Sample(3, 1372, 28000, 4000000, 0, True, 0, 0, 0, 0, 1, -1),
     ]
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)

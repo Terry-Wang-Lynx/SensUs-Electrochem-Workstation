@@ -2,19 +2,7 @@
 set -euo pipefail
 
 ROOT="${0:A:h:h}"
-VARIANT="${SENSUS_APP_VARIANT:-v4}"
-if [[ "$VARIANT" == "v51" ]]; then
-  APP_NAME="SensUs V5.1 Workstation"
-  INFO_PLIST="$ROOT/macos/Info-v51.plist"
-  SWIFT_FLAGS=(-D SENSUS_V51)
-elif [[ "$VARIANT" == "v4" ]]; then
-  APP_NAME="SensUs Workstation"
-  INFO_PLIST="$ROOT/macos/Info.plist"
-  SWIFT_FLAGS=()
-else
-  echo "Unknown SENSUS_APP_VARIANT: $VARIANT (expected v4 or v51)" >&2
-  exit 2
-fi
+APP_NAME="SensUs Workstation"
 BUILD_DIR="$ROOT/build/macos"
 APP_BUILD="$BUILD_DIR/$APP_NAME.app"
 APP_DIST="$ROOT/dist/$APP_NAME.app"
@@ -56,17 +44,16 @@ X86_BINARY="$BUILD_DIR/SensUsWorkstation-x86_64"
 UNIVERSAL_BINARY="$BUILD_DIR/SensUsWorkstation"
 
 xcrun swiftc -swift-version 5 -O -target arm64-apple-macos13.0 \
-  "${SWIFT_FLAGS[@]}" -framework AppKit -framework WebKit "$SOURCE" -o "$ARM_BINARY"
+  -framework AppKit -framework WebKit "$SOURCE" -o "$ARM_BINARY"
 xcrun swiftc -swift-version 5 -O -target x86_64-apple-macos13.0 \
-  "${SWIFT_FLAGS[@]}" -framework AppKit -framework WebKit "$SOURCE" -o "$X86_BINARY"
+  -framework AppKit -framework WebKit "$SOURCE" -o "$X86_BINARY"
 /usr/bin/lipo -create "$ARM_BINARY" "$X86_BINARY" -output "$UNIVERSAL_BINARY"
 
 rm -rf "$APP_BUILD"
 mkdir -p "$APP_BUILD/Contents/MacOS" "$APP_BUILD/Contents/Resources"
 cp "$UNIVERSAL_BINARY" "$APP_BUILD/Contents/MacOS/SensUsWorkstation"
-cp "$INFO_PLIST" "$APP_BUILD/Contents/Info.plist"
+cp "$ROOT/macos/Info.plist" "$APP_BUILD/Contents/Info.plist"
 cp "$BUILD_DIR/AppIcon.icns" "$APP_BUILD/Contents/Resources/AppIcon.icns"
-printf '%s\n' "$ROOT" > "$APP_BUILD/Contents/Resources/project-root.txt"
 
 /usr/bin/codesign --force --deep --sign - "$APP_BUILD"
 rm -rf "$APP_DIST"

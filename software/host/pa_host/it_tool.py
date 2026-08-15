@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -100,14 +101,12 @@ def _plot_calibration(points, model: CalibrationModel, output: str | Path) -> No
 
 
 def _cmd_measure(args: argparse.Namespace) -> int:
-    # Keep this wrapper transparent: collect.py owns the line protocol and raw CSV.
+    # Keep this wrapper transparent: collect.py owns the RTT protocol and raw CSV.
     cmd = [sys.executable, "-m", "pa_host.collect",
            "--out", str(args.out), "--duration", str(args.duration),
            "--idle-timeout", str(args.idle_timeout), "--progress-every", "100"]
     cmd += ["--cv"] if args.cv else ["--it-10hz"]
-    if args.serial:
-        cmd += ["--serial", args.serial]
-    elif args.start_jlink:
+    if args.start_jlink:
         cmd += ["--start-jlink", "--elf", str(args.elf)]
         if args.probe_serial:
             cmd += ["--probe-serial", args.probe_serial]
@@ -125,21 +124,49 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         cmd += ["--raw-log", str(args.raw_log)]
     if args.trigger:
         cmd += ["--trigger", args.trigger]
-    return subprocess.call(cmd)
+
+    child: subprocess.Popen[bytes] | None = None
+    pending_sigterm = False
+
+    def _forward_sigterm(signum, _frame) -> None:
+        nonlocal pending_sigterm
+        pending_sigterm = True
+        if child is None:
+            return
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    previous_sigterm = signal.signal(signal.SIGTERM, _forward_sigterm)
+    try:
+        child = subprocess.Popen(cmd)
+        # SIGTERM may arrive after Popen starts the process but before it returns
+        # and assigns ``child``. Forward that pending request once assignment is safe.
+        if pending_sigterm:
+            try:
+                child.send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        exit_code = child.wait()
+        # The collector exits 0 after a graceful signal so its CSV is complete.
+        # Preserve a distinct wrapper code so callers do not treat a partial,
+        # manually stopped acquisition as a naturally completed run.
+        return 3 if pending_sigterm else exit_code
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="10Hz i-t 标定与浓度预测工具")
     sub = ap.add_subparsers(dest="command", required=True)
 
-    measure = sub.add_parser("measure", help="从 RTT/USB CDC 收取原始数据")
+    measure = sub.add_parser("measure", help="从 RTT 收取原始 120s 数据")
     source = measure.add_mutually_exclusive_group()
     source.add_argument("--socket", default=None,
                          help="连接已启动的 RTT socket,如 127.0.0.1:19021")
     source.add_argument("--start-jlink", action="store_true",
                         help="用项目推荐的 J-Link V8.80 自动启动 RTT")
-    source.add_argument("--serial", default=None,
-                        help="V5.1 DATA CDC,如 /dev/cu.usbmodemXXXX")
     measure.add_argument("--elf", type=Path,
                          default=Path("/tmp/pabuild/firmware/zephyr/zephyr.elf"))
     measure.add_argument("--probe-serial")

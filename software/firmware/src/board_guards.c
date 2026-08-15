@@ -18,46 +18,6 @@ LOG_MODULE_REGISTER(guards, CONFIG_LOG_DEFAULT_LEVEL);
 static const struct device *wdt_dev;
 static int wdt_ch = -1;
 
-#if defined(CONFIG_BOARD_PA_CONVERTER_V51)
-static uint32_t boot_uicr_approtect;
-static uint32_t boot_uicr_regout0;
-static nrf_power_mainregstatus_t boot_mainregstatus;
-#endif
-
-int board_guards_preflight(void)
-{
-#if defined(CONFIG_BOARD_PA_CONVERTER_V51)
-	bool bad = false;
-
-	/* Read only: UICR is never written by application firmware. */
-	boot_uicr_approtect = NRF_UICR->APPROTECT;
-	boot_uicr_regout0 = NRF_UICR->REGOUT0;
-	boot_mainregstatus = nrf_power_mainregstatus_get(NRF_POWER);
-
-	/* The optional REG1 DC/DC inductor is not fitted on V5.1. */
-	if (nrf_power_dcdcen_get(NRF_POWER)) {
-		nrf_power_dcdcen_set(NRF_POWER, false);
-		bad = true;
-	}
-
-	if ((boot_uicr_approtect & UICR_APPROTECT_PALL_Msk) !=
-	    UICR_APPROTECT_PALL_HwDisabled) {
-		bad = true;
-	}
-	if ((boot_uicr_regout0 & UICR_REGOUT0_VOUT_Msk) !=
-	    UICR_REGOUT0_VOUT_3V3) {
-		bad = true;
-	}
-	if (boot_mainregstatus != NRF_POWER_MAINREGSTATUS_HIGH) {
-		bad = true;
-	}
-
-	return bad ? -EPERM : 0;
-#else
-	return 0;
-#endif
-}
-
 /* ------------------------------------------------------------------ */
 /* [1] DCDCEN 断言                                                     */
 /* ------------------------------------------------------------------ */
@@ -77,9 +37,8 @@ static void assert_dcdc_disabled(void)
 			"检查是否有 overlay/prj.conf 打开了 CONFIG_BOARD_ENABLE_DCDC");
 		nrf_power_dcdcen_set(NRF_POWER, false);
 	} else {
-		LOG_INF("DCDCEN=0 OK(LDO mode)");
+		LOG_INF("DCDCEN=0 OK(LDO 模式,radio 电流约 2x,续航按此预算)");
 	}
-
 }
 
 /* ------------------------------------------------------------------ */
@@ -97,12 +56,7 @@ static void assert_dcdc_disabled(void)
 static void setup_power_fail_comparator(void)
 {
 	nrf_power_pofcon_set(NRF_POWER, true, NRF_POWER_POFTHR_V20);
-#if defined(CONFIG_BOARD_PA_CONVERTER_V51)
-	nrf_power_pofcon_vddh_set(NRF_POWER, NRF_POWER_POFTHRVDDH_V42);
-	LOG_INF("POFCON = ON @2.0V VDD / 4.2V VDDH(USB high-voltage mode)");
-#else
 	LOG_INF("POFCON = ON @2.0V(VDD=VDDH normal voltage mode)");
-#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -149,28 +103,10 @@ static int setup_watchdog(void)
 /* ------------------------------------------------------------------ */
 int board_guards_init(void)
 {
-	int rc = board_guards_preflight();
-
-	if (rc != 0) {
-#if defined(CONFIG_BOARD_PA_CONVERTER_V51)
-		LOG_ERR("V5.1 power/UICR audit failed: APPROTECT=0x%08x "
-			"REGOUT0=0x%08x MAINREGSTATUS=%u (required: 0x5a, 3.3V, VDDH)",
-			boot_uicr_approtect, boot_uicr_regout0,
-			(unsigned)boot_mainregstatus);
-#else
-		LOG_ERR("board preflight failed: %d", rc);
-#endif
-		return rc;
-	}
-
-#if defined(CONFIG_BOARD_PA_CONVERTER_V51)
-	LOG_INF("V5.1 UICR/power audit OK: APPROTECT=0x%02x REGOUT0=3.3V VDDH=active",
-		(unsigned)(boot_uicr_approtect & UICR_APPROTECT_PALL_Msk));
-#endif
 	assert_dcdc_disabled();
 	setup_power_fail_comparator();
 
-	rc = setup_watchdog();
+	int rc = setup_watchdog();
 
 	if (rc) {
 		/*

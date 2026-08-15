@@ -150,11 +150,13 @@ header > span {
 }
 
 #progressText {
-  width: 34px;
+  min-width: 34px;
+  max-width: 132px;
   color: #66767a;
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .controls {

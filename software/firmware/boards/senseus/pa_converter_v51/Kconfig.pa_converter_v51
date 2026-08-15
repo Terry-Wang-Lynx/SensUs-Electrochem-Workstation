@@ -1,3 +1,0 @@
-config BOARD_PA_CONVERTER_V51
-	bool "pA-Converter V5.1 (custom, USB)"
-	select SOC_NRF52833_QDAA

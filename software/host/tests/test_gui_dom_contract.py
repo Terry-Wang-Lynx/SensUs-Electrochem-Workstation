@@ -1,0 +1,421 @@
+import json
+import re
+import subprocess
+from pathlib import Path
+
+
+GUI_DIR = Path(__file__).parents[1] / "pa_host" / "gui"
+
+
+def _extract_js_function(source: str, name: str) -> str:
+    start = source.index(f"function {name}(")
+    opening = source.index("{", start)
+    depth = 0
+    for offset in range(opening, len(source)):
+        if source[offset] == "{":
+            depth += 1
+        elif source[offset] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:offset + 1]
+    raise AssertionError(f"Unterminated JavaScript function: {name}")
+
+
+def _evaluate_chart_js(names: list[str], setup: str, result: str) -> object:
+    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    functions = "\n".join(_extract_js_function(source, name) for name in names)
+    script = f"{functions}\n{setup}\nconsole.log(JSON.stringify({result}));"
+    completed = subprocess.run(
+        ["node", "-e", script], check=True, capture_output=True, text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_app_references_existing_html_ids() -> None:
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+
+    referenced = set(re.findall(r"\$\('([^']+)'\)", app))
+    declared = set(re.findall(r'\bid="([^"]+)"', html))
+
+    assert referenced <= declared, f"Missing DOM ids: {sorted(referenced - declared)}"
+
+
+def test_both_filter_panels_expose_only_the_shared_lowpass_configuration() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    required = {
+        "mode", "lowpass_enabled", "lowpass_cutoff_hz", "lowpass_auto",
+        "lowpass_order",
+    }
+    for key in required:
+        assert html.count(f'data-filter-key="{key}"') == 2, key
+    assert html.count('data-show-raw') == 2
+    assert html.count('data-filter-apply') == 2
+    assert html.count('>显示原数据</span>') == 2
+    assert html.count('type="text" inputmode="decimal" autocomplete="off" data-filter-key="lowpass_cutoff_hz"') == 2
+    assert "data-filter-note" not in html
+    assert "等待足够数据后计算滤波器" not in app
+    assert "分析结果另存为 *-filtered.csv" not in app
+    assert "notch" not in html.lower()
+
+
+def test_calibration_chart_has_independent_point_visibility_controls() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="showCalibrationPoints" type="checkbox" checked' in html
+    assert 'id="showTestPoints" type="checkbox" checked' in html
+
+
+def test_ap_chart_keeps_the_literal_blue_boundary() -> None:
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "zone==='blue'?[x-2,x+2]" in app
+
+
+def test_ap_chart_zone_colors_keep_green_and_blue_distinct() -> None:
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert "band('green','#cfe8dc');band('blue','#cfe1e8')" in app
+    assert ".ap-swatch.blue{background:#cfe1e8}.ap-swatch.green{background:#cfe8dc}" in styles
+
+
+def test_ap_chart_uses_a_fixed_zero_to_fifty_domain() -> None:
+    domain = _evaluate_chart_js(
+        ["apChartDomain"],
+        """
+const candidates = [
+  {concentration_um: 100, predicted_concentration_um: 250},
+  {concentration_um: 30, predicted_concentration_um: -20},
+];
+const domain = apChartDomain(candidates, candidates);
+""",
+        "domain",
+    )
+
+    assert domain == {"xMax": 50, "yMax": 50, "minValue": 0}
+
+
+def test_ap_chart_is_square_and_visible_without_test_points() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert ".ap-chart{width:640px" in styles
+    assert "max-width:100%;height:auto;aspect-ratio:1/1;padding:0" in styles
+    assert ".ap-chart canvas{display:block}" in styles
+    assert ".ap-chart{height:330px}" not in styles
+    assert "const m={l:52,r:18,t:18,b:52}" in app
+    assert app.count("ctx.rect(m.l,m.t,w-m.l-m.r,h-m.t-m.b);ctx.clip()") == 2
+    assert "apScoreEmpty" not in html
+    assert "apScoreEmpty" not in app
+
+
+def test_unknown_concentrations_are_excluded_from_coordinate_charts() -> None:
+    included = _evaluate_chart_js(
+        ["hasFiniteConcentration"],
+        """
+const points = [
+  {concentration_um: null},
+  {concentration_um: ''},
+  {},
+  {concentration_um: 0},
+  {concentration_um: '5'},
+];
+""",
+        "points.map(hasFiniteConcentration)",
+    )
+
+    assert included == [False, False, False, True, True]
+
+
+def test_browser_inverse_matches_backend_selection_and_tolerance() -> None:
+    values = _evaluate_chart_js(
+        ["modelPredictAt"],
+        """
+const quadratic = {
+  degree: 2, coefficients: [-1, 10, -25],
+  concentration_min_um: 0, concentration_max_um: 10,
+};
+const shallowLinear = {
+  degree: 1, coefficients: [1e-14, 0],
+  concentration_min_um: 0, concentration_max_um: 10,
+};
+""",
+        "[modelPredictAt(quadratic, -4), modelPredictAt(shallowLinear, 2e-14)]",
+    )
+
+    assert values == [7, 2]
+
+
+def test_unknown_concentration_does_not_hide_an_uninvertible_point() -> None:
+    has_uninvertible = _evaluate_chart_js(
+        ["localApDetail", "localApScore", "hasUninvertibleApPoint"],
+        """
+const points = [
+  {concentration_um: null, predicted_concentration_um: 5},
+  {concentration_um: 5, predicted_concentration_um: null},
+];
+""",
+        "hasUninvertibleApPoint(localApScore(points))",
+    )
+
+    assert has_uninvertible is True
+
+
+def test_new_run_resets_only_the_fixed_it_chart_window() -> None:
+    fixed, tail_20, tail_5, same_run = _evaluate_chart_js(
+        ["syncChartWindowRun"],
+        """
+let state = {chartRunId: 'run-1', chartWindowFixed: true, chartWindowS: 500};
+syncChartWindowRun('run-2');
+const fixed = {...state};
+state = {chartRunId: 'run-2', chartWindowFixed: false, chartWindowS: 20};
+syncChartWindowRun('run-3');
+const tail20 = {...state};
+state = {chartRunId: 'run-3', chartWindowFixed: false, chartWindowS: 5};
+syncChartWindowRun('run-4');
+const tail5 = {...state};
+state = {chartRunId: 'run-4', chartWindowFixed: true, chartWindowS: 600};
+syncChartWindowRun('run-4');
+const sameRun = {...state};
+""",
+        "[fixed, tail20, tail5, sameRun]",
+    )
+
+    assert fixed == {"chartRunId": "run-2", "chartWindowFixed": True, "chartWindowS": 300}
+    assert tail_20["chartWindowS"] == 20
+    assert tail_5["chartWindowS"] == 5
+    assert same_run["chartWindowS"] == 600
+
+
+def test_it_conditions_expose_only_one_automatic_stop_control() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert html.count('id="adaptiveStop"') == 1
+    assert html.count(">自动停止</span>") == 1
+    assert "智能平台停止" not in html
+
+
+def test_live_metric_strip_uses_backend_it_metrics_and_keeps_cv_separate() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+    strip = re.search(
+        r'<section class="panel chart-panel">.*?'
+        r'<div class="metric-strip">(.*?)</div>\s*'
+        r'<div class="filter-panel"',
+        html,
+        re.S,
+    )
+
+    assert strip is not None
+    assert strip.group(1).count("<div>") == 4
+    for element_id in (
+        "steadyCurrent", "steadySd", "metricTertiaryValue",
+        "metricTrendState", "metricQuaternaryValue", "metricProgressDetail",
+    ):
+        assert html.count(f'id="{element_id}"') == 1
+    assert "平稳仅代表斜率进入阈值，不代表自动停止全部门禁通过" in html
+    it_renderer = _extract_js_function(app, "renderItMetricStrip")
+    cv_renderer = _extract_js_function(app, "renderCvMetricStrip")
+    for field in (
+        "data.rolling_metrics", "steady_current_nA", "noise_nA",
+        "slope_nA_per_s", "trend_state", "native_point_count",
+        "progress_percent", "data.stability_eta?.display_text",
+    ):
+        assert field in it_renderer
+    assert "data.data" not in it_renderer
+    assert "consecutive_passes" not in it_renderer
+    assert "required_consecutive_windows" not in it_renderer
+    assert "adaptive?'预计稳定':'进度'" in it_renderer
+    assert "个原生点" in it_renderer
+    assert "'frozen'" in it_renderer
+    assert "fmt(metrics.slope_nA_per_s,3)" in it_renderer
+    assert "data.data" not in cv_renderer
+    assert "data.rolling_metrics" in cv_renderer
+    assert "metrics.native_point_count" in cv_renderer
+    assert "metrics.expected_native_point_count" in cv_renderer
+    assert "metrics.progress_percent" in cv_renderer
+    assert "stability_eta" not in cv_renderer
+    for state, symbol, label in (
+        ("rising", "↑", "上升"), ("falling", "↓", "下降"),
+        ("flat", "✓", "平稳"), ("insufficient", "·", "数据不足"),
+    ):
+        assert f"{state}:['{symbol}','{label}']" in app
+    assert ".metric-trend.trend-rising,.metric-trend.trend-falling{color:var(--red)}" in styles
+    assert ".metric-trend.trend-flat{color:var(--green-dark)}" in styles
+    assert ".metric-trend.trend-insufficient{color:var(--muted)}" in styles
+
+
+def test_metric_formatter_preserves_negative_zero_slope() -> None:
+    values = _evaluate_chart_js(
+        ["fmt"], "", "[fmt(-0, 3), fmt(-0.0001, 3), fmt(0, 3)]",
+    )
+
+    assert values == ["-0.000", "-0.000", "0.000"]
+
+
+def test_adaptive_fit_window_stays_editable_and_drives_timing() -> None:
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "$('fitWindowS').disabled=false" in app
+    assert "$('fitWindowS').disabled=adaptive" not in app
+    assert "adaptive?`I-T 智能平台检测与末 ${s.fit_window_s} 秒稳态分析`" in app
+    assert "Math.max(plateauWindowDuration(plateau),Number(s.fit_window_s||0))" in app
+
+
+def test_plateau_configuration_is_shared_by_two_collapsed_panels() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    keys = {
+        "segment_duration_s", "segment_count", "absolute_tolerance_nA",
+        "relative_tolerance", "scatter_multiplier", "minimum_coverage_ratio",
+        "maximum_gap_periods", "required_consecutive_windows",
+        "spike_scale_multiplier", "spike_neighbor_multiplier",
+    }
+
+    assert html.count("data-plateau-panel") == 2
+    assert html.count("data-plateau-apply") == 2
+    assert html.count("data-plateau-window") == 2
+    for key in keys:
+        assert html.count(f'data-plateau-key="{key}"') == 2, key
+    assert not re.search(r"<details[^>]*data-plateau-panel[^>]*\bopen\b", html)
+    assert "api('/api/plateau')" in app
+    assert "post('/api/plateau/apply'" in app
+    assert 'document.querySelectorAll(`[data-plateau-key="${input.dataset.plateauKey}"]`)' in app
+
+
+def test_debug_chart_exposes_persisted_optional_layers_and_plateau_window() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="dbgShowPotential" type="checkbox" checked' in html
+    assert 'id="dbgShowPlateau" type="checkbox" checked' in html
+    assert "显示电位" in html
+    assert "显示平台判定" in html
+    assert 'data-window="plateau"' in html
+    assert "debugShowPotential" in app
+    assert "debugShowPlateau" in app
+    assert "state.dbgShowPotential?[" in app
+    assert "axis:'right'" in app
+
+
+def test_debug_controls_become_read_only_during_a_formal_run() -> None:
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "const readOnly = running && !d.debug_run;" in app
+    assert "const readOnly = running && !d?.debug_run;" in app
+    assert "正式测量中 · Debug 只读" in app
+    assert "$(field.id).disabled = readOnly" in app
+    assert "$('dbgStop').disabled = !running || stopping || readOnly" in app
+    assert "!running || stopping || waiting || readOnly" in app
+    assert "setPlateauFormalRunLock(readOnly)" in app
+    assert "setPlateauFormalRunLock(running&&!Boolean(data.metadata?.debug))" in app
+    assert "control.disabled=state.plateauBusy||state.plateauLockedByFormalRun" in app
+    assert "if(state.plateauBusy||state.plateauLockedByFormalRun)return" in app
+    assert "formalDebugPanel" not in app
+
+
+def test_debug_actions_do_not_reuse_pre_action_snapshots() -> None:
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "function invalidateDebugSnapshots()" in app
+    assert "async function fetchDebugSnapshot(fresh=false)" in app
+    assert app.count("fetchDebugSnapshot(true)") >= 3
+    assert "let debugSessionStarted = Boolean(waiting && state.debug?.debug_run)" in app
+    assert "if (debugSessionStarted)" in app
+    assert "generation!==state.dbgSnapshotGeneration" in app
+
+
+def test_debug_plateau_diagnostics_are_permanent_and_backend_driven() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    required_ids = {
+        "dbgPlateauStatus", "dbgPlateauPasses", "dbgPlateauSlope",
+        "dbgPlateauTrend", "dbgPlateauHalf", "dbgPlateauHalfMeans",
+        "dbgPlateauScatter", "dbgPlateauSegments",
+    }
+
+    for element_id in required_ids:
+        assert html.count(f'id="{element_id}"') == 1, element_id
+    layers = _extract_js_function(app, "debugPlateauLayers")
+    assert "evaluation.segment_means_nA" in layers
+    assert "evaluation.segment_centres_s" in layers
+    assert "evaluation.fit_intercept_nA" in layers
+    assert "evaluation.first_half_mean_nA" in layers
+    assert "evaluation.second_half_mean_nA" in layers
+    assert "tolerance_nA" not in layers
+    assert "stable=" not in layers
+    assert "if(options.bands?.length)" in app
+
+
+def test_debug_tail_stats_use_the_last_valid_points_only() -> None:
+    result = _evaluate_chart_js(
+        ["validTailStats"],
+        "const mixed=validTailStats([1,2,999,4],[true,true,false,true],3);"
+        "const even=validTailStats([2,4],[true,true],2);"
+        "const empty=validTailStats([999],[false],20);",
+        "{mixed,even,empty}",
+    )
+
+    assert result["mixed"]["median"] == 2
+    assert abs(result["mixed"]["sd"] - (14 / 9) ** 0.5) < 1e-12
+    assert result["mixed"]["count"] == 3
+    assert result["even"]["median"] == 3
+    assert result["empty"] is None
+
+
+def test_debug_metric_strip_has_one_desktop_track_per_metric() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+    metric_strip = re.search(
+        r'<section class="panel chart-panel dbg-chart">.*?'
+        r'<div class="metric-strip">(.*?)</div>\s*'
+        r'<div class="plateau-diagnostics"',
+        html,
+        re.S,
+    )
+
+    assert metric_strip is not None
+    assert metric_strip.group(1).count("<div>") == 9
+    assert ".dbg-chart .metric-strip{grid-template-columns:repeat(9,1fr)}" in css
+
+
+def test_gui_javascript_passes_node_syntax_check() -> None:
+    subprocess.run(
+        ["node", "--check", str(GUI_DIR / "app.js")],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_debug_overlay_controls_remain_clickable_in_empty_and_narrow_states() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert html.count("20260815-live-metrics-1") == 2
+    assert ".empty-chart{position:absolute;inset:0;display:grid;place-items:center;color:#8a969a;font-size:12px;pointer-events:none}" in css
+    assert ".chart-legend{position:absolute;z-index:2;" in css
+    assert "@media(max-width:900px)" in css
+    assert ".dbg-chart .panel-head{align-items:flex-start;flex-direction:column;gap:10px}" in css
+
+
+def test_plateau_input_bounds_match_backend_validation() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert html.count("相对容差（1%=0.01）") == 2
+    for key, minimum, maximum in (
+        ("segment_duration_s", "0.5", "60"),
+        ("segment_count", "2", "60"),
+        ("absolute_tolerance_nA", "0", "1000"),
+        ("relative_tolerance", "0", "1"),
+        ("scatter_multiplier", "0", "100"),
+        ("minimum_coverage_ratio", "0.01", "1"),
+        ("maximum_gap_periods", "0.1", "100"),
+        ("required_consecutive_windows", "1", "100"),
+        ("spike_scale_multiplier", "0.1", "1000"),
+        ("spike_neighbor_multiplier", "0.1", "1000"),
+    ):
+        pattern = rf'<input type="number" min="{minimum}" max="{maximum}"[^>]*data-plateau-key="{key}">'
+        assert len(re.findall(pattern, html)) == 2, key
