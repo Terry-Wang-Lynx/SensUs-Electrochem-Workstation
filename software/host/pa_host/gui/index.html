@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SensUs 电化学工作站</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20260815-live-metrics-1">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260815-concentration-step-1">
 </head>
 <body>
   <div class="app-shell">
@@ -78,7 +78,16 @@
               <section class="measure-control-panel sample-controls" data-control-panel="sample" role="tabpanel">
                 <div class="sample-role-block" id="sampleRoleBlock"><span>本轮用途</span><div class="segmented role-segmented" id="sampleRole"><button class="active" data-role="calibration">标定</button><button data-role="test">测试</button></div></div>
                 <label>样品名称<input id="sampleName" placeholder="例如：未知样品 01"></label>
-                <label id="concentrationField"><span id="concentrationLabel">已知浓度（标定必填）</span><div class="input-unit"><input id="knownConcentration" type="number" min="0" step="0.001" placeholder="请输入标定浓度"><span>µM</span></div></label>
+                <div class="concentration-field" id="concentrationField">
+                  <label id="concentrationLabel" for="knownConcentration">已知浓度（标定必填）</label>
+                  <div class="concentration-input-row">
+                    <div class="input-unit"><input id="knownConcentration" type="number" min="0" step="any" placeholder="请输入标定浓度"><span>µM</span></div>
+                    <div class="segmented concentration-stepper" role="group" aria-label="快速调整已知浓度">
+                      <button id="doubleKnownConcentration" type="button" title="已知浓度乘二" aria-label="已知浓度乘二">×2</button>
+                      <button id="halveKnownConcentration" type="button" title="已知浓度除以二" aria-label="已知浓度除以二">÷2</button>
+                    </div>
+                  </div>
+                </div>
                 <div class="auto-save-preview"><span>自动保存</span><strong id="autoSaveName">样品名称-浓度.csv</strong></div>
                 <div class="action-row"><button class="primary" id="startMeasure">开始标定测量</button><button class="icon-button" id="stopMeasure" title="停止当前测量" disabled>■</button></div>
                 <button class="secondary full" id="useForCalibration" hidden disabled>将结果加入标定</button>
@@ -373,6 +382,6 @@
     </main>
   </div>
   <div class="toast" id="toast"></div>
-  <script src="/assets/app.js?v=20260815-live-metrics-1"></script>
+  <script src="/assets/app.js?v=20260815-concentration-step-1"></script>
 </body>
 </html>

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -44,7 +45,6 @@ from .it import (
     load_model,
     load_run_csv,
     resample_run_10hz,
-    save_model,
     save_summary,
     summarize_run,
 )
@@ -4039,6 +4039,7 @@ class AppState:
         self.point_records: list[dict[str, Any]] = []
         self.selected_point_ids: list[str] = []
         self.model_created_at: float | None = None
+        self.validation_started_at: float | None = None
         self.records: list[dict[str, Any]] = []
         self.validation_overrides: dict[str, dict[str, Any]] = {}
         self.drift = self._empty_drift()
@@ -4096,6 +4097,16 @@ class AppState:
             )
             for record in self.point_records
         ]
+
+    def _points_revision_locked(self) -> str:
+        """Identify the persisted candidate set while ``self.lock`` is held."""
+        encoded = json.dumps(
+            _json_safe(self.point_records),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
     def _filter_signature(config: dict[str, Any] | None) -> dict[str, Any]:
@@ -4183,6 +4194,7 @@ class AppState:
             self.point_records = []
             self.selected_point_ids = []
             self.model_created_at = None
+            self.validation_started_at = None
             self.records = []
             self.validation_overrides = {}
             self.drift = self._empty_drift()
@@ -4266,8 +4278,17 @@ class AppState:
                         self.model_created_at = (
                             float(raw_created_at) if raw_created_at is not None else None
                         )
+                        raw_validation_started_at = selection.get(
+                            "validation_started_at", raw_created_at
+                        )
+                        self.validation_started_at = (
+                            float(raw_validation_started_at)
+                            if raw_validation_started_at is not None else None
+                        )
                     except (OSError, ValueError, TypeError, json.JSONDecodeError):
                         self.selected_point_ids = []
+                        self.model_created_at = None
+                        self.validation_started_at = None
                 if not self.selected_point_ids:
                     # Legacy models used every saved point. Preserve that model's scope.
                     self.selected_point_ids = [
@@ -4512,6 +4533,92 @@ class AppState:
                     **{key: record.get(key, "") for key in fields},
                     "selected": int(record["point_id"] in selected),
                 })
+
+    @staticmethod
+    def _calibration_points_text(
+        records: list[dict[str, Any]], selected_point_ids: list[str]
+    ) -> str:
+        buffer = io.StringIO(newline="")
+        fields = [
+            "point_id", "acquired_at", "run_id", "label",
+            "concentration_um", "current_nA", "data_path", "selected",
+        ]
+        writer = csv.DictWriter(buffer, fieldnames=fields)
+        writer.writeheader()
+        selected = set(selected_point_ids)
+        for record in records:
+            writer.writerow({
+                **{key: record.get(key, "") for key in fields},
+                "selected": int(record["point_id"] in selected),
+            })
+        return buffer.getvalue()
+
+    @staticmethod
+    def _replace_workspace_files(contents: dict[Path, str | None]) -> None:
+        """Commit related workspace files together, restoring them on failure."""
+        staged: dict[Path, Path] = {}
+        backups: dict[Path, Path | None] = {}
+        committed: list[Path] = []
+        temporary_paths: set[Path] = set()
+        try:
+            for path, content in contents.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if content is None:
+                    continue
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", newline="", delete=False,
+                    prefix=f".{path.name}.stage-", dir=path.parent,
+                ) as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    temporary = Path(handle.name)
+                temporary_paths.add(temporary)
+                mode = (path.stat().st_mode & 0o777) if path.exists() else 0o644
+                os.chmod(temporary, mode)
+                staged[path] = temporary
+
+            for path, content in contents.items():
+                backup: Path | None = None
+                if path.exists():
+                    descriptor, backup_name = tempfile.mkstemp(
+                        prefix=f".{path.name}.backup-", dir=path.parent
+                    )
+                    os.close(descriptor)
+                    backup = Path(backup_name)
+                    temporary_paths.add(backup)
+                    os.replace(path, backup)
+                backups[path] = backup
+                committed.append(path)
+                if content is not None:
+                    os.replace(staged.pop(path), path)
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            for path in reversed(committed):
+                backup = backups.get(path)
+                try:
+                    path.unlink(missing_ok=True)
+                    if backup is not None and backup.exists():
+                        os.replace(backup, path)
+                except OSError as rollback_exc:
+                    rollback_errors.append(f"{path.name}: {rollback_exc}")
+            if rollback_errors:
+                # Keep any surviving backups available for manual recovery.
+                temporary_paths.difference_update(
+                    backup for backup in backups.values()
+                    if backup is not None and backup.exists()
+                )
+                raise RuntimeError(
+                    "标定文件写入失败且回滚不完整："
+                    + "; ".join(rollback_errors)
+                ) from exc
+            raise
+        finally:
+            for path in temporary_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     @staticmethod
     def _ensure_measurement_index_schema(
@@ -4861,7 +4968,13 @@ class AppState:
                     result["filtered_data_path"] = ""
 
                 steady = result["steady_current_nA"]
-                if run.get("state") == "completed" and steady is not None:
+                try:
+                    steady_value = float(steady) if steady is not None else None
+                except (TypeError, ValueError, OverflowError):
+                    steady_value = None
+                if steady_value is not None and not math.isfinite(steady_value):
+                    steady_value = None
+                if run.get("state") == "completed" and steady_value is not None:
                     if role == "calibration" and concentration is not None:
                         run_settings = SettingsController.validate(dict(run["settings"]))
                         run_plateau = self._run_plateau_signature(run, run_settings)
@@ -4913,7 +5026,7 @@ class AppState:
                             "run_id": str(run.get("run_id") or ""),
                             "label": sample_name,
                             "concentration_um": float(concentration),
-                            "current_nA": float(steady),
+                            "current_nA": steady_value,
                             "data_path": result.get("data_path", ""),
                         })
                         self._sync_points()
@@ -4924,7 +5037,7 @@ class AppState:
                             "calibration_ready"
                         ]
                     elif role == "test" and self.model is not None:
-                        effective_current = float(steady) - self._effective_bias_nA()
+                        effective_current = steady_value - self._effective_bias_nA()
                         try:
                             result["predicted_concentration_um"] = float(
                                 self.model.predict_concentration(effective_current)
@@ -4951,6 +5064,7 @@ class AppState:
                         str(self.model_path) if self.model_path else ""
                     ),
                     "calibration_model_created_at": self.model_created_at,
+                    "calibration_validation_started_at": self.validation_started_at,
                     "calibration_selected_point_ids": self.selected_point_ids,
                     "calibration_model": (
                         self.model.to_json() if self.model is not None else None
@@ -4993,107 +5107,168 @@ class AppState:
             self.calibration_plateau = None
             self.calibration_filter = None
             self.model_created_at = None
+            self.validation_started_at = None
             self.validation_overrides = {}
             self.latest_workflow_result = None
             self.drift = self._empty_drift()
         return self.workflow_snapshot()
 
     def fit(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
-            raise RuntimeError("请等待当前测量或自动任务结束后再生成测试曲线")
+        # Measurement and schedule starts use the same lock at the HTTP
+        # boundary. Holding it through the activity snapshot and fit prevents
+        # an idle fit from crossing into a newly started acquisition.
+        with self.operation_lock:
+            return self._fit_locked(payload)
+
+    def _fit_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         raw_points = payload.get("points", [])
         if not isinstance(raw_points, list):
             raise ValueError("标定点必须是数组")
         degree = int(payload.get("degree", 1))
         if degree not in (1, 2):
             raise ValueError("上位机标定仅支持线性或二次模型")
-        records: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for index, row in enumerate(raw_points, 1):
-            if not isinstance(row, dict):
-                raise ValueError("标定点必须是对象")
-            point_id = str(row.get("point_id") or f"manual-{index:04d}")
-            if point_id in seen_ids:
-                point_id = f"{point_id}-{index}"
-            seen_ids.add(point_id)
-            records.append({
-                "point_id": point_id,
-                "acquired_at": float(row.get("acquired_at") or 0),
-                "run_id": str(row.get("run_id") or ""),
-                "label": str(row.get("label", "")),
-                "concentration_um": float(row["concentration_um"]),
-                "current_nA": float(row["current_nA"]),
-                "data_path": str(row.get("data_path") or ""),
-            })
         requested_ids = payload.get("selected_point_ids")
-        selected_ids = (
-            [str(value) for value in requested_ids]
-            if requested_ids is not None else [record["point_id"] for record in records]
-        )
-        selected_id_set = set(selected_ids)
-        selected_records = [
-            record for record in records if record["point_id"] in selected_id_set
-        ]
-        if len(selected_records) < degree + 1:
-            raise ValueError(f"至少选择 {degree + 1} 个标定点")
-        selected_points = [
-            CalibrationPoint(
-                float(record["concentration_um"]), float(record["current_nA"]),
-                str(record["label"]),
-            )
-            for record in selected_records
-        ]
-        model_settings = self.settings.snapshot()["settings"]
-        model_plateau = (
-            self._plateau_signature(self.plateau.settings)
-            if self._uses_plateau_protocol(model_settings) else None
-        )
-        if (
-            self.calibration_settings is not None
-            and not self._same_calibration_protocol(
-                self.calibration_settings,
-                self.calibration_plateau,
-                model_settings,
-                model_plateau,
-            )
-        ):
-            raise ValueError("当前 IT 条件与候选标定点不一致，不能生成测试曲线")
-        model = fit_calibration(selected_points, degree=degree)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        paths = self._workspace_paths()
-        path = paths["model"]
-        current_filter = self._filter_signature(self.filter.snapshot()["settings"])
-        save_model(model, path)
-        paths["settings"].write_text(
-            json.dumps(model_settings, indent=2, ensure_ascii=False)
-        )
-        if model_plateau is not None:
-            paths["plateau"].write_text(json.dumps(
-                {"settings": model_plateau}, indent=2, ensure_ascii=False
-            ))
-        else:
-            paths["plateau"].unlink(missing_ok=True)
-        paths["filter"].write_text(
-            json.dumps({
-                "settings": current_filter,
-                "policy": "mixed_filters_allowed",
-            }, indent=2, ensure_ascii=False)
-        )
-        created_at = time.time()
-        paths["selection"].write_text(json.dumps({
-            "created_at": created_at,
-            "degree": degree,
-            "selected_point_ids": [
-                record["point_id"] for record in selected_records
-            ],
-            "candidate_points_count": len(records),
-        }, indent=2, ensure_ascii=False))
+        if requested_ids is not None and not isinstance(requested_ids, list):
+            raise ValueError("选中标定点必须是数组")
+
+        # Read controller activity before taking the workspace lock. Some
+        # terminal measurement paths invoke the completion hook while holding
+        # MeasurementController.lock, so taking those locks in the opposite
+        # order here could deadlock the final export.
+        busy = self.measurement.is_busy() or self.schedule.snapshot()["active"]
+
+        # Completion exports and fitting both replace related workspace files.
+        # Keep the entire fit transaction under one lock so a just-finished run
+        # cannot be lost to a stale browser payload.
         with self.lock:
-            self.point_records = records
-            self._sync_points()
-            self.selected_point_ids = [
+            current_revision = self._points_revision_locked()
+            supplied_revision = payload.get("points_revision")
+            if (
+                not busy
+                and supplied_revision is not None
+                and str(supplied_revision) != current_revision
+            ):
+                raise RuntimeError("候选标定点已在后台更新，请刷新页面后重试")
+
+            if busy:
+                # During acquisition, only completed candidates already saved
+                # by _measurement_completed are eligible. Browser edits and a
+                # still-running summary must never enter the fitted model.
+                records = [dict(record) for record in self.point_records]
+            else:
+                records = []
+                seen_ids: set[str] = set()
+                for index, row in enumerate(raw_points, 1):
+                    if not isinstance(row, dict):
+                        raise ValueError("标定点必须是对象")
+                    point_id = str(row.get("point_id") or f"manual-{index:04d}")
+                    if point_id in seen_ids:
+                        point_id = f"{point_id}-{index}"
+                    seen_ids.add(point_id)
+                    records.append({
+                        "point_id": point_id,
+                        "acquired_at": float(row.get("acquired_at") or 0),
+                        "run_id": str(row.get("run_id") or ""),
+                        "label": str(row.get("label", "")),
+                        "concentration_um": float(row["concentration_um"]),
+                        "current_nA": float(row["current_nA"]),
+                        "data_path": str(row.get("data_path") or ""),
+                    })
+
+            selected_ids = (
+                [str(value) for value in requested_ids]
+                if requested_ids is not None
+                else [record["point_id"] for record in records]
+            )
+            available_ids = {record["point_id"] for record in records}
+            unknown_ids = set(selected_ids) - available_ids
+            if busy and unknown_ids:
+                raise RuntimeError(
+                    "测量进行中只能使用已完成并保存的候选点，"
+                    "请刷新标定页后重新选择"
+                )
+            selected_id_set = set(selected_ids)
+            selected_records = [
+                record for record in records
+                if record["point_id"] in selected_id_set
+            ]
+            if len(selected_records) < degree + 1:
+                raise ValueError(f"至少选择 {degree + 1} 个标定点")
+            selected_points = [
+                CalibrationPoint(
+                    float(record["concentration_um"]),
+                    float(record["current_nA"]),
+                    str(record["label"]),
+                )
+                for record in selected_records
+            ]
+            model_settings = self.settings.snapshot()["settings"]
+            model_plateau = (
+                self._plateau_signature(self.plateau.settings)
+                if self._uses_plateau_protocol(model_settings) else None
+            )
+            if (
+                self.calibration_settings is not None
+                and not self._same_calibration_protocol(
+                    self.calibration_settings,
+                    self.calibration_plateau,
+                    model_settings,
+                    model_plateau,
+                )
+            ):
+                raise ValueError(
+                    "当前 IT 条件与候选标定点不一致，不能生成测试曲线"
+                )
+            model = fit_calibration(selected_points, degree=degree)
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            paths = self._workspace_paths()
+            path = paths["model"]
+            current_filter = self._filter_signature(
+                self.filter.snapshot()["settings"]
+            )
+            created_at = time.time()
+            validation_started_at = (
+                created_at
+                if self.validation_started_at is None
+                else self.validation_started_at
+            )
+            selected_record_ids = [
                 record["point_id"] for record in selected_records
             ]
+            selection_payload = {
+                "created_at": created_at,
+                "validation_started_at": validation_started_at,
+                "degree": degree,
+                "selected_point_ids": selected_record_ids,
+                "candidate_points_count": len(records),
+            }
+            self._replace_workspace_files({
+                path: json.dumps(model.to_json(), indent=2) + "\n",
+                paths["settings"]: json.dumps(
+                    model_settings, indent=2, ensure_ascii=False
+                ),
+                paths["plateau"]: (
+                    json.dumps(
+                        {"settings": model_plateau},
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    if model_plateau is not None else None
+                ),
+                paths["filter"]: json.dumps({
+                    "settings": current_filter,
+                    "policy": "mixed_filters_allowed",
+                }, indent=2, ensure_ascii=False),
+                paths["selection"]: json.dumps(
+                    selection_payload, indent=2, ensure_ascii=False
+                ),
+                paths["points"]: self._calibration_points_text(
+                    records, selected_record_ids
+                ),
+            })
+            self.point_records = records
+            self._sync_points()
+            self.selected_point_ids = selected_record_ids
             self.model = model
             self.model_path = path
             self.model_settings = model_settings
@@ -5106,8 +5281,8 @@ class AppState:
             )
             self.calibration_filter = current_filter
             self.model_created_at = created_at
-            self._save_calibration_points()
-        return self.model_payload()
+            self.validation_started_at = validation_started_at
+            return self.model_payload()
 
     def load_points(self, path: str) -> dict[str, Any]:
         points = load_calibration_points(path)
@@ -5131,6 +5306,7 @@ class AppState:
     def model_payload(self) -> dict[str, Any]:
         with self.lock:
             bias_nA = self._effective_bias_nA()
+            points_payload = self.points_payload()
             model_compatible = (
                 self.model is not None
                 and self.model_settings is not None
@@ -5144,11 +5320,13 @@ class AppState:
             if self.model is None:
                 return {
                     "model": None,
-                    "points": self.points_payload()["points"],
+                    "points": points_payload["points"],
+                    "points_revision": points_payload["points_revision"],
                     "validation_points": [],
                     "ap_score": evaluate_ap_score([]),
                     "selected_point_ids": self.selected_point_ids,
                     "model_created_at": self.model_created_at,
+                    "validation_started_at": self.validation_started_at,
                     "drift_bias_nA": bias_nA,
                     "model_compatible": False,
                 }
@@ -5178,13 +5356,15 @@ class AppState:
             return {
                 "model": _json_safe(model.to_json()),
                 "model_path": str(self.model_path) if self.model_path else "",
-                "points": self.points_payload()["points"],
+                "points": points_payload["points"],
+                "points_revision": points_payload["points_revision"],
                 "curve": {"concentration_um": xs, "current_nA": ys},
                 "validation_points": validation_points,
                 "ap_score": ap_score,
                 "measurement_settings": self.model_settings,
                 "selected_point_ids": self.selected_point_ids,
                 "model_created_at": self.model_created_at,
+                "validation_started_at": self.validation_started_at,
                 "drift_bias_nA": bias_nA,
                 "model_compatible": model_compatible,
             }
@@ -5194,16 +5374,16 @@ class AppState:
     ) -> list[dict[str, Any]]:
         """Build test points for the calibration chart without refitting the model.
 
-        Only completed test runs acquired after the current model was created,
-        with a finite steady current, can be placed on its chart. A missing
-        known concentration is kept editable but excluded from AP scoring until
-        the user fills it in. Starting a new calibration or regenerating the
-        model therefore starts an empty validation set without deleting the
-        historical measurement index. The measured current stays untouched;
-        the model's optional drift bias is applied only when calculating the
-        expected current and predicted concentration.
+        Only completed test runs acquired after the first model in the current
+        calibration batch, with a finite steady current, can be placed on its
+        chart. A missing known concentration is kept editable but excluded from
+        AP scoring until the user fills it in. Regenerating the model preserves
+        those test results; explicitly starting a new calibration batch resets
+        the boundary without deleting the historical measurement index. The
+        measured current stays untouched; the model's optional drift bias is
+        applied only when calculating expected current and concentration.
         """
-        if self.model_created_at is None:
+        if self.validation_started_at is None:
             return []
         validation_points: list[dict[str, Any]] = []
         for index, row in enumerate(self.records, 1):
@@ -5218,7 +5398,7 @@ class AppState:
                 continue
             if not math.isfinite(measured_current):
                 continue
-            if finished_at <= self.model_created_at:
+            if finished_at <= self.validation_started_at:
                 continue
             raw_concentration = override.get(
                 "concentration_um", row.get("known_concentration_um")
@@ -5271,15 +5451,18 @@ class AppState:
         return validation_points
 
     def points_payload(self) -> dict[str, Any]:
-        return {
-            "points": [
-                {
-                    **record,
-                    "selected": record["point_id"] in set(self.selected_point_ids),
-                }
-                for record in self.point_records
-            ]
-        }
+        with self.lock:
+            selected_ids = set(self.selected_point_ids)
+            return {
+                "points_revision": self._points_revision_locked(),
+                "points": [
+                    {
+                        **record,
+                        "selected": record["point_id"] in selected_ids,
+                    }
+                    for record in self.point_records
+                ],
+            }
 
     def predict(self, payload: dict[str, Any]) -> dict[str, Any]:
         model = load_model(payload["model_path"]) if payload.get("model_path") else self.model

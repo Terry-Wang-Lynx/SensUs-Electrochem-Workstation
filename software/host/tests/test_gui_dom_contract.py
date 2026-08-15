@@ -41,6 +41,81 @@ def test_app_references_existing_html_ids() -> None:
     assert referenced <= declared, f"Missing DOM ids: {sorted(referenced - declared)}"
 
 
+def test_known_concentration_stepper_has_stable_accessible_controls() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="knownConcentration" type="number" min="0" step="any"' in html
+    assert 'id="doubleKnownConcentration" type="button"' in html
+    assert 'id="halveKnownConcentration" type="button"' in html
+    assert 'aria-label="已知浓度乘二"' in html
+    assert 'aria-label="已知浓度除以二"' in html
+    assert "$('knownConcentration').addEventListener('input',previewFilename)" in app
+    assert "new Event('input',{bubbles:true})" in app
+    assert "points_revision:state.calibration?.points_revision??null" in app
+    assert ".concentration-input-row{display:grid;grid-template-columns:minmax(0,1fr) auto" in styles
+    assert ".concentration-stepper button{width:38px;min-width:38px" in styles
+    assert "#concentrationField,.sample-controls .action-row" in styles
+
+
+def test_known_concentration_scaling_handles_boundaries_without_invalid_values() -> None:
+    result = _evaluate_chart_js(
+        ["scaledConcentrationValue"],
+        """
+const values = {
+  doubled: scaledConcentrationValue('1.25', 2),
+  halved: scaledConcentrationValue('1.25', .5),
+  roundTrip: scaledConcentrationValue(scaledConcentrationValue('0.1', 2), .5),
+  zeroDouble: scaledConcentrationValue('0', 2),
+  zeroHalf: scaledConcentrationValue('0', .5),
+  blank: scaledConcentrationValue('  ', 2),
+  invalid: scaledConcentrationValue('not-a-number', 2),
+  negative: scaledConcentrationValue('-1', 2),
+  overflow: scaledConcentrationValue('1e308', 2),
+};
+""",
+        "values",
+    )
+
+    assert result == {
+        "doubled": "2.5",
+        "halved": "0.625",
+        "roundTrip": "0.1",
+        "zeroDouble": "0",
+        "zeroHalf": "0",
+        "blank": None,
+        "invalid": None,
+        "negative": None,
+        "overflow": None,
+    }
+
+
+def test_known_concentration_stepper_dispatches_one_bubbling_input_event() -> None:
+    result = _evaluate_chart_js(
+        ["scaledConcentrationValue", "scaleKnownConcentration"],
+        """
+class Event { constructor(type, options={}) { this.type=type; this.bubbles=Boolean(options.bubbles); } }
+const events = [], messages = [];
+const input = {value:'1.25', dispatchEvent(event){events.push({type:event.type,bubbles:event.bubbles,value:this.value});}};
+const $ = id => { if(id!=='knownConcentration')throw new Error(id); return input; };
+const toast = message => messages.push(message);
+const success = scaleKnownConcentration(2);
+input.value = '';
+const rejected = scaleKnownConcentration(.5);
+""",
+        "{success,rejected,events,messages,value:input.value}",
+    )
+
+    assert result == {
+        "success": True,
+        "rejected": False,
+        "events": [{"type": "input", "bubbles": True, "value": "2.5"}],
+        "messages": ["请先输入有效的非负浓度"],
+        "value": "",
+    }
+
+
 def test_both_filter_panels_expose_only_the_shared_lowpass_configuration() -> None:
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
@@ -394,7 +469,7 @@ def test_debug_overlay_controls_remain_clickable_in_empty_and_narrow_states() ->
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
 
-    assert html.count("20260815-live-metrics-1") == 2
+    assert html.count("20260815-concentration-step-1") == 2
     assert ".empty-chart{position:absolute;inset:0;display:grid;place-items:center;color:#8a969a;font-size:12px;pointer-events:none}" in css
     assert ".chart-legend{position:absolute;z-index:2;" in css
     assert "@media(max-width:900px)" in css

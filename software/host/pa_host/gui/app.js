@@ -238,6 +238,20 @@ plateauPanels().forEach(panel=>{
 });
 renderPlateauControls(state.plateau,'正在读取后台设置');
 function concentrationValue(){return $('knownConcentration').value===''?null:$('knownConcentration').value}
+function scaledConcentrationValue(raw,factor){
+  const text=String(raw??'').trim(),value=Number(text),multiplier=Number(factor);
+  if(text===''||!Number.isFinite(value)||value<0||!Number.isFinite(multiplier)||multiplier<=0)return null;
+  const scaled=value*multiplier;
+  if(!Number.isFinite(scaled)||scaled<0)return null;
+  return String(Number(scaled.toPrecision(12)));
+}
+function scaleKnownConcentration(factor){
+  const input=$('knownConcentration'),scaled=scaledConcentrationValue(input.value,factor);
+  if(scaled===null){toast('请先输入有效的非负浓度');return false}
+  input.value=scaled;
+  input.dispatchEvent(new Event('input',{bubbles:true}));
+  return true;
+}
 function previewFilename(){const sample=($('sampleName').value||'样品名称').trim().replace(/[\\/:*?"<>|]/g,'_'), concentration=concentrationValue();$('autoSaveName').textContent=`${sample}-${concentration===null?'unknown':`${Number(concentration)}uM`}.csv`}
 function updateStartState(){
   const running=state.measurement?.busy??state.measurement?.state==='running', ready=state.workflow?.calibration_ready;
@@ -706,6 +720,8 @@ $('startMeasure').addEventListener('click',async()=>{const button=$('startMeasur
 $('stopMeasure').addEventListener('click',async()=>{try{updateMeasurement(await post('/api/measurement/stop'))}catch(e){errorBox('measureError',e)}});
 $('sampleRole').addEventListener('click',event=>{const button=event.target.closest('button[data-role]');if(button)setSampleRole(button.dataset.role)});
 $('sampleName').addEventListener('input',previewFilename);$('knownConcentration').addEventListener('input',previewFilename);
+$('doubleKnownConcentration').addEventListener('click',()=>scaleKnownConcentration(2));
+$('halveKnownConcentration').addEventListener('click',()=>scaleKnownConcentration(.5));
 $('applySaveDirectory').onclick=async()=>{try{renderWorkflow(await post('/api/workflow/config',{save_dir:$('saveDirectory').value}));state.calibration=await api('/api/calibration');renderCalibration();toast('保存目录已应用')}catch(e){errorBox('measureError',e)}};
 $('resetCalibration').onclick=async()=>{if(!confirm('开始一套新标定？现有标定文件会保留为带时间戳的归档。'))return;try{renderWorkflow(await post('/api/workflow/reset-calibration'));state.calibration=await api('/api/calibration');renderCalibration();setSampleRole('calibration',true);toast('已开始新的标定')}catch(e){errorBox('measureError',e)}};
 
@@ -772,7 +788,7 @@ $('applyPointRange').onclick=()=>{const rows=[...$('pointsBody').querySelectorAl
 $('clearPointSelection').onclick=()=>{$('pointsBody').querySelectorAll('.point-selector').forEach(input=>input.checked=false);syncCalibrationPreview()};
 $('useForCalibration').onclick=()=>{const current=state.measurement?.summary?.steady_current_nA, concentration=$('knownConcentration').value;if(concentration===''){toast('请先填写已知浓度');return}$('pointsBody').appendChild(row({label:$('sampleName').value||state.measurement.run_id,concentration_um:concentration,current_nA:current}));document.querySelector('[data-view="calibrate"]').click();toast('已加入标定数据')};
 $('predictConcentration').onclick=async()=>{try{const result=await post('/api/predict',{});$('predictionResult').querySelector('strong').textContent=fmt(result.predicted_concentration_um,3);toast('浓度预测完成')}catch(e){errorBox('measureError',e)}};
-$('fitCalibration').onclick=async()=>{try{const points=readPoints(),selected=points.filter(point=>point.selected).map(point=>point.point_id);if(!selected.length){toast('请先选择一个标定点范围');return}const data=await post('/api/calibration/fit',{points,selected_point_ids:selected,degree:Number($('fitDegree').value)});state.calibration=data;renderCalibration();renderWorkflow(await api('/api/workflow'));setSampleRole('test',true);toast('选中范围已生成并锁定为测试曲线')}catch(e){toast(e.message)}};
+$('fitCalibration').onclick=async()=>{try{const points=readPoints(),selected=points.filter(point=>point.selected).map(point=>point.point_id);if(!selected.length){toast('请先选择一个标定点范围');return}const data=await post('/api/calibration/fit',{points,points_revision:state.calibration?.points_revision??null,selected_point_ids:selected,degree:Number($('fitDegree').value)});state.calibration=data;renderCalibration();renderWorkflow(await api('/api/workflow'));setSampleRole('test',true);toast('选中范围已生成并锁定为测试曲线')}catch(e){toast(e.message)}};
 function modelCurrentAt(model, concentration){
   const coefficients=(model?.coefficients||[]).map(Number), x=Number(concentration);
   if(!coefficients.length||!Number.isFinite(x))return null;

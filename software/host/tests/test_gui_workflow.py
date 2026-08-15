@@ -6,9 +6,11 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import signal
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -129,6 +131,384 @@ def test_workspace_keeps_all_candidates_but_fits_only_selected_range() -> None:
         assert [row["selected"] for row in rows] == ["0", "1", "1", "1"]
         selection = json.loads((workspace / "calibration-selection.json").read_text())
         assert selection["selected_point_ids"] == ["p2", "p3", "p4"]
+        assert payload["points_revision"] == app.points_payload()["points_revision"]
+
+
+@pytest.mark.parametrize("activity", ["measurement", "schedule"])
+def test_busy_fit_uses_only_persisted_candidates_and_completed_tests(
+    activity: str,
+) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / f"busy-{activity}"
+        app._load_workspace()
+        with patch("pa_host.gui_server.time.time", return_value=100):
+            app.fit({
+                "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+                "selected_point_ids": ["zero", "ten"],
+            })
+        candidate_payload = app.points_payload()
+        browser_points = [dict(point) for point in candidate_payload["points"]]
+        browser_points[0]["current_nA"] = 999
+        for record in (
+            {
+                "finished_at": 110, "run_id": "test-completed",
+                "sample_name": "已完成", "sample_role": "test",
+                "known_concentration_um": 5, "steady_current_nA": 20,
+                "state": "completed",
+            },
+            {
+                "finished_at": 111, "run_id": "test-running",
+                "sample_name": "采集中", "sample_role": "test",
+                "known_concentration_um": 5, "steady_current_nA": 21,
+                "state": "running",
+            },
+            {
+                "finished_at": 112, "run_id": "test-no-summary",
+                "sample_name": "无稳态摘要", "sample_role": "test",
+                "known_concentration_um": 5, "steady_current_nA": None,
+                "state": "completed",
+            },
+        ):
+            app._append_record(record)
+
+        if activity == "measurement":
+            with app.measurement.lock:
+                app.measurement.state = "running"
+                app.measurement.run_id = "active-run"
+                app.measurement.metadata = {"sample_name": "活动测量"}
+            before = app.measurement.snapshot()
+        else:
+            with app.schedule.lock:
+                app.schedule.active = True
+                app.schedule.message = "自动任务进行中"
+            before = app.schedule.snapshot()
+
+        with patch("pa_host.gui_server.time.time", return_value=120):
+            result = app.fit({
+                "points": browser_points,
+                "points_revision": candidate_payload["points_revision"],
+                "selected_point_ids": ["zero", "ten"],
+            })
+
+        assert result["model"]["coefficients"] == pytest.approx([2, 10])
+        assert result["model_created_at"] == 120
+        assert result["validation_started_at"] == 100
+        assert [point["run_id"] for point in result["validation_points"]] == [
+            "test-completed"
+        ]
+        assert [point["point_id"] for point in result["points"]] == [
+            "zero", "ten"
+        ]
+        after = (
+            app.measurement.snapshot()
+            if activity == "measurement" else app.schedule.snapshot()
+        )
+        assert after == before
+
+        reloaded = AppState()
+        reloaded.save_dir = app.save_dir
+        reloaded._load_workspace()
+        assert reloaded.model_created_at == 120
+        assert reloaded.validation_started_at == 100
+        assert [
+            point["run_id"] for point in reloaded.model_payload()["validation_points"]
+        ] == ["test-completed"]
+
+
+def test_busy_fit_preserves_a_candidate_added_after_the_browser_snapshot() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "busy-stale-browser"
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        stale = app.points_payload()
+        with patch("pa_host.gui_server._send_system_notification"):
+            app._measurement_completed({
+                "run_id": "new-completed-point",
+                "state": "completed",
+                "finished_at": 50,
+                "metadata": {
+                    "sample_name": "后台新点",
+                    "sample_role": "calibration",
+                    "known_concentration_um": 20,
+                },
+                "summary": {"steady_current_nA": 50},
+                "settings": app.settings.snapshot()["settings"],
+                "raw_path": str(app.save_dir / "missing-raw.csv"),
+                "resampled_path": str(app.save_dir / "missing.csv"),
+                "filtered_path": str(app.save_dir / "missing-filtered.csv"),
+            })
+        assert stale["points_revision"] != app.points_payload()["points_revision"]
+
+        with pytest.raises(RuntimeError, match="后台更新"):
+            app.fit({
+                "points": stale["points"],
+                "points_revision": stale["points_revision"],
+                "selected_point_ids": ["zero", "ten"],
+            })
+        assert [record["point_id"] for record in app.point_records] == [
+            "zero", "ten", "new-completed-point"
+        ]
+
+        with app.measurement.lock:
+            app.measurement.state = "running"
+        result = app.fit({
+            "points": stale["points"],
+            "points_revision": stale["points_revision"],
+            "selected_point_ids": ["zero", "ten"],
+        })
+
+        assert [point["point_id"] for point in result["points"]] == [
+            "zero", "ten", "new-completed-point"
+        ]
+        assert result["model"]["n_points"] == 2
+        assert result["selected_point_ids"] == ["zero", "ten"]
+        rows = list(csv.DictReader(
+            (app.save_dir / "calibration-points.csv").open()
+        ))
+        assert [row["point_id"] for row in rows] == [
+            "zero", "ten", "new-completed-point"
+        ]
+
+
+def test_busy_fit_rejects_an_unpersisted_active_run_point() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "busy-active-point"
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        saved = app.points_payload()
+        model_before = (app.save_dir / "calibration-model.json").read_text()
+        with app.measurement.lock:
+            app.measurement.state = "running"
+            app.measurement.run_id = "active-run"
+
+        with pytest.raises(RuntimeError, match="已完成并保存"):
+            app.fit({
+                "points": [*saved["points"], _point("active-run", 20, 999)],
+                "points_revision": saved["points_revision"],
+                "selected_point_ids": ["zero", "ten", "active-run"],
+            })
+
+        assert [record["point_id"] for record in app.point_records] == [
+            "zero", "ten"
+        ]
+        assert (app.save_dir / "calibration-model.json").read_text() == model_before
+
+
+def test_fit_waits_for_measurement_state_without_holding_the_workspace_lock() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "fit-lock-order"
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        saved = app.points_payload()
+        measurement_locked = threading.Event()
+        measurement_check_started = threading.Event()
+        try_workspace_lock = threading.Event()
+        workspace_lock_acquired = threading.Event()
+        fit_finished = threading.Event()
+        fit_errors: list[Exception] = []
+        original_is_busy = app.measurement.is_busy
+
+        def observed_is_busy() -> bool:
+            measurement_check_started.set()
+            return original_is_busy()
+
+        def terminal_callback_order() -> None:
+            with app.measurement.lock:
+                measurement_locked.set()
+                assert try_workspace_lock.wait(1)
+                with app.lock:
+                    workspace_lock_acquired.set()
+
+        def run_fit() -> None:
+            try:
+                app.fit({
+                    "points": saved["points"],
+                    "points_revision": saved["points_revision"],
+                    "selected_point_ids": ["zero", "ten"],
+                })
+            except Exception as exc:  # surfaced by the assertion below
+                fit_errors.append(exc)
+            finally:
+                fit_finished.set()
+
+        app.measurement.is_busy = observed_is_busy  # type: ignore[method-assign]
+        terminal_thread = threading.Thread(
+            target=terminal_callback_order, daemon=True
+        )
+        fit_thread = threading.Thread(target=run_fit, daemon=True)
+        terminal_thread.start()
+        assert measurement_locked.wait(1)
+        fit_thread.start()
+        assert measurement_check_started.wait(1)
+        try_workspace_lock.set()
+
+        assert workspace_lock_acquired.wait(1), "fit 与测量收尾发生锁顺序反转"
+        assert fit_finished.wait(1)
+        terminal_thread.join(timeout=1)
+        fit_thread.join(timeout=1)
+        assert fit_errors == []
+
+
+def test_measurement_start_and_fit_share_one_operation_boundary() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "fit-start-boundary"
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        saved = app.points_payload()
+        tampered = [dict(point) for point in saved["points"]]
+        tampered[1]["current_nA"] = 40
+        start_has_lock = threading.Event()
+        allow_start = threading.Event()
+        fit_finished = threading.Event()
+        fit_results: list[dict[str, object]] = []
+        fit_errors: list[Exception] = []
+
+        def start_measurement() -> None:
+            with app.operation_lock:
+                start_has_lock.set()
+                assert allow_start.wait(1)
+                with app.measurement.lock:
+                    app.measurement.state = "running"
+
+        def run_fit() -> None:
+            try:
+                fit_results.append(app.fit({
+                    "points": tampered,
+                    "points_revision": saved["points_revision"],
+                    "selected_point_ids": ["zero", "ten"],
+                }))
+            except Exception as exc:  # surfaced by the assertion below
+                fit_errors.append(exc)
+            finally:
+                fit_finished.set()
+
+        start_thread = threading.Thread(target=start_measurement, daemon=True)
+        fit_thread = threading.Thread(target=run_fit, daemon=True)
+        start_thread.start()
+        assert start_has_lock.wait(1)
+        fit_thread.start()
+        assert not fit_finished.wait(0.05)
+        allow_start.set()
+
+        start_thread.join(timeout=1)
+        fit_thread.join(timeout=1)
+        assert fit_finished.is_set()
+        assert fit_errors == []
+        assert fit_results[0]["model"]["coefficients"] == pytest.approx([2, 10])
+        assert [record["current_nA"] for record in app.point_records] == [10, 30]
+
+
+def test_fit_rolls_back_all_workspace_files_when_commit_fails() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "fit-rollback"
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        paths = app._workspace_paths()
+        tracked_paths = [
+            paths[key] for key in (
+                "model", "settings", "plateau", "filter", "selection", "points"
+            )
+        ]
+        before = {
+            path: path.read_bytes() if path.exists() else None
+            for path in tracked_paths
+        }
+        records_before = [dict(record) for record in app.point_records]
+        coefficients_before = app.model.coefficients if app.model is not None else None
+        payload = app.points_payload()
+        changed_points = [dict(point) for point in payload["points"]]
+        changed_points[1]["current_nA"] = 40
+        real_replace = os.replace
+
+        def fail_filter_commit(source: object, destination: object) -> None:
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                ".stage-" in source_path.name
+                and destination_path == paths["filter"]
+            ):
+                raise OSError("injected filter commit failure")
+            real_replace(source, destination)
+
+        with patch(
+            "pa_host.gui_server.os.replace", side_effect=fail_filter_commit
+        ):
+            with pytest.raises(OSError, match="injected filter commit failure"):
+                app.fit({
+                    "points": changed_points,
+                    "points_revision": payload["points_revision"],
+                    "selected_point_ids": ["zero", "ten"],
+                })
+
+        after = {
+            path: path.read_bytes() if path.exists() else None
+            for path in tracked_paths
+        }
+        assert after == before
+        assert app.point_records == records_before
+        assert (
+            app.model.coefficients if app.model is not None else None
+        ) == coefficients_before
+        assert list(app.save_dir.glob(".*.stage-*")) == []
+        assert list(app.save_dir.glob(".*.backup-*")) == []
+
+
+def test_completion_adds_only_finite_completed_calibration_summaries() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = AppState()
+        app.save_dir = Path(tmp) / "completion-summary-gate"
+        app._load_workspace()
+
+        def complete(run_id: str, state: str, steady: object) -> None:
+            app._measurement_completed({
+                "run_id": run_id,
+                "state": state,
+                "finished_at": 10,
+                "metadata": {
+                    "sample_name": run_id,
+                    "sample_role": "calibration",
+                    "known_concentration_um": 5,
+                },
+                "summary": {"steady_current_nA": steady},
+                "settings": app.settings.snapshot()["settings"],
+                "raw_path": str(app.save_dir / f"missing-{run_id}-raw.csv"),
+                "resampled_path": str(app.save_dir / f"missing-{run_id}.csv"),
+                "filtered_path": str(
+                    app.save_dir / f"missing-{run_id}-filtered.csv"
+                ),
+            })
+
+        with patch("pa_host.gui_server._send_system_notification"):
+            complete("still-running", "running", 20)
+            complete("missing-summary", "completed", None)
+            complete("nan-summary", "completed", float("nan"))
+            complete("valid-summary", "completed", 20)
+
+        assert [record["point_id"] for record in app.point_records] == [
+            "valid-summary"
+        ]
+        assert app.point_records[0]["current_nA"] == 20
 
 
 def test_switching_workspace_loads_an_independent_model() -> None:
