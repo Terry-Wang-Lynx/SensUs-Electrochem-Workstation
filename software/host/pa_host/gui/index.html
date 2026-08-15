@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SensUs 电化学工作站</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20260815-concentration-step-1">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260815-concentration-step-1-history">
 </head>
 <body>
   <div class="app-shell">
@@ -14,6 +14,7 @@
         <button class="nav-item active" data-view="measure"><span>⌁</span>实时测量</button>
         <button class="nav-item" data-view="calibrate"><span>⌗</span>标定与漂移</button>
         <button class="nav-item" data-view="schedule"><span>◷</span>稳定化 / 自动</button>
+        <button class="nav-item" data-view="history"><span>◴</span>历史记录</button>
         <button class="nav-item" data-view="debug"><span>⚙</span>硬件 DEBUG</button>
       </nav>
       <div class="sidebar-footer">
@@ -250,6 +251,21 @@
         </div>
       </section>
 
+      <section class="view" id="view-history">
+        <section class="panel workspace-history-panel">
+          <div class="panel-head workspace-history-head">
+            <div><h2>工作区历史</h2><p id="workspaceHistorySummary">正在读取历史记录</p></div>
+            <div class="workspace-history-tools">
+              <label class="history-favorite-filter"><input id="historyFavoritesOnly" type="checkbox"><span>仅看收藏</span></label>
+              <button class="secondary" id="registerCurrentHistory" type="button">登记当前工作区</button>
+              <button class="icon-button" id="refreshWorkspaceHistory" type="button" title="刷新历史" aria-label="刷新历史">↻</button>
+            </div>
+          </div>
+          <div class="notice error" id="workspaceHistoryError" hidden></div>
+          <div class="workspace-history-list" id="workspaceHistoryList" aria-live="polite"></div>
+        </section>
+      </section>
+
       <!-- 硬件 DEBUG:只暴露「一次 I-t 测量」这一个抽象,不含标定/工作流。
            所有 id 一律 dbg 前缀 —— app.js 全篇假定 id 全局唯一且在模块顶层
            直接 $('id').onclick,复用现有 id 会让第二个永远不画。 -->
@@ -382,6 +398,6 @@
     </main>
   </div>
   <div class="toast" id="toast"></div>
-  <script src="/assets/app.js?v=20260815-concentration-step-1"></script>
+  <script src="/assets/app.js?v=20260815-concentration-step-1-history"></script>
 </body>
 </html>

@@ -10,6 +10,7 @@ the tested RTT/J-Link path remains the single source of truth.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import io
@@ -74,6 +75,7 @@ from .live_metrics import (
     prepare_live_stage,
 )
 from .stability_eta import StabilityEtaEstimator
+from .workspace_history import WorkspaceHistory
 
 _IS_WIN = sys.platform == "win32"
 
@@ -110,6 +112,7 @@ SETTINGS_PATH = PROJECT_DIR / "measurements" / "gui_settings.json"
 FILTER_SETTINGS_PATH = PROJECT_DIR / "measurements" / "filter_settings.json"
 PLATEAU_SETTINGS_PATH = PROJECT_DIR / "measurements" / "plateau_settings.json"
 WORKFLOW_PATH = PROJECT_DIR / "measurements" / "gui_workflow.json"
+HISTORY_PATH = PROJECT_DIR / "measurements" / "workspace_history.json"
 DEFAULT_SAVE_DIR = PROJECT_DIR / "measurements" / "experiment_data"
 JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "").strip()
 
@@ -4017,6 +4020,7 @@ class AppState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.operation_lock = threading.RLock()
+        self.history = WorkspaceHistory(HISTORY_PATH, PROJECT_DIR)
         self.settings = SettingsController()
         self.filter = FilterController()
         self.plateau = PlateauController()
@@ -4043,6 +4047,9 @@ class AppState:
         self.records: list[dict[str, Any]] = []
         self.validation_overrides: dict[str, dict[str, Any]] = {}
         self.drift = self._empty_drift()
+        self.workspace_runtime_settings: dict[str, Any] | None = None
+        self.workspace_runtime_filter: dict[str, Any] | None = None
+        self.workspace_runtime_plateau: dict[str, Any] | None = None
         self.latest_workflow_result: dict[str, Any] | None = None
         if WORKFLOW_PATH.exists():
             try:
@@ -4086,6 +4093,7 @@ class AppState:
             "validation": self.save_dir / "calibration-validation.json",
             "index": self.save_dir / "measurement-index.csv",
             "drift": self.save_dir / "calibration-drift.json",
+            "runtime": self.save_dir / "workspace-state.json",
         }
 
     def _sync_points(self) -> None:
@@ -4198,6 +4206,9 @@ class AppState:
             self.records = []
             self.validation_overrides = {}
             self.drift = self._empty_drift()
+            self.workspace_runtime_settings = None
+            self.workspace_runtime_filter = None
+            self.workspace_runtime_plateau = None
             self.latest_workflow_result = None
             if paths["points"].exists():
                 try:
@@ -4248,7 +4259,7 @@ class AppState:
             if paths["filter"].exists():
                 try:
                     saved_filter = json.loads(paths["filter"].read_text())
-                    self.calibration_filter = self._filter_signature(
+                    self.calibration_filter = validate_filter_config(
                         saved_filter.get("settings", saved_filter)
                         if isinstance(saved_filter, dict) else None
                     )
@@ -4323,12 +4334,138 @@ class AppState:
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     self.validation_overrides = {}
 
-    def configure_workflow(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
-            raise RuntimeError("测量或自动任务运行期间不能切换工作目录")
-        path = self._resolve_save_dir(str(payload.get("save_dir", "")))
+            if paths["runtime"].exists():
+                try:
+                    runtime = json.loads(paths["runtime"].read_text(encoding="utf-8"))
+                    if not isinstance(runtime, dict):
+                        raise ValueError("workspace state must be an object")
+                    self.workspace_runtime_settings = SettingsController.validate(
+                        runtime.get("settings", {})
+                    )
+                    self.workspace_runtime_filter = validate_filter_config(
+                        runtime.get("filter", {})
+                    )
+                    self.workspace_runtime_plateau = PlateauConfig.validate(
+                        runtime.get("plateau")
+                    ).to_dict()
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    self.workspace_runtime_settings = None
+                    self.workspace_runtime_filter = None
+                    self.workspace_runtime_plateau = None
+
+    _WORKSPACE_STATE_FIELDS = (
+        "save_dir", "model", "model_path", "model_settings", "model_plateau",
+        "calibration_filter", "calibration_settings", "calibration_plateau",
+        "points", "point_records", "selected_point_ids", "model_created_at",
+        "validation_started_at", "records", "validation_overrides", "drift",
+        "workspace_runtime_settings", "workspace_runtime_filter",
+        "workspace_runtime_plateau", "latest_workflow_result",
+    )
+
+    @staticmethod
+    def _atomic_json_file(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
         try:
-            path.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix=f".{path.name}.",
+                suffix=".tmp", dir=path.parent, delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    def _workspace_memory_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                name: copy.deepcopy(getattr(self, name))
+                for name in self._WORKSPACE_STATE_FIELDS
+            }
+
+    def _restore_workspace_memory(self, snapshot: dict[str, Any]) -> None:
+        with self.lock:
+            for name, value in snapshot.items():
+                setattr(self, name, value)
+
+    def _controller_snapshot(self) -> dict[str, Any]:
+        return {
+            "settings": self.settings.snapshot(),
+            "filter": self.filter.snapshot()["settings"],
+            "plateau": self.plateau.snapshot()["settings"],
+        }
+
+    def _restore_controllers(self, snapshot: dict[str, Any]) -> None:
+        settings_snapshot = snapshot["settings"]
+        with self.settings.lock:
+            self.settings.settings = dict(settings_snapshot["settings"])
+            self.settings.applied = bool(settings_snapshot["applied"])
+            self.settings.state = str(settings_snapshot["state"])
+            self.settings.message = str(settings_snapshot["message"])
+            self.settings.error = str(settings_snapshot.get("error") or "")
+        with self.filter.lock:
+            self.filter.settings = validate_filter_config(snapshot["filter"])
+        plateau = PlateauConfig.validate(snapshot["plateau"])
+        with self.plateau.lock:
+            self.plateau.settings = plateau
+        with self.measurement.lock:
+            self.measurement.settings = dict(self.settings.settings)
+            self.measurement.filter_config = dict(self.filter.settings)
+            self.measurement.set_plateau_config(plateau)
+            self.measurement._reset_live_analysis_locked()
+        self.schedule.set_plateau_config(plateau)
+
+    def _latest_record_settings(self) -> dict[str, Any] | None:
+        for record in reversed(self.records):
+            try:
+                raw = json.loads(str(record.get("measurement_settings_json") or ""))
+                if isinstance(raw, dict):
+                    return SettingsController.validate(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return None
+
+    def _activate_workspace_configuration(self) -> None:
+        settings = (
+            self.workspace_runtime_settings
+            or self.calibration_settings
+            or self._latest_record_settings()
+        )
+        filter_settings = self.workspace_runtime_filter or self.calibration_filter
+        plateau_settings = self.workspace_runtime_plateau or self.calibration_plateau
+        if settings is not None:
+            with self.settings.lock:
+                self.settings.settings = SettingsController.validate(settings)
+                self.settings.applied = False
+                self.settings.state = "not_applied"
+                self.settings.message = "已恢复历史条件，继续测量前请重新应用到硬件"
+                self.settings.error = ""
+        if filter_settings is not None:
+            with self.filter.lock:
+                self.filter.settings = validate_filter_config(filter_settings)
+        if plateau_settings is not None:
+            with self.plateau.lock:
+                self.plateau.settings = PlateauConfig.validate(plateau_settings)
+        with self.measurement.lock:
+            self.measurement.settings = dict(self.settings.settings)
+            self.measurement.filter_config = dict(self.filter.settings)
+            self.measurement.set_plateau_config(self.plateau.settings)
+            self.measurement._reset_live_analysis_locked()
+        self.schedule.set_plateau_config(self.plateau.settings)
+
+    @staticmethod
+    def _probe_workspace(path: Path, create: bool) -> None:
+        try:
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
+            if not path.is_dir():
+                raise OSError("目录不存在")
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", prefix=".sensus-write-test-",
                 dir=path, delete=True,
@@ -4337,12 +4474,52 @@ class AppState:
                 probe.flush()
         except OSError as exc:
             raise ValueError(f"保存目录不可写：{exc}") from exc
-        with self.lock:
-            self.save_dir = path
-            WORKFLOW_PATH.parent.mkdir(parents=True, exist_ok=True)
-            WORKFLOW_PATH.write_text(json.dumps({"save_dir": str(path)}, indent=2,
-                                                ensure_ascii=False))
-        self._load_workspace()
+
+    def _switch_workspace(self, path: Path, *, create: bool, restore: bool) -> None:
+        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
+            raise RuntimeError("测量或自动任务运行期间不能切换工作目录")
+        self._probe_workspace(path, create)
+        memory_before = self._workspace_memory_snapshot()
+        controllers_before = self._controller_snapshot()
+        workflow_before = WORKFLOW_PATH.read_bytes() if WORKFLOW_PATH.exists() else None
+        try:
+            self.save_dir = path.resolve()
+            self._load_workspace()
+            if restore:
+                self._activate_workspace_configuration()
+            self._atomic_json_file(WORKFLOW_PATH, {"save_dir": str(self.save_dir)})
+        except Exception:
+            self._restore_workspace_memory(memory_before)
+            self._restore_controllers(controllers_before)
+            try:
+                if workflow_before is None:
+                    WORKFLOW_PATH.unlink(missing_ok=True)
+                else:
+                    WORKFLOW_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    temporary: Path | None = None
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode="wb", prefix=f".{WORKFLOW_PATH.name}.", suffix=".tmp",
+                            dir=WORKFLOW_PATH.parent, delete=False,
+                        ) as handle:
+                            temporary = Path(handle.name)
+                            handle.write(workflow_before)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.replace(temporary, WORKFLOW_PATH)
+                        temporary = None
+                    finally:
+                        if temporary is not None:
+                            temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    def configure_workflow(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._resolve_save_dir(str(payload.get("save_dir", "")))
+        with self.operation_lock:
+            self._switch_workspace(path, create=True, restore=False)
+            self._refresh_history_best_effort()
         return self.workflow_snapshot()
 
     def workflow_snapshot(self) -> dict[str, Any]:
@@ -4391,6 +4568,119 @@ class AppState:
             "latest_result": self.latest_workflow_result,
             "records": list(reversed(self.records[-20:])),
         })
+
+    def _persist_workspace_runtime(self) -> None:
+        settings = self.settings.snapshot()["settings"]
+        filter_settings = self.filter.snapshot()["settings"]
+        plateau = self.plateau.snapshot()["settings"]
+        self._atomic_json_file(self._workspace_paths()["runtime"], {
+            "version": 1,
+            "settings": settings,
+            "filter": filter_settings,
+            "plateau": plateau,
+            "saved_at": time.time(),
+        })
+        with self.lock:
+            self.workspace_runtime_settings = dict(settings)
+            self.workspace_runtime_filter = dict(filter_settings)
+            self.workspace_runtime_plateau = dict(plateau)
+
+    def _history_summary(self) -> dict[str, Any]:
+        with self.lock:
+            completed = [row for row in self.records if row.get("state") == "completed"]
+            roles = {
+                role: sum(row.get("sample_role") == role for row in completed)
+                for role in ("calibration", "test", "stabilization", "cv")
+            }
+            latest = completed[-1] if completed else None
+            latest_at = 0.0
+            if latest is not None:
+                try:
+                    latest_at = float(latest.get("finished_at") or 0)
+                except (TypeError, ValueError):
+                    latest_at = 0.0
+            settings = (
+                self.workspace_runtime_settings
+                or self.calibration_settings
+                or self._latest_record_settings()
+                or {}
+            )
+            return _json_safe({
+                "points_count": len(self.point_records),
+                "selected_points_count": len(self.selected_point_ids),
+                "records_count": len(self.records),
+                "completed_count": len(completed),
+                "calibration_count": roles["calibration"],
+                "test_count": roles["test"],
+                "stabilization_count": roles["stabilization"],
+                "cv_count": roles["cv"],
+                "has_model": self.model is not None,
+                "model_r2": self.model.r2 if self.model is not None else None,
+                "model_created_at": self.model_created_at,
+                "method": settings.get("method", "it"),
+                "latest_result_at": latest_at or None,
+                "latest_sample_name": str((latest or {}).get("sample_name") or ""),
+                "latest_sample_role": str((latest or {}).get("sample_role") or ""),
+            })
+
+    def register_history(
+        self, payload: dict[str, Any] | None = None, *, allow_busy: bool = False,
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        if not allow_busy and (
+            self.measurement.is_busy() or self.schedule.snapshot()["active"]
+        ):
+            raise RuntimeError("测量或自动任务运行期间不能登记工作区")
+        with self.operation_lock:
+            self._persist_workspace_runtime()
+            return self.history.register(
+                self.save_dir,
+                self._history_summary(),
+                str(payload.get("label") or ""),
+            )
+
+    def _refresh_history_best_effort(self) -> None:
+        try:
+            self.register_history(allow_busy=True)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
+
+    def history_snapshot(self) -> dict[str, Any]:
+        return self.history.list(self.save_dir)
+
+    def open_history(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workspace_id = str(payload.get("workspace_id") or "")
+        if not workspace_id:
+            raise ValueError("请指定历史记录")
+        if payload.get("unsaved_changes") and not payload.get("discard_unsaved"):
+            raise RuntimeError("当前页面有未保存编辑，请先保存或确认放弃")
+        with self.operation_lock:
+            _, path = self.history.resolve(workspace_id)
+            self._switch_workspace(path, create=False, restore=True)
+        return {
+            "workflow": self.workflow_snapshot(),
+            "calibration": self.model_payload(),
+            "settings": self.settings.snapshot(),
+            "filter": self.filter.snapshot(),
+            "plateau": self.plateau.snapshot(),
+            "history": self.history_snapshot(),
+        }
+
+    def favorite_history(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workspace_id = str(payload.get("workspace_id") or "")
+        if not workspace_id:
+            raise ValueError("请指定历史记录")
+        favorite = payload.get("favorite")
+        return self.history.favorite(
+            workspace_id, None if favorite is None else bool(favorite)
+        )
+
+    def remove_history(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workspace_id = str(payload.get("workspace_id") or "")
+        if not workspace_id:
+            raise ValueError("请指定历史记录")
+        self.history.remove(workspace_id)
+        return self.history_snapshot()
 
     def start_measurement(self, payload: dict[str, Any]) -> dict[str, Any]:
         requested_dir = str(payload.get("save_dir", "")).strip()
@@ -5008,7 +5298,7 @@ class AppState:
                                 "结果未加入标定"
                             )
                         if self.calibration_filter is None:
-                            self.calibration_filter = self._filter_signature(
+                            self.calibration_filter = validate_filter_config(
                                 (run.get("filter") or {}).get("config")
                                 if isinstance(run.get("filter"), dict) else None
                             )
@@ -5079,6 +5369,7 @@ class AppState:
         except Exception as exc:
             result["export_error"] = str(exc)
             self.latest_workflow_result = dict(result)
+        self._refresh_history_best_effort()
         self.measurement.set_workflow_result(result)
         _notify_measurement_completion(run, result)
 
@@ -5223,7 +5514,7 @@ class AppState:
             self.save_dir.mkdir(parents=True, exist_ok=True)
             paths = self._workspace_paths()
             path = paths["model"]
-            current_filter = self._filter_signature(
+            current_filter = validate_filter_config(
                 self.filter.snapshot()["settings"]
             )
             created_at = time.time()
@@ -5582,6 +5873,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/workflow":
             self._send_json(APP.workflow_snapshot())
             return
+        if parsed.path == "/api/history":
+            self._send_json(APP.history_snapshot())
+            return
         if parsed.path == "/api/drift":
             self._send_json(APP.drift_payload())
             return
@@ -5724,6 +6018,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/workflow/reset-calibration":
                 with APP.operation_lock:
                     result = APP.reset_calibration()
+            elif self.path == "/api/history/register":
+                result = APP.register_history(payload)
+            elif self.path == "/api/history/open":
+                result = APP.open_history(payload)
+            elif self.path == "/api/history/favorite":
+                result = APP.favorite_history(payload)
+            elif self.path == "/api/history/remove":
+                result = APP.remove_history(payload)
             else:
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 return

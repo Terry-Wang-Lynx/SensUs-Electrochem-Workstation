@@ -142,6 +142,42 @@ def test_calibration_chart_has_independent_point_visibility_controls() -> None:
     assert 'id="showTestPoints" type="checkbox" checked' in html
 
 
+def test_workspace_history_view_exposes_restore_favorite_filter_and_safe_remove_controls() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert 'data-view="history"' in html
+    for element_id in (
+        "view-history", "workspaceHistoryList", "historyFavoritesOnly",
+        "registerCurrentHistory", "refreshWorkspaceHistory", "workspaceHistoryError",
+    ):
+        assert f'id="{element_id}"' in html
+    for endpoint in (
+        "/api/history", "/api/history/register", "/api/history/open",
+        "/api/history/favorite", "/api/history/remove",
+    ):
+        assert endpoint in app
+    assert "原始测量目录和数据不会被删除" in app
+    assert "workspaceHasUnsavedChanges" in app
+    assert "discard_unsaved:unsaved" in app
+    assert ".workspace-history-card.unavailable" in styles
+    assert ".workspace-history-list{grid-template-columns:minmax(0,1fr)" in styles
+    assert ".sidebar nav{grid-template-columns:repeat(5,1fr)}" in styles
+
+
+def test_history_status_label_maps_missing_and_corrupt_entries() -> None:
+    values = _evaluate_chart_js(
+        ["historyStatusLabel"],
+        """
+const values = ['available', 'missing', 'corrupt', 'other'].map(historyStatusLabel);
+""",
+        "values",
+    )
+
+    assert values == ["可用", "目录缺失", "数据损坏", "不可用"]
+
+
 def test_ap_chart_keeps_the_literal_blue_boundary() -> None:
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
 
