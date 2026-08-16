@@ -36,12 +36,17 @@ try {
         throw "OpenOCD archive extraction failed with exit code $LASTEXITCODE"
     }
 
-    $bundleRoot = Get-ChildItem -Path $Extracted -Directory | Select-Object -First 1
-    if (-not $bundleRoot) {
-        throw "OpenOCD archive did not contain a top-level directory"
+    # The official archive stores bin/ and share/ directly at its root. Keep
+    # support for a future archive that adds a single top-level directory.
+    $bundleRoot = $Extracted
+    if (-not (Test-Path (Join-Path $bundleRoot "bin\openocd.exe"))) {
+        $nestedRoot = Get-ChildItem -Path $Extracted -Directory | Select-Object -First 1
+        if ($nestedRoot) {
+            $bundleRoot = $nestedRoot.FullName
+        }
     }
-    $sourceBin = Join-Path $bundleRoot.FullName "bin"
-    $sourceScripts = Join-Path $bundleRoot.FullName "share\openocd\scripts"
+    $sourceBin = Join-Path $bundleRoot "bin"
+    $sourceScripts = Join-Path $bundleRoot "share\openocd\scripts"
     $sourceExecutable = Join-Path $sourceBin "openocd.exe"
     if (-not (Test-Path $sourceExecutable) -or -not (Test-Path $sourceScripts)) {
         throw "OpenOCD archive is missing openocd.exe or its scripts"
