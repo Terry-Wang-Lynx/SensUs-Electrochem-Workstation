@@ -101,6 +101,23 @@ def test_serial_transport_requires_a_data_port(monkeypatch) -> None:
         gui_server._resolve_hardware_transport("serial", "")
 
 
+def test_auto_transport_rejects_an_unidentified_usb_cdc(monkeypatch) -> None:
+    monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "")
+    monkeypatch.setattr(gui_server, "_discover_serial_data_port", lambda: None)
+    monkeypatch.setattr(gui_server, "_serial_port_infos", lambda: [_PortInfo(
+        "/dev/cu.usbmodem1101"
+    )])
+
+    with pytest.raises(ValueError, match="未找到可用的 V5.1 DATA CDC"):
+        gui_server._resolve_hardware_transport("auto", "")
+
+
+def test_process_tail_omits_openocd_shutdown_banner() -> None:
+    assert gui_server._meaningful_process_tail(
+        "Error: no J-Link found\nshutdown command invoked\n"
+    ) == ["Error: no J-Link found"]
+
+
 def test_it_tool_serial_mode_does_not_start_jlink() -> None:
     child = Mock()
     child.wait.return_value = 0

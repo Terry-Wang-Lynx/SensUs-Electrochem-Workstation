@@ -416,6 +416,22 @@ def _serial_port_infos() -> list[Any]:
     return [info for info in list_ports.comports() if is_candidate(info)]
 
 
+def _meaningful_process_tail(*outputs: object, limit: int = 6) -> list[str]:
+    """Return useful process diagnostics without OpenOCD's normal shutdown line."""
+    generic = {"shutdown command invoked"}
+    lines: list[str] = []
+    for output in outputs:
+        if output is None:
+            continue
+        for raw_line in str(output).splitlines():
+            line = raw_line.strip()
+            if not line or line.lower() in generic:
+                continue
+            if not lines or lines[-1] != line:
+                lines.append(line)
+    return lines[-limit:]
+
+
 def _discover_serial_data_port(*, force: bool = False) -> str | None:
     """Find the V5.1 DATA CDC without confusing it with SMP or J-Link CDC."""
     if SERIAL_DATA_PORT and not force:
@@ -433,18 +449,25 @@ def _discover_serial_data_port(*, force: bool = False) -> str | None:
             with serial.Serial(candidate, 115200, timeout=0.1,
                                write_timeout=0.5) as stream:
                 stream.dtr = True
-                stream.write(b"GET req=workstation-probe\n")
-                stream.flush()
-                deadline = time.monotonic() + 1.5
-                received = bytearray()
-                while time.monotonic() < deadline:
-                    chunk = stream.read(256)
-                    if chunk:
-                        received.extend(chunk)
-                        text = received.decode("utf-8", "replace")
-                        if ("CFG_CONFIRMED" in text
-                                and "req=workstation-probe" in text):
-                            return candidate
+                # USB1 firmware predates request IDs and only understands a
+                # bare GET. Try the tagged request first, then fall back to
+                # the legacy form while accepting either response format.
+                for probe in (b"GET req=workstation-probe\n", b"GET\n"):
+                    try:
+                        stream.reset_input_buffer()
+                    except (AttributeError, OSError, ValueError):
+                        pass
+                    stream.write(probe)
+                    stream.flush()
+                    deadline = time.monotonic() + 1.5
+                    received = bytearray()
+                    while time.monotonic() < deadline:
+                        chunk = stream.read(256)
+                        if chunk:
+                            received.extend(chunk)
+                            text = received.decode("utf-8", "replace")
+                            if "CFG_CONFIRMED" in text:
+                                return candidate
         except (OSError, ValueError, serial.SerialException):
             continue
     return None
@@ -500,6 +523,11 @@ def _refresh_usb_transport() -> None:
         raise RuntimeError(
             "USB 模式未找到 V5.1 DATA CDC，请重新插拔 USB 后重试"
         )
+    if _serial_port_infos():
+        raise RuntimeError(
+            "检测到 USB CDC，但未找到可用的 V5.1 DATA CDC；"
+            "请确认固件已更新并重新插拔 USB"
+        )
     SERIAL_DATA_PORT = ""
     SERIAL_SMP_PORT = ""
     HARDWARE_TRANSPORT = "rtt"
@@ -531,6 +559,11 @@ def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
             _discover_serial_smp_port(discovered) or SERIAL_SMP_PORT
         )
         return "serial"
+    if _serial_port_infos():
+        raise ValueError(
+            "检测到 USB CDC，但未找到可用的 V5.1 DATA CDC；"
+            "请确认固件已更新并重新插拔 USB"
+        )
     return "rtt"
 
 
@@ -1363,12 +1396,15 @@ class SettingsController:
         # 不接住的话会变成未处理 500,state 停在 "applying",前端只能看到通用错误。
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
                 OSError, RuntimeError) as exc:
-            output = getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or str(exc)
-            detail = output.strip().splitlines()
+            detail = _meaningful_process_tail(
+                getattr(exc, "stderr", ""),
+                getattr(exc, "stdout", ""),
+                str(exc),
+            )
             with self.lock:
                 self.state = "error"
                 self.applied = False
-                self.error = detail[-1] if detail else "固件编译或烧录失败"
+                self.error = " | ".join(detail) if detail else "固件编译或烧录失败"
                 self.message = "参数应用失败"
             raise RuntimeError(self.error) from exc
         with self.lock:
@@ -3548,9 +3584,29 @@ class MeasurementController:
                     terminal_data, completed=False,
                 )
                 self.state = "error"
-                self.error = (
-                    f"采集进程退出码 {return_code}。请查看 {self.run_dir / 'collector.log'}"
+                collector_log = self.run_dir / "collector.log"
+                try:
+                    log_text = collector_log.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    log_text = ""
+                detail = _meaningful_process_tail(log_text)
+                transport = (
+                    "V5.1 USB DATA CDC"
+                    if HARDWARE_TRANSPORT == "serial"
+                    else "RTT/J-Link"
                 )
+                if detail:
+                    self.error = (
+                        f"{transport} 采集失败（退出码 {return_code}）："
+                        f"{' | '.join(detail)}"
+                    )
+                else:
+                    self.error = (
+                        f"{transport} 采集失败（退出码 {return_code}）。"
+                        f"请查看 {collector_log}"
+                    )
                 self.message = "测量失败"
                 self._notify_complete()
                 return
