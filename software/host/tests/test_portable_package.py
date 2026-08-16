@@ -1,12 +1,32 @@
 import json
 import hashlib
 import os
+import plistlib
+import re
 import runpy
 from pathlib import Path
 
 import pytest
 
+import pa_host
 from pa_host import collect, gui_server, runtime
+
+
+def test_release_versions_stay_in_sync() -> None:
+    root = Path(__file__).parents[3]
+    match = re.search(
+        r'^version = "([^"]+)"$',
+        (root / "pyproject.toml").read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    assert match is not None
+    project_version = match.group(1)
+    with (root / "macos" / "Info.plist").open("rb") as handle:
+        app_metadata = plistlib.load(handle)
+
+    assert pa_host.__version__ == project_version
+    assert app_metadata["CFBundleShortVersionString"] == project_version
+    assert app_metadata["CFBundleVersion"] == project_version
 
 
 def test_bundled_runtime_firmware_metadata_matches_artifacts() -> None:
