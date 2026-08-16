@@ -235,3 +235,54 @@ def test_concurrent_open_requests_serialize_and_leave_a_complete_workspace() -> 
         assert errors == []
         assert app.save_dir.resolve() in {(root / "workspace-a").resolve(), (root / "workspace-b").resolve()}
         assert app.workflow_snapshot()["save_dir"] == str(app.save_dir)
+
+
+def test_new_calibration_batch_uses_child_directory_and_preserves_root_history() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        app, registry = _isolated_app(root)
+        app._append_record({
+            "finished_at": "20", "run_id": "root-run", "sample_name": "根目录样品",
+            "sample_role": "calibration", "state": "completed",
+            "steady_current_nA": "22", "known_concentration_um": "5",
+        })
+        root_dir = app.save_dir
+
+        first = app.reset_calibration()
+        first_dir = app.save_dir
+        assert first_dir.parent.resolve() == root_dir.resolve()
+        assert first_dir.resolve() != root_dir.resolve()
+        assert first["workspace_root"] == str(root_dir.resolve())
+        assert first["batch_id"]
+        assert first["batch_label"].startswith("批次 ")
+        assert (root_dir / "measurement-index.csv").exists()
+        assert not (first_dir / "measurement-index.csv").exists()
+
+        second = app.reset_calibration()
+        second_dir = app.save_dir
+        assert second_dir.parent.resolve() == root_dir.resolve()
+        assert second_dir.resolve() != first_dir.resolve()
+        assert first_dir.exists()
+
+        history = app.history_snapshot()
+        root_entry = next(
+            entry for entry in history["entries"]
+            if entry["workspace_id"] == history["active_workspace_id"]
+        )
+        batch_entries = [
+            entry for entry in history["batches"]
+            if entry["workspace_root_id"] == root_entry["workspace_id"]
+        ]
+        assert root_entry["kind"] == "workspace"
+        assert len(batch_entries) == 2
+
+        restored = AppState()
+        restored.history = WorkspaceHistory(root / "history.json", root)
+        result = restored.open_history({"workspace_id": root_entry["workspace_id"]})
+        assert restored.save_dir.resolve() == root_dir.resolve()
+        assert restored.records[0]["run_id"] == "root-run"
+        assert result["workflow"]["batch_id"] == ""
+
+        restored.open_history({"workspace_id": first["batch_id"]})
+        assert restored.save_dir.resolve() == first_dir.resolve()
+        assert restored.workspace_root.resolve() == root_dir.resolve()

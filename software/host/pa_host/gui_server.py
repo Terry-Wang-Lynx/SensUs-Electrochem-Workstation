@@ -76,7 +76,7 @@ from .live_metrics import (
     prepare_live_stage,
 )
 from .stability_eta import StabilityEtaEstimator
-from .workspace_history import WorkspaceHistory
+from .workspace_history import BATCH_KIND, WORKSPACE_KIND, WorkspaceHistory
 from .frontend_update import FrontendUpdater
 from . import runtime
 
@@ -4378,6 +4378,7 @@ class AppState:
             self.measurement._reset_live_analysis_locked()
         self.schedule.set_plateau_config(self.plateau.settings)
         self.save_dir = DEFAULT_SAVE_DIR
+        self.workspace_root = DEFAULT_SAVE_DIR
         self.model: CalibrationModel | None = None
         self.model_path: Path | None = None
         self.model_settings: dict[str, Any] | None = None
@@ -4397,12 +4398,25 @@ class AppState:
         self.workspace_runtime_filter: dict[str, Any] | None = None
         self.workspace_runtime_plateau: dict[str, Any] | None = None
         self.latest_workflow_result: dict[str, Any] | None = None
+        saved_workspace_root: Path | None = None
         if WORKFLOW_PATH.exists():
             try:
                 saved = json.loads(WORKFLOW_PATH.read_text())
                 self.save_dir = self._resolve_save_dir(str(saved.get("save_dir", "")))
+                raw_workspace_root = str(saved.get("workspace_root") or "").strip()
+                if raw_workspace_root:
+                    saved_workspace_root = self._resolve_save_dir(raw_workspace_root)
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 self.save_dir = DEFAULT_SAVE_DIR
+        inferred_root = self._workspace_root_for(self.save_dir)
+        self.workspace_root = (
+            saved_workspace_root
+            if saved_workspace_root is not None and (
+                saved_workspace_root == self.save_dir
+                or self.save_dir.parent == saved_workspace_root
+            )
+            else inferred_root
+        )
         self._load_workspace()
         self.schedule.metadata_hook = self._prepare_export_metadata
         self.measurement.completion_hook = self._measurement_completed
@@ -4422,6 +4436,32 @@ class AppState:
         if not path.is_absolute():
             path = PROJECT_DIR / path
         return path.resolve()
+
+    def _workspace_root_for(self, path: Path) -> Path:
+        """Resolve a batch directory back to its selected workspace root."""
+        resolved = path.resolve()
+        marker = self.history.marker_info(resolved)
+        if marker.get("kind") != BATCH_KIND:
+            return resolved
+        parent = resolved.parent
+        root_marker = self.history.marker_info(parent)
+        root_id = str(marker.get("workspace_root_id") or "")
+        if root_marker.get("kind") == WORKSPACE_KIND and (
+            not root_id or root_marker.get("workspace_id") == root_id
+        ):
+            return parent.resolve()
+        return resolved
+
+    def _batch_metadata(self) -> dict[str, str]:
+        marker = self.history.marker_info(self.save_dir)
+        kind = str(marker.get("kind") or WORKSPACE_KIND)
+        return {
+            "batch_id": str(marker.get("workspace_id") or "")
+            if kind == BATCH_KIND else "",
+            "batch_label": str(
+                marker.get("label") or self.save_dir.name
+            ) if kind == BATCH_KIND else "",
+        }
 
     @staticmethod
     def _safe_filename(value: str) -> str:
@@ -4708,7 +4748,7 @@ class AppState:
                     self.workspace_runtime_plateau = None
 
     _WORKSPACE_STATE_FIELDS = (
-        "save_dir", "model", "model_path", "model_settings", "model_plateau",
+        "save_dir", "workspace_root", "model", "model_path", "model_settings", "model_plateau",
         "calibration_filter", "calibration_settings", "calibration_plateau",
         "points", "point_records", "selected_point_ids", "model_created_at",
         "validation_started_at", "records", "validation_overrides", "drift",
@@ -4829,7 +4869,14 @@ class AppState:
         except OSError as exc:
             raise ValueError(f"保存目录不可写：{exc}") from exc
 
-    def _switch_workspace(self, path: Path, *, create: bool, restore: bool) -> None:
+    def _switch_workspace(
+        self,
+        path: Path,
+        *,
+        create: bool,
+        restore: bool,
+        workspace_root: Path | None = None,
+    ) -> None:
         if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
             raise RuntimeError("测量或自动任务运行期间不能切换工作目录")
         self._probe_workspace(path, create)
@@ -4838,10 +4885,18 @@ class AppState:
         workflow_before = WORKFLOW_PATH.read_bytes() if WORKFLOW_PATH.exists() else None
         try:
             self.save_dir = path.resolve()
+            self.workspace_root = (
+                workspace_root.resolve()
+                if workspace_root is not None
+                else self._workspace_root_for(self.save_dir)
+            )
             self._load_workspace()
             if restore:
                 self._activate_workspace_configuration()
-            self._atomic_json_file(WORKFLOW_PATH, {"save_dir": str(self.save_dir)})
+            self._atomic_json_file(WORKFLOW_PATH, {
+                "save_dir": str(self.save_dir),
+                "workspace_root": str(self.workspace_root),
+            })
         except Exception:
             self._restore_workspace_memory(memory_before)
             self._restore_controllers(controllers_before)
@@ -4909,8 +4964,11 @@ class AppState:
         schedule_state = self.schedule.snapshot()
         if schedule_state["active"] and schedule_state["sample_role"] == "stabilization":
             stage = "stabilization"
+        batch = self._batch_metadata()
         return _json_safe({
             "save_dir": str(self.save_dir),
+            "workspace_root": str(self.workspace_root),
+            **batch,
             "calibration_ready": calibration_ready,
             "settings_match": settings_match,
             "stage": stage,
@@ -4987,10 +5045,16 @@ class AppState:
             raise RuntimeError("测量或自动任务运行期间不能登记工作区")
         with self.operation_lock:
             self._persist_workspace_runtime()
+            marker = self.history.marker_info(self.save_dir)
+            kind = str(marker.get("kind") or WORKSPACE_KIND)
+            root_id = str(marker.get("workspace_root_id") or "")
+            label = str(payload.get("label") or marker.get("label") or "")
             return self.history.register(
                 self.save_dir,
                 self._history_summary(),
-                str(payload.get("label") or ""),
+                label,
+                kind=kind,
+                workspace_root_id=root_id,
             )
 
     def import_history(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -5007,11 +5071,14 @@ class AppState:
             raise ValueError(detail or "历史工作区不可用")
         label = str(payload.get("label") or path.name or "未命名工作区")
         with self.operation_lock:
+            marker = self.history.marker_info(path)
             self.history.register(
                 path,
                 WorkspaceHistory.summarize(path),
                 label,
                 create_marker=False,
+                kind=str(marker.get("kind") or WORKSPACE_KIND),
+                workspace_root_id=str(marker.get("workspace_root_id") or ""),
             )
         return self.history_snapshot()
 
@@ -5022,7 +5089,23 @@ class AppState:
             pass
 
     def history_snapshot(self) -> dict[str, Any]:
-        return self.history.list(self.save_dir)
+        snapshot = self.history.list(self.save_dir)
+        root_marker = self.history.marker_info(self.workspace_root)
+        root_id = str(root_marker.get("workspace_id") or "")
+        entries = snapshot.get("entries", [])
+        snapshot.update({
+            "workspace_root": str(self.workspace_root),
+            "active_workspace_id": root_id,
+            "workspaces": [
+                entry for entry in entries
+                if entry.get("kind", WORKSPACE_KIND) != BATCH_KIND
+            ],
+            "batches": [
+                entry for entry in entries
+                if entry.get("kind") == BATCH_KIND
+            ],
+        })
+        return snapshot
 
     def open_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         workspace_id = str(payload.get("workspace_id") or "")
@@ -5753,31 +5836,28 @@ class AppState:
         if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
             raise RuntimeError("测量或自动任务运行期间不能重置标定")
         stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1_000_000:06d}"
-        paths = self._workspace_paths()
-        with self.lock:
-            for key in (
-                "points", "model", "settings", "plateau", "filter", "selection",
-                "validation", "drift",
-            ):
-                path = paths[key]
-                if path.exists():
-                    archived = path.with_name(f"{path.stem}-{stamp}{path.suffix}")
-                    path.replace(archived)
-            self.points = []
-            self.point_records = []
-            self.selected_point_ids = []
-            self.model = None
-            self.model_path = None
-            self.model_settings = None
-            self.model_plateau = None
-            self.calibration_settings = None
-            self.calibration_plateau = None
-            self.calibration_filter = None
-            self.model_created_at = None
-            self.validation_started_at = None
-            self.validation_overrides = {}
-            self.latest_workflow_result = None
-            self.drift = self._empty_drift()
+        with self.operation_lock:
+            root = self._workspace_root_for(self.save_dir)
+            self.workspace_root = root
+            self._probe_workspace(root, create=True)
+            self.history.register(
+                root, WorkspaceHistory.summarize(root), root.name,
+                kind=WORKSPACE_KIND,
+            )
+            batch_name = f"batch-{stamp}"
+            batch_path = root / batch_name
+            suffix = 2
+            while batch_path.exists():
+                batch_path = root / f"{batch_name}-{suffix}"
+                suffix += 1
+            self._switch_workspace(
+                batch_path, create=True, restore=False, workspace_root=root,
+            )
+            self.history.register_batch(
+                batch_path, root, self._history_summary(),
+                f"批次 {stamp}",
+            )
+            self._refresh_history_best_effort()
         return self.workflow_snapshot()
 
     def fit(self, payload: dict[str, Any]) -> dict[str, Any]:

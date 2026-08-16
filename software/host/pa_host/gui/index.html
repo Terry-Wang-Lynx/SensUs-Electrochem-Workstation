@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SensUs 电化学工作站</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20260816-usb-refresh-history-import">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260816-persistent-batches">
 </head>
 <body>
   <div class="app-shell">
@@ -262,6 +262,10 @@
             </div>
           </div>
           <div class="notice error" id="workspaceHistoryError" hidden></div>
+          <div class="workspace-history-picker">
+            <label>工作区<select id="historyWorkspaceSelect" aria-label="选择工作区"></select></label>
+            <span id="historyBatchSummary">选择工作区后显示其批次</span>
+          </div>
           <div class="workspace-history-import">
             <label>已有数据目录<div class="directory-row"><input id="historyImportPath" placeholder="例如：/Users/lynx/Documents/实验数据"><button class="secondary" id="importHistoryDirectory" type="button">导入目录</button></div></label>
           </div>
@@ -401,6 +405,6 @@
     </main>
   </div>
   <div class="toast" id="toast"></div>
-  <script src="/assets/app.js?v=20260816-usb-refresh-history-import"></script>
+  <script src="/assets/app.js?v=20260816-persistent-batches"></script>
 </body>
 </html>

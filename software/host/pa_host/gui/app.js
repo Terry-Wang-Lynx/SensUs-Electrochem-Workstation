@@ -315,8 +315,21 @@ function historyStat(label,value){const node=document.createElement('div'),name=
 function renderWorkspaceHistory(data=state.history){
   state.history=data||{entries:[]};
   const all=state.history.entries||[],favoritesOnly=$('historyFavoritesOnly').checked;
-  const entries=favoritesOnly?all.filter(entry=>entry.favorite):all;
-  $('workspaceHistorySummary').textContent=`${all.length} 个工作区 · ${all.filter(entry=>entry.favorite).length} 个收藏`;
+  const workspaces=state.history.workspaces||all.filter(entry=>entry.kind!=='batch');
+  const select=$('historyWorkspaceSelect'),previous=select.value;
+  select.replaceChildren();
+  workspaces.forEach(entry=>{
+    const option=document.createElement('option');option.value=entry.workspace_id;option.textContent=`${entry.label} · ${entry.location}`;select.appendChild(option);
+  });
+  const preferred=workspaces.some(entry=>entry.workspace_id===previous)?previous:
+    (state.history.active_workspace_id&&workspaces.some(entry=>entry.workspace_id===state.history.active_workspace_id)?state.history.active_workspace_id:(workspaces[0]?.workspace_id||''));
+  select.value=preferred;
+  const selectedWorkspace=workspaces.find(entry=>entry.workspace_id===preferred);
+  const scoped=preferred?all.filter(entry=>entry.workspace_id===preferred||(entry.kind==='batch'&&entry.workspace_root_id===preferred)):all;
+  const entries=favoritesOnly?scoped.filter(entry=>entry.favorite):scoped;
+  const batchCount=scoped.filter(entry=>entry.kind==='batch').length;
+  $('workspaceHistorySummary').textContent=`${workspaces.length} 个工作区 · 当前 ${batchCount} 个批次 · ${all.filter(entry=>entry.favorite).length} 个收藏`;
+  $('historyBatchSummary').textContent=selectedWorkspace?`当前工作区：${selectedWorkspace.label} · ${batchCount} 个批次`:'暂无可用工作区';
   const error=$('workspaceHistoryError'),registryError=String(state.history.registry_error||'');
   error.textContent=registryError;error.hidden=!registryError;
   const list=$('workspaceHistoryList');list.replaceChildren();
@@ -324,7 +337,7 @@ function renderWorkspaceHistory(data=state.history){
   entries.forEach(entry=>{
     const card=document.createElement('article');card.className=`workspace-history-card ${entry.current?'current ':''}${entry.status==='available'?'':'unavailable'}`.trim();card.dataset.workspaceId=entry.workspace_id;
     const title=document.createElement('div');title.className='workspace-history-title';
-    const identity=document.createElement('div'),name=document.createElement('strong'),location=document.createElement('small');name.textContent=`${entry.current?'当前 · ':''}${entry.label}`;location.textContent=entry.location;identity.append(name,location);
+    const identity=document.createElement('div'),name=document.createElement('strong'),location=document.createElement('small');name.textContent=`${entry.current?'当前 · ':''}${entry.kind==='batch'?'批次 · ':'工作区 · '}${entry.label}`;location.textContent=entry.location;identity.append(name,location);
     const star=document.createElement('button');star.type='button';star.className=`workspace-history-star ${entry.favorite?'active':''}`;star.textContent=entry.favorite?'★':'☆';star.title=entry.favorite?'取消收藏':'收藏';star.setAttribute('aria-label',star.title);star.onclick=()=>void toggleWorkspaceFavorite(entry);
     title.append(identity,star);
     const meta=document.createElement('div');meta.className='workspace-history-meta';const timestamp=document.createElement('span'),status=document.createElement('strong');timestamp.textContent=historyTimestamp(entry.summary?.latest_result_at||entry.updated_at);status.className=`workspace-history-status ${entry.status}`;status.textContent=historyStatusLabel(entry.status);status.title=entry.status_detail||'';meta.append(timestamp,status);
@@ -350,6 +363,7 @@ async function openWorkspaceHistory(entry){
   }catch(e){errorBox('workspaceHistoryError',e)}
 }
 $('historyFavoritesOnly').addEventListener('change',()=>renderWorkspaceHistory());
+$('historyWorkspaceSelect').addEventListener('change',()=>renderWorkspaceHistory());
 $('refreshWorkspaceHistory').addEventListener('click',()=>void refreshWorkspaceHistory());
 $('registerCurrentHistory').addEventListener('click',async()=>{try{await post('/api/history/register',{});await refreshWorkspaceHistory();toast('当前工作区已登记')}catch(e){errorBox('workspaceHistoryError',e)}});
 $('importHistoryDirectory').addEventListener('click',async()=>{
@@ -782,7 +796,7 @@ $('sampleName').addEventListener('input',previewFilename);$('knownConcentration'
 $('doubleKnownConcentration').addEventListener('click',()=>scaleKnownConcentration(2));
 $('halveKnownConcentration').addEventListener('click',()=>scaleKnownConcentration(.5));
 $('applySaveDirectory').onclick=async()=>{try{renderWorkflow(await post('/api/workflow/config',{save_dir:$('saveDirectory').value}));state.calibration=await api('/api/calibration');renderCalibration();toast('保存目录已应用')}catch(e){errorBox('measureError',e)}};
-$('resetCalibration').onclick=async()=>{if(!confirm('开始一套新标定？现有标定文件会保留为带时间戳的归档。'))return;try{renderWorkflow(await post('/api/workflow/reset-calibration'));state.calibration=await api('/api/calibration');renderCalibration();setSampleRole('calibration',true);toast('已开始新的标定')}catch(e){errorBox('measureError',e)}};
+$('resetCalibration').onclick=async()=>{if(!confirm('开始一套新标定？软件会在当前工作区下新建一个批次目录，旧批次数据保持不变。'))return;try{renderWorkflow(await post('/api/workflow/reset-calibration'));state.calibration=await api('/api/calibration');renderCalibration();setSampleRole('calibration',true);toast('已新建批次并切换到新目录')}catch(e){errorBox('measureError',e)}};
 
 function readSettings(){const potential=Number($('potentialV').value),low=Number($('cvLowV').value),high=Number($('cvHighV').value),rate=Number($('cvScanRate').value),cycles=Number($('cvCycles').value),cv=state.method==='cv',duration=cv?2*(high-low)/rate*cycles:Number($('durationS').value);return {method:state.method,initial_potential_v:cv?low:potential,potential_v:cv?low:potential,working_electrode_v:Number($('workingElectrodeV').value),prestep_s:cv?Number($('cvQuietS').value):0,duration_s:duration,adaptive_stop:!cv&&$('adaptiveStop').checked,sens_period_code:Number($('sensPeriodCode').value),target_rate_hz:Number($('sampleRateHz').value),fit_window_s:Number($('fitWindowS').value),fsr_nA:Number($('fsrNA').value),offset_mode:$('offsetNA').value,cv_low_v:low,cv_high_v:high,cv_scan_rate_v_s:rate,cv_cycles:cycles,cv_step_v:.001,cv_quiet_s:Number($('cvQuietS').value),cv_eis_fsr_uA:Number($('cvEisFsrUA').value)}}
 function renderOffsetLabels(fsr){$('offsetNA').querySelectorAll('option[data-pct]').forEach(option=>{const pct=Number(option.dataset.pct);option.textContent=`${pct}% FSR (${fsr*pct/100} nA)`})}

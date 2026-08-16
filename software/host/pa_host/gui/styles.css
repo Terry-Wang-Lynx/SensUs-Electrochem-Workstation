@@ -43,7 +43,7 @@
 .workspace-history-actions .secondary{flex:1}
 .workspace-history-actions .text-button{color:var(--red)}
 .workspace-history-empty{grid-column:1/-1;padding:80px 18px;text-align:center;color:var(--muted)}
-.workspace-history-import{padding:14px 16px 0;border-top:1px solid #e7ebec}
+.workspace-history-picker{display:grid;grid-template-columns:minmax(240px,520px) 1fr;gap:14px;align-items:end;padding:14px 16px 0;border-top:1px solid #e7ebec}.workspace-history-picker label{margin:0}.workspace-history-picker>span{padding-bottom:10px;color:var(--muted);font-size:10px}.workspace-history-import{padding:14px 16px 0}
 .workspace-history-import label{max-width:760px;margin:0}
 .workspace-history-import .directory-row{grid-template-columns:minmax(0,1fr) auto}
 .workspace-history-panel>.notice{margin-top:14px}
@@ -56,7 +56,7 @@
   .workspace-history-tools .secondary{flex:1;min-width:185px}
   .workspace-history-list{grid-template-columns:minmax(0,1fr);padding:12px}
 }
-@media(max-width:620px){.sidebar nav{grid-template-columns:repeat(5,1fr)}.workspace-history-card{padding:12px}.workspace-history-actions{align-items:stretch}.workspace-history-actions .text-button{padding-left:6px;padding-right:6px}}
+@media(max-width:620px){.sidebar nav{grid-template-columns:repeat(5,1fr)}.workspace-history-picker{grid-template-columns:1fr}.workspace-history-picker>span{padding-bottom:0}.workspace-history-card{padding:12px}.workspace-history-actions{align-items:stretch}.workspace-history-actions .text-button{padding-left:6px;padding-right:6px}}
 /* 方案 C:运行档位区块。刻意与「IT 条件」分开呈现 —— 它显示的是硬件运行时真值,
    可以和上面那组"已烧录参数"不一致(RANGE 命令在运行中改档位不重烧)。 */
 .range-live{margin:4px 18px 14px;padding:11px 12px;background:#f5f7f9;border-left:3px solid var(--blue);border-radius:0 4px 4px 0}

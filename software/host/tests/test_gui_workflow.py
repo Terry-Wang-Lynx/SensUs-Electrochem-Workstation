@@ -582,8 +582,10 @@ def test_adaptive_plateau_signature_persists_and_gates_the_calibration_model() -
         reloaded.reset_calibration()
         assert reloaded.calibration_plateau is None
         assert reloaded.model_plateau is None
-        assert not signature_path.exists()
-        assert list(workspace.glob("calibration-plateau-*.json"))
+        assert reloaded.save_dir.parent.resolve() == workspace.resolve()
+        assert reloaded.save_dir.resolve() != workspace.resolve()
+        assert signature_path.exists()
+        assert (reloaded.save_dir / ".sensus-workspace.json").exists()
 
 
 def test_legacy_adaptive_model_without_plateau_signature_requires_recalibration() -> None:
@@ -1404,10 +1406,13 @@ def test_new_calibration_batch_starts_with_no_previous_validation_points() -> No
             }]
             assert len(app.model_payload()["validation_points"]) == 1
 
-            app.reset_calibration()
-            assert app.model_payload()["validation_points"] == []
-            app.fit({"points": points, "selected_point_ids": ["zero", "ten"]})
-            assert app.model_payload()["validation_points"] == []
+        previous_dir = app.save_dir
+        app.reset_calibration()
+        assert app.save_dir.parent.resolve() == previous_dir.resolve()
+        assert app.save_dir.resolve() != previous_dir.resolve()
+        assert app.model_payload()["validation_points"] == []
+        app.fit({"points": points, "selected_point_ids": ["zero", "ten"]})
+        assert app.model_payload()["validation_points"] == []
 
 
 if __name__ == "__main__":

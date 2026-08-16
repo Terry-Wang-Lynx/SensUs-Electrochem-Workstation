@@ -15,6 +15,9 @@ from typing import Any
 
 REGISTRY_VERSION = 1
 MARKER_NAME = ".sensus-workspace.json"
+WORKSPACE_KIND = "workspace"
+BATCH_KIND = "batch"
+_KNOWN_KINDS = {WORKSPACE_KIND, BATCH_KIND}
 
 
 class WorkspaceHistory:
@@ -74,6 +77,12 @@ class WorkspaceHistory:
             relative = str(locator.get("path") or "")
             if anchor not in {"project", "home", "registry", "filesystem"} or not self._safe_relative(relative):
                 continue
+            kind = str(item.get("kind") or WORKSPACE_KIND)
+            if kind not in _KNOWN_KINDS:
+                kind = WORKSPACE_KIND
+            workspace_root_id = str(item.get("workspace_root_id") or "")
+            if kind == WORKSPACE_KIND:
+                workspace_root_id = workspace_id
             seen.add(workspace_id)
             entries.append({
                 "workspace_id": workspace_id,
@@ -83,6 +92,8 @@ class WorkspaceHistory:
                 "updated_at": self._number(item.get("updated_at"), 0.0),
                 "favorite": bool(item.get("favorite", False)),
                 "summary": dict(item.get("summary") or {}),
+                "kind": kind,
+                "workspace_root_id": workspace_root_id,
             })
         return {
             "version": REGISTRY_VERSION,
@@ -144,25 +155,75 @@ class WorkspaceHistory:
         return candidate
 
     def _marker_id(self, workspace: Path) -> str | None:
+        value = self.marker_info(workspace).get("workspace_id")
+        return str(value) if value else None
+
+    @staticmethod
+    def _valid_marker_kind(value: Any) -> str:
+        kind = str(value or WORKSPACE_KIND)
+        return kind if kind in _KNOWN_KINDS else WORKSPACE_KIND
+
+    def marker_info(self, workspace: Path) -> dict[str, Any]:
+        """Read the directory marker without requiring a registry entry."""
         marker = workspace / MARKER_NAME
         try:
             payload = json.loads(marker.read_text(encoding="utf-8"))
-            value = str(payload.get("workspace_id") or "")
-            return value or None
+            if not isinstance(payload, dict):
+                return {}
+            workspace_id = str(payload.get("workspace_id") or "")
+            if not workspace_id:
+                return {}
+            return {
+                **payload,
+                "workspace_id": workspace_id,
+                "kind": self._valid_marker_kind(payload.get("kind")),
+                "workspace_root_id": str(
+                    payload.get("workspace_root_id") or ""
+                ),
+            }
         except (OSError, TypeError, json.JSONDecodeError, UnicodeError):
-            return None
+            return {}
 
-    def _ensure_marker(self, workspace: Path, workspace_id: str | None = None) -> str:
+    def _ensure_marker(
+        self,
+        workspace: Path,
+        workspace_id: str | None = None,
+        *,
+        kind: str = WORKSPACE_KIND,
+        workspace_root_id: str = "",
+        label: str = "",
+    ) -> str:
         workspace.mkdir(parents=True, exist_ok=True)
-        existing = self._marker_id(workspace)
+        kind = self._valid_marker_kind(kind)
+        existing_payload = self.marker_info(workspace)
+        existing = str(existing_payload.get("workspace_id") or "")
         if existing:
+            updates: dict[str, Any] = {}
+            if existing_payload.get("kind") != kind:
+                updates["kind"] = kind
+            if kind == BATCH_KIND and workspace_root_id:
+                if existing_payload.get("workspace_root_id") != workspace_root_id:
+                    updates["workspace_root_id"] = workspace_root_id
+            if label and not existing_payload.get("label"):
+                updates["label"] = label
+            if updates:
+                self._atomic_json(workspace / MARKER_NAME, {
+                    **existing_payload, **updates,
+                })
             return existing
         workspace_id = workspace_id or uuid.uuid4().hex
-        self._atomic_json(workspace / MARKER_NAME, {
+        payload: dict[str, Any] = {
             "version": 1,
             "workspace_id": workspace_id,
             "created_at": time.time(),
-        })
+        }
+        if kind != WORKSPACE_KIND:
+            payload["kind"] = kind
+        if workspace_root_id:
+            payload["workspace_root_id"] = workspace_root_id
+        if label:
+            payload["label"] = label
+        self._atomic_json(workspace / MARKER_NAME, payload)
         return workspace_id
 
     def _relocate(self, entry: dict[str, Any]) -> Path | None:
@@ -326,7 +387,8 @@ class WorkspaceHistory:
 
     def register(
         self, workspace: Path, summary: dict[str, Any], label: str = "",
-        *, create_marker: bool = True,
+        *, create_marker: bool = True, kind: str | None = None,
+        workspace_root_id: str | None = None,
     ) -> dict[str, Any]:
         with self.lock:
             data = self._read()
@@ -336,12 +398,42 @@ class WorkspaceHistory:
                 (item for item in data["entries"] if item["locator"] == locator),
                 None,
             )
+            marker = self.marker_info(workspace)
+            resolved_kind = self._valid_marker_kind(
+                kind
+                or (existing or {}).get("kind")
+                or marker.get("kind")
+                or WORKSPACE_KIND
+            )
+            resolved_root_id = str(
+                workspace_root_id
+                or (existing or {}).get("workspace_root_id")
+                or marker.get("workspace_root_id")
+                or ""
+            )
             if existing is not None:
                 workspace_id = existing["workspace_id"]
             elif create_marker:
-                workspace_id = self._ensure_marker(workspace)
+                workspace_id = self._ensure_marker(
+                    workspace, kind=resolved_kind,
+                    workspace_root_id=resolved_root_id,
+                    label=label.strip(),
+                )
             else:
                 workspace_id = self._marker_id(workspace) or uuid.uuid4().hex
+            if resolved_kind == WORKSPACE_KIND:
+                resolved_root_id = workspace_id
+            elif not resolved_root_id:
+                resolved_root_id = workspace_id
+            if create_marker:
+                self._ensure_marker(
+                    workspace, workspace_id=workspace_id,
+                    kind=resolved_kind,
+                    workspace_root_id=(
+                        resolved_root_id if resolved_kind == BATCH_KIND else ""
+                    ),
+                    label=label.strip(),
+                )
             now = time.time()
             entry = next(
                 (item for item in data["entries"] if item["workspace_id"] == workspace_id),
@@ -359,11 +451,31 @@ class WorkspaceHistory:
                 "label": label.strip() or workspace.name or "未命名工作区",
                 "updated_at": now,
                 "summary": dict(summary),
+                "kind": resolved_kind,
+                "workspace_root_id": resolved_root_id,
             })
             self._atomic_json(self.registry_path, {
                 "version": REGISTRY_VERSION, "entries": data["entries"],
             })
             return self._public(entry, workspace, "available", "")
+
+    def register_batch(
+        self,
+        workspace: Path,
+        workspace_root: Path,
+        summary: dict[str, Any],
+        label: str = "",
+    ) -> dict[str, Any]:
+        """Register a batch directory below a selected workspace root."""
+        root = workspace_root.resolve()
+        root_id = self._marker_id(root)
+        if not root_id:
+            root_entry = self.register(root, self.summarize(root))
+            root_id = root_entry["workspace_id"]
+        return self.register(
+            workspace, summary, label, kind=BATCH_KIND,
+            workspace_root_id=root_id,
+        )
 
     def list(self, current_workspace: Path | None = None) -> dict[str, Any]:
         with self.lock:
@@ -453,6 +565,10 @@ class WorkspaceHistory:
             "label": entry["label"],
             "location": locator["path"],
             "location_anchor": locator["anchor"],
+            "kind": entry.get("kind", WORKSPACE_KIND),
+            "workspace_root_id": entry.get(
+                "workspace_root_id", entry["workspace_id"]
+            ),
             "created_at": entry["created_at"],
             "updated_at": entry["updated_at"],
             "favorite": bool(entry["favorite"]),

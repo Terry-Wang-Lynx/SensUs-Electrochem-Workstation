@@ -150,7 +150,8 @@ def test_workspace_history_view_exposes_restore_favorite_filter_and_safe_remove_
     assert 'data-view="history"' in html
     for element_id in (
         "view-history", "workspaceHistoryList", "historyFavoritesOnly",
-        "registerCurrentHistory", "refreshWorkspaceHistory", "workspaceHistoryError",
+        "historyWorkspaceSelect", "historyBatchSummary", "registerCurrentHistory",
+        "refreshWorkspaceHistory", "workspaceHistoryError",
         "historyImportPath", "importHistoryDirectory",
     ):
         assert f'id="{element_id}"' in html
@@ -162,6 +163,8 @@ def test_workspace_history_view_exposes_restore_favorite_filter_and_safe_remove_
     assert "原始测量目录和数据不会被删除" in app
     assert "workspaceHasUnsavedChanges" in app
     assert "discard_unsaved:unsaved" in app
+    assert "entry.kind==='batch'" in app
+    assert "historyWorkspaceSelect" in app
     assert ".workspace-history-card.unavailable" in styles
     assert ".workspace-history-list{grid-template-columns:minmax(0,1fr)" in styles
     assert ".sidebar nav{grid-template-columns:repeat(5,1fr)}" in styles
@@ -506,7 +509,7 @@ def test_debug_overlay_controls_remain_clickable_in_empty_and_narrow_states() ->
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
 
-    assert html.count("20260816-usb-refresh-history-import") == 2
+    assert html.count("20260816-persistent-batches") == 2
     assert ".empty-chart{position:absolute;inset:0;display:grid;place-items:center;color:#8a969a;font-size:12px;pointer-events:none}" in css
     assert ".chart-legend{position:absolute;z-index:2;" in css
     assert "@media(max-width:900px)" in css
