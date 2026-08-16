@@ -54,7 +54,11 @@ def test_external_unix_workspace_uses_non_absolute_filesystem_locator() -> None:
         workspace = root / "external-workspace"
         entry = registry.register(workspace, {})
         raw = (root / "registry" / "history.json").read_text(encoding="utf-8")
-        assert entry["location_anchor"] == "filesystem"
+        expected_anchor = (
+            "home" if workspace.resolve().is_relative_to(Path.home().resolve())
+            else "filesystem"
+        )
+        assert entry["location_anchor"] == expected_anchor
         assert '"path": "/' not in raw
         assert registry.resolve(entry["workspace_id"])[1] == workspace.resolve()
 

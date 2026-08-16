@@ -106,7 +106,8 @@ def _resolve_jlink_exe() -> Path:
     if found:
         try:
             probe = subprocess.run(
-                [found, "-version"], capture_output=True, text=True, timeout=5,
+                [found, "-version"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
                 check=False,
             )
             banner = f"{probe.stdout}\n{probe.stderr}"
@@ -304,7 +305,8 @@ def find_rtt_address(elf: Path) -> int:
         )
 
     out = subprocess.run(
-        [str(ZEPHYR_SDK_NM), str(elf)], capture_output=True, text=True, check=False
+        [str(ZEPHYR_SDK_NM), str(elf)], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=False
     ).stdout
     for line in out.splitlines():
         parts = line.split()
@@ -336,6 +338,7 @@ def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace",
         )
         assert proc.stdin is not None
         reset_cmds = "r\nsleep 100\ng\nsleep 500\n" if reset_before_read else ""
@@ -371,6 +374,7 @@ def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
     return subprocess.Popen(
         cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT, text=True,
+        encoding="utf-8", errors="replace",
     )
 
 

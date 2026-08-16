@@ -990,14 +990,16 @@ def fit_calibration(points: Sequence[CalibrationPoint], degree: int = 1) -> Cali
 def save_model(model: CalibrationModel, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(model.to_json(), indent=2) + "\n")
+    path.write_text(json.dumps(model.to_json(), indent=2) + "\n", encoding="utf-8")
 
 
 def load_model(path: str | Path) -> CalibrationModel:
-    return CalibrationModel.from_json(json.loads(Path(path).read_text()))
+    return CalibrationModel.from_json(
+        json.loads(Path(path).read_text(encoding="utf-8"))
+    )
 
 
 def save_summary(summary: RunSummary, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(summary), indent=2) + "\n")
+    path.write_text(json.dumps(asdict(summary), indent=2) + "\n", encoding="utf-8")

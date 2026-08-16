@@ -1154,7 +1154,7 @@ class SettingsController:
         self._saved_firmware_source = "build"
         if SETTINGS_PATH.exists():
             try:
-                saved = json.loads(SETTINGS_PATH.read_text())
+                saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
                 if not isinstance(saved, dict):
                     raise ValueError("settings file must contain an object")
                 saved_settings = saved.get("settings", saved)
@@ -1213,7 +1213,7 @@ class SettingsController:
         """Run a build in its own process group and reclaim every descendant."""
         process = subprocess.Popen(
             command, cwd=PROJECT_DIR, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             **(
                 {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
                 if _IS_WIN else {"start_new_session": True}
@@ -1242,7 +1242,8 @@ class SettingsController:
             try:
                 result = subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=10,
                 )
                 killed = result.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
@@ -1349,7 +1350,7 @@ class SettingsController:
             done = subprocess.run(
                 command,
                 cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
-                timeout=120,
+                encoding="utf-8", errors="replace", timeout=120,
             )
             blob = f"{done.stdout}\n{done.stderr}"
             if "Programming Finished" not in blob or "Verified OK" not in blob:
@@ -1375,7 +1376,7 @@ class SettingsController:
             done = subprocess.run(
                 command,
                 cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
-                timeout=120,
+                encoding="utf-8", errors="replace", timeout=120,
             )
         finally:
             script_path.unlink(missing_ok=True)
@@ -1407,19 +1408,22 @@ class SettingsController:
         )
         subprocess.run(
             [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "5", "os", "reset"],
-            check=True, capture_output=True, text=True, timeout=15,
+            check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
         )
         if runtime.is_frozen() or _IS_WIN:
             done = subprocess.run(
                 [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "10", "upgrade",
                  str(image)],
-                check=True, capture_output=True, text=True, timeout=150,
+                check=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=150,
             )
         else:
             done = subprocess.run(
                 ["/bin/bash", str(V51_UPLOAD_SCRIPT), str(image)],
                 cwd=PROJECT_DIR,
-                check=True, capture_output=True, text=True, timeout=150,
+                check=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=150,
             )
         blob = f"{done.stdout}\n{done.stderr}"
         if "Upgrade complete." not in blob:
@@ -1717,7 +1721,7 @@ class SettingsController:
             if can_use_prebuilt:
                 firmware_source = "prebuilt"
                 if not runtime.is_frozen():
-                    FIRMWARE_CONFIG.write_text(header)
+                    FIRMWARE_CONFIG.write_text(header, encoding="utf-8")
                 firmware_hex = (
                     V51_PREBUILT_IMAGE if usb_transport
                     else FIRMWARE_PREBUILT_DIR / "zephyr.hex"
@@ -1732,7 +1736,7 @@ class SettingsController:
                     "firmware_source": firmware_source,
                     "firmware_sha256": self._firmware_hash(firmware_hex),
                     "transport": "serial" if usb_transport else "rtt",
-                }, indent=2, ensure_ascii=False))
+                }, indent=2, ensure_ascii=False), encoding="utf-8")
                 with self.lock:
                     self.settings = settings
                     self.applied = True
@@ -1754,7 +1758,7 @@ class SettingsController:
                 raise RuntimeError(
                     "当前条件与随包固件不同；请先双击“03-安装固件工具链.command”"
                 )
-            FIRMWARE_CONFIG.write_text(header)
+            FIRMWARE_CONFIG.write_text(header, encoding="utf-8")
             # 🔴 west 装在 NCS 自己的 venv 里(默认 ~/ncs/.venv/bin/west)。
             #    `zephyr-env.sh` 只把 $ZEPHYR_BASE/scripts 塞进 PATH,**不激活该 venv**
             #    ⇒ 不先激活就是 `zsh:1: command not found: west`,按钮看起来"没反应"
@@ -1807,7 +1811,7 @@ class SettingsController:
                 "firmware_source": firmware_source,
                 "firmware_sha256": self._firmware_hash(firmware_artifact),
                 "transport": "serial" if usb_transport else "rtt",
-            }, indent=2, ensure_ascii=False))
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
         # RuntimeError:_flash_firmware() 的「exit 0 但没烧成」判据会抛它,
         # 不接住的话会变成未处理 500,state 停在 "applying",前端只能看到通用错误。
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
@@ -2648,7 +2652,9 @@ class MeasurementController:
                     command += ["--probe-serial", JLINK_SERIAL]
             if method == "cv":
                 command.append("--cv")
-            log_handle = (self.run_dir / "collector.log").open("w", buffering=1)
+            log_handle = (self.run_dir / "collector.log").open(
+                "w", buffering=1, encoding="utf-8", errors="replace"
+            )
             try:
                 self.process = subprocess.Popen(
                     command,
@@ -2656,7 +2662,7 @@ class MeasurementController:
                     env=env,
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     # 🔴 自成进程组:进程树是
                     #      gui_server → it_tool → pa_host.collect → JLinkExe
                     #    只 terminate 第一层(it_tool)的话,孙进程 collect 与曾孙
@@ -4285,7 +4291,9 @@ class MeasurementController:
                     self._data_cache.update({
                         "potential_v": [], "cycle": [], "direction": [],
                     })
-            with self.raw_path.open(newline="") as handle:
+            with self.raw_path.open(
+                newline="", encoding="utf-8", errors="replace"
+            ) as handle:
                 handle.seek(self._data_cache_position)
                 chunk = handle.read()
                 self._data_cache_position = handle.tell()
@@ -4818,7 +4826,7 @@ class AppState:
         saved_workspace_root: Path | None = None
         if WORKFLOW_PATH.exists():
             try:
-                saved = json.loads(WORKFLOW_PATH.read_text())
+                saved = json.loads(WORKFLOW_PATH.read_text(encoding="utf-8"))
                 self.save_dir = self._resolve_save_dir(str(saved.get("save_dir", "")))
                 raw_workspace_root = str(saved.get("workspace_root") or "").strip()
                 if raw_workspace_root:
@@ -5023,7 +5031,9 @@ class AppState:
             self.latest_workflow_result = None
             if paths["points"].exists():
                 try:
-                    with paths["points"].open(newline="") as handle:
+                    with paths["points"].open(
+                        newline="", encoding="utf-8", errors="replace"
+                    ) as handle:
                         for index, row in enumerate(csv.DictReader(handle), 1):
                             point_id = str(row.get("point_id") or f"point-{index:04d}")
                             if any(item["point_id"] == point_id for item in self.point_records):
@@ -5043,7 +5053,9 @@ class AppState:
                     self.points = []
             if paths["settings"].exists():
                 try:
-                    saved_calibration_settings = json.loads(paths["settings"].read_text())
+                    saved_calibration_settings = json.loads(
+                        paths["settings"].read_text(encoding="utf-8")
+                    )
                     # Before these controls existed, firmware always stepped from 0 V
                     # immediately. Preserve that historical protocol instead of
                     # silently assigning today's defaults to legacy calibration data.
@@ -5059,7 +5071,9 @@ class AppState:
                 and paths["plateau"].exists()
             ):
                 try:
-                    saved_plateau = json.loads(paths["plateau"].read_text())
+                    saved_plateau = json.loads(
+                        paths["plateau"].read_text(encoding="utf-8")
+                    )
                     raw_plateau = (
                         saved_plateau.get("settings", saved_plateau)
                         if isinstance(saved_plateau, dict) else None
@@ -5069,7 +5083,9 @@ class AppState:
                     self.calibration_plateau = None
             if paths["filter"].exists():
                 try:
-                    saved_filter = json.loads(paths["filter"].read_text())
+                    saved_filter = json.loads(
+                        paths["filter"].read_text(encoding="utf-8")
+                    )
                     self.calibration_filter = validate_filter_config(
                         saved_filter.get("settings", saved_filter)
                         if isinstance(saved_filter, dict) else None
@@ -5090,7 +5106,9 @@ class AppState:
             if self.model is not None:
                 if paths["selection"].exists():
                     try:
-                        selection = json.loads(paths["selection"].read_text())
+                        selection = json.loads(
+                            paths["selection"].read_text(encoding="utf-8")
+                        )
                         known_ids = {record["point_id"] for record in self.point_records}
                         self.selected_point_ids = [
                             str(point_id) for point_id in selection.get("selected_point_ids", [])
@@ -5126,14 +5144,18 @@ class AppState:
                     self.records = []
             if paths["drift"].exists():
                 try:
-                    saved_drift = json.loads(paths["drift"].read_text())
+                    saved_drift = json.loads(
+                        paths["drift"].read_text(encoding="utf-8")
+                    )
                     if isinstance(saved_drift, dict):
                         self.drift = {**self._empty_drift(), **saved_drift}
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     self.drift = self._empty_drift()
             if paths["validation"].exists():
                 try:
-                    saved_validation = json.loads(paths["validation"].read_text())
+                    saved_validation = json.loads(
+                        paths["validation"].read_text(encoding="utf-8")
+                    )
                     raw_points = (saved_validation.get("points", saved_validation)
                                   if isinstance(saved_validation, dict) else {})
                     if isinstance(raw_points, dict):
@@ -5686,7 +5708,7 @@ class AppState:
 
     def _save_calibration_points(self) -> None:
         path = self._workspace_paths()["points"]
-        with path.open("w", newline="") as handle:
+        with path.open("w", newline="", encoding="utf-8") as handle:
             fields = [
                 "point_id", "acquired_at", "run_id", "label",
                 "concentration_um", "current_nA", "data_path", "selected",
@@ -5855,13 +5877,15 @@ class AppState:
 
     def _save_drift(self) -> None:
         self._workspace_paths()["drift"].write_text(
-            json.dumps(_json_safe(self.drift), indent=2, ensure_ascii=False)
+            json.dumps(_json_safe(self.drift), indent=2, ensure_ascii=False),
+            encoding="utf-8",
         )
 
     def _save_validation_overrides(self) -> None:
         self._workspace_paths()["validation"].write_text(
             json.dumps({"points": self.validation_overrides}, indent=2,
-                       ensure_ascii=False)
+                       ensure_ascii=False),
+            encoding="utf-8",
         )
 
     def update_validation_points(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -6149,7 +6173,8 @@ class AppState:
                             self.calibration_plateau = run_plateau
                             self._workspace_paths()["settings"].write_text(
                                 json.dumps(self.calibration_settings, indent=2,
-                                           ensure_ascii=False)
+                                           ensure_ascii=False),
+                                encoding="utf-8",
                             )
                             if run_plateau is not None:
                                 self._workspace_paths()["plateau"].write_text(
@@ -6157,7 +6182,8 @@ class AppState:
                                         {"settings": run_plateau},
                                         indent=2,
                                         ensure_ascii=False,
-                                    )
+                                    ),
+                                    encoding="utf-8",
                                 )
                             else:
                                 self._workspace_paths()["plateau"].unlink(
@@ -6180,7 +6206,8 @@ class AppState:
                             )
                             self._workspace_paths()["filter"].write_text(
                                 json.dumps({"settings": self.calibration_filter},
-                                           indent=2, ensure_ascii=False)
+                                           indent=2, ensure_ascii=False),
+                                encoding="utf-8",
                             )
                         point_id = str(run.get("run_id") or f"point-{time.time_ns()}")
                         existing_ids = {item["point_id"] for item in self.point_records}
@@ -6237,8 +6264,11 @@ class AppState:
                     ),
                     "drift_correction": self.drift_payload(),
                 }
-                summary_target.write_text(json.dumps(_json_safe(exported_summary), indent=2,
-                                                     ensure_ascii=False))
+                summary_target.write_text(
+                    json.dumps(_json_safe(exported_summary), indent=2,
+                               ensure_ascii=False),
+                    encoding="utf-8",
+                )
                 result["summary_path"] = str(summary_target)
                 self._append_record(result)
                 self.latest_workflow_result = dict(result)

@@ -15,6 +15,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install test dependencies
         run: python -m pip install -e ".[dev,analysis]"
       - name: Run host tests
@@ -40,9 +43,16 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install test dependencies
         run: python -m pip install -e ".[dev,analysis]"
       - name: Run host tests
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
+          SENSUS_TRANSPORT: rtt
         run: python -m pytest -q software/host/tests
       - name: Build portable ZIP
         shell: pwsh

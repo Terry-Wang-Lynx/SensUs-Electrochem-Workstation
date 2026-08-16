@@ -140,7 +140,10 @@ def export_cv_csv(raw_path: str | Path, output_path: str | Path,
 
 
 def save_cv_summary(summary: CVSummary, path: str | Path) -> None:
-    Path(path).write_text(json.dumps(asdict(summary), indent=2, ensure_ascii=False) + "\n")
+    Path(path).write_text(
+        json.dumps(asdict(summary), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def plot_cv(path: str | Path, output: str | Path) -> None:

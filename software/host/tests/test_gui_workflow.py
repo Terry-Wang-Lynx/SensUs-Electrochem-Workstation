@@ -267,9 +267,10 @@ def test_busy_fit_preserves_a_candidate_added_after_the_browser_snapshot() -> No
         ]
         assert result["model"]["n_points"] == 2
         assert result["selected_point_ids"] == ["zero", "ten"]
-        rows = list(csv.DictReader(
-            (app.save_dir / "calibration-points.csv").open()
-        ))
+        with (app.save_dir / "calibration-points.csv").open(
+            encoding="utf-8", newline=""
+        ) as points_file:
+            rows = list(csv.DictReader(points_file))
         assert [row["point_id"] for row in rows] == [
             "zero", "ten", "new-completed-point"
         ]
@@ -874,7 +875,7 @@ def test_build_timeout_terminates_the_complete_process_group() -> None:
     with (
         patch("pa_host.gui_server._IS_WIN", False),
         patch("pa_host.gui_server.subprocess.Popen", return_value=process),
-        patch("pa_host.gui_server.os.killpg") as kill_group,
+        patch("pa_host.gui_server.os.killpg", create=True) as kill_group,
         pytest.raises(subprocess.TimeoutExpired),
     ):
         SettingsController._run_build(["build"], timeout_s=0.01)

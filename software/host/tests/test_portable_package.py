@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 from pathlib import Path
 
 from pa_host import collect, gui_server, runtime
@@ -44,7 +45,9 @@ def test_frozen_build_prefers_openocd_shipped_next_to_workstation(
 ) -> None:
     resources = tmp_path / "Resources"
     workstation = resources / "workstation"
-    executable = resources / "tools" / "openocd" / "bin" / "openocd"
+    executable = resources / "tools" / "openocd" / "bin" / (
+        "openocd.exe" if os.name == "nt" else "openocd"
+    )
     scripts = resources / "tools" / "openocd" / "share" / "openocd" / "scripts"
     workstation.mkdir(parents=True)
     executable.parent.mkdir(parents=True)
