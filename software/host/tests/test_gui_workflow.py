@@ -1815,6 +1815,34 @@ def test_workflow_write_probe_never_replaces_a_user_file() -> None:
         assert existing.read_text(encoding="utf-8") == "user data"
 
 
+def test_openocd_flash_retries_swd_parity_errors_at_lower_speed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        firmware = Path(tmp) / "firmware.hex"
+        firmware.write_text(":00000001FF\n", encoding="ascii")
+        failed = subprocess.CalledProcessError(
+            1, ["openocd"], output="",
+            stderr="Error: SWD: Read data parity mismatch\n** Programming Failed **",
+        )
+        succeeded = subprocess.CompletedProcess(
+            ["openocd"], 0,
+            stdout="** Programming Finished **\n** Verified OK **\n",
+            stderr="",
+        )
+        with (
+            patch("pa_host.gui_server.JLINK_EXE", Path(tmp) / "missing"),
+            patch("pa_host.gui_server.OPENOCD_EXE", Path("/usr/bin/true")),
+            patch("pa_host.gui_server.subprocess.run",
+                  side_effect=[failed, succeeded]) as run,
+        ):
+            SettingsController._flash_firmware(firmware)
+
+        assert run.call_count == 2
+        first_command = run.call_args_list[0].args[0]
+        second_command = run.call_args_list[1].args[0]
+        assert "adapter speed 4000" in first_command
+        assert "adapter speed 2000" in second_command
+
+
 def test_control_api_requires_json_and_rejects_cross_origin_posts() -> None:
     assert _request_body(
         b'{"enabled":true}', origin="http://127.0.0.1:8769"

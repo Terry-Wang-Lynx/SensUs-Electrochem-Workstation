@@ -1336,27 +1336,48 @@ class SettingsController:
                 raise RuntimeError(
                     f"既找不到 JLinkExe({JLINK_EXE})，也找不到 OpenOCD"
                 )
-            command = [
-                str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
-                "-f", "interface/jlink.cfg", "-c", "transport select swd",
-                "-f", "target/nrf52.cfg",
-            ]
-            if JLINK_SERIAL:
-                command += ["-c", f"adapter serial {JLINK_SERIAL}"]
-            command += [
-                "-c", f"adapter speed {JLINK_SPEED_KHZ}",
-                "-c", f"program {firmware_hex} verify reset exit",
-            ]
-            done = subprocess.run(
-                command,
-                cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=120,
-            )
-            blob = f"{done.stdout}\n{done.stderr}"
-            if "Programming Finished" not in blob or "Verified OK" not in blob:
-                tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
-                raise RuntimeError("OpenOCD 烧录未确认成功:" + " | ".join(tail))
-            return
+            speeds = list(dict.fromkeys([JLINK_SPEED_KHZ, 2000, 500, 100]))
+            failures: list[str] = []
+            for speed in speeds:
+                command = [
+                    str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+                    "-f", "interface/jlink.cfg", "-c", "transport select swd",
+                    "-f", "target/nrf52.cfg",
+                ]
+                if JLINK_SERIAL:
+                    command += ["-c", f"adapter serial {JLINK_SERIAL}"]
+                command += [
+                    "-c", f"adapter speed {speed}",
+                    "-c", f"program {firmware_hex} verify reset exit",
+                ]
+                try:
+                    done = subprocess.run(
+                        command,
+                        cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=120,
+                    )
+                    blob = f"{done.stdout}\n{done.stderr}"
+                except subprocess.CalledProcessError as exc:
+                    blob = f"{exc.stdout or ''}\n{exc.stderr or ''}"
+                    transient = any(marker in blob.lower() for marker in (
+                        "parity mismatch", "failed to read memory",
+                        "error waiting nvmc_ready", "examination failed",
+                    ))
+                    tail = [line for line in blob.strip().splitlines()
+                            if line.strip()][-3:]
+                    failures.append(f"{speed} kHz: " + " | ".join(tail))
+                    if transient and speed != speeds[-1]:
+                        continue
+                    raise RuntimeError(
+                        "OpenOCD 烧录失败:" + " || ".join(failures)
+                    ) from exc
+                if "Programming Finished" in blob and "Verified OK" in blob:
+                    return
+                tail = [line for line in blob.strip().splitlines()
+                        if line.strip()][-3:]
+                failures.append(f"{speed} kHz: " + " | ".join(tail))
+                break
+            raise RuntimeError("OpenOCD 烧录未确认成功:" + " || ".join(failures))
 
         script = f"loadfile {firmware_hex}\nr\ng\nq\n"
         with tempfile.NamedTemporaryFile(
