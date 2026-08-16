@@ -58,11 +58,24 @@ private final class BackendManager {
     }
 
     private func launchServer() throws {
-        let bundledBackend = Bundle.main.resourceURL?
-            .appendingPathComponent("backend/SensUsBackend")
-        let usingBundledBackend = bundledBackend.map {
-            FileManager.default.isExecutableFile(atPath: $0.path)
-        } ?? false
+        let bundledBackendCandidates: [URL] = {
+            guard let resources = Bundle.main.resourceURL else { return [] }
+            // PyInstaller's macOS onedir build stores the executable inside
+            // its distribution directory; keep the one-file layout working too.
+            return [
+                resources.appendingPathComponent("backend/SensUsBackend/SensUsBackend"),
+                resources.appendingPathComponent("backend/SensUsBackend"),
+            ]
+        }()
+        let bundledBackend = bundledBackendCandidates.first { candidate in
+            var isDirectory = ObjCBool(false)
+            return FileManager.default.fileExists(
+                atPath: candidate.path,
+                isDirectory: &isDirectory
+            ) && !isDirectory.boolValue
+                && FileManager.default.isExecutableFile(atPath: candidate.path)
+        }
+        let usingBundledBackend = bundledBackend != nil
         let executable: URL
         let arguments: [String]
         if let bundledBackend, usingBundledBackend {
