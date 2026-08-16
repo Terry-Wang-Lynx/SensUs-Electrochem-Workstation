@@ -167,7 +167,7 @@ def test_calibration_chart_has_independent_point_visibility_controls() -> None:
     assert 'id="showTestPoints" type="checkbox" checked' in html
 
 
-def test_workspace_history_view_exposes_restore_favorite_filter_and_safe_remove_controls() -> None:
+def test_workspace_history_view_exposes_current_workspace_batches_and_safe_remove_controls() -> None:
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
     styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
@@ -175,24 +175,39 @@ def test_workspace_history_view_exposes_restore_favorite_filter_and_safe_remove_
     assert 'data-view="history"' in html
     for element_id in (
         "view-history", "workspaceHistoryList", "historyFavoritesOnly",
-        "historyWorkspaceSelect", "historyBatchSummary", "registerCurrentHistory",
         "refreshWorkspaceHistory", "workspaceHistoryError",
-        "historyImportPath", "importHistoryDirectory",
     ):
         assert f'id="{element_id}"' in html
     for endpoint in (
-        "/api/history", "/api/history/register", "/api/history/open",
-        "/api/history/import", "/api/history/favorite", "/api/history/remove",
+        "/api/history", "/api/history/open", "/api/history/favorite",
+        "/api/history/remove",
     ):
         assert endpoint in app
     assert "原始测量目录和数据不会被删除" in app
     assert "workspaceHasUnsavedChanges" in app
     assert "discard_unsaved:unsaved" in app
-    assert "entry.kind==='batch'" in app
-    assert "historyWorkspaceSelect" in app
+    assert "current_batches" in app
+    assert "historyWorkspaceSelect" not in app
     assert ".workspace-history-card.unavailable" in styles
     assert ".workspace-history-list{grid-template-columns:minmax(0,1fr)" in styles
     assert ".sidebar nav{grid-template-columns:repeat(5,1fr)}" in styles
+
+
+def test_gui_exposes_history_curve_overlay_batch_naming_and_cross_add_controls() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    for element_id in (
+        "toggleHistoryCurves", "historyCurvePanel", "historyCurveList",
+        "refreshHistoryCurves",
+    ):
+        assert f'id="{element_id}"' in html
+    assert "batch_name" in app
+    assert "/api/history/curves" in app
+    assert "/api/history/curves/load" in app
+    assert "/api/calibration/promote-validation" in app
+    assert "/api/calibration/add-validation" in app
+    assert "integerX:true" in app
 
 
 def test_history_status_label_maps_missing_and_corrupt_entries() -> None:

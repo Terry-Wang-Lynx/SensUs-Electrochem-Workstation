@@ -34,13 +34,13 @@
           <div class="workflow-heading"><div><h2>数据流程</h2><p id="workflowMessage">设置保存目录后，先标定再测试</p></div><div class="live-badge" id="workflowBadge">待配置</div></div>
           <div class="workflow-body">
             <div class="workflow-steps"><span class="active" id="calibrationStep"><b>1</b> 采集标定点</span><i></i><span id="selectionStep"><b>2</b> 选择范围</span><i></i><span id="testStep"><b>3</b> 稳定化 / 测试</span></div>
-            <label class="save-directory">自动保存目录<div class="directory-row"><input id="saveDirectory" placeholder="例如：/Users/lynx/Documents/实验数据"><button class="secondary" id="applySaveDirectory">应用目录</button></div></label>
+            <label class="save-directory">工作区目录<div class="directory-row"><input id="saveDirectory" placeholder="例如：/Users/lynx/Documents/实验数据"><button class="secondary" id="applySaveDirectory">新建批次</button></div></label>
             <button class="text-button reset-calibration" id="resetCalibration">新建标定批次</button>
           </div>
         </section>
         <div class="workspace-grid">
           <section class="panel chart-panel">
-            <div class="panel-head"><div><h2 id="chartTitle">I-T 计时电流曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small id="liveCurrentUnit">nA</small><em id="liveCurrentTime">尚无数据</em></div><div class="segmented" id="chartWindow"><button class="active" data-window="300">300 s</button><button data-window="20">20 s</button><button data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
+            <div class="panel-head"><div><h2 id="chartTitle">I-T 计时电流曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small id="liveCurrentUnit">nA</small><em id="liveCurrentTime">尚无数据</em></div><button class="secondary" id="toggleHistoryCurves" type="button">历史曲线</button><div class="segmented" id="chartWindow"><button class="active" data-window="300">300 s</button><button data-window="20">20 s</button><button data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
             <div class="chart-wrap"><canvas id="itChart" aria-label="IT 电流时间曲线"></canvas><div class="chart-legend"><span><i class="valid-point"></i>有效点</span><span><i class="invalid-point"></i>异常点</span></div><div class="empty-chart" id="chartEmpty">开始测量后显示实时电流</div></div>
             <div class="metric-strip">
               <div><span id="metricPrimaryLabel">稳态电流</span><strong id="steadyCurrent">--</strong><small id="metricPrimaryUnit">nA</small><em class="metric-note" id="metricPrimaryNote">等待测量</em></div>
@@ -59,6 +59,10 @@
                 <label class="filter-check"><input type="checkbox" data-show-raw><span>显示原数据</span></label>
                 <button class="secondary" data-filter-apply>保存设置</button>
               </div>
+            </div>
+            <div class="history-curve-panel" id="historyCurvePanel" hidden>
+              <div class="history-curve-head"><strong>当前批次历史曲线</strong><button class="text-button" id="refreshHistoryCurves" type="button">刷新</button></div>
+              <div class="history-curve-list" id="historyCurveList"><span>加载中</span></div>
             </div>
           </section>
 
@@ -195,7 +199,7 @@
           </section>
           <section class="panel validation-panel">
             <div class="panel-head"><div><h2>测试点与误差</h2><p>真实浓度、电流和样品名可修改；原始测量文件不会被覆盖</p></div><div class="validation-actions"><span class="live-badge" id="validationEditBadge">未保存修改</span><button class="primary" id="saveValidation" disabled>保存测试点修改</button></div></div>
-            <div class="table-wrap validation-table-wrap"><table><thead><tr><th>#</th><th>样品</th><th>真实浓度 / µM</th><th>测量电流 / nA</th><th>理论电流 / nA</th><th>电流误差 / nA</th><th>预测浓度 / µM</th><th>绝对误差 / µM</th><th>误差 / %</th><th>区域</th><th>点分</th></tr></thead><tbody id="validationBody"></tbody></table><div class="empty-history" id="validationEmpty">生成测试曲线后，已完成的测试记录会出现在这里；真实浓度可随后补填</div></div>
+            <div class="table-wrap validation-table-wrap"><table><thead><tr><th>#</th><th>样品</th><th>真实浓度 / µM</th><th>测量电流 / nA</th><th>理论电流 / nA</th><th>电流误差 / nA</th><th>预测浓度 / µM</th><th>绝对误差 / µM</th><th>误差 / %</th><th>区域</th><th>点分</th><th></th></tr></thead><tbody id="validationBody"></tbody></table><div class="empty-history" id="validationEmpty">生成测试曲线后，已完成的测试记录会出现在这里；真实浓度可随后补填</div></div>
             <div class="validation-summary" id="validationSummary">暂无测试点统计</div>
           </section>
           <section class="panel ap-panel">
@@ -254,21 +258,13 @@
       <section class="view" id="view-history">
         <section class="panel workspace-history-panel">
           <div class="panel-head workspace-history-head">
-            <div><h2>工作区历史</h2><p id="workspaceHistorySummary">正在读取历史记录</p></div>
+            <div><h2>批次历史</h2><p id="workspaceHistorySummary">正在读取当前工作区的批次</p></div>
             <div class="workspace-history-tools">
               <label class="history-favorite-filter"><input id="historyFavoritesOnly" type="checkbox"><span>仅看收藏</span></label>
-              <button class="secondary" id="registerCurrentHistory" type="button">登记当前工作区</button>
               <button class="icon-button" id="refreshWorkspaceHistory" type="button" title="刷新历史" aria-label="刷新历史">↻</button>
             </div>
           </div>
           <div class="notice error" id="workspaceHistoryError" hidden></div>
-          <div class="workspace-history-picker">
-            <label>工作区<select id="historyWorkspaceSelect" aria-label="选择工作区"></select></label>
-            <span id="historyBatchSummary">选择工作区后显示其批次</span>
-          </div>
-          <div class="workspace-history-import">
-            <label>已有数据目录<div class="directory-row"><input id="historyImportPath" placeholder="例如：/Users/lynx/Documents/实验数据"><button class="secondary" id="importHistoryDirectory" type="button">导入目录</button></div></label>
-          </div>
           <div class="workspace-history-list" id="workspaceHistoryList" aria-live="polite"></div>
         </section>
       </section>

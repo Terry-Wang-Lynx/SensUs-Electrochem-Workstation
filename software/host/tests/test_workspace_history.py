@@ -290,3 +290,31 @@ def test_new_calibration_batch_uses_child_directory_and_preserves_root_history()
         restored.open_history({"workspace_id": first["batch_id"]})
         assert restored.save_dir.resolve() == first_dir.resolve()
         assert restored.workspace_root.resolve() == root_dir.resolve()
+
+
+def test_configured_workspace_creates_a_named_child_batch_and_history_curves_stay_scoped() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        app, _ = _isolated_app(root)
+        workspace = root / "实验工作区"
+        app.configure_workflow({"save_dir": str(workspace), "batch_name": "第一批"})
+        assert app.workspace_root == workspace.resolve()
+        assert app.save_dir == (workspace / "第一批").resolve()
+        assert app.history.marker_info(app.save_dir)["kind"] == "batch"
+
+        trace = app.save_dir / "trace.csv"
+        trace.write_text(
+            "time_s,current_nA,valid\n0,1,1\n1,2,1\n2,3,1\n",
+            encoding="utf-8",
+        )
+        app._append_record({
+            "finished_at": 10, "run_id": "run-1", "sample_name": "样品 1",
+            "sample_role": "calibration", "state": "completed",
+            "steady_current_nA": 3, "data_path": str(trace),
+            "measurement_settings": {"method": "it"},
+        })
+        assert app.history_curves_snapshot()["curves"][0]["run_id"] == "run-1"
+        loaded = app.load_history_curves({"run_ids": ["run-1"]})["curves"]
+        assert loaded[0]["time_s"] == [0.0, 1.0, 2.0]
+        with pytest.raises(ValueError, match="当前批次"):
+            app.load_history_curves({"run_ids": ["other-batch"]})

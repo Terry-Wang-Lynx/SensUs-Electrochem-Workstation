@@ -4948,6 +4948,7 @@ class AppState:
         self.validation_started_at: float | None = None
         self.records: list[dict[str, Any]] = []
         self.validation_overrides: dict[str, dict[str, Any]] = {}
+        self.manual_validation_points: list[dict[str, Any]] = []
         self.drift = self._empty_drift()
         self.workspace_runtime_settings: dict[str, Any] | None = None
         self.workspace_runtime_filter: dict[str, Any] | None = None
@@ -5154,6 +5155,7 @@ class AppState:
             self.validation_started_at = None
             self.records = []
             self.validation_overrides = {}
+            self.manual_validation_points = []
             self.drift = self._empty_drift()
             self.workspace_runtime_settings = None
             self.workspace_runtime_filter = None
@@ -5294,8 +5296,15 @@ class AppState:
                             for point_id, values in raw_points.items()
                             if isinstance(values, dict)
                         }
+                    raw_manual = saved_validation.get("manual_points", [])
+                    if isinstance(raw_manual, list):
+                        self.manual_validation_points = [
+                            dict(point) for point in raw_manual
+                            if isinstance(point, dict)
+                        ]
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     self.validation_overrides = {}
+                    self.manual_validation_points = []
 
             if paths["runtime"].exists():
                 try:
@@ -5320,7 +5329,8 @@ class AppState:
         "save_dir", "workspace_root", "model", "model_path", "model_settings", "model_plateau",
         "calibration_filter", "calibration_settings", "calibration_plateau",
         "points", "point_records", "selected_point_ids", "model_created_at",
-        "validation_started_at", "records", "validation_overrides", "drift",
+        "validation_started_at", "records", "validation_overrides",
+        "manual_validation_points", "drift",
         "workspace_runtime_settings", "workspace_runtime_filter",
         "workspace_runtime_plateau", "latest_workflow_result",
     )
@@ -5493,10 +5503,36 @@ class AppState:
                 pass
             raise
 
+    def _new_batch_path(self, root: Path, label: str) -> Path:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        name = self._safe_filename(label) if label.strip() else f"batch-{stamp}"
+        candidate = root / name
+        suffix = 2
+        while candidate.exists():
+            candidate = root / f"{name}-{suffix}"
+            suffix += 1
+        return candidate
+
+    def _start_batch(self, root: Path, label: str) -> None:
+        self._probe_workspace(root, create=True)
+        self.history.register(
+            root, WorkspaceHistory.summarize(root), root.name,
+            kind=WORKSPACE_KIND,
+        )
+        batch_path = self._new_batch_path(root, label)
+        self._switch_workspace(
+            batch_path, create=True, restore=False, workspace_root=root,
+        )
+        display_label = label.strip() or f"批次 {batch_path.name}"
+        self.history.register_batch(
+            batch_path, root, self._history_summary(), display_label,
+        )
+
     def configure_workflow(self, payload: dict[str, Any]) -> dict[str, Any]:
-        path = self._resolve_save_dir(str(payload.get("save_dir", "")))
+        root = self._resolve_save_dir(str(payload.get("save_dir", "")))
+        label = str(payload.get("batch_name") or "").strip()
         with self.operation_lock:
-            self._switch_workspace(path, create=True, restore=False)
+            self._start_batch(root, label)
             self._refresh_history_best_effort()
         return self.workflow_snapshot()
 
@@ -5673,8 +5709,109 @@ class AppState:
                 entry for entry in entries
                 if entry.get("kind") == BATCH_KIND
             ],
+            "current_batches": [
+                entry for entry in entries
+                if entry.get("kind") == BATCH_KIND
+                and entry.get("workspace_root_id") == root_id
+            ],
         })
         return snapshot
+
+    @staticmethod
+    def _downsample_curve(values: Any, maximum: int = 3000) -> list[Any]:
+        count = len(values)
+        if count <= maximum:
+            return values.tolist() if hasattr(values, "tolist") else list(values)
+        step = max(1, math.ceil((count - 1) / (maximum - 1)))
+        indexes = list(range(0, count, step))
+        if indexes[-1] != count - 1:
+            indexes.append(count - 1)
+        return [values[index].item() if hasattr(values[index], "item") else values[index]
+                for index in indexes]
+
+    def _curve_from_record(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        raw_path = str(record.get("data_path") or "").strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path).resolve()
+        try:
+            path.relative_to(self.save_dir.resolve())
+        except ValueError:
+            return None
+        if not path.is_file():
+            return None
+        settings: dict[str, Any] = {}
+        try:
+            decoded = json.loads(str(record.get("measurement_settings_json") or ""))
+            if isinstance(decoded, dict):
+                settings = decoded
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        method = str(settings.get("method") or "it")
+        try:
+            if method == "cv":
+                data = load_cv_run(path)
+                return {
+                    "method": "cv",
+                    "time_s": self._downsample_curve(data["time_s"]),
+                    "potential_v": self._downsample_curve(data["potential_v"]),
+                    "current_nA": self._downsample_curve(data["current_nA"]),
+                    "cycle": self._downsample_curve(data["cycle"]),
+                    "valid": self._downsample_curve(data["valid"]),
+                }
+            time_s, current_nA, valid = load_run_csv(path)
+            return {
+                "method": "it",
+                "time_s": self._downsample_curve(time_s),
+                "current_nA": self._downsample_curve(current_nA),
+                "valid": self._downsample_curve(valid),
+            }
+        except (OSError, ValueError, csv.Error):
+            return None
+
+    def history_curves_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            curves = []
+            for record in self.records:
+                if record.get("state") != "completed" or not record.get("data_path"):
+                    continue
+                curves.append({
+                    "run_id": str(record.get("run_id") or ""),
+                    "sample_name": str(record.get("sample_name") or "未命名样品"),
+                    "sample_role": str(record.get("sample_role") or ""),
+                    "finished_at": record.get("finished_at"),
+                    "steady_current_nA": record.get("steady_current_nA"),
+                    "measurement_settings_json": record.get("measurement_settings_json", ""),
+                })
+        return {"curves": list(reversed(curves[-80:]))}
+
+    def load_history_curves(self, payload: dict[str, Any]) -> dict[str, Any]:
+        requested = payload.get("run_ids", [])
+        if not isinstance(requested, list):
+            raise ValueError("历史曲线必须是数组")
+        requested_ids = [str(value) for value in requested if str(value)]
+        if len(requested_ids) > 12:
+            raise ValueError("一次最多叠加 12 条历史曲线")
+        with self.lock:
+            records_by_id = {
+                str(record.get("run_id") or ""): dict(record)
+                for record in self.records if record.get("state") == "completed"
+            }
+        curves: list[dict[str, Any]] = []
+        for run_id in requested_ids:
+            record = records_by_id.get(run_id)
+            if record is None:
+                raise ValueError("历史曲线不属于当前批次")
+            curve = self._curve_from_record(record)
+            if curve is not None:
+                curves.append({
+                    "run_id": run_id,
+                    "sample_name": str(record.get("sample_name") or run_id),
+                    "sample_role": str(record.get("sample_role") or ""),
+                    "finished_at": record.get("finished_at"),
+                    **curve,
+                })
+        return {"curves": curves}
 
     def open_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         workspace_id = str(payload.get("workspace_id") or "")
@@ -5685,6 +5822,15 @@ class AppState:
         with self.operation_lock:
             _, path = self.history.resolve(workspace_id)
             self._switch_workspace(path, create=False, restore=True)
+        preview = None
+        for record in reversed(self.records):
+            if record.get("state") == "completed":
+                curve = self._curve_from_record(record)
+                if curve is not None:
+                    preview = {"run_id": str(record.get("run_id") or ""),
+                               "sample_name": str(record.get("sample_name") or ""),
+                               **curve}
+                    break
         return {
             "workflow": self.workflow_snapshot(),
             "calibration": self.model_payload(),
@@ -5692,6 +5838,7 @@ class AppState:
             "filter": self.filter.snapshot(),
             "plateau": self.plateau.snapshot(),
             "history": self.history_snapshot(),
+            "measurement_preview": preview,
         }
 
     def favorite_history(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -5712,7 +5859,9 @@ class AppState:
 
     def start_measurement(self, payload: dict[str, Any]) -> dict[str, Any]:
         requested_dir = str(payload.get("save_dir", "")).strip()
-        if requested_dir and self._resolve_save_dir(requested_dir) != self.save_dir:
+        if requested_dir and self._resolve_save_dir(requested_dir) not in {
+            self.save_dir, self.workspace_root,
+        }:
             self.configure_workflow({"save_dir": requested_dir})
         sample_name = str(payload.get("sample_name", "")).strip()
         if not sample_name:
@@ -6013,7 +6162,8 @@ class AppState:
 
     def _save_validation_overrides(self) -> None:
         self._workspace_paths()["validation"].write_text(
-            json.dumps({"points": self.validation_overrides}, indent=2,
+            json.dumps({"points": self.validation_overrides,
+                        "manual_points": self.manual_validation_points}, indent=2,
                        ensure_ascii=False),
             encoding="utf-8",
         )
@@ -6029,11 +6179,13 @@ class AppState:
             if row.get("sample_role") == "test" and row.get("state") == "completed"
         }
         overrides: dict[str, dict[str, Any]] = {}
+        manual = {str(point.get("point_id") or ""): dict(point)
+                  for point in self.manual_validation_points}
         for item in raw_points:
             if not isinstance(item, dict):
                 raise ValueError("测试点必须是对象")
             point_id = str(item.get("point_id") or "")
-            if not point_id or point_id not in available:
+            if not point_id or (point_id not in available and point_id not in manual):
                 raise ValueError("测试点记录不存在")
             try:
                 current = float(item["current_nA"])
@@ -6051,13 +6203,18 @@ class AppState:
                     raise ValueError("测试点浓度必须是数字") from exc
                 if not math.isfinite(concentration) or concentration < 0:
                     raise ValueError("测试点浓度必须是非负有限数字")
-            overrides[point_id] = {
+            updated = {
                 "sample_name": str(item.get("sample_name") or "").strip(),
                 "concentration_um": concentration,
                 "current_nA": current,
             }
+            if point_id in manual:
+                manual[point_id].update(updated)
+            else:
+                overrides[point_id] = updated
         with self.lock:
             self.validation_overrides = overrides
+            self.manual_validation_points = list(manual.values())
             self._save_validation_overrides()
         return self.model_payload()
 
@@ -6409,31 +6566,15 @@ class AppState:
         self.measurement.set_workflow_result(result)
         _notify_measurement_completion(run, result)
 
-    def reset_calibration(self) -> dict[str, Any]:
+    def reset_calibration(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
             raise RuntimeError("测量或自动任务运行期间不能重置标定")
-        stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1_000_000:06d}"
+        payload = payload or {}
+        label = str(payload.get("batch_name") or "").strip()
         with self.operation_lock:
             root = self._workspace_root_for(self.save_dir)
             self.workspace_root = root
-            self._probe_workspace(root, create=True)
-            self.history.register(
-                root, WorkspaceHistory.summarize(root), root.name,
-                kind=WORKSPACE_KIND,
-            )
-            batch_name = f"batch-{stamp}"
-            batch_path = root / batch_name
-            suffix = 2
-            while batch_path.exists():
-                batch_path = root / f"{batch_name}-{suffix}"
-                suffix += 1
-            self._switch_workspace(
-                batch_path, create=True, restore=False, workspace_root=root,
-            )
-            self.history.register_batch(
-                batch_path, root, self._history_summary(),
-                f"批次 {stamp}",
-            )
+            self._start_batch(root, label)
             self._refresh_history_best_effort()
         return self.workflow_snapshot()
 
@@ -6710,6 +6851,7 @@ class AppState:
         if self.validation_started_at is None:
             return []
         validation_points: list[dict[str, Any]] = []
+        sources: list[dict[str, Any]] = []
         for index, row in enumerate(self.records, 1):
             if row.get("sample_role") != "test" or row.get("state") != "completed":
                 continue
@@ -6751,7 +6893,7 @@ class AppState:
                 # test current. Keep the measured point and current error on
                 # the chart, while leaving concentration error unavailable.
                 predicted_concentration = None
-            validation_points.append({
+            sources.append({
                 "point_id": point_id,
                 "run_id": point_id,
                 "sample_name": str(override.get("sample_name") or row.get("sample_name") or point_id or "测试样品"),
@@ -6772,7 +6914,104 @@ class AppState:
                 "data_path": str(row.get("data_path") or ""),
                 "edited": bool(override),
             })
-        return validation_points
+        for point in self.manual_validation_points:
+            point_id = str(point.get("point_id") or "")
+            try:
+                measured_current = float(point["current_nA"])
+                finished_at = float(point.get("finished_at") or 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not point_id or not math.isfinite(measured_current):
+                continue
+            raw_concentration = point.get("concentration_um")
+            try:
+                concentration = None if raw_concentration in (None, "") else float(raw_concentration)
+            except (TypeError, ValueError):
+                concentration = None
+            if concentration is not None and (not math.isfinite(concentration) or concentration < 0):
+                concentration = None
+            expected_current = (float(model.current_from_concentration(concentration)) + bias_nA
+                                if concentration is not None else None)
+            try:
+                predicted_concentration = float(model.predict_concentration(measured_current - bias_nA))
+            except (TypeError, ValueError, OverflowError):
+                predicted_concentration = None
+            sources.append({
+                "point_id": point_id,
+                "run_id": str(point.get("source_point_id") or point_id),
+                "sample_name": str(point.get("sample_name") or point_id),
+                "finished_at": finished_at,
+                "concentration_um": concentration,
+                "current_nA": measured_current,
+                "expected_current_nA": expected_current,
+                "predicted_concentration_um": predicted_concentration,
+                "error_nA": measured_current - expected_current if expected_current is not None else None,
+                "error_um": predicted_concentration - concentration if predicted_concentration is not None and concentration is not None else None,
+                "data_path": str(point.get("data_path") or ""),
+                "edited": True,
+                "manual": True,
+            })
+        return sources
+
+    def add_validation_to_calibration(self, payload: dict[str, Any]) -> dict[str, Any]:
+        point_id = str(payload.get("point_id") or "")
+        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
+            raise RuntimeError("测量或自动任务运行期间不能修改标定点")
+        if self.model is None:
+            raise ValueError("请先生成测试曲线")
+        validation = next((point for point in self._validation_points_payload(self.model)
+                           if point["point_id"] == point_id), None)
+        if validation is None:
+            raise ValueError("测试点不存在")
+        concentration = validation.get("concentration_um")
+        current = validation.get("current_nA")
+        if concentration is None or current is None:
+            raise ValueError("测试点必须有真实浓度和测量电流才能加入标定")
+        if any(record.get("run_id") == validation.get("run_id")
+               for record in self.point_records):
+            return self.model_payload()
+        with self.operation_lock, self.lock:
+            candidate_id = f"from-test-{point_id}"
+            while any(record["point_id"] == candidate_id for record in self.point_records):
+                candidate_id = f"{candidate_id}-copy"
+            self.point_records.append({
+                "point_id": candidate_id,
+                "acquired_at": float(validation.get("finished_at") or time.time()),
+                "run_id": str(validation.get("run_id") or point_id),
+                "label": str(validation.get("sample_name") or point_id),
+                "concentration_um": float(concentration),
+                "current_nA": float(current),
+                "data_path": str(validation.get("data_path") or ""),
+            })
+            self._sync_points()
+            self._save_calibration_points()
+        self._refresh_history_best_effort()
+        return self.model_payload()
+
+    def add_calibration_to_validation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        point_id = str(payload.get("point_id") or "")
+        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
+            raise RuntimeError("测量或自动任务运行期间不能修改测试点")
+        with self.operation_lock, self.lock:
+            source = next((record for record in self.point_records
+                           if record["point_id"] == point_id), None)
+            if source is None:
+                raise ValueError("标定点不存在")
+            existing = next((point for point in self.manual_validation_points
+                             if point.get("source_point_id") == point_id), None)
+            if existing is None:
+                self.manual_validation_points.append({
+                    "point_id": f"manual-test-{point_id}",
+                    "source_point_id": point_id,
+                    "sample_name": str(source.get("label") or point_id),
+                    "concentration_um": source.get("concentration_um"),
+                    "current_nA": source.get("current_nA"),
+                    "data_path": str(source.get("data_path") or ""),
+                    "finished_at": source.get("acquired_at") or time.time(),
+                })
+                self._save_validation_overrides()
+        self._refresh_history_best_effort()
+        return self.model_payload()
 
     def points_payload(self) -> dict[str, Any]:
         with self.lock:
@@ -7050,6 +7289,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = APP.fit(payload)
             elif self.path == "/api/calibration/validation":
                 result = APP.update_validation_points(payload)
+            elif self.path == "/api/calibration/promote-validation":
+                result = APP.add_validation_to_calibration(payload)
+            elif self.path == "/api/calibration/add-validation":
+                result = APP.add_calibration_to_validation(payload)
             elif self.path == "/api/drift/calculate":
                 result = APP.calculate_drift(payload)
             elif self.path == "/api/drift/toggle":
@@ -7123,7 +7366,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     result = APP.configure_workflow(payload)
             elif self.path == "/api/workflow/reset-calibration":
                 with APP.operation_lock:
-                    result = APP.reset_calibration()
+                    result = APP.reset_calibration(payload)
             elif self.path == "/api/history/register":
                 result = APP.register_history(payload)
             elif self.path == "/api/history/import":
@@ -7134,6 +7377,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = APP.favorite_history(payload)
             elif self.path == "/api/history/remove":
                 result = APP.remove_history(payload)
+            elif self.path == "/api/history/curves":
+                result = APP.history_curves_snapshot()
+            elif self.path == "/api/history/curves/load":
+                result = APP.load_history_curves(payload)
             else:
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 return

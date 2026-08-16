@@ -3,7 +3,7 @@ const $ = (id) => {
   if (!node) throw new Error(`界面资源版本不一致（缺少 ${id}），请刷新页面后重试`);
   return node;
 };
-const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, devices: {devices: [], selected_device_id: null, busy: false}, deviceRefreshPromise: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, driftDirty: false, exiting: false };
+const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, historyCurveCatalog: [], historyCurves: [], historyCurveIds: [], historyPreview: null, devices: {devices: [], selected_device_id: null, busy: false}, deviceRefreshPromise: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, driftDirty: false, exiting: false };
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
   calibrate: ['标定与漂移', '选择标定范围并管理过渡期 bias'],
@@ -284,13 +284,14 @@ function setSampleRole(role, quiet=false){
   updateStartState();previewFilename();
 }
 function renderWorkflow(data){
-  state.workflow=data;$('saveDirectory').value=data.save_dir||'';
+  state.workflow=data;$('saveDirectory').value=data.workspace_root||data.save_dir||'';
   const cv=state.method==='cv';
   document.querySelector('.workflow-steps').hidden=cv;
   $('resetCalibration').hidden=cv;
   const labels={collect:'标定采集',select:'待选范围',stabilization:'稳定化中',test:'测试就绪'};
   $('workflowBadge').textContent=cv?'自动保存':labels[data.stage]||'待配置';$('workflowBadge').className=`live-badge ${cv||data.calibration_ready?'running':''}`;
-  $('workflowMessage').textContent=cv?'CV 原始点、标准 CSV、汇总与曲线图将在扫描结束后写入当前目录':data.calibration_ready?`测试曲线采用 ${data.selected_points_count} / ${data.points_count} 个候选点；后续采集不会自动改写`:data.points_count&&!data.settings_match?'当前 IT 条件与已有标定不同；请恢复原条件或新建标定批次':`已记录 ${data.points_count} 个候选点，请到“标定与漂移”选择用于拟合的范围`;
+  const batchLabel=data.batch_label?` · 当前批次：${data.batch_label}`:'';
+  $('workflowMessage').textContent=(cv?'CV 原始点、标准 CSV、汇总与曲线图将在当前批次写入':data.calibration_ready?`测试曲线采用 ${data.selected_points_count} / ${data.points_count} 个候选点；后续采集不会自动改写`:data.points_count&&!data.settings_match?'当前 IT 条件与已有标定不同；请恢复原条件或新建标定批次':`已记录 ${data.points_count} 个候选点，请到“标定与漂移”选择用于拟合的范围`)+batchLabel;
   $('calibrationStep').classList.toggle('active',data.stage==='collect');$('selectionStep').classList.toggle('active',data.stage==='select');$('testStep').classList.toggle('active',['stabilization','test'].includes(data.stage));
   const testButton=$('sampleRole').querySelector('[data-role="test"]');testButton.disabled=!data.calibration_ready;
   ['test','stabilization'].forEach(role=>$('scheduleRole').querySelector(`option[value="${role}"]`).disabled=!data.calibration_ready);
@@ -320,7 +321,7 @@ async function handleWorkflowCompletion(data){
 }
 
 function workspaceHasUnsavedChanges(){
-  const directoryDraft=Boolean(state.workflow&&$('saveDirectory').value.trim()!==String(state.workflow.save_dir||''));
+  const directoryDraft=Boolean(state.workflow&&$('saveDirectory').value.trim()!==String(state.workflow.workspace_root||state.workflow.save_dir||''));
   return Boolean(state.calibrationDirty||state.validationDirty||state.settingsDirty||state.filterDirty||state.plateauDirty||state.driftDirty||directoryDraft);
 }
 function historyStatusLabel(status){return {available:'可用',missing:'目录缺失',corrupt:'数据损坏'}[status]||'不可用'}
@@ -328,22 +329,10 @@ function historyTimestamp(value){const numeric=Number(value);return Number.isFin
 function historyStat(label,value){const node=document.createElement('div'),name=document.createElement('span'),number=document.createElement('strong');name.textContent=label;number.textContent=String(value??0);node.append(name,number);return node}
 function renderWorkspaceHistory(data=state.history){
   state.history=data||{entries:[]};
-  const all=state.history.entries||[],favoritesOnly=$('historyFavoritesOnly').checked;
-  const workspaces=state.history.workspaces||all.filter(entry=>entry.kind!=='batch');
-  const select=$('historyWorkspaceSelect'),previous=select.value;
-  select.replaceChildren();
-  workspaces.forEach(entry=>{
-    const option=document.createElement('option');option.value=entry.workspace_id;option.textContent=`${entry.label} · ${entry.location}`;select.appendChild(option);
-  });
-  const preferred=workspaces.some(entry=>entry.workspace_id===previous)?previous:
-    (state.history.active_workspace_id&&workspaces.some(entry=>entry.workspace_id===state.history.active_workspace_id)?state.history.active_workspace_id:(workspaces[0]?.workspace_id||''));
-  select.value=preferred;
-  const selectedWorkspace=workspaces.find(entry=>entry.workspace_id===preferred);
-  const scoped=preferred?all.filter(entry=>entry.workspace_id===preferred||(entry.kind==='batch'&&entry.workspace_root_id===preferred)):all;
-  const entries=favoritesOnly?scoped.filter(entry=>entry.favorite):scoped;
-  const batchCount=scoped.filter(entry=>entry.kind==='batch').length;
-  $('workspaceHistorySummary').textContent=`${workspaces.length} 个工作区 · 当前 ${batchCount} 个批次 · ${all.filter(entry=>entry.favorite).length} 个收藏`;
-  $('historyBatchSummary').textContent=selectedWorkspace?`当前工作区：${selectedWorkspace.label} · ${batchCount} 个批次`:'暂无可用工作区';
+  const favoritesOnly=$('historyFavoritesOnly').checked;
+  const entries=(state.history.current_batches||[]).filter(entry=>!favoritesOnly||entry.favorite);
+  const batchCount=(state.history.current_batches||[]).length;
+  $('workspaceHistorySummary').textContent=`工作区：${state.history.workspace_root||'未设置'} · ${batchCount} 个批次`;
   const error=$('workspaceHistoryError'),registryError=String(state.history.registry_error||'');
   error.textContent=registryError;error.hidden=!registryError;
   const list=$('workspaceHistoryList');list.replaceChildren();
@@ -351,7 +340,7 @@ function renderWorkspaceHistory(data=state.history){
   entries.forEach(entry=>{
     const card=document.createElement('article');card.className=`workspace-history-card ${entry.current?'current ':''}${entry.status==='available'?'':'unavailable'}`.trim();card.dataset.workspaceId=entry.workspace_id;
     const title=document.createElement('div');title.className='workspace-history-title';
-    const identity=document.createElement('div'),name=document.createElement('strong'),location=document.createElement('small');name.textContent=`${entry.current?'当前 · ':''}${entry.kind==='batch'?'批次 · ':'工作区 · '}${entry.label}`;location.textContent=entry.location;identity.append(name,location);
+    const identity=document.createElement('div'),name=document.createElement('strong'),location=document.createElement('small');name.textContent=`${entry.current?'当前 · ':''}批次 · ${entry.label}`;location.textContent=entry.location;identity.append(name,location);
     const star=document.createElement('button');star.type='button';star.className=`workspace-history-star ${entry.favorite?'active':''}`;star.textContent=entry.favorite?'★':'☆';star.title=entry.favorite?'取消收藏':'收藏';star.setAttribute('aria-label',star.title);star.onclick=()=>void toggleWorkspaceFavorite(entry);
     title.append(identity,star);
     const meta=document.createElement('div');meta.className='workspace-history-meta';const timestamp=document.createElement('span'),status=document.createElement('strong');timestamp.textContent=historyTimestamp(entry.summary?.latest_result_at||entry.updated_at);status.className=`workspace-history-status ${entry.status}`;status.textContent=historyStatusLabel(entry.status);status.title=entry.status_detail||'';meta.append(timestamp,status);
@@ -372,23 +361,39 @@ async function openWorkspaceHistory(entry){
   try{
     const result=await post('/api/history/open',{workspace_id:entry.workspace_id,unsaved_changes:unsaved,discard_unsaved:unsaved});
     state.settingsDirty=state.calibrationDirty=state.validationDirty=state.filterDirty=state.plateauDirty=state.driftDirty=false;
-    state.workflow=result.workflow;state.calibration=result.calibration;state.settings=result.settings;state.filter={...FILTER_DEFAULTS,...(result.filter?.settings||{})};state.plateau=result.plateau;renderSettings(state.settings);renderWorkflow(state.workflow);renderFilterControls();renderPlateauControls(state.plateau);renderCalibration();try{renderDrift(await api('/api/drift'))}catch{}renderWorkspaceHistory(result.history);setSampleRole(state.workflow?.calibration_ready?'test':'calibration',true);
+    state.historyPreview=result.measurement_preview||null;state.historyCurves=[];state.historyCurveIds=[];
+    state.workflow=result.workflow;state.calibration=result.calibration;state.settings=result.settings;state.filter={...FILTER_DEFAULTS,...(result.filter?.settings||{})};state.plateau=result.plateau;renderSettings(state.settings);renderWorkflow(state.workflow);renderFilterControls();renderPlateauControls(state.plateau);renderCalibration();try{renderDrift(await api('/api/drift'))}catch{}renderWorkspaceHistory(result.history);setSampleRole(state.workflow?.calibration_ready?'test':'calibration',true);drawAll();
     document.querySelector('.nav-item[data-view="measure"]').click();toast('已恢复历史工作区，继续测量前请重新应用硬件条件');
   }catch(e){errorBox('workspaceHistoryError',e)}
 }
 $('historyFavoritesOnly').addEventListener('change',()=>renderWorkspaceHistory());
-$('historyWorkspaceSelect').addEventListener('change',()=>renderWorkspaceHistory());
 $('refreshWorkspaceHistory').addEventListener('click',()=>void refreshWorkspaceHistory());
-$('registerCurrentHistory').addEventListener('click',async()=>{try{await post('/api/history/register',{});await refreshWorkspaceHistory();toast('当前工作区已登记')}catch(e){errorBox('workspaceHistoryError',e)}});
-$('importHistoryDirectory').addEventListener('click',async()=>{
-  const path=$('historyImportPath').value.trim();
-  if(!path){errorBox('workspaceHistoryError',new Error('请填写历史数据目录'));return}
-  try{
-    renderWorkspaceHistory(await post('/api/history/import',{path}));
-    $('historyImportPath').value='';
-    toast('历史数据目录已导入');
-  }catch(e){errorBox('workspaceHistoryError',e)}
+
+function historyCurveLabel(curve){
+  const at=historyTimestamp(curve.finished_at),role={calibration:'标定',test:'测试',stabilization:'稳定化',cv:'CV'}[curve.sample_role]||curve.sample_role||'测量';
+  return `${curve.sample_name||curve.run_id} · ${role} · ${at}`;
+}
+function renderHistoryCurves(){
+  const list=$('historyCurveList');list.replaceChildren();
+  if(!state.historyCurveCatalog.length){const empty=document.createElement('span');empty.textContent='当前批次还没有可叠加的已完成曲线';list.appendChild(empty);return}
+  state.historyCurveCatalog.forEach(curve=>{
+    const label=document.createElement('label'),input=document.createElement('input'),text=document.createElement('span');
+    label.className='history-curve-option';input.type='checkbox';input.value=curve.run_id;input.checked=state.historyCurveIds.includes(curve.run_id);
+    input.addEventListener('change',()=>void selectHistoryCurves());text.textContent=historyCurveLabel(curve);label.append(input,text);list.appendChild(label);
+  });
+}
+async function refreshHistoryCurves(){
+  try{state.historyCurveCatalog=(await post('/api/history/curves')).curves||[];renderHistoryCurves()}catch(e){toast(`读取历史曲线失败：${e.message}`)}
+}
+async function selectHistoryCurves(){
+  const ids=[...$('historyCurveList').querySelectorAll('input:checked')].map(input=>input.value);
+  try{state.historyCurveIds=ids;state.historyCurves=(await post('/api/history/curves/load',{run_ids:ids})).curves||[];drawAll()}catch(e){toast(e.message);await refreshHistoryCurves()}
+}
+$('toggleHistoryCurves').addEventListener('click',async()=>{
+  const panel=$('historyCurvePanel');panel.hidden=!panel.hidden;
+  if(!panel.hidden)await refreshHistoryCurves();
 });
+$('refreshHistoryCurves').addEventListener('click',()=>void refreshHistoryCurves());
 
 document.querySelectorAll('.nav-item').forEach(button => button.addEventListener('click', () => {
   document.querySelectorAll('.nav-item').forEach(x => x.classList.toggle('active', x === button));
@@ -439,6 +444,7 @@ function drawChart(canvas, series, options = {}) {
   if (!all.length) return;
   const xBounds=finiteBounds(all,0);
   let xmin = options.xmin ?? xBounds[0], xmax = options.xmax ?? xBounds[1];
+  if(options.integerX){xmin=Math.floor(xmin);xmax=Math.ceil(xmax);if(xmin===xmax){xmin-=1;xmax+=1}}
   const span = list => {
     if (!list.length) return [0, 1];
     const bounds=finiteBounds(list,1),lo=bounds[0],hi=bounds[1];
@@ -470,11 +476,14 @@ function drawChart(canvas, series, options = {}) {
     if(hasRight){ctx.fillStyle='#8a6fb0';ctx.fillText((y2min+(y2max-y2min)*f).toFixed(y2d),w-m.r+6,yy+3)}
   }
   ctx.fillStyle='#718086';
-  for(let i=0;i<=6;i++){const x=xmin+(xmax-xmin)*i/6, xx=px(x);ctx.beginPath();ctx.moveTo(xx,m.t);ctx.lineTo(xx,h-m.b);ctx.stroke();ctx.fillText(x.toFixed(xmax<=60?1:0),xx-8,h-15)}
+  const xTicks=options.integerX?Array.from({length:Math.floor((xmax-xmin)/Math.max(1,Math.ceil((xmax-xmin)/6)))+1},(_,i)=>xmin+i*Math.max(1,Math.ceil((xmax-xmin)/6))).filter(x=>x<=xmax):Array.from({length:7},(_,i)=>xmin+(xmax-xmin)*i/6);
+  if(options.integerX&&xTicks.at(-1)!==xmax)xTicks.push(xmax);
+  xTicks.forEach(x=>{const xx=px(x);ctx.beginPath();ctx.moveTo(xx,m.t);ctx.lineTo(xx,h-m.b);ctx.stroke();ctx.fillText(x.toFixed(options.integerX?0:(xmax<=60?1:0)),xx-8,h-15)});
   series.forEach(s => {
     const points = s.points.filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
     const yf = s.axis === 'right' ? py2 : py;
     const width = s.width ?? 1.6;
+    ctx.globalAlpha=s.alpha??1;
     if (width > 0 && points.length) {
       ctx.strokeStyle = s.color;
       ctx.lineWidth = width;
@@ -493,6 +502,7 @@ function drawChart(canvas, series, options = {}) {
         ctx.fill();
       });
     }
+    ctx.globalAlpha=1;
   });
   ctx.fillStyle='#68767b';ctx.fillText(options.xlabel||'Time (s)',w/2-22,h-2);
   ctx.save();ctx.translate(12,h/2+25);ctx.rotate(-Math.PI/2);ctx.fillText(options.ylabel||'Current (nA)',0,0);ctx.restore();
@@ -526,13 +536,18 @@ function drawApScoreChart(points){
 }
 function drawAll(){
   if(document.visibilityState==='hidden')return;
-  const d = state.measurement?.data || {};
+  const live=state.measurement?.data||{},preview=state.historyPreview;
+  const d=(!state.measurement?.busy&&!live.current_nA?.length&&preview)?preview:live;
   const current = d.current_nA || [], allSeries=[];
   const filtered = filterValues(d.time_s || current.map((_,i)=>i), current, d.valid).values;
   if(state.method==='cv' && d.potential_v){
     const maxCycle=Math.max(0,...(d.cycle||[]));
     const keep=state.chartWindowS===null?Infinity:state.chartWindowS;
     const firstCycle=Math.max(1,maxCycle-keep+1);
+    state.historyCurves.filter(curve=>curve.method==='cv').forEach((curve,index)=>{
+      const color=['#8b6f5a','#766f9b','#5b8792','#9a6d7e','#6e8b65','#a7844c'][index%6],values=filterValues(curve.time_s||curve.potential_v,curve.current_nA||[],curve.valid).values;
+      const cycles=[...new Set(curve.cycle||[])];cycles.forEach(cycle=>{const points=[];(curve.potential_v||[]).forEach((potential,i)=>{if(curve.cycle?.[i]===cycle&&curve.valid?.[i]!==false)points.push([potential,Number(values[i])/1000])});if(points.length)allSeries.push({points,color,width:.8,alpha:.72})});
+    });
     for(let cycle=firstCycle;cycle<=maxCycle;cycle++){
       const rawValid=[],filteredValid=[],invalid=[];
       d.potential_v.forEach((potential,i)=>{
@@ -553,6 +568,10 @@ function drawAll(){
     const duration=Number(state.measurement?.settings?.duration_s||state.settings?.settings?.duration_s||180),adaptive=Boolean(state.measurement?.settings?.adaptive_stop??state.settings?.settings?.adaptive_stop),latest=rawPoints.at(-1)?.[0]||0;
     if(state.chartWindowFixed){while(latest>state.chartWindowS)state.chartWindowS+=100}
     const xmin=state.chartWindowFixed?0:Math.max(0,latest-state.chartWindowS),xmax=state.chartWindowFixed?Math.max(300,state.chartWindowS):Math.max(state.chartWindowS,latest),visible=points=>points.filter(point=>point[0]>=xmin&&point[0]<=xmax);
+    state.historyCurves.filter(curve=>curve.method==='it').forEach((curve,index)=>{
+      const values=filterValues(curve.time_s||[],curve.current_nA||[],curve.valid).values,color=['#8b6f5a','#766f9b','#5b8792','#9a6d7e','#6e8b65','#a7844c'][index%6];
+      const points=(curve.time_s||[]).map((time,i)=>[time,values[i]]).filter(point=>point[0]>=xmin&&point[0]<=xmax);if(points.length)allSeries.push({points,color,width:1.05,alpha:.75});
+    });
     if(state.showRaw)allSeries.push({points:visible(rawPoints),color:'#b8c0c2',width:.55},
       {points:visible(validPoints),color:'#9aa7aa',width:0,dots:true,pointRadius:1.1});
     allSeries.push({points:visible(filteredPoints),color:'#167b74',width:1.45});
@@ -566,7 +585,7 @@ function drawAll(){
   if(state.showCalibrationPoints&&selected.length)series.push({points:selected.map(p=>[Number(p.concentration_um),Number(p.current_nA)]),color:'#28708c',dots:true,width:0,pointRadius:4});
   const validation=(c.validation_points||[]).filter(p=>hasFiniteConcentration(p)&&Number.isFinite(Number(p.current_nA)));
   if(state.showTestPoints&&validation.length)series.push({points:validation.map(p=>[Number(p.concentration_um),Number(p.current_nA)]),color:'#b54455',dots:true,width:0,pointRadius:4.5});
-  $('calibrationEmpty').hidden=series.length>0;drawChart($('calibrationChart'),series,{xlabel:'浓度 (µM)',ylabel:'电流 (nA)'});
+  $('calibrationEmpty').hidden=series.length>0;drawChart($('calibrationChart'),series,{xlabel:'浓度 (µM)',ylabel:'电流 (nA)',integerX:true});
   drawApScoreChart(c.validation_points||[]);
 }
 [
@@ -902,8 +921,9 @@ $('sampleRole').addEventListener('click',event=>{const button=event.target.close
 $('sampleName').addEventListener('input',previewFilename);$('knownConcentration').addEventListener('input',previewFilename);
 $('doubleKnownConcentration').addEventListener('click',()=>scaleKnownConcentration(2));
 $('halveKnownConcentration').addEventListener('click',()=>scaleKnownConcentration(.5));
-$('applySaveDirectory').onclick=async()=>{try{renderWorkflow(await post('/api/workflow/config',{save_dir:$('saveDirectory').value}));state.calibration=await api('/api/calibration');renderCalibration();toast('保存目录已应用')}catch(e){errorBox('measureError',e)}};
-$('resetCalibration').onclick=async()=>{if(!confirm('开始一套新标定？软件会在当前工作区下新建一个批次目录，旧批次数据保持不变。'))return;try{renderWorkflow(await post('/api/workflow/reset-calibration'));state.calibration=await api('/api/calibration');renderCalibration();setSampleRole('calibration',true);toast('已新建批次并切换到新目录')}catch(e){errorBox('measureError',e)}};
+function requestedBatchName(){const value=window.prompt('请输入批次名称',`批次 ${new Date().toLocaleString('zh-CN',{hour12:false})}`);if(value===null)return null;if(!value.trim()){toast('请输入批次名称');return null}return value.trim()}
+$('applySaveDirectory').onclick=async()=>{const batchName=requestedBatchName();if(batchName===null)return;try{renderWorkflow(await post('/api/workflow/config',{save_dir:$('saveDirectory').value,batch_name:batchName}));state.calibration=await api('/api/calibration');state.historyPreview=null;state.historyCurves=[];state.historyCurveIds=[];renderCalibration();toast('已在工作区新建批次')}catch(e){errorBox('measureError',e)}};
+$('resetCalibration').onclick=async()=>{const batchName=requestedBatchName();if(batchName===null)return;try{renderWorkflow(await post('/api/workflow/reset-calibration',{batch_name:batchName}));state.calibration=await api('/api/calibration');state.historyPreview=null;state.historyCurves=[];state.historyCurveIds=[];renderCalibration();setSampleRole('calibration',true);toast('已新建批次并切换到新目录')}catch(e){errorBox('measureError',e)}};
 
 function readSettings(){const potential=Number($('potentialV').value),low=Number($('cvLowV').value),high=Number($('cvHighV').value),rate=Number($('cvScanRate').value),cycles=Number($('cvCycles').value),cv=state.method==='cv',duration=cv?2*(high-low)/rate*cycles:Number($('durationS').value);return {method:state.method,initial_potential_v:cv?low:potential,potential_v:cv?low:potential,working_electrode_v:Number($('workingElectrodeV').value),prestep_s:cv?Number($('cvQuietS').value):0,duration_s:duration,adaptive_stop:!cv&&$('adaptiveStop').checked,sens_period_code:Number($('sensPeriodCode').value),target_rate_hz:Number($('sampleRateHz').value),fit_window_s:Number($('fitWindowS').value),fsr_nA:Number($('fsrNA').value),offset_mode:$('offsetNA').value,cv_low_v:low,cv_high_v:high,cv_scan_rate_v_s:rate,cv_cycles:cycles,cv_step_v:.001,cv_quiet_s:Number($('cvQuietS').value),cv_eis_fsr_uA:Number($('cvEisFsrUA').value)}}
 function renderOffsetLabels(fsr){$('offsetNA').querySelectorAll('option[data-pct]').forEach(option=>{const pct=Number(option.dataset.pct);option.textContent=`${pct}% FSR (${fsr*pct/100} nA)`})}
@@ -952,7 +972,7 @@ function row(point={},index=0){
   makeCell(tr,String(index+1));
   makeCell(tr,point.acquired_at?new Date(Number(point.acquired_at)*1000).toLocaleString('zh-CN',{hour12:false}):'手动');
   const labelInput=pointInput('label',point.label||'');labelInput.addEventListener('input',()=>{refreshRangeControls();syncCalibrationPreview()});makeCell(tr,labelInput);const concentrationInput=pointInput('concentration_um',point.concentration_um,'number'),currentInput=pointInput('current_nA',point.current_nA,'number');concentrationInput.addEventListener('input',syncCalibrationPreview);currentInput.addEventListener('input',syncCalibrationPreview);makeCell(tr,concentrationInput);makeCell(tr,currentInput);
-  const remove=document.createElement('button');remove.className='delete-point';remove.title='删除候选点';remove.textContent='×';remove.onclick=()=>{tr.remove();refreshRangeControls();syncCalibrationPreview()};makeCell(tr,remove);return tr;
+  const actions=document.createElement('div');actions.className='point-actions';const asTest=document.createElement('button');asTest.className='text-button';asTest.type='button';asTest.textContent='添加为测试点';asTest.title='将此候选标定点加入测试点列表';asTest.onclick=async()=>{try{state.calibration=await post('/api/calibration/add-validation',{point_id:tr.dataset.pointId});renderCalibration();toast('已添加为测试点')}catch(e){toast(e.message)}};const remove=document.createElement('button');remove.className='delete-point';remove.title='删除候选点';remove.textContent='×';remove.onclick=()=>{tr.remove();refreshRangeControls();syncCalibrationPreview()};actions.append(asTest,remove);makeCell(tr,actions);return tr;
 }
 function refreshRangeControls(){
   const rows=[...$('pointsBody').querySelectorAll('tr')],start=$('rangeStart'),end=$('rangeEnd'),oldStart=start.value,oldEnd=end.value;start.innerHTML='';end.innerHTML='';
@@ -1035,7 +1055,7 @@ function updateValidationSummary(){
 }
 function renderValidation(points){
   const body=$('validationBody');body.replaceChildren();const rows=state.calibration?.model?(points||[]):[];$('validationEmpty').hidden=rows.length>0;
-  rows.forEach((point,index)=>{const tr=document.createElement('tr');tr.dataset.pointId=point.point_id||point.run_id||`validation-${index+1}`;const number=document.createElement('td');number.textContent=String(index+1);tr.appendChild(number);[['sample_name',point.sample_name||''],['concentration_um',point.concentration_um],['current_nA',point.current_nA]].forEach(([key,value])=>{const td=document.createElement('td'),input=document.createElement('input');input.dataset.validationKey=key;input.value=value??'';if(key!=='sample_name'){input.type='number';input.step='0.001';input.min=key==='concentration_um'?'0':''}input.addEventListener('input',()=>{state.validationDirty=true;$('validationEditBadge').textContent='未保存修改';$('validationEditBadge').className='live-badge warn';$('saveValidation').disabled=false;updateValidationSummary()});td.appendChild(input);tr.appendChild(td)});for(let i=0;i<7;i++){const td=document.createElement('td');td.dataset.validationDerived='true';tr.appendChild(td)}body.appendChild(tr);syncValidationRow(tr)});
+  rows.forEach((point,index)=>{const tr=document.createElement('tr');tr.dataset.pointId=point.point_id||point.run_id||`validation-${index+1}`;const number=document.createElement('td');number.textContent=String(index+1);tr.appendChild(number);[['sample_name',point.sample_name||''],['concentration_um',point.concentration_um],['current_nA',point.current_nA]].forEach(([key,value])=>{const td=document.createElement('td'),input=document.createElement('input');input.dataset.validationKey=key;input.value=value??'';if(key!=='sample_name'){input.type='number';input.step='0.001';input.min=key==='concentration_um'?'0':''}input.addEventListener('input',()=>{state.validationDirty=true;$('validationEditBadge').textContent='未保存修改';$('validationEditBadge').className='live-badge warn';$('saveValidation').disabled=false;updateValidationSummary()});td.appendChild(input);tr.appendChild(td)});for(let i=0;i<7;i++){const td=document.createElement('td');td.dataset.validationDerived='true';tr.appendChild(td)}const action=document.createElement('td'),promote=document.createElement('button');promote.className='text-button';promote.type='button';promote.textContent='添加为标定点';promote.title='将该测试点复制到候选标定点列表';promote.onclick=async()=>{try{state.calibration=await post('/api/calibration/promote-validation',{point_id:tr.dataset.pointId});renderCalibration();toast('已添加为候选标定点，请选择后重新拟合')}catch(e){toast(e.message)}};action.appendChild(promote);tr.appendChild(action);body.appendChild(tr);syncValidationRow(tr)});
   state.validationDirty=false;$('validationEditBadge').textContent='已保存';$('validationEditBadge').className='live-badge running';$('saveValidation').disabled=true;updateValidationSummary();
 }
 function renderCalibration(){

@@ -1224,6 +1224,40 @@ def test_validation_edits_persist_without_rewriting_the_measurement_index() -> N
         assert restored["current_nA"] == 24
 
 
+def test_calibration_and_test_points_can_be_copied_between_lists_and_persisted() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "cross-add"
+        app = AppState()
+        app.save_dir = workspace
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        app._append_record({
+            "finished_at": float(app.model_created_at or 0) + 10,
+            "run_id": "test-copy", "sample_name": "测试样品",
+            "sample_role": "test", "known_concentration_um": 5,
+            "steady_current_nA": 20, "state": "completed",
+            "data_path": "test.csv", "raw_path": "test-raw.csv",
+        })
+
+        promoted = app.add_validation_to_calibration({"point_id": "test-copy"})
+        assert len(promoted["points"]) == 3
+        assert promoted["points"][-1]["run_id"] == "test-copy"
+
+        copied = app.add_calibration_to_validation({"point_id": "zero"})
+        assert {point["point_id"] for point in copied["validation_points"]} == {
+            "test-copy", "manual-test-zero",
+        }
+
+        reloaded = AppState()
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        assert any(point.get("source_point_id") == "zero"
+                   for point in reloaded.manual_validation_points)
+
+
 def test_ap_scoring_keeps_the_complete_index_beyond_one_hundred_rows() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp) / "complete-index"
