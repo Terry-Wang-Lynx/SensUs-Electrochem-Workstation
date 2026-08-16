@@ -214,14 +214,134 @@ class WorkspaceHistory:
                 return "corrupt", f"{name} 无法读取：{exc}"
         return "available", ""
 
+    @staticmethod
+    def summarize(workspace: Path) -> dict[str, Any]:
+        """Build a display summary from an existing workspace directory."""
+        workspace = workspace.resolve()
+        point_count = 0
+        selected_count = 0
+        points_path = workspace / "calibration-points.csv"
+        if points_path.exists():
+            try:
+                with points_path.open(newline="", encoding="utf-8") as handle:
+                    point_count = sum(
+                        1 for row in csv.DictReader(handle)
+                        if row.get("concentration_um") not in (None, "")
+                        and row.get("current_nA") not in (None, "")
+                    )
+            except (OSError, UnicodeError, csv.Error):
+                point_count = 0
+
+        selection_path = workspace / "calibration-selection.json"
+        if selection_path.exists():
+            try:
+                selection = json.loads(selection_path.read_text(encoding="utf-8"))
+                selected = selection.get("selected_point_ids", [])
+                selected_count = len(selected) if isinstance(selected, list) else 0
+            except (OSError, UnicodeError, TypeError, json.JSONDecodeError):
+                selected_count = 0
+
+        records: list[dict[str, Any]] = []
+        index_path = workspace / "measurement-index.csv"
+        if index_path.exists():
+            try:
+                with index_path.open(newline="", encoding="utf-8") as handle:
+                    records = [dict(row) for row in csv.DictReader(handle)]
+            except (OSError, UnicodeError, csv.Error):
+                records = []
+        if not records:
+            # Older exports may contain summaries without the workspace index.
+            for summary_path in sorted(workspace.glob("*-summary.json")):
+                try:
+                    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                records.append({
+                    "finished_at": payload.get("finished_at"),
+                    "sample_name": payload.get("sample_name"),
+                    "sample_role": payload.get("sample_role"),
+                    "state": payload.get("state") or "completed",
+                    "steady_current_nA": payload.get("steady_current_nA"),
+                    "measurement_settings_json": json.dumps(
+                        payload.get("measurement_settings") or {}
+                    ),
+                })
+
+        completed = [row for row in records if row.get("state") == "completed"]
+        role_counts = {
+            role: sum(row.get("sample_role") == role for row in completed)
+            for role in ("calibration", "test", "stabilization", "cv")
+        }
+        latest = max(
+            completed,
+            key=lambda row: WorkspaceHistory._number(row.get("finished_at"), 0.0),
+            default=None,
+        )
+        model_r2: float | None = None
+        model_path = workspace / "calibration-model.json"
+        if model_path.exists():
+            try:
+                model = json.loads(model_path.read_text(encoding="utf-8"))
+                raw_r2 = model.get("r2") if isinstance(model, dict) else None
+                model_r2 = float(raw_r2) if raw_r2 is not None else None
+            except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+                model_r2 = None
+        settings: dict[str, Any] = {}
+        for settings_name in (
+            "workspace-state.json", "calibration-settings.json",
+        ):
+            settings_path = workspace / settings_name
+            if not settings_path.exists():
+                continue
+            try:
+                payload = json.loads(settings_path.read_text(encoding="utf-8"))
+                candidate = payload.get("settings", payload) if isinstance(payload, dict) else {}
+                if isinstance(candidate, dict):
+                    settings = candidate
+                    break
+            except (OSError, UnicodeError, TypeError, json.JSONDecodeError):
+                continue
+
+        return {
+            "points_count": point_count,
+            "selected_points_count": selected_count,
+            "records_count": len(records),
+            "completed_count": len(completed),
+            "calibration_count": role_counts["calibration"],
+            "test_count": role_counts["test"],
+            "stabilization_count": role_counts["stabilization"],
+            "cv_count": role_counts["cv"],
+            "has_model": model_path.exists(),
+            "model_r2": model_r2,
+            "method": settings.get("method", "it"),
+            "latest_result_at": (
+                WorkspaceHistory._number(latest.get("finished_at"), 0.0)
+                if latest else None
+            ),
+            "latest_sample_name": str((latest or {}).get("sample_name") or ""),
+            "latest_sample_role": str((latest or {}).get("sample_role") or ""),
+        }
+
     def register(
         self, workspace: Path, summary: dict[str, Any], label: str = "",
+        *, create_marker: bool = True,
     ) -> dict[str, Any]:
         with self.lock:
             data = self._read()
             workspace = workspace.resolve()
             locator = self._locator(workspace)
-            workspace_id = self._ensure_marker(workspace)
+            existing = next(
+                (item for item in data["entries"] if item["locator"] == locator),
+                None,
+            )
+            if existing is not None:
+                workspace_id = existing["workspace_id"]
+            elif create_marker:
+                workspace_id = self._ensure_marker(workspace)
+            else:
+                workspace_id = self._marker_id(workspace) or uuid.uuid4().hex
             now = time.time()
             entry = next(
                 (item for item in data["entries"] if item["workspace_id"] == workspace_id),

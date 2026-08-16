@@ -493,14 +493,16 @@ def _refresh_usb_transport() -> None:
     discovered = _discover_serial_data_port(force=True)
     if discovered:
         SERIAL_DATA_PORT = discovered
-        SERIAL_SMP_PORT = (
-            _discover_serial_smp_port(discovered, force=True)
-            or SERIAL_SMP_PORT
-        )
+        SERIAL_SMP_PORT = _discover_serial_smp_port(discovered, force=True) or ""
         HARDWARE_TRANSPORT = "serial"
         return
-    if HARDWARE_TRANSPORT_REQUESTED == "serial":
-        raise RuntimeError("USB 模式未找到 V5.1 DATA CDC，请检查 USB 连接")
+    if HARDWARE_TRANSPORT_REQUESTED == "serial" or HARDWARE_TRANSPORT == "serial":
+        raise RuntimeError(
+            "USB 模式未找到 V5.1 DATA CDC，请重新插拔 USB 后重试"
+        )
+    SERIAL_DATA_PORT = ""
+    SERIAL_SMP_PORT = ""
+    HARDWARE_TRANSPORT = "rtt"
 
 
 def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
@@ -2023,6 +2025,11 @@ class MeasurementController:
               filter_config: dict[str, Any] | None = None,
               plateau_config: PlateauConfig | dict[str, Any] | None = None,
               verify_runtime_config: bool = False) -> dict[str, Any]:
+        # V5.1 re-enumerates both CDC interfaces after firmware upload. Probe
+        # immediately before opening the collector so a stale DATA path from
+        # the pre-flash device cannot become a misleading exit-code-1 failure.
+        if HARDWARE_TRANSPORT_REQUESTED != "rtt":
+            _refresh_usb_transport()
         with self.lock:
             if self.state == "running" or (
                 self.thread is not None and self.thread.is_alive()
@@ -4930,6 +4937,28 @@ class AppState:
                 str(payload.get("label") or ""),
             )
 
+    def import_history(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Register an existing local data directory without switching into it."""
+        payload = payload or {}
+        raw_path = str(payload.get("path") or "").strip()
+        if not raw_path:
+            raise ValueError("请填写历史数据目录")
+        path = self._resolve_save_dir(raw_path)
+        status, detail = WorkspaceHistory._health(path)
+        if status == "missing":
+            raise ValueError(detail)
+        if status != "available":
+            raise ValueError(detail or "历史工作区不可用")
+        label = str(payload.get("label") or path.name or "未命名工作区")
+        with self.operation_lock:
+            self.history.register(
+                path,
+                WorkspaceHistory.summarize(path),
+                label,
+                create_marker=False,
+            )
+        return self.history_snapshot()
+
     def _refresh_history_best_effort(self) -> None:
         try:
             self.register_history(allow_busy=True)
@@ -6316,6 +6345,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     result = APP.reset_calibration()
             elif self.path == "/api/history/register":
                 result = APP.register_history(payload)
+            elif self.path == "/api/history/import":
+                result = APP.import_history(payload)
             elif self.path == "/api/history/open":
                 result = APP.open_history(payload)
             elif self.path == "/api/history/favorite":

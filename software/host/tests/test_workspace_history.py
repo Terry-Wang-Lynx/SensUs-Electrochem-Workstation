@@ -59,6 +59,39 @@ def test_external_unix_workspace_uses_non_absolute_filesystem_locator() -> None:
         assert registry.resolve(entry["workspace_id"])[1] == workspace.resolve()
 
 
+def test_import_summary_reads_existing_measurements_without_marker_write() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        workspace = root / "old-data"
+        workspace.mkdir()
+        (workspace / "calibration-points.csv").write_text(
+            "point_id,concentration_um,current_nA\np1,1,2\n",
+            encoding="utf-8",
+        )
+        (workspace / "calibration-selection.json").write_text(
+            '{"selected_point_ids":["p1"]}', encoding="utf-8"
+        )
+        (workspace / "measurement-index.csv").write_text(
+            "finished_at,run_id,sample_name,sample_role,state,steady_current_nA\n"
+            "10,r1,旧样品,calibration,completed,2\n",
+            encoding="utf-8",
+        )
+        (workspace / "calibration-model.json").write_text(
+            '{"r2":0.99}', encoding="utf-8"
+        )
+        registry = WorkspaceHistory(root / "registry" / "history.json", root)
+
+        entry = registry.register(
+            workspace, WorkspaceHistory.summarize(workspace), create_marker=False
+        )
+
+        assert not (workspace / ".sensus-workspace.json").exists()
+        assert entry["summary"]["points_count"] == 1
+        assert entry["summary"]["completed_count"] == 1
+        assert entry["summary"]["calibration_count"] == 1
+        assert entry["summary"]["has_model"] is True
+
+
 def test_duplicate_registration_and_favorite_remove_preserve_source_files() -> None:
     with TemporaryDirectory() as tmp:
         root = Path(tmp)

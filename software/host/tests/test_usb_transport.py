@@ -69,6 +69,20 @@ def test_auto_transport_refreshes_after_usb_is_inserted(monkeypatch) -> None:
     assert gui_server.SERIAL_SMP_PORT == "/dev/cu.usbmodem1101"
 
 
+def test_refresh_rejects_a_stale_serial_path_after_usb_reenumeration(monkeypatch) -> None:
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT", "serial")
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
+    monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "/dev/cu.usbmodem1103")
+    monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "/dev/cu.usbmodem1101")
+    monkeypatch.setattr(
+        gui_server, "_discover_serial_data_port",
+        lambda *, force=False: None,
+    )
+
+    with pytest.raises(RuntimeError, match="重新插拔 USB"):
+        gui_server._refresh_usb_transport()
+
+
 def test_transport_rtt_does_not_probe_usb(monkeypatch) -> None:
     monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "")
     monkeypatch.setattr(

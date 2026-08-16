@@ -43,6 +43,9 @@
 .workspace-history-actions .secondary{flex:1}
 .workspace-history-actions .text-button{color:var(--red)}
 .workspace-history-empty{grid-column:1/-1;padding:80px 18px;text-align:center;color:var(--muted)}
+.workspace-history-import{padding:14px 16px 0;border-top:1px solid #e7ebec}
+.workspace-history-import label{max-width:760px;margin:0}
+.workspace-history-import .directory-row{grid-template-columns:minmax(0,1fr) auto}
 .workspace-history-panel>.notice{margin-top:14px}
 @media(max-width:1180px){.workspace-history-list{grid-template-columns:repeat(2,minmax(230px,1fr))}}
 @media(max-width:720px){

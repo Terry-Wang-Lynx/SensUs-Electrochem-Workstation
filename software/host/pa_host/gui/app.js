@@ -352,6 +352,15 @@ async function openWorkspaceHistory(entry){
 $('historyFavoritesOnly').addEventListener('change',()=>renderWorkspaceHistory());
 $('refreshWorkspaceHistory').addEventListener('click',()=>void refreshWorkspaceHistory());
 $('registerCurrentHistory').addEventListener('click',async()=>{try{await post('/api/history/register',{});await refreshWorkspaceHistory();toast('当前工作区已登记')}catch(e){errorBox('workspaceHistoryError',e)}});
+$('importHistoryDirectory').addEventListener('click',async()=>{
+  const path=$('historyImportPath').value.trim();
+  if(!path){errorBox('workspaceHistoryError',new Error('请填写历史数据目录'));return}
+  try{
+    renderWorkspaceHistory(await post('/api/history/import',{path}));
+    $('historyImportPath').value='';
+    toast('历史数据目录已导入');
+  }catch(e){errorBox('workspaceHistoryError',e)}
+});
 
 document.querySelectorAll('.nav-item').forEach(button => button.addEventListener('click', () => {
   document.querySelectorAll('.nav-item').forEach(x => x.classList.toggle('active', x === button));

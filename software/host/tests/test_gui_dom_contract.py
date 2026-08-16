@@ -151,11 +151,12 @@ def test_workspace_history_view_exposes_restore_favorite_filter_and_safe_remove_
     for element_id in (
         "view-history", "workspaceHistoryList", "historyFavoritesOnly",
         "registerCurrentHistory", "refreshWorkspaceHistory", "workspaceHistoryError",
+        "historyImportPath", "importHistoryDirectory",
     ):
         assert f'id="{element_id}"' in html
     for endpoint in (
         "/api/history", "/api/history/register", "/api/history/open",
-        "/api/history/favorite", "/api/history/remove",
+        "/api/history/import", "/api/history/favorite", "/api/history/remove",
     ):
         assert endpoint in app
     assert "原始测量目录和数据不会被删除" in app
@@ -505,7 +506,7 @@ def test_debug_overlay_controls_remain_clickable_in_empty_and_narrow_states() ->
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
 
-    assert html.count("20260815-concentration-step-1") == 2
+    assert html.count("20260816-usb-refresh-history-import") == 2
     assert ".empty-chart{position:absolute;inset:0;display:grid;place-items:center;color:#8a969a;font-size:12px;pointer-events:none}" in css
     assert ".chart-legend{position:absolute;z-index:2;" in css
     assert "@media(max-width:900px)" in css
