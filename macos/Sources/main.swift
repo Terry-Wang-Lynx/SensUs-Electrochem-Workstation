@@ -1,12 +1,13 @@
 import AppKit
+import Darwin
 import Foundation
 import WebKit
 
-private let workstationURL = URL(string: "http://127.0.0.1:8765/")!
-private let healthURL = URL(string: "http://127.0.0.1:8765/api/health")!
+private let defaultServerPort = 8765
 
 private final class BackendManager {
     private(set) var process: Process?
+    private(set) var serverPort = defaultServerPort
     private var logHandle: FileHandle?
     private var watchdogTimer: Timer?
     private var consecutiveHealthFailures = 0
@@ -14,6 +15,14 @@ private final class BackendManager {
     let projectRoot: URL
     let stateURL: URL
     let logURL: URL
+
+    var serverURL: URL {
+        URL(string: "http://127.0.0.1:\(serverPort)/")!
+    }
+
+    private var healthURL: URL {
+        URL(string: "http://127.0.0.1:\(serverPort)/api/health")!
+    }
 
     init() {
         projectRoot = Self.resolveProjectRoot()
@@ -32,12 +41,13 @@ private final class BackendManager {
             if available {
                 DispatchQueue.main.async {
                     self.beginHealthMonitoring()
-                    completion(.success(workstationURL))
+                    completion(.success(self.serverURL))
                 }
                 return
             }
             DispatchQueue.main.async {
                 do {
+                    self.serverPort = try Self.findAvailablePort(preferred: defaultServerPort)
                     try self.launchServer()
                     self.pollUntilReady(attempt: 0, completion: completion)
                 } catch {
@@ -57,7 +67,7 @@ private final class BackendManager {
         let arguments: [String]
         if let bundledBackend, usingBundledBackend {
             executable = bundledBackend
-            arguments = ["gui", "--host", "127.0.0.1", "--port", "8765"]
+            arguments = ["gui", "--host", "127.0.0.1", "--port", String(serverPort)]
         } else {
             let serverModule = projectRoot
                 .appendingPathComponent("software/host/pa_host/gui_server.py")
@@ -80,7 +90,7 @@ private final class BackendManager {
             arguments = [
                 "-m", "pa_host.gui_server",
                 "--host", "127.0.0.1",
-                "--port", "8765",
+                "--port", String(serverPort),
             ]
         }
 
@@ -133,7 +143,7 @@ private final class BackendManager {
             DispatchQueue.main.async {
                 if available {
                     self.beginHealthMonitoring()
-                    completion(.success(workstationURL))
+                    completion(.success(self.serverURL))
                 } else if attempt >= 80 {
                     completion(.failure(BackendError.serverTimeout(self.logURL.path)))
                 } else {
@@ -161,6 +171,36 @@ private final class BackendManager {
                 .standardizedFileURL.path
             completion(reportedRoot == projectRoot.standardizedFileURL.path)
         }.resume()
+    }
+
+    private static func findAvailablePort(preferred: Int) throws -> Int {
+        let candidates = [preferred] + Array(49152...65535)
+        for port in candidates where canBind(port: port) {
+            return port
+        }
+        throw BackendError.noPortAvailable
+    }
+
+    private static func canBind(port: Int) -> Bool {
+        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return false }
+        defer { Darwin.close(descriptor) }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(UInt16(port).bigEndian)
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(
+                    descriptor,
+                    $0,
+                    socklen_t(MemoryLayout<sockaddr_in>.size)
+                )
+            }
+        }
+        return result == 0
     }
 
     func stopServer() {
@@ -208,6 +248,7 @@ private final class BackendManager {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             do {
+                self.serverPort = try Self.findAvailablePort(preferred: self.serverPort)
                 try self.launchServer()
                 self.pollUntilReady(attempt: 0) { [weak self] _ in
                     self?.consecutiveHealthFailures = 0
@@ -265,6 +306,7 @@ private final class BackendManager {
         case pythonNotFound
         case serverExited(String)
         case serverTimeout(String)
+        case noPortAvailable
 
         var errorDescription: String? {
             switch self {
@@ -276,6 +318,8 @@ private final class BackendManager {
                 return "后台服务提前退出。日志：\(log)"
             case .serverTimeout(let log):
                 return "后台服务启动超时。日志：\(log)"
+            case .noPortAvailable:
+                return "找不到可用的本地服务端口，请关闭占用本地端口的程序后重试"
             }
         }
     }
@@ -598,7 +642,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             loadOverlayPage()
         } else if mainWebView.url == nil {
             mainWebView.load(
-                URLRequest(url: workstationURL, cachePolicy: .reloadIgnoringLocalCacheData)
+                URLRequest(url: backend.serverURL, cachePolicy: .reloadIgnoringLocalCacheData)
             )
         } else {
             mainWebView.reloadFromOrigin()
@@ -606,7 +650,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     @objc private func openInBrowser() {
-        NSWorkspace.shared.open(workstationURL)
+        NSWorkspace.shared.open(backend.serverURL)
     }
 
     @objc private func showMainWindow() {
@@ -643,7 +687,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             ), baseURL: nil)
             return
         }
-        overlayWebView.loadHTMLString(html, baseURL: workstationURL)
+        overlayWebView.loadHTMLString(html, baseURL: backend.serverURL)
     }
 
     private func showLoadingPage() {

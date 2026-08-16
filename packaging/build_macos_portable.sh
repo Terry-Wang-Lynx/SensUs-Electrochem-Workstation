@@ -6,15 +6,34 @@ VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "$ROOT/pyproject.toml")"
 ARTIFACTS="$ROOT/artifacts"
 BUILD="$ARTIFACTS/build/macos-arm64"
 RELEASES="$ARTIFACTS/releases/$VERSION"
+RELEASES="${SENSUS_RELEASES_DIR:-$RELEASES}"
 VENV="$ARTIFACTS/build-env/macos-arm64"
 APP_NAME="SensUs Workstation"
 APP="$RELEASES/$APP_NAME.app"
+
+# PyInstaller's global cache can live in a protected or cloud-synced folder.
+# Keep each packaging run's cache in a local temporary directory instead.
+if [[ -z "${PYINSTALLER_CONFIG_DIR:-}" ]]; then
+  PYINSTALLER_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sensus-pyinstaller.XXXXXX")"
+  export PYINSTALLER_CONFIG_DIR
+fi
+if [[ -z "${SWIFT_MODULECACHE_PATH:-}" ]]; then
+  SWIFT_MODULECACHE_PATH="$(mktemp -d "${TMPDIR:-/tmp}/sensus-swift-cache.XXXXXX")"
+  export SWIFT_MODULECACHE_PATH
+fi
 
 mkdir -p "$BUILD" "$RELEASES" "${VENV:h}"
 if [[ ! -x "$VENV/bin/python" ]]; then
   "${PYTHON:-python3}" -m venv "$VENV"
 fi
-"$VENV/bin/python" -m pip install --disable-pip-version-check -e "${ROOT}[portable]"
+INSTALL_FLAGS=()
+if "$VENV/bin/python" -c 'import setuptools, wheel' >/dev/null 2>&1; then
+  # Reuse the pinned build environment when packaging offline. A fresh venv
+  # still falls back to pip's normal isolated build dependency installation.
+  INSTALL_FLAGS+=(--no-build-isolation)
+fi
+"$VENV/bin/python" -m pip install --disable-pip-version-check \
+  "${INSTALL_FLAGS[@]}" -e "${ROOT}[portable]"
 "$VENV/bin/python" -m PyInstaller --noconfirm --clean \
   --distpath "$BUILD/pyinstaller-dist" --workpath "$BUILD/pyinstaller-work" \
   "$ROOT/packaging/portable.spec"
@@ -23,26 +42,18 @@ fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/backend"
 xcrun swiftc -swift-version 5 -O -target arm64-apple-macos13.0 \
+  -module-cache-path "$SWIFT_MODULECACHE_PATH" \
   -framework AppKit -framework WebKit "$ROOT/macos/Sources/main.swift" \
   -o "$APP/Contents/MacOS/SensUsWorkstation"
 cp "$ROOT/macos/Info.plist" "$APP/Contents/Info.plist"
-ditto "$BUILD/pyinstaller-dist/SensUsBackend" "$APP/Contents/Resources/backend"
-ditto "$BUILD/workstation" "$APP/Contents/Resources/workstation"
+/bin/cp -R -X \
+  "$BUILD/pyinstaller-dist/SensUsBackend" "$APP/Contents/Resources/backend"
+/bin/cp -R -X \
+  "$BUILD/workstation" "$APP/Contents/Resources/workstation"
 
 ICON_SOURCE="$BUILD/AppIcon-1024.png"
-ICONSET="$BUILD/AppIcon.iconset"
-"$VENV/bin/python" "$ROOT/macos/create_icon.py" "$ICON_SOURCE"
-rm -rf "$ICONSET"
-mkdir -p "$ICONSET"
-for spec in \
-  "16 icon_16x16.png" "32 icon_16x16@2x.png" "32 icon_32x32.png" \
-  "64 icon_32x32@2x.png" "128 icon_128x128.png" "256 icon_128x128@2x.png" \
-  "256 icon_256x256.png" "512 icon_256x256@2x.png" \
-  "512 icon_512x512.png" "1024 icon_512x512@2x.png"; do
-  pixels="${spec%% *}"; name="${spec#* }"
-  sips -z "$pixels" "$pixels" "$ICON_SOURCE" --out "$ICONSET/$name" >/dev/null
-done
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+"$VENV/bin/python" "$ROOT/macos/create_icon.py" "$ICON_SOURCE" \
+  "$APP/Contents/Resources/AppIcon.icns"
 
 OPENOCD="${SENSUS_OPENOCD_EXE:-}"
 if [[ -z "$OPENOCD" ]]; then

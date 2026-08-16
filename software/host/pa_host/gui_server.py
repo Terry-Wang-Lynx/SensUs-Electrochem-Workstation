@@ -113,6 +113,7 @@ JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "").strip()
 SERIAL_DATA_PORT = os.environ.get("SENSUS_SERIAL_PORT", "").strip()
 SERIAL_SMP_PORT = os.environ.get("SENSUS_SMP_PORT", "").strip()
 HARDWARE_TRANSPORT = os.environ.get("SENSUS_TRANSPORT", "auto").lower()
+HARDWARE_TRANSPORT_REQUESTED = HARDWARE_TRANSPORT
 JLINK_CDC_SERIAL = os.environ.get("SENSUS_JLINK_CDC_SERIAL", "0000297345691")
 SMPMGR_EXE = Path(
     os.environ.get("SENSUS_SMPMGR")
@@ -385,22 +386,47 @@ def _port_accepts_connections(port: int) -> bool:
         return False
 
 
-def _discover_serial_data_port() -> str | None:
-    """Find the V5.1 DATA CDC without confusing it with SMP or J-Link CDC."""
-    if SERIAL_DATA_PORT:
-        return SERIAL_DATA_PORT
+def _serial_port_infos() -> list[Any]:
+    """Return USB serial candidates while keeping their descriptor metadata."""
     try:
         from serial.tools import list_ports
+    except ImportError:
+        return []
+
+    def is_candidate(info: Any) -> bool:
+        device = str(getattr(info, "device", "") or "")
+        if not device:
+            return False
+        descriptor = " ".join(
+            str(getattr(info, field, "") or "")
+            for field in (
+                "device", "description", "hwid", "manufacturer", "product",
+                "serial_number", "location",
+            )
+        )
+        if JLINK_CDC_SERIAL and JLINK_CDC_SERIAL in descriptor:
+            return False
+        lowered = device.lower()
+        return (
+            "usbmodem" in lowered
+            or "usbserial" in lowered
+            or device.upper().startswith("COM")
+        )
+
+    return [info for info in list_ports.comports() if is_candidate(info)]
+
+
+def _discover_serial_data_port(*, force: bool = False) -> str | None:
+    """Find the V5.1 DATA CDC without confusing it with SMP or J-Link CDC."""
+    if SERIAL_DATA_PORT and not force:
+        return SERIAL_DATA_PORT
+    try:
         import serial
     except ImportError:
         return None
 
     candidates = sorted(
-        str(info.device) for info in list_ports.comports()
-        if str(info.device) and JLINK_CDC_SERIAL not in str(info.device)
-        and ("usbmodem" in str(info.device).lower()
-             or "usbserial" in str(info.device).lower()
-             or str(info.device).upper().startswith("COM"))
+        str(info.device) for info in _serial_port_infos()
     )
     for candidate in candidates:
         try:
@@ -424,9 +450,62 @@ def _discover_serial_data_port() -> str | None:
     return None
 
 
+def _same_usb_device(left: Any, right: Any) -> bool:
+    """Match CDC interfaces by stable USB identity, never by device suffix."""
+    fields = ("vid", "pid", "serial_number", "location")
+    known = [
+        field for field in fields
+        if getattr(left, field, None) not in (None, "")
+        and getattr(right, field, None) not in (None, "")
+    ]
+    return bool(known) and all(
+        getattr(left, field, None) == getattr(right, field, None)
+        for field in known
+    )
+
+
+def _discover_serial_smp_port(
+    data_port: str, *, force: bool = False
+) -> str | None:
+    """Find the sibling SMP CDC exposed by the same V5.1 USB device."""
+    if SERIAL_SMP_PORT and not force:
+        return SERIAL_SMP_PORT
+    infos = _serial_port_infos()
+    data_info = next(
+        (info for info in infos if str(getattr(info, "device", "")) == data_port),
+        None,
+    )
+    if data_info is None:
+        return None
+    siblings = [
+        str(info.device) for info in infos
+        if str(getattr(info, "device", "")) != data_port
+        and _same_usb_device(info, data_info)
+    ]
+    return siblings[0] if len(siblings) == 1 else None
+
+
+def _refresh_usb_transport() -> None:
+    """Refresh USB CDC paths immediately before an idle hardware operation."""
+    global HARDWARE_TRANSPORT, SERIAL_DATA_PORT, SERIAL_SMP_PORT
+    if HARDWARE_TRANSPORT_REQUESTED == "rtt":
+        return
+    discovered = _discover_serial_data_port(force=True)
+    if discovered:
+        SERIAL_DATA_PORT = discovered
+        SERIAL_SMP_PORT = (
+            _discover_serial_smp_port(discovered, force=True)
+            or SERIAL_SMP_PORT
+        )
+        HARDWARE_TRANSPORT = "serial"
+        return
+    if HARDWARE_TRANSPORT_REQUESTED == "serial":
+        raise RuntimeError("USB 模式未找到 V5.1 DATA CDC，请检查 USB 连接")
+
+
 def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
     """Resolve auto mode once when the GUI starts, preserving explicit modes."""
-    global SERIAL_DATA_PORT
+    global SERIAL_DATA_PORT, SERIAL_SMP_PORT
     mode = requested.lower()
     if mode not in {"auto", "rtt", "serial"}:
         raise ValueError(f"未知硬件传输模式:{requested}")
@@ -437,12 +516,18 @@ def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
             SERIAL_DATA_PORT = _discover_serial_data_port() or ""
         if not SERIAL_DATA_PORT:
             raise ValueError("USB 模式未找到 V5.1 DATA CDC，请指定 --serial-port")
+        SERIAL_SMP_PORT = (
+            _discover_serial_smp_port(SERIAL_DATA_PORT) or SERIAL_SMP_PORT
+        )
         return "serial"
     if mode == "rtt":
         return "rtt"
     discovered = _discover_serial_data_port()
     if discovered:
         SERIAL_DATA_PORT = discovered
+        SERIAL_SMP_PORT = (
+            _discover_serial_smp_port(discovered) or SERIAL_SMP_PORT
+        )
         return "serial"
     return "rtt"
 
@@ -1152,7 +1237,15 @@ class SettingsController:
             "#endif\n"
         )
         try:
+            # App may have started before the USB cable was connected. Refresh
+            # only behind this idle-operation gate so an active measurement
+            # never loses its DATA stream.
+            _refresh_usb_transport()
             usb_transport = HARDWARE_TRANSPORT == "serial"
+            if usb_transport and not SERIAL_SMP_PORT:
+                raise RuntimeError(
+                    "已找到 V5.1 DATA CDC，但未找到同一设备的 SMP CDC"
+                )
             if not usb_transport:
                 _release_stale_measurement_bridge()
             firmware_source = "build"
@@ -6285,7 +6378,8 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
 
 
 def main(argv: list[str] | None = None) -> int:
-    global HARDWARE_TRANSPORT, SERIAL_DATA_PORT, SERIAL_SMP_PORT
+    global HARDWARE_TRANSPORT, HARDWARE_TRANSPORT_REQUESTED
+    global SERIAL_DATA_PORT, SERIAL_SMP_PORT
     parser = argparse.ArgumentParser(description="本地 i-t 电化学检测 GUI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -6298,6 +6392,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--smp-port", default=SERIAL_SMP_PORT,
                         help="V5.1 SMP CDC 路径；仅 USB 固件更新需要")
     args = parser.parse_args(argv)
+    HARDWARE_TRANSPORT_REQUESTED = args.transport.lower()
     HARDWARE_TRANSPORT = _resolve_hardware_transport(
         args.transport, args.serial_port or ""
     )
