@@ -318,3 +318,32 @@ def test_configured_workspace_creates_a_named_child_batch_and_history_curves_sta
         assert loaded[0]["time_s"] == [0.0, 1.0, 2.0]
         with pytest.raises(ValueError, match="当前批次"):
             app.load_history_curves({"run_ids": ["other-batch"]})
+
+
+def test_history_discovers_matching_batch_directories_copied_into_workspace() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        app, _ = _isolated_app(root)
+        workspace = root / "workspace"
+        app.configure_workflow({"save_dir": str(workspace), "batch_name": "第一批"})
+        root_id = app.history.marker_info(workspace)["workspace_id"]
+        copied = workspace / "外部导入批次"
+        app.history._ensure_marker(
+            copied,
+            kind="batch",
+            workspace_root_id=root_id,
+            label="外部导入批次",
+        )
+
+        history = app.history_snapshot()
+
+        assert any(
+            entry["workspace_id"] == root_id
+            for entry in history["workspaces"]
+        )
+        discovered = next(
+            entry for entry in history["current_batches"]
+            if entry["label"] == "外部导入批次"
+        )
+        assert discovered["status"] == "available"
+        assert discovered["workspace_root_id"] == root_id

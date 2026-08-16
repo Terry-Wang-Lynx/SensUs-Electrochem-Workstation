@@ -383,7 +383,7 @@ function renderHistoryCurves(){
   });
 }
 async function refreshHistoryCurves(){
-  try{state.historyCurveCatalog=(await post('/api/history/curves')).curves||[];renderHistoryCurves()}catch(e){toast(`读取历史曲线失败：${e.message}`)}
+  try{state.historyCurveCatalog=(await post('/api/history/curves')).curves||[];renderHistoryCurves()}catch(e){const detail=String(e.message||e);toast(detail.toLowerCase()==='not found'?'前后端版本不一致，请退出并重新打开软件':`读取历史曲线失败：${detail}`)}
 }
 async function selectHistoryCurves(){
   const ids=[...$('historyCurveList').querySelectorAll('input:checked')].map(input=>input.value);
@@ -921,9 +921,9 @@ $('sampleRole').addEventListener('click',event=>{const button=event.target.close
 $('sampleName').addEventListener('input',previewFilename);$('knownConcentration').addEventListener('input',previewFilename);
 $('doubleKnownConcentration').addEventListener('click',()=>scaleKnownConcentration(2));
 $('halveKnownConcentration').addEventListener('click',()=>scaleKnownConcentration(.5));
-function requestedBatchName(){const value=window.prompt('请输入批次名称',`批次 ${new Date().toLocaleString('zh-CN',{hour12:false})}`);if(value===null)return null;if(!value.trim()){toast('请输入批次名称');return null}return value.trim()}
-$('applySaveDirectory').onclick=async()=>{const batchName=requestedBatchName();if(batchName===null)return;try{renderWorkflow(await post('/api/workflow/config',{save_dir:$('saveDirectory').value,batch_name:batchName}));state.calibration=await api('/api/calibration');state.historyPreview=null;state.historyCurves=[];state.historyCurveIds=[];renderCalibration();toast('已在工作区新建批次')}catch(e){errorBox('measureError',e)}};
-$('resetCalibration').onclick=async()=>{const batchName=requestedBatchName();if(batchName===null)return;try{renderWorkflow(await post('/api/workflow/reset-calibration',{batch_name:batchName}));state.calibration=await api('/api/calibration');state.historyPreview=null;state.historyCurves=[];state.historyCurveIds=[];renderCalibration();setSampleRole('calibration',true);toast('已新建批次并切换到新目录')}catch(e){errorBox('measureError',e)}};
+function requestedBatchName(message='请输入批次名称'){const value=window.prompt(message,`批次 ${new Date().toLocaleString('zh-CN',{hour12:false})}`);if(value===null)return null;if(!value.trim()){toast('请输入批次名称');return null}return value.trim()}
+$('applySaveDirectory').onclick=async()=>{const batchName=requestedBatchName('请输入这个工作区的首个批次名称');if(batchName===null)return;try{renderWorkflow(await post('/api/workflow/config',{save_dir:$('saveDirectory').value,batch_name:batchName}));state.calibration=await api('/api/calibration');state.historyPreview=null;state.historyCurves=[];state.historyCurveIds=[];renderCalibration();toast('已切换工作区并新建批次')}catch(e){errorBox('measureError',e)}};
+$('resetCalibration').onclick=async()=>{const batchName=requestedBatchName('请输入新批次名称');if(batchName===null)return;try{renderWorkflow(await post('/api/workflow/reset-calibration',{batch_name:batchName}));state.calibration=await api('/api/calibration');state.historyPreview=null;state.historyCurves=[];state.historyCurveIds=[];renderCalibration();setSampleRole('calibration',true);toast('已新建批次并切换到新目录')}catch(e){errorBox('measureError',e)}};
 
 function readSettings(){const potential=Number($('potentialV').value),low=Number($('cvLowV').value),high=Number($('cvHighV').value),rate=Number($('cvScanRate').value),cycles=Number($('cvCycles').value),cv=state.method==='cv',duration=cv?2*(high-low)/rate*cycles:Number($('durationS').value);return {method:state.method,initial_potential_v:cv?low:potential,potential_v:cv?low:potential,working_electrode_v:Number($('workingElectrodeV').value),prestep_s:cv?Number($('cvQuietS').value):0,duration_s:duration,adaptive_stop:!cv&&$('adaptiveStop').checked,sens_period_code:Number($('sensPeriodCode').value),target_rate_hz:Number($('sampleRateHz').value),fit_window_s:Number($('fitWindowS').value),fsr_nA:Number($('fsrNA').value),offset_mode:$('offsetNA').value,cv_low_v:low,cv_high_v:high,cv_scan_rate_v_s:rate,cv_cycles:cycles,cv_step_v:.001,cv_quiet_s:Number($('cvQuietS').value),cv_eis_fsr_uA:Number($('cvEisFsrUA').value)}}
 function renderOffsetLabels(fsr){$('offsetNA').querySelectorAll('option[data-pct]').forEach(option=>{const pct=Number(option.dataset.pct);option.textContent=`${pct}% FSR (${fsr*pct/100} nA)`})}

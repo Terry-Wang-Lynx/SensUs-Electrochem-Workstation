@@ -5714,7 +5714,54 @@ class AppState:
         except (OSError, RuntimeError, TypeError, ValueError):
             pass
 
+    def _discover_workspace_batches(self) -> None:
+        """Register batch directories copied or migrated into the active root."""
+        root = self.workspace_root.resolve()
+        root_marker = self.history.marker_info(root)
+        root_id = str(root_marker.get("workspace_id") or "")
+        if root_marker.get("kind", WORKSPACE_KIND) != WORKSPACE_KIND or not root_id:
+            return
+        known_ids = {
+            str(entry.get("workspace_id") or "")
+            for entry in self.history.list(self.save_dir).get("entries", [])
+        }
+        if root_id not in known_ids:
+            self.history.register(
+                root,
+                WorkspaceHistory.summarize(root),
+                str(root_marker.get("label") or root.name),
+                create_marker=False,
+                kind=WORKSPACE_KIND,
+            )
+            known_ids.add(root_id)
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            return
+        for child in children:
+            if not child.is_dir():
+                continue
+            marker = self.history.marker_info(child)
+            batch_id = str(marker.get("workspace_id") or "")
+            if (
+                marker.get("kind") != BATCH_KIND
+                or marker.get("workspace_root_id") != root_id
+                or not batch_id
+                or batch_id in known_ids
+            ):
+                continue
+            self.history.register(
+                child,
+                WorkspaceHistory.summarize(child),
+                str(marker.get("label") or child.name),
+                create_marker=False,
+                kind=BATCH_KIND,
+                workspace_root_id=root_id,
+            )
+            known_ids.add(batch_id)
+
     def history_snapshot(self) -> dict[str, Any]:
+        self._discover_workspace_batches()
         snapshot = self.history.list(self.save_dir)
         root_marker = self.history.marker_info(self.workspace_root)
         root_id = str(root_marker.get("workspace_id") or "")

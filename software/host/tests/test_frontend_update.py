@@ -10,6 +10,10 @@ from pa_host import frontend_update
 from pa_host.frontend_update import FrontendUpdateError, FrontendUpdater
 
 
+def test_frontend_api_major_covers_history_curve_contract() -> None:
+    assert frontend_update.BACKEND_API_MAJOR == 2
+
+
 def _frontend(path: Path, marker: str = "ok") -> None:
     path.mkdir(parents=True)
     for name in frontend_update.REQUIRED_FILES:

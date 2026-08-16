@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 
-BACKEND_API_MAJOR = 1
+BACKEND_API_MAJOR = 2
 CHECK_INTERVAL_S = 30 * 60
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024

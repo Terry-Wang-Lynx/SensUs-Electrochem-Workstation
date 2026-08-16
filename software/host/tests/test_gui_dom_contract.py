@@ -208,6 +208,16 @@ def test_gui_exposes_history_curve_overlay_batch_naming_and_cross_add_controls()
     assert "/api/calibration/promote-validation" in app
     assert "/api/calibration/add-validation" in app
     assert "integerX:true" in app
+    assert '>切换工作区</button>' in html
+    assert '>新建批次</button>' in html
+    assert "新建标定批次" not in html
+    assert "前后端版本不一致，请退出并重新打开软件" in app
+    assert "#chartWindow button,#dbgChartWindow button{min-width:48px" in (
+        GUI_DIR / "styles.css"
+    ).read_text(encoding="utf-8")
+    assert ".sidebar nav{grid-template-columns:repeat(5,minmax(0,1fr))}" in (
+        GUI_DIR / "styles.css"
+    ).read_text(encoding="utf-8")
 
 
 def test_history_status_label_maps_missing_and_corrupt_entries() -> None:
