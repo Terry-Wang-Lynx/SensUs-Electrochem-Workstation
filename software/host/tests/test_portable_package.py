@@ -1,9 +1,27 @@
 import json
 import hashlib
 import os
+import runpy
 from pathlib import Path
 
 from pa_host import collect, gui_server, runtime
+
+
+def test_windows_portable_falls_back_to_system_browser(monkeypatch) -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(entry["webbrowser"], "open", opened.append)
+
+    class Child:
+        def wait(self) -> int:
+            return 17
+
+    fallback = entry["_fallback_to_system_browser"]
+    assert fallback("http://127.0.0.1:8765/", Child(), RuntimeError("WebView2")) == 17
+    assert opened == ["http://127.0.0.1:8765/"]
 
 
 def test_prebuilt_firmware_selection(tmp_path: Path, monkeypatch) -> None:
@@ -67,6 +85,16 @@ def test_frozen_build_prefers_openocd_shipped_next_to_workstation(
 
     assert resolved_executable == executable
     assert resolved_scripts == scripts
+
+
+def test_windows_frozen_build_does_not_use_host_jlink_install(monkeypatch) -> None:
+    monkeypatch.setattr(collect, "_IS_WIN", True)
+    monkeypatch.setattr(collect.runtime, "is_frozen", lambda: True)
+    monkeypatch.delenv("SENSUS_JLINK_EXE", raising=False)
+
+    assert collect._resolve_jlink_exe() == Path(
+        "/__sensus_portable_no_jlink_exe__/JLink.exe"
+    )
 
 
 def test_frozen_project_dir_resolves_app_resources_without_source_checkout(

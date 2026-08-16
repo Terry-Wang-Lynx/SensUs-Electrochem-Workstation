@@ -7,7 +7,8 @@ Windows 与 macOS 使用同一套 Python LTS 后端和本地 HTTP API。后端�
 限制和现有控制接口校验继续有效。
 
 - macOS：Apple Silicon、macOS 13+，输出 ad-hoc 签名 DMG。
-- Windows：Windows 10/11 x64，输出包含 WebView2 窗口的 ZIP。
+- Windows：Windows 10/11 x64，输出包含冻结后端、OpenOCD/libjaylink 和固件资源的 ZIP。
+  WebView2 Runtime 是可选的；若系统没有它，启动器自动退回系统默认浏览器。
 - 源码开发：`make app`、`make run`、现有烧录和测量命令保持不变。
 - 便携版数据：配置和缓存放系统用户目录，实验数据默认放 `Documents/SensUs Measurements`。
 
@@ -23,6 +24,10 @@ Windows 原生构建：
 ```powershell
 ./windows/build_portable.ps1
 ```
+
+构建脚本会从 OpenOCD 官方 v0.12.0 Release 下载固定 SHA-256 的 Windows 归档，
+并将 `openocd.exe`、运行库和 `interface/jlink.cfg` 等 scripts 放入 ZIP。运行时不
+需要目标电脑安装 Python、OpenOCD、nRF Connect SDK 或 SEGGER J-Link 软件。
 
 产物只写入 `artifacts/releases/<version>/`。Windows EXE 必须在 Windows 或对应 CI
 runner 上生成，不能从 macOS 交叉打包。

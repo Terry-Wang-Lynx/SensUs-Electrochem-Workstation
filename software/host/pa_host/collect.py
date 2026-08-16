@@ -90,6 +90,11 @@ def _resolve_jlink_exe() -> Path:
     override = os.environ.get("SENSUS_JLINK_EXE")
     if override:
         return Path(override)
+    if _IS_WIN and runtime.is_frozen():
+        # The Windows portable package ships a pinned libjaylink OpenOCD.
+        # Do not accidentally select an arbitrary host JLink.exe (especially
+        # a V9 install that is incompatible with the validated clone probes).
+        return Path("/__sensus_portable_no_jlink_exe__/JLink.exe")
     # 按优先级搜索各平台已知位置
     candidates: list[Path] = []
     if _IS_WIN:

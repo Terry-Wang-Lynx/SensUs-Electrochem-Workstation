@@ -2,7 +2,19 @@
 
 ## 快速开始
 
-### 方式一：双击启动（推荐）
+### 便携包（推荐）
+
+从 GitHub Release 下载 `SensUs-Workstation-Windows-x64-<version>.zip`，先完整解压，
+再双击解压目录中的 `SensUsBackend.exe`。便携包已经包含 Python、工作站依赖、
+V4/V5.1 随包固件、`smpmgr` 和带 `libjaylink` 的 OpenOCD，不需要安装 Python、
+OpenOCD 或 nRF Connect SDK。Windows 10/11 x64 的 USB CDC 和 J-Link 硬件通道均可
+直接使用。若本机没有 WebView2 Runtime，启动器会自动改用系统默认浏览器打开界面。
+
+### 源码目录启动
+
+以下方式只适用于源码开发目录：
+
+#### 方式一：双击启动（推荐）
 
 双击仓库根目录下的 **`Launch_Electrochem_Workstation.bat`**。
 
@@ -18,13 +30,13 @@
 
 启动后在浏览器中访问：`http://127.0.0.1:8765/`
 
-### 方式二：Python 启动器
+#### 方式二：Python 启动器
 
 ```cmd
 python windows/run_app.py
 ```
 
-### 方式三：命令行
+#### 方式三：命令行
 
 ```cmd
 python -m venv .venv
@@ -46,7 +58,8 @@ windows\build_win.bat
 ```
 
 需要预先安装 Python 3.10+。打包脚本会在 `artifacts/build-env/` 创建隔离环境，
-用 PyInstaller 生成 onedir 后端，并打包 WebView2 原生窗口、V4/V5.1 稳定固件资源。
+用 PyInstaller 生成 onedir 后端，并打包 WebView2 原生窗口、OpenOCD/libjaylink 和
+V4/V5.1 稳定固件资源。
 
 输出：`artifacts\releases\<version>\SensUs-Workstation-Windows-x64-<version>.zip`
 
@@ -61,17 +74,14 @@ windows\build_win.bat
 硬件控制模式（编译/烧录固件、RTT 采集）需要：
 
 ### J-Link 调试探头
-- 推荐 SEGGER J-Link V8.80（V9.x 不兼容克隆探头）
-- 设置环境变量 `SENSUS_JLINK_EXE` 指向 JLink.exe 路径
-- 设置 `SENSUS_JLINK_SERIAL` 指定探头序列号（多探头时）
-- 默认搜索路径:
-  - `C:\Program Files\SEGGER\JLink\JLink.exe`
-  - `C:\ST\STM32CubeIDE\...\tools\bin\JLink.exe`
+- 便携包默认使用随包 OpenOCD/libjaylink，不需要安装 SEGGER J-Link 软件。
+- 多探头时可在界面中手动选择设备；也可以设置 `SENSUS_JLINK_SERIAL` 指定序列号。
+- 源码目录仍可优先使用 `SENSUS_JLINK_EXE` 指向的 JLink.exe。
 
-### OpenOCD（J-Link 不可用时的回退方案）
-- 设置 `SENSUS_OPENOCD_EXE` 指向 openocd.exe
-- 设置 `SENSUS_OPENOCD_SCRIPTS` 指向 scripts 目录
-- 默认搜索: `C:\Program Files\OpenOCD\`
+### OpenOCD（源码目录）
+- 便携包已自带 OpenOCD 和 scripts，无需配置环境变量。
+- 源码目录可设置 `SENSUS_OPENOCD_EXE` 指向 openocd.exe，或设置
+  `SENSUS_OPENOCD_SCRIPTS` 指向 scripts 目录。
 
 ### nRF Connect SDK（编译固件用）
 - 默认路径: `%USERPROFILE%\ncs`
@@ -94,7 +104,8 @@ windows\build_win.bat
 | 标定/预测 | ✅ | ✅ |
 | 自动测量 | ✅ | ✅ |
 
-> **Windows 用户**：源码启动继续使用浏览器；便携包默认使用 WebView2 原生窗口。
+> **Windows 用户**：源码启动继续使用浏览器；便携包优先使用 WebView2 原生窗口，
+> 缺少 WebView2 Runtime 时自动退回系统浏览器。
 > I-T/CV 采集、标定、分析、预测和自动测量共用同一后端。
 
 ## 故障排查
@@ -103,11 +114,11 @@ windows\build_win.bat
 → 安装 Python 3.10+ 并勾选"Add Python to PATH"。
 
 ### "无法启动采集进程"
-→ 检查 J-Link 驱动是否正确安装，探头是否连接。
+→ 检查探头是否连接，并确认设备管理器已识别 J-Link；便携包不需要安装 J-Link 软件。
 
 ### "找不到 JLinkExe / JLink.exe"
-→ 设置环境变量 `SENSUS_JLINK_EXE` 指向 JLink.exe 完整路径。
-  例如: `set SENSUS_JLINK_EXE=C:\Program Files\SEGGER\JLink\JLink.exe`
+→ 便携包会自动回退到随包 OpenOCD；只有源码目录需要设置
+  `SENSUS_JLINK_EXE` 或 `SENSUS_OPENOCD_EXE`。
 
 ### "pip install 失败"
 → 尝试以管理员身份运行，或检查网络连接。

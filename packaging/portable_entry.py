@@ -30,6 +30,21 @@ def _wait_for_server(url: str, expected_project: str, timeout_s: float = 25) -> 
     raise RuntimeError("SensUs backend did not become ready")
 
 
+def _fallback_to_system_browser(url: str, child: subprocess.Popen[bytes] | None,
+                                reason: BaseException | None = None) -> int:
+    """Keep the portable server usable when the optional WebView2 runtime is absent."""
+    if reason is not None:
+        print(
+            f"[app] WebView2 unavailable ({reason}); opening the system browser.",
+            file=sys.stderr,
+            flush=True,
+        )
+    webbrowser.open(url)
+    if child is not None:
+        return child.wait()
+    return 0
+
+
 def _windows_app() -> int:
     from pa_host.runtime import project_dir
 
@@ -53,10 +68,10 @@ def _windows_app() -> int:
                 "SensUs 电化学工作站", url, width=1440, height=920, min_size=(1080, 720)
             )
             webview.start(gui="edgechromium")
-        except ImportError:
-            webbrowser.open(url)
-            if child is not None:
-                return child.wait()
+        except ImportError as exc:
+            return _fallback_to_system_browser(url, child, exc)
+        except Exception as exc:
+            return _fallback_to_system_browser(url, child, exc)
         return 0
     finally:
         if child is not None and child.poll() is None:

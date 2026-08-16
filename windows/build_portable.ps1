@@ -22,6 +22,10 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Release
 New-Item -ItemType Directory -Force -Path $Release | Out-Null
 Copy-Item -Recurse (Join-Path $Build "pyinstaller-dist\SensUsBackend\*") $Release
 Copy-Item -Recurse (Join-Path $Build "workstation") (Join-Path $Release "workstation")
+& (Join-Path $Root "packaging\bundle_windows_openocd.ps1") `
+  -Destination (Join-Path $Release "tools\openocd")
+Copy-Item (Join-Path $Root "packaging\THIRD_PARTY_NOTICES.txt") `
+  (Join-Path $Release "THIRD_PARTY_NOTICES.txt")
 $Zip = "$Release.zip"
 Remove-Item -Force -ErrorAction SilentlyContinue $Zip
 Compress-Archive -Path "$Release\*" -DestinationPath $Zip -CompressionLevel Optimal

@@ -1,0 +1,10 @@
+SensUs Electrochem Workstation portable package
+
+This package includes OpenOCD 0.12.0 for Windows (i686-w64-mingw32 archive).
+OpenOCD is distributed under the GNU General Public License, version 2 or
+later. Source and license information:
+https://github.com/openocd-org/openocd
+
+The bundled OpenOCD build includes libjaylink support for SEGGER J-Link
+compatible probes. SEGGER trademarks and proprietary J-Link software are not
+included in this package.
