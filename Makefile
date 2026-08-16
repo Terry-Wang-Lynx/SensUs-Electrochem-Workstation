@@ -40,7 +40,7 @@ run:
 ifeq ($(OS),Windows_NT)
 	set SENSUS_PROJECT_DIR=$(CURDIR) && $(VENV_PYTHON) -m pa_host.gui_server --open-browser
 else
-	SENSUS_PROJECT_DIR="$(CURDIR)" $(VENV_PYTHON) -m pa_host.gui_server --open-browser
+	SENSUS_PROJECT_DIR="$(CURDIR)" "$(CURDIR)/macos/start_web_server.sh" "$(CURDIR)" "$${SENSUS_WEB_PORT:-8765}"
 endif
 
 app:

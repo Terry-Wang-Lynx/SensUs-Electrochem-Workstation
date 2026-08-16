@@ -8,14 +8,25 @@ const state = {
 };
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: {'Content-Type': 'application/json'},
-    cache: 'no-store',
-    ...options
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || '请求失败');
-  return data;
+  const {timeoutMs = 5000, ...fetchOptions} = options;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(path, {
+      headers: {'Content-Type': 'application/json'},
+      cache: 'no-store',
+      ...fetchOptions,
+      signal: controller.signal
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '请求失败');
+    return data;
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error('请求超时，设备正在重新连接');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function post(path, body = {}) {
@@ -117,6 +128,7 @@ function renderMeasurement(payload) {
 }
 
 function drawChart(payload) {
+  if (document.visibilityState === 'hidden') return;
   const canvas = $('liveChart');
   const rect = canvas.getBoundingClientRect();
   const ratio = window.devicePixelRatio || 1;
@@ -136,7 +148,8 @@ function drawChart(payload) {
   const cv = payload.settings?.method === 'cv';
   let points;
   if (cv) {
-    const cycle = Math.max(0, ...(data.cycle || []));
+    let cycle = 0;
+    for (const value of (data.cycle || [])) cycle = Math.max(cycle, Number(value) || 0);
     points = (data.potential_v || []).map((x, index) => ({
       x,
       y: current[index] / 1000,
@@ -155,10 +168,11 @@ function drawChart(payload) {
   }
   if (!points.length) return;
 
-  let xmin = Math.min(...points.map(point => point.x));
-  let xmax = Math.max(...points.map(point => point.x));
-  let ymin = Math.min(...points.map(point => point.y));
-  let ymax = Math.max(...points.map(point => point.y));
+  let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+  for (const point of points) {
+    xmin = Math.min(xmin, point.x); xmax = Math.max(xmax, point.x);
+    ymin = Math.min(ymin, point.y); ymax = Math.max(ymax, point.y);
+  }
   if (xmin === xmax) xmax = xmin + 1;
   if (ymin === ymax) { ymin -= 1; ymax += 1; }
   const ypad = (ymax - ymin) * 0.12;
@@ -244,7 +258,7 @@ async function refresh() {
   if (state.refreshing) return;
   state.refreshing = true;
   try {
-    const measurement = await api('/api/status');
+    const measurement = await api('/api/status', {timeoutMs: 1500});
     renderMeasurement(measurement);
     if (measurement.state !== 'running') {
       renderWorkflow(await api('/api/workflow'));
@@ -275,8 +289,31 @@ $('sampleRole').addEventListener('click', event => {
   if (button) setRole(button.dataset.role);
 });
 $('measureButton').addEventListener('click', toggleMeasurement);
-window.addEventListener('resize', () => {
-  if (state.measurement) drawChart(state.measurement);
+let resizeTimer = null;
+let resizeRedrawForced = false;
+let lastChartLayout = '';
+function scheduleChartRedraw(force = false) {
+  resizeRedrawForced = resizeRedrawForced || force;
+  if (resizeTimer !== null) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    resizeTimer = null;
+    const forced = resizeRedrawForced;
+    resizeRedrawForced = false;
+    if (document.visibilityState === 'hidden' || !state.measurement) return;
+    const canvas = $('liveChart'), rect = canvas.getBoundingClientRect();
+    const layout = `${Math.round(rect.width * 100)}x${Math.round(rect.height * 100)}@${window.devicePixelRatio || 1}`;
+    if (!forced && layout === lastChartLayout) return;
+    lastChartLayout = layout;
+    requestAnimationFrame(() => drawChart(state.measurement));
+  }, 120);
+}
+window.addEventListener('resize', () => scheduleChartRedraw(), {passive: true});
+window.addEventListener('orientationchange', () => scheduleChartRedraw(true), {passive: true});
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    scheduleChartRedraw(true);
+    void refresh();
+  }
 });
 
 setRole(state.role);

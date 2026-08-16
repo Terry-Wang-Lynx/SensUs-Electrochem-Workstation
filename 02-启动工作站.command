@@ -42,4 +42,4 @@ if [[ -d "$ROOT/SensUs 电化学工作站.app" ]]; then
   /usr/bin/open "$ROOT/SensUs 电化学工作站.app"
   exit 0
 fi
-exec .venv/bin/python3 -m pa_host.gui_server --open-browser
+exec "$ROOT/macos/start_web_server.sh" "$ROOT" "${SENSUS_WEB_PORT:-8765}"

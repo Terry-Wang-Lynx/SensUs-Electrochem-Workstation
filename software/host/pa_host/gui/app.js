@@ -3,7 +3,7 @@ const $ = (id) => {
   if (!node) throw new Error(`界面资源版本不一致（缺少 ${id}），请刷新页面后重试`);
   return node;
 };
-const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, devices: {devices: [], selected_device_id: null, busy: false}, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, driftDirty: false, exiting: false };
+const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, devices: {devices: [], selected_device_id: null, busy: false}, deviceRefreshPromise: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, driftDirty: false, exiting: false };
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
   calibrate: ['标定与漂移', '选择标定范围并管理过渡期 bias'],
@@ -14,12 +14,26 @@ const pages = {
 };
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {headers: {'Content-Type': 'application/json'}, ...options});
-  const body = await response.text();
-  let data = {};
-  try { data = body ? JSON.parse(body) : {}; } catch { data = {error: body || '服务返回了无效响应'}; }
-  if (!response.ok) throw new Error(data.error || '请求失败');
-  return data;
+  const {timeoutMs = 5000, ...fetchOptions} = options;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(path, {
+      headers: {'Content-Type': 'application/json'},
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+    const body = await response.text();
+    let data = {};
+    try { data = body ? JSON.parse(body) : {}; } catch { data = {error: body || '服务返回了无效响应'}; }
+    if (!response.ok) throw new Error(data.error || '请求失败');
+    return data;
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error('请求超时，设备正在重新连接');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 function post(path, body = {}) { return api(path, {method: 'POST', body: JSON.stringify(body)}); }
 function toast(message) { const node = $('toast'); node.textContent = message; node.classList.add('show'); setTimeout(() => node.classList.remove('show'), 2600); }
@@ -406,6 +420,11 @@ function setupCanvas(canvas) {
   canvas.width = Math.max(1, rect.width * ratio); canvas.height = Math.max(1, rect.height * ratio);
   const ctx = canvas.getContext('2d'); ctx.setTransform(ratio, 0, 0, ratio, 0, 0); return {ctx, w: rect.width, h: rect.height};
 }
+function finiteBounds(points, index) {
+  let min=Infinity,max=-Infinity;
+  for(const point of points){const value=Number(point[index]);if(!Number.isFinite(value))continue;min=Math.min(min,value);max=Math.max(max,value)}
+  return min===Infinity?null:[min,max];
+}
 /* 双轴是 **opt-in 扩展**:series 里带 `axis:'right'` 的走右轴,
  * options 可给 y2label / y2Digits / yDigits。不传 `axis` 时行为与改动前**像素级相同**
  * ⇒ 现有两个调用点(itChart / calibrationChart)一个字都不用改。
@@ -418,10 +437,11 @@ function drawChart(canvas, series, options = {}) {
   const pts = list => list.flatMap(s => s.points).filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
   const allL = pts(left), allR = pts(right), all = allL.concat(allR);
   if (!all.length) return;
-  let xmin = options.xmin ?? Math.min(...all.map(p => p[0])), xmax = options.xmax ?? Math.max(...all.map(p => p[0]));
+  const xBounds=finiteBounds(all,0);
+  let xmin = options.xmin ?? xBounds[0], xmax = options.xmax ?? xBounds[1];
   const span = list => {
     if (!list.length) return [0, 1];
-    let lo = Math.min(...list.map(p => p[1])), hi = Math.max(...list.map(p => p[1]));
+    const bounds=finiteBounds(list,1),lo=bounds[0],hi=bounds[1];
     if (hi === lo) {lo -= 1; hi += 1;}
     const pad = (hi - lo) * .12; return [lo - pad, hi + pad];
   };
@@ -505,6 +525,7 @@ function drawApScoreChart(points){
   ctx.fillStyle='#68767b';ctx.fillText('真实浓度 x (µM)',w/2-42,h-8);ctx.save();ctx.translate(12,h/2+28);ctx.rotate(-Math.PI/2);ctx.fillText('测量浓度 y (µM)',0,0);ctx.restore();
 }
 function drawAll(){
+  if(document.visibilityState==='hidden')return;
   const d = state.measurement?.data || {};
   const current = d.current_nA || [], allSeries=[];
   const filtered = filterValues(d.time_s || current.map((_,i)=>i), current, d.valid).values;
@@ -777,7 +798,7 @@ function updateMeasurement(data){
   $('deviceTransport').textContent=`${deviceName||transportLabel} · MAX30131`;
   if(data.error){$('measureError').textContent=data.error;$('measureError').hidden=false}else $('measureError').hidden=true; updateStartState();drawAll();void handleWorkflowCompletion(data);
 }
-async function refreshMeasurement(){if(state.exiting)return;try{updateMeasurement(await api('/api/status'))}catch(e){$('deviceState').textContent='服务未连接';$('deviceTransport').textContent='连接方式未知 · MAX30131';$('deviceDot').className='status-dot'}}
+async function refreshMeasurement(){if(state.exiting)return;try{updateMeasurement(await api('/api/status',{timeoutMs:1500}))}catch(e){$('deviceState').textContent=e.message.includes('超时')?'设备正在重新连接':'服务未连接';$('deviceTransport').textContent='连接方式未知 · MAX30131';$('deviceDot').className='status-dot'}}
 async function measurementRefreshLoop(){
   if(state.exiting)return;
   await refreshMeasurement();
@@ -808,7 +829,7 @@ $('exitApp').addEventListener('click',async()=>{
 function deviceCardDetail(device){
   if(device.kind==='jlink')return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探头 SN ${device.probe_serial}`:''}`;
   const ports=[device.data_port&&`DATA ${device.data_port}`,device.smp_port&&`SMP ${device.smp_port}`].filter(Boolean);
-  if(device.probe_required)return '测量进行中，暂不打开 CDC 探测';
+  if(device.probe_required)return state.devices.probing?'正在后台识别 CDC 接口':'测量进行中，暂不打开 CDC 探测';
   return ports.length?ports.join(' · '):'未识别 DATA/SMP 接口';
 }
 function renderDeviceList(payload=state.devices){
@@ -836,10 +857,24 @@ function renderDeviceList(payload=state.devices){
   $('deviceDialogBusy').textContent=state.devices.busy?'测量或自动任务运行期间不能切换设备':'';
 }
 async function refreshDevices(open=false){
+  if(state.deviceRefreshPromise)return state.deviceRefreshPromise;
   const dialog=$('deviceDialog');
   if(open){if(typeof dialog.showModal==='function')dialog.showModal();else dialog.setAttribute('open','')}
-  try{renderDeviceList(await api('/api/devices'))}
-  catch(e){$('deviceDialogSummary').textContent='设备列表读取失败';$('deviceDialogBusy').textContent=e.message;$('deviceDialogBusy').hidden=false}
+  const shouldPoll = open || Boolean(dialog.open);
+  state.deviceRefreshPromise=(async()=>{
+    try{
+      let payload=null;
+      const attempts=shouldPoll?20:1;
+      for(let attempt=0;attempt<attempts;attempt++){
+        payload=await api('/api/devices',{timeoutMs:3000});
+        renderDeviceList(payload);
+        if(!payload.probing||attempt===attempts-1)break;
+        await new Promise(resolve=>setTimeout(resolve,150));
+      }
+    }catch(e){$('deviceDialogSummary').textContent='设备列表读取失败';$('deviceDialogBusy').textContent=e.message;$('deviceDialogBusy').hidden=false}
+    finally{state.deviceRefreshPromise=null}
+  })();
+  return state.deviceRefreshPromise;
 }
 async function chooseDevice(deviceId){
   const buttons=$('deviceList').querySelectorAll('button');buttons.forEach(button=>{button.disabled=true});
@@ -1420,6 +1455,7 @@ function renderDebug(d) {
 }
 
 function drawDebug() {
+  if(document.visibilityState==='hidden')return;
   const s = state.debug?.series || {};
   const cur = s.current || {t: [], nA: [], valid: []}, cv = s.cell_v || {t: [], e_mv: [], clipped: []};
   const adaptive=state.debug?.adaptive_stop||{},overlay=debugPlateauLayers(adaptive),evaluation=adaptive.evaluation;
@@ -1756,5 +1792,24 @@ $('dbgStop').addEventListener('click', async () => {
   }
 });
 setInterval(refreshDebug,1000);
-window.addEventListener('resize',()=>{drawAll();drawDebug()});
+let resizeTimer=null,resizeRedrawForced=false,lastCanvasLayout='';
+function scheduleCanvasRedraw(force=false){
+  resizeRedrawForced=resizeRedrawForced||force;
+  if(resizeTimer!==null)clearTimeout(resizeTimer);
+  resizeTimer=setTimeout(()=>{
+    resizeTimer=null;
+    const forced=resizeRedrawForced;resizeRedrawForced=false;
+    if(document.visibilityState==='hidden')return;
+    const canvas=$('itChart'),rect=canvas.getBoundingClientRect(),ratio=window.devicePixelRatio||1;
+    const layout=`${Math.round(rect.width*100)}x${Math.round(rect.height*100)}@${ratio}`;
+    if(!forced&&layout===lastCanvasLayout)return;
+    lastCanvasLayout=layout;
+    requestAnimationFrame(()=>{drawAll();drawDebug()});
+  },120);
+}
+window.addEventListener('resize',()=>scheduleCanvasRedraw(),{passive:true});
+window.addEventListener('orientationchange',()=>scheduleCanvasRedraw(true),{passive:true});
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'){scheduleCanvasRedraw(true);void refreshMeasurement()}
+});
 init();

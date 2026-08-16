@@ -120,6 +120,16 @@ JLINK_CDC_SERIAL = os.environ.get("SENSUS_JLINK_CDC_SERIAL", "0000297345691")
 # "自动检测" choice and is never changed while a hardware operation is busy.
 DEVICE_SELECTION_LOCK = threading.RLock()
 SELECTED_DEVICE: dict[str, Any] | None = None
+# Serial probing is deliberately kept out of the HTTP request path. A USB
+# device can take several seconds to answer while macOS is re-enumerating it;
+# the browser should keep rendering and receive the previous snapshot instead.
+DEVICE_DISCOVERY_LOCK = threading.RLock()
+DEVICE_DISCOVERY_CACHE: list[dict[str, Any]] = []
+DEVICE_DISCOVERY_AT = 0.0
+DEVICE_DISCOVERY_THREAD: threading.Thread | None = None
+DEVICE_DISCOVERY_ERROR = ""
+DEVICE_DISCOVERY_TTL_S = 1.0
+DEVICE_PROBE_LOCK = threading.Lock()
 SMPMGR_EXE = Path(
     os.environ.get("SENSUS_SMPMGR")
     or shutil.which("smpmgr")
@@ -676,6 +686,16 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
                 if _probe_serial_data_candidate(str(getattr(info, "device", "") or "")):
                     data_info = info
                     break
+        elif SERIAL_DATA_PORT:
+            # A previously verified DATA path is safe to describe without
+            # opening the port again. This keeps a hot-plug refresh instant.
+            data_info = next(
+                (
+                    info for info in group
+                    if str(getattr(info, "device", "") or "") == SERIAL_DATA_PORT
+                ),
+                None,
+            )
         data_port = str(getattr(data_info, "device", "") or "") if data_info else ""
         representative = data_info or group[0]
         smp_port = (
@@ -697,9 +717,15 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
             "smp_port": smp_port or "",
             "interfaces": [str(getattr(info, "device", "") or "") for info in group],
             "selectable": bool(data_port and smp_port),
-            "probe_required": not probe,
+            "probe_required": not probe and not data_port,
         })
     return sorted(devices, key=_device_sort_key)
+
+
+def _discover_devices_with_probe() -> list[dict[str, Any]]:
+    """Serialize port probes so a hot-plug refresh cannot race selection."""
+    with DEVICE_PROBE_LOCK:
+        return _discover_devices(probe=True)
 
 
 def _selected_device_copy() -> dict[str, Any] | None:
@@ -746,8 +772,13 @@ def _set_device_selection(device: dict[str, Any] | None) -> None:
     HARDWARE_TRANSPORT = "rtt"
 
 
-def _devices_payload(*, probe: bool = True) -> dict[str, Any]:
-    devices = _discover_devices(probe=probe)
+def _devices_payload_from_devices(
+    devices: list[dict[str, Any]],
+    *,
+    busy: bool = False,
+    probing: bool = False,
+    error: str = "",
+) -> dict[str, Any]:
     selected = _selected_device_copy()
     selected_id = selected.get("id") if selected else None
     if selected_id:
@@ -760,9 +791,94 @@ def _devices_payload(*, probe: bool = True) -> dict[str, Any]:
         "selected_device_id": selected_id,
         "selected_device": selected,
         "selection_mode": "manual" if selected_id else "auto",
-        "busy": False,
+        "busy": busy,
+        "probing": probing,
         **_transport_status(),
     }
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _remember_device_discovery(
+    devices: list[dict[str, Any]], error: str = ""
+) -> None:
+    global DEVICE_DISCOVERY_CACHE, DEVICE_DISCOVERY_AT, DEVICE_DISCOVERY_ERROR
+    with DEVICE_DISCOVERY_LOCK:
+        DEVICE_DISCOVERY_CACHE = copy.deepcopy(devices)
+        DEVICE_DISCOVERY_AT = time.monotonic()
+        DEVICE_DISCOVERY_ERROR = error
+
+
+def _run_device_discovery() -> None:
+    global DEVICE_DISCOVERY_THREAD
+    error = ""
+    devices: list[dict[str, Any]] = []
+    try:
+        devices = _discover_devices_with_probe()
+    except (OSError, RuntimeError, ValueError) as exc:
+        error = str(exc)
+        # Preserve the last known list during a transient USB re-enumeration;
+        # a short unplug/replug should not make the dialog lose the J-Link.
+        with DEVICE_DISCOVERY_LOCK:
+            devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
+    finally:
+        _remember_device_discovery(devices, error)
+        with DEVICE_DISCOVERY_LOCK:
+            DEVICE_DISCOVERY_THREAD = None
+
+
+def _start_device_discovery() -> bool:
+    global DEVICE_DISCOVERY_THREAD
+    with DEVICE_DISCOVERY_LOCK:
+        if DEVICE_DISCOVERY_THREAD is not None and DEVICE_DISCOVERY_THREAD.is_alive():
+            return False
+        worker = threading.Thread(
+            target=_run_device_discovery,
+            name="device-discovery",
+            daemon=True,
+        )
+        DEVICE_DISCOVERY_THREAD = worker
+        worker.start()
+        return True
+
+
+def _cached_devices_payload(*, busy: bool = False) -> dict[str, Any]:
+    """Return a fast device snapshot while refreshing CDC probes in background."""
+    global DEVICE_DISCOVERY_CACHE, DEVICE_DISCOVERY_AT, DEVICE_DISCOVERY_ERROR
+    now = time.monotonic()
+    with DEVICE_DISCOVERY_LOCK:
+        devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
+        updated_at = DEVICE_DISCOVERY_AT
+        error = DEVICE_DISCOVERY_ERROR
+        probing = (
+            DEVICE_DISCOVERY_THREAD is not None
+            and DEVICE_DISCOVERY_THREAD.is_alive()
+        )
+    had_cache = bool(devices)
+    if not devices:
+        # Descriptor enumeration is fast and does not open a serial port. It
+        # gives the dialog something useful to show during the first probe.
+        devices = _discover_devices(probe=False)
+        _remember_device_discovery(devices)
+        updated_at = time.monotonic()
+    stale = now - updated_at >= DEVICE_DISCOVERY_TTL_S
+    if not busy and (stale or not had_cache):
+        probing = _start_device_discovery() or probing
+    return _devices_payload_from_devices(
+        devices, busy=busy, probing=probing, error=error
+    )
+
+
+def _devices_payload(*, probe: bool = True) -> dict[str, Any]:
+    devices = (
+        _discover_devices_with_probe()
+        if probe
+        else _discover_devices(probe=False)
+    )
+    if probe:
+        _remember_device_discovery(devices)
+    return _devices_payload_from_devices(devices)
 
 
 def _refresh_usb_transport() -> None:
@@ -796,7 +912,7 @@ def _refresh_usb_transport() -> None:
         return
     if HARDWARE_TRANSPORT_REQUESTED == "auto":
         candidates = [
-            device for device in _discover_devices(probe=True)
+            device for device in _discover_devices_with_probe()
             if device.get("selectable")
         ]
         if len(candidates) > 1:
@@ -6638,7 +6754,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             # Never open a CDC port while the collector owns it. During a
             # running measurement the list is descriptive only; selection is
             # rejected until the operation is idle.
-            result = _devices_payload(probe=not busy)
+            result = (
+                _cached_devices_payload(busy=busy)
+                if not busy
+                else _devices_payload(probe=False)
+            )
             result["busy"] = busy
             self._send_json(result)
             return
@@ -6711,7 +6831,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         result = _devices_payload(probe=True)
                         result["message"] = "已恢复自动检测"
                     else:
-                        devices = _discover_devices(probe=True)
+                        devices = _discover_devices_with_probe()
                         device = next(
                             (item for item in devices if item.get("id") == requested_id),
                             None,
@@ -6869,6 +6989,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
           open_browser: bool = False) -> None:
     global HTTP_SERVER, _SHUTDOWN_REQUESTED
+    # A CDC probe can outlive the browser request during USB re-enumeration.
+    # Daemon request threads keep the server responsive and let shutdown
+    # finish without waiting for a detached serial read.
+    ThreadingHTTPServer.daemon_threads = True
+    ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer((host, port), RequestHandler)
     with _SHUTDOWN_LOCK:
         HTTP_SERVER = server

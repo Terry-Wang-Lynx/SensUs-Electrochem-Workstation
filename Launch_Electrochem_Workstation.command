@@ -23,4 +23,5 @@ if [[ ! -f "$ROOT/.venv-installed" || "$ROOT/pyproject.toml" -nt "$ROOT/.venv-in
   touch "$ROOT/.venv-installed"
 fi
 
-exec "$PYTHON" -m pa_host.gui_server --open-browser
+PORT="${SENSUS_WEB_PORT:-8765}"
+exec "$ROOT/macos/start_web_server.sh" "$ROOT" "$PORT"
