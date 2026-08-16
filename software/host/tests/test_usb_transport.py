@@ -32,6 +32,17 @@ def test_transport_auto_prefers_discovered_data_cdc(monkeypatch) -> None:
     assert gui_server.SERIAL_DATA_PORT == "/dev/cu.usbmodem1103"
 
 
+def test_transport_status_exposes_selected_backend_label(monkeypatch) -> None:
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT", "serial")
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
+
+    assert gui_server._transport_status() == {
+        "transport": "serial",
+        "transport_label": "USB DATA CDC",
+        "transport_requested": "auto",
+    }
+
+
 def test_smp_port_is_the_sibling_cdc_of_the_same_usb_device(monkeypatch) -> None:
     data = _PortInfo("/dev/cu.usbmodem1103")
     smp = _PortInfo("/dev/cu.usbmodem1101")

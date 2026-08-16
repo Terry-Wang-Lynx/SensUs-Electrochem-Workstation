@@ -41,6 +41,19 @@ def test_app_references_existing_html_ids() -> None:
     assert referenced <= declared, f"Missing DOM ids: {sorted(referenced - declared)}"
 
 
+def test_gui_exposes_dynamic_transport_and_graceful_exit_controls() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="deviceTransport"' in html
+    assert 'id="exitApp"' in html
+    assert "transport_label" in app
+    assert "/api/shutdown" in app
+    assert ".exit-button" in styles
+    assert "J-Link · MAX30131" not in html
+
+
 def test_known_concentration_stepper_has_stable_accessible_controls() -> None:
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
@@ -509,7 +522,7 @@ def test_debug_overlay_controls_remain_clickable_in_empty_and_narrow_states() ->
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
 
-    assert html.count("20260816-persistent-batches") == 2
+    assert html.count("20260816-exit-transport") == 2
     assert ".empty-chart{position:absolute;inset:0;display:grid;place-items:center;color:#8a969a;font-size:12px;pointer-events:none}" in css
     assert ".chart-legend{position:absolute;z-index:2;" in css
     assert "@media(max-width:900px)" in css

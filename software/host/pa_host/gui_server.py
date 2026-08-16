@@ -129,6 +129,21 @@ V51_PREBUILT_IMAGE = (
 )
 
 
+def _transport_status(transport: str | None = None) -> dict[str, str]:
+    """Expose the transport selected for the next/current acquisition."""
+    actual = str(transport or HARDWARE_TRANSPORT or "unknown").lower()
+    labels = {
+        "serial": "USB DATA CDC",
+        "rtt": "RTT / J-Link",
+        "auto": "自动检测",
+    }
+    return {
+        "transport": actual,
+        "transport_label": labels.get(actual, "连接方式未知"),
+        "transport_requested": str(HARDWARE_TRANSPORT_REQUESTED or "auto").lower(),
+    }
+
+
 def _escape_applescript(value: object) -> str:
     """Escape a value for an AppleScript double-quoted string literal."""
     return (str(value)
@@ -4032,6 +4047,7 @@ class MeasurementController:
                         "direction": data["direction"][index],
                     })
             payload = {
+                **_transport_status(),
                 "state": self.state,
                 "busy": self.state == "running" or bool(
                     self.thread is not None and self.thread.is_alive()
@@ -6244,6 +6260,27 @@ class AppState:
 
 
 APP = AppState()
+HTTP_SERVER: ThreadingHTTPServer | None = None
+_SHUTDOWN_LOCK = threading.Lock()
+_SHUTDOWN_REQUESTED = False
+
+
+def _request_server_shutdown() -> None:
+    """Ask the serving loop to enter its existing graceful cleanup path."""
+    global _SHUTDOWN_REQUESTED
+    with _SHUTDOWN_LOCK:
+        if _SHUTDOWN_REQUESTED:
+            return
+        _SHUTDOWN_REQUESTED = True
+        server = HTTP_SERVER
+    if server is not None:
+        # ``shutdown`` must run outside the request/serve thread. Starting it
+        # after the response has been written lets the browser receive its ACK.
+        threading.Thread(
+            target=server.shutdown,
+            name="gui-server-shutdown",
+            daemon=True,
+        ).start()
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -6359,10 +6396,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        shutdown_requested = False
         try:
             payload = self._body()
             if self.path == "/api/frontend/ready":
                 result = FRONTEND_UPDATER.mark_ready()
+            elif self.path == "/api/shutdown":
+                # The normal ``serve()`` finalizer stops schedules, ends an
+                # active acquisition,收回采集子进程/J-Link, then closes the HTTP server.
+                result = {"ok": True, "message": "后端正在退出"}
+                shutdown_requested = True
             elif self.path == "/api/measurement/start":
                 with APP.operation_lock:
                     if APP.schedule.snapshot()["active"]:
@@ -6493,6 +6536,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 return
             self._send_json(result)
+            if shutdown_requested:
+                _request_server_shutdown()
         except (ValueError, KeyError, TypeError, OSError) as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except RuntimeError as exc:
@@ -6501,7 +6546,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
           open_browser: bool = False) -> None:
+    global HTTP_SERVER, _SHUTDOWN_REQUESTED
     server = ThreadingHTTPServer((host, port), RequestHandler)
+    with _SHUTDOWN_LOCK:
+        HTTP_SERVER = server
+        _SHUTDOWN_REQUESTED = False
     FRONTEND_UPDATER.start(APP.hardware_idle)
     url = f"http://{host}:{server.server_port}/"
     print(f"i-t GUI: {url}", flush=True)
@@ -6541,6 +6590,9 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
                 MeasurementController._kill_tree(proc)
         APP.measurement.wait_for_completion()
         server.server_close()
+        with _SHUTDOWN_LOCK:
+            if HTTP_SERVER is server:
+                HTTP_SERVER = None
         print("i-t GUI 已退出(采集子进程与 J-Link 已收回)", flush=True)
 
 

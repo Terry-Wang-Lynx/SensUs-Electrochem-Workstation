@@ -3,7 +3,7 @@ const $ = (id) => {
   if (!node) throw new Error(`界面资源版本不一致（缺少 ${id}），请刷新页面后重试`);
   return node;
 };
-const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, driftDirty: false };
+const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, driftDirty: false, exiting: false };
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
   calibrate: ['标定与漂移', '选择标定范围并管理过渡期 bias'],
@@ -770,17 +770,40 @@ function updateMeasurement(data){
   const hardwareState=data.state==='error'?'error':running?'busy':data.state==='completed'?'ok':'';
   $('deviceDot').className=`status-dot ${hardwareState}`;
   $('deviceState').textContent=data.state==='error'?'硬件 / 采集异常':running?'设备测量中':data.state==='completed'?'上轮测量完成':'硬件待测';
+  const transportLabel=String(data.transport_label||(
+    data.transport==='serial'?'USB DATA CDC':data.transport==='rtt'?'RTT / J-Link':'连接方式未知'
+  ));
+  $('deviceTransport').textContent=`${transportLabel} · MAX30131`;
   if(data.error){$('measureError').textContent=data.error;$('measureError').hidden=false}else $('measureError').hidden=true; updateStartState();drawAll();void handleWorkflowCompletion(data);
 }
-async function refreshMeasurement(){try{updateMeasurement(await api('/api/status'))}catch(e){$('deviceState').textContent='服务未连接';$('deviceDot').className='status-dot'}}
+async function refreshMeasurement(){if(state.exiting)return;try{updateMeasurement(await api('/api/status'))}catch(e){$('deviceState').textContent='服务未连接';$('deviceTransport').textContent='连接方式未知 · MAX30131';$('deviceDot').className='status-dot'}}
 async function measurementRefreshLoop(){
+  if(state.exiting)return;
   await refreshMeasurement();
+  if(state.exiting)return;
   const running = state.measurement?.state === 'running';
   const duration = Number(state.measurement?.settings?.duration_s || 180);
   /* Long CV runs still render every native point; batching UI refreshes keeps
    * the 72,000-point status payload responsive without decimation. */
   setTimeout(measurementRefreshLoop, running ? (duration <= 300 ? 100 : 2000) : 1000);
 }
+$('exitApp').addEventListener('click',async()=>{
+  if(state.exiting)return;
+  const activeMeasurement=state.measurement?.state==='running';
+  const activeSchedule=Boolean(state.schedule?.active);
+  if((activeMeasurement||activeSchedule)&&!confirm('当前仍有硬件任务，退出会先停止任务并关闭后端。确定退出吗？'))return;
+  state.exiting=true;
+  const button=$('exitApp');
+  button.disabled=true;button.textContent='退出中…';
+  let acknowledged=false;
+  try{await post('/api/shutdown');acknowledged=true}catch{}
+  try{window.open('','_self');window.close()}catch{}
+  setTimeout(()=>{
+    if(window.closed)return;
+    button.disabled=false;
+    button.textContent=acknowledged?'后端已退出，请关闭标签页':'后端未响应，请检查运行进程';
+  },350);
+});
 $('chartWindow').addEventListener('click', event => {
   const button = event.target.closest('button[data-window]');
   if (!button) return;
@@ -983,7 +1006,7 @@ $('scheduleRole').addEventListener('change',renderScheduleMode);
 $('startSchedule').onclick=async()=>{try{$('scheduleError').hidden=true;updateSchedule(await post('/api/schedule/start',{interval_minutes:$('intervalMinutes').value,max_runs:$('maxRuns').value,total_minutes:$('totalMinutes').value,sample_prefix:$('schedulePrefix').value,known_concentration_um:$('scheduleConcentration').value===''?null:$('scheduleConcentration').value,sample_role:$('scheduleRole').value,start_now:$('startNow').checked}))}catch(e){errorBox('scheduleError',e)}};
 $('stopSchedule').onclick=async()=>{try{updateSchedule(await post('/api/schedule/stop'))}catch(e){errorBox('scheduleError',e)}};
 
-async function init(){setInterval(()=>$('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);await loadFilter();await loadPlateau();try{state.settingsDirty=false;renderSettings(await api('/api/settings'))}catch{}try{renderWorkflow(await api('/api/workflow'))}catch{}try{state.calibration=await api('/api/calibration');renderCalibration()}catch{}try{renderDrift(await api('/api/drift'))}catch{}try{updateSchedule(await api('/api/schedule'))}catch{}try{await refreshWorkspaceHistory()}catch{}setSampleRole(state.workflow?.calibration_ready?'test':'calibration',true);previewFilename();measurementRefreshLoop();setInterval(async()=>{try{updateSchedule(await api('/api/schedule'))}catch{}},1000);try{await post('/api/frontend/ready')}catch{}}
+async function init(){setInterval(()=>$('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);await loadFilter();await loadPlateau();try{state.settingsDirty=false;renderSettings(await api('/api/settings'))}catch{}try{renderWorkflow(await api('/api/workflow'))}catch{}try{state.calibration=await api('/api/calibration');renderCalibration()}catch{}try{renderDrift(await api('/api/drift'))}catch{}try{updateSchedule(await api('/api/schedule'))}catch{}try{await refreshWorkspaceHistory()}catch{}setSampleRole(state.workflow?.calibration_ready?'test':'calibration',true);previewFilename();measurementRefreshLoop();setInterval(async()=>{if(!state.exiting){try{updateSchedule(await api('/api/schedule'))}catch{}}},1000);try{await post('/api/frontend/ready')}catch{}}
 
 // ══════════════════════════════════════════════════════════════════════════
 // 硬件 DEBUG 模式

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SensUs 电化学工作站</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20260816-persistent-batches">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260816-exit-transport">
 </head>
 <body>
   <div class="app-shell">
@@ -18,7 +18,7 @@
         <button class="nav-item" data-view="debug"><span>⚙</span>硬件 DEBUG</button>
       </nav>
       <div class="sidebar-footer">
-        <div class="device-row"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small>J-Link · MAX30131</small></div></div>
+        <div class="device-row"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small id="deviceTransport">连接方式检查中 · MAX30131</small></div></div>
         <div class="firmware-note" id="firmwareNote">+0.2 V · 500 nA FSR</div>
       </div>
     </aside>
@@ -26,7 +26,7 @@
     <main>
       <header class="topbar">
         <div><h1 id="pageTitle">实时测量</h1><p id="pageSubtitle">180 秒 IT 检测与末 20 秒稳态分析</p></div>
-        <div class="clock" id="clock"></div>
+        <div class="topbar-actions"><div class="clock" id="clock"></div><button class="exit-button" id="exitApp" type="button" title="关闭当前标签页并退出后端">退出</button></div>
       </header>
 
       <section class="view active" id="view-measure">
@@ -405,6 +405,6 @@
     </main>
   </div>
   <div class="toast" id="toast"></div>
-  <script src="/assets/app.js?v=20260816-persistent-batches"></script>
+  <script src="/assets/app.js?v=20260816-exit-transport"></script>
 </body>
 </html>
