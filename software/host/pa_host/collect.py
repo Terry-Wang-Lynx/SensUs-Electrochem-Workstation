@@ -59,6 +59,7 @@ from .record import (
     parse_line,
     sample_to_row,
 )
+from . import runtime
 
 # 首选已验证的 V8.80;路径来自 STM32CubeIDE 自带的 J-Link 工具链。
 # 若 CubeIDE 被移除，回退到启用 libjaylink 的开源 OpenOCD：它仍通过同一个
@@ -129,6 +130,26 @@ def _resolve_openocd() -> tuple[Path, Path]:
     """选取启用 J-Link 驱动的 OpenOCD 及其 scripts 目录。"""
     configured = os.environ.get("SENSUS_OPENOCD_EXE")
     candidates: list[Path] = [Path(configured).expanduser()] if configured else []
+    if runtime.is_frozen():
+        # Portable builds place OpenOCD beside the staged ``workstation``
+        # resources, rather than on PATH. Keep this after an explicit
+        # environment override but before host-installed tools so a copied
+        # app remains self-contained and reproducible.
+        resource_roots: list[Path] = []
+        try:
+            resource_roots.append(runtime.project_dir().parent)
+        except (OSError, RuntimeError):
+            pass
+        executable_parent = Path(sys.executable).resolve().parent
+        resource_roots.extend((executable_parent, executable_parent.parent))
+        seen_roots: set[Path] = set()
+        for root in resource_roots:
+            root = root.resolve()
+            if root in seen_roots:
+                continue
+            seen_roots.add(root)
+            candidates.append(root / "tools" / "openocd" / "bin" /
+                             ("openocd.exe" if _IS_WIN else "openocd"))
     if _IS_WIN:
         openocd_name = "openocd.exe"
         candidates.extend([

@@ -35,15 +35,24 @@ def project_dir() -> Path:
     if configured is not None:
         return configured
     if is_frozen():
-        bundle_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        executable = Path(sys.executable).resolve()
+        bundle_dir = Path(getattr(sys, "_MEIPASS", executable.parent))
         candidates = [
             bundle_dir / "workstation",
-            Path(sys.executable).resolve().parent / "workstation",
-            Path(sys.executable).resolve().parent.parent / "workstation",
+            bundle_dir.parent / "workstation",
+            bundle_dir.parent.parent / "workstation",
+            bundle_dir.parent.parent.parent / "workstation",
+            executable.parent / "workstation",
+            executable.parent.parent / "workstation",
+            executable.parent.parent.parent / "workstation",
         ]
         for candidate in candidates:
             if candidate.exists():
                 return candidate.resolve()
+        # A frozen app must never discover and use a developer's checkout
+        # through the current working directory. Returning the expected
+        # bundled location keeps a broken package obvious to its caller.
+        return (bundle_dir / "workstation").resolve()
     return _source_project_dir()
 
 

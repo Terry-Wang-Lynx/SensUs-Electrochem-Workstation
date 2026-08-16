@@ -39,6 +39,51 @@ def test_rtt_address_falls_back_to_prebuilt_metadata(
     assert collect.find_rtt_address(elf) == 0x20001100
 
 
+def test_frozen_build_prefers_openocd_shipped_next_to_workstation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    resources = tmp_path / "Resources"
+    workstation = resources / "workstation"
+    executable = resources / "tools" / "openocd" / "bin" / "openocd"
+    scripts = resources / "tools" / "openocd" / "share" / "openocd" / "scripts"
+    workstation.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    scripts.joinpath("interface").mkdir(parents=True)
+    executable.write_text("portable openocd", encoding="ascii")
+    scripts.joinpath("interface", "jlink.cfg").write_text(
+        "adapter driver jlink\n", encoding="ascii"
+    )
+
+    monkeypatch.setattr(collect.runtime, "is_frozen", lambda: True)
+    monkeypatch.setattr(collect.runtime, "project_dir", lambda: workstation)
+    monkeypatch.setattr(collect.sys, "executable", str(resources / "backend" / "SensUsBackend"))
+    monkeypatch.delenv("SENSUS_OPENOCD_EXE", raising=False)
+    monkeypatch.delenv("SENSUS_OPENOCD_SCRIPTS", raising=False)
+
+    resolved_executable, resolved_scripts = collect._resolve_openocd()
+
+    assert resolved_executable == executable
+    assert resolved_scripts == scripts
+
+
+def test_frozen_project_dir_resolves_app_resources_without_source_checkout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    resources = tmp_path / "Resources"
+    backend = resources / "backend" / "SensUsBackend"
+    workstation = resources / "workstation"
+    backend.mkdir(parents=True)
+    workstation.mkdir()
+
+    monkeypatch.setattr(runtime, "is_frozen", lambda: True)
+    monkeypatch.setattr(runtime.sys, "executable", str(backend / "SensUsBackend"))
+    monkeypatch.setattr(runtime.sys, "_MEIPASS", str(backend / "_internal"), raising=False)
+    monkeypatch.delenv("SENSUS_RESOURCE_DIR", raising=False)
+    monkeypatch.delenv("SENSUS_PROJECT_DIR", raising=False)
+
+    assert runtime.project_dir() == workstation.resolve()
+
+
 def test_command_stream_keeps_partial_lines() -> None:
     lines, pending = collect._split_complete_lines("SET fsr=2", "")
     assert lines == []
