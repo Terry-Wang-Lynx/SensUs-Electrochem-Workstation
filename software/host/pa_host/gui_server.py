@@ -135,13 +135,16 @@ SMPMGR_EXE = Path(
     or shutil.which("smpmgr")
     or "/tmp/smpvenv/bin/smpmgr"
 )
-V51_UPLOAD_SCRIPT = (
-    PROJECT_DIR / "software" / "ver5.1" / "scripts" /
-    "03-usb-upload.sh"
+_V51_RESOURCE_CANDIDATES = (
+    PROJECT_DIR / "software" / "ver5.1",
+    PROJECT_DIR / "packaging" / "resources" / "v51",
 )
-V51_PREBUILT_IMAGE = (
-    PROJECT_DIR / "software" / "ver5.1" / "images" / "app.signed.bin"
+V51_RESOURCE_DIR = next(
+    (path for path in _V51_RESOURCE_CANDIDATES if path.exists()),
+    _V51_RESOURCE_CANDIDATES[0],
 )
+V51_UPLOAD_SCRIPT = V51_RESOURCE_DIR / "scripts" / "03-usb-upload.sh"
+V51_PREBUILT_IMAGE = V51_RESOURCE_DIR / "images" / "app.signed.bin"
 
 
 def _transport_status(transport: str | None = None) -> dict[str, Any]:
@@ -1183,6 +1186,42 @@ class SettingsController:
             return ""
         return hashlib.sha256(firmware_hex.read_bytes()).hexdigest()
 
+    @classmethod
+    def _verify_prebuilt_artifact(
+        cls, artifact: Path, metadata: dict[str, Any]
+    ) -> str:
+        if not artifact.exists():
+            raise RuntimeError(f"找不到内置固件:{artifact}")
+        digest = cls._firmware_hash(artifact)
+        expected = ""
+        sha256 = metadata.get("sha256")
+        if isinstance(sha256, dict):
+            expected = str(sha256.get(artifact.name) or "").lower()
+        elif isinstance(sha256, str):
+            expected = sha256.lower()
+        artifact_hashes = metadata.get("artifacts_sha256")
+        if not expected and isinstance(artifact_hashes, dict):
+            expected = str(artifact_hashes.get(artifact.name) or "").lower()
+        if expected and digest.lower() != expected:
+            raise RuntimeError(
+                f"内置固件校验失败:{artifact.name} SHA-256 不匹配"
+            )
+        return digest
+
+    @staticmethod
+    def _supports_runtime_settings(metadata: dict[str, Any]) -> bool:
+        protocol = metadata.get("runtime_protocol")
+        return bool(
+            metadata.get("runtime_configurable") is True
+            and isinstance(protocol, dict)
+            and protocol.get("name") == "MEAS"
+            and protocol.get("version") == 1
+        )
+
+    def _set_apply_message(self, message: str) -> None:
+        with self.lock:
+            self.message = message
+
     def restore_for_transport(self, transport: str) -> None:
         if not self._loaded_saved:
             return
@@ -1318,7 +1357,135 @@ class SettingsController:
             )
 
     @staticmethod
-    def _flash_firmware(firmware_hex: Path | None = None) -> None:
+    def _intel_hex_flash_sectors(
+        firmware_hex: Path, page_size: int = 4096, flash_size: int = 512 * 1024
+    ) -> list[int]:
+        """Return nRF flash sectors touched by a validated Intel HEX image."""
+        base_address = 0
+        sectors: set[int] = set()
+        for line_number, raw_line in enumerate(
+            firmware_hex.read_text(encoding="ascii").splitlines(), start=1
+        ):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if not line.startswith(":"):
+                raise RuntimeError(
+                    f"Intel HEX 格式错误（第 {line_number} 行）"
+                )
+            try:
+                record = bytes.fromhex(line[1:])
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Intel HEX 编码错误（第 {line_number} 行）"
+                ) from exc
+            if len(record) < 5 or len(record) != record[0] + 5:
+                raise RuntimeError(
+                    f"Intel HEX 长度错误（第 {line_number} 行）"
+                )
+            if sum(record) & 0xFF:
+                raise RuntimeError(
+                    f"Intel HEX 校验和错误（第 {line_number} 行）"
+                )
+            address = (record[1] << 8) | record[2]
+            record_type = record[3]
+            data = record[4:-1]
+            if record_type == 0x00 and data:
+                start = base_address + address
+                end = start + len(data) - 1
+                flash_start = max(0, start)
+                flash_end = min(flash_size - 1, end)
+                if flash_start <= flash_end:
+                    sectors.update(range(
+                        flash_start // page_size,
+                        flash_end // page_size + 1,
+                    ))
+            elif record_type == 0x01:
+                break
+            elif record_type == 0x02 and len(data) == 2:
+                base_address = int.from_bytes(data, "big") << 4
+            elif record_type == 0x04 and len(data) == 2:
+                base_address = int.from_bytes(data, "big") << 16
+        if not sectors:
+            raise RuntimeError("Intel HEX 中没有 nRF52833 Flash 数据")
+        return sorted(sectors)
+
+    @staticmethod
+    def _openocd_command(speed: int, *commands: str) -> list[str]:
+        command = [
+            str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+            "-f", "interface/jlink.cfg", "-c", "transport select swd",
+            "-f", "target/nrf52.cfg",
+        ]
+        if JLINK_SERIAL:
+            command += ["-c", f"adapter serial {JLINK_SERIAL}"]
+        command += ["-c", f"adapter speed {speed}"]
+        for openocd_command in commands:
+            command += ["-c", openocd_command]
+        return command
+
+    @staticmethod
+    def _openocd_path(path: Path) -> str:
+        text = str(path.resolve()).replace("\\", "/")
+        if any(character in text for character in "{}\r\n"):
+            raise RuntimeError(f"OpenOCD 无法处理固件路径:{path}")
+        return "{" + text + "}"
+
+    @classmethod
+    def _flash_openocd_reconnecting(cls, firmware_hex: Path) -> None:
+        """Recover clone probes that disconnect after every NVMC page erase."""
+        sectors = cls._intel_hex_flash_sectors(firmware_hex)
+        speed = 100
+        for sector in sectors:
+            try:
+                subprocess.run(
+                    cls._openocd_command(
+                        speed, "init", "reset halt",
+                        f"flash erase_sector 0 {sector} {sector}", "shutdown",
+                    ),
+                    cwd=PROJECT_DIR, check=False, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=15,
+                )
+            except subprocess.TimeoutExpired:
+                # The erase register write may have completed before the clone
+                # dropped SWD. The independent erase check below is authoritative.
+                pass
+
+        checked = subprocess.run(
+            cls._openocd_command(speed, "init", "flash erase_check 0", "shutdown"),
+            cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
+        )
+        check_blob = f"{checked.stdout}\n{checked.stderr}"
+        if "successfully checked erase state" not in check_blob:
+            raise RuntimeError("OpenOCD 未能确认 Flash 擦除状态")
+        not_erased = {
+            int(match.group(1))
+            for match in re.finditer(r"#\s*(\d+):[^\n]*not erased", check_blob)
+        }
+        dirty = sorted(set(sectors) & not_erased)
+        if dirty:
+            raise RuntimeError(
+                "OpenOCD 重连擦除失败，未擦净页:"
+                + ", ".join(str(sector) for sector in dirty)
+            )
+
+        firmware_path = cls._openocd_path(firmware_hex)
+        written = subprocess.run(
+            cls._openocd_command(
+                speed, "init", "reset halt",
+                f"flash write_image {firmware_path}",
+                f"verify_image {firmware_path}", "reset run", "shutdown",
+            ),
+            cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=180,
+        )
+        write_blob = f"{written.stdout}\n{written.stderr}".lower()
+        if "wrote " not in write_blob or "verified " not in write_blob:
+            raise RuntimeError("OpenOCD 重连烧录未确认写入和全镜像校验")
+
+    @classmethod
+    def _flash_firmware(cls, firmware_hex: Path | None = None) -> None:
         """用可用的 SWD 后端把 hex 烧进片子并校验。
 
         Homebrew 的默认 openocd 没有编入 jlink 驱动；本机的用户级
@@ -1336,50 +1503,42 @@ class SettingsController:
                 raise RuntimeError(
                     f"既找不到 JLinkExe({JLINK_EXE})，也找不到 OpenOCD"
                 )
-            speeds = list(dict.fromkeys([JLINK_SPEED_KHZ, 2000, 500, 100]))
-            failures: list[str] = []
-            for speed in speeds:
-                command = [
-                    str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
-                    "-f", "interface/jlink.cfg", "-c", "transport select swd",
-                    "-f", "target/nrf52.cfg",
-                ]
-                if JLINK_SERIAL:
-                    command += ["-c", f"adapter serial {JLINK_SERIAL}"]
-                command += [
-                    "-c", f"adapter speed {speed}",
-                    "-c", f"program {firmware_hex} verify reset exit",
-                ]
-                try:
-                    done = subprocess.run(
-                        command,
-                        cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
-                        encoding="utf-8", errors="replace", timeout=120,
-                    )
-                    blob = f"{done.stdout}\n{done.stderr}"
-                except subprocess.CalledProcessError as exc:
-                    blob = f"{exc.stdout or ''}\n{exc.stderr or ''}"
-                    transient = any(marker in blob.lower() for marker in (
-                        "parity mismatch", "failed to read memory",
-                        "error waiting nvmc_ready", "examination failed",
-                    ))
-                    tail = [line for line in blob.strip().splitlines()
-                            if line.strip()][-3:]
-                    failures.append(f"{speed} kHz: " + " | ".join(tail))
-                    if transient and speed != speeds[-1]:
-                        continue
-                    raise RuntimeError(
-                        "OpenOCD 烧录失败:" + " || ".join(failures)
-                    ) from exc
-                if "Programming Finished" in blob and "Verified OK" in blob:
+            firmware_path = cls._openocd_path(firmware_hex)
+            command = cls._openocd_command(
+                JLINK_SPEED_KHZ,
+                f"program {firmware_path} verify reset exit",
+            )
+            try:
+                done = subprocess.run(
+                    command,
+                    cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120,
+                )
+                blob = f"{done.stdout}\n{done.stderr}"
+            except subprocess.CalledProcessError as exc:
+                blob = f"{exc.stdout or ''}\n{exc.stderr or ''}"
+                transient = any(marker in blob.lower() for marker in (
+                    "parity mismatch", "failed to read memory",
+                    "error waiting nvmc_ready", "examination failed",
+                    "failed erasing sectors", "failed to erase reg",
+                ))
+                if transient:
+                    cls._flash_openocd_reconnecting(firmware_hex)
                     return
                 tail = [line for line in blob.strip().splitlines()
-                        if line.strip()][-3:]
-                failures.append(f"{speed} kHz: " + " | ".join(tail))
-                break
-            raise RuntimeError("OpenOCD 烧录未确认成功:" + " || ".join(failures))
+                        if line.strip()][-5:]
+                raise RuntimeError(
+                    "OpenOCD 烧录失败:" + " | ".join(tail)
+                ) from exc
+            if "Programming Finished" in blob and "Verified OK" in blob:
+                return
+            cls._flash_openocd_reconnecting(firmware_hex)
+            return
 
-        script = f"loadfile {firmware_hex}\nr\ng\nq\n"
+        jlink_path = str(firmware_hex.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+        if "\n" in jlink_path or "\r" in jlink_path:
+            raise RuntimeError(f"JLinkExe 无法处理固件路径:{firmware_hex}")
+        script = f'loadfile "{jlink_path}"\nr\ng\nq\n'
         with tempfile.NamedTemporaryFile(
             "w", suffix=".jlink", delete=False, encoding="utf-8"
         ) as handle:
@@ -1407,11 +1566,12 @@ class SettingsController:
             raise RuntimeError("JLinkExe 烧录未确认成功:" + " | ".join(tail))
 
     @staticmethod
-    def _upgrade_v51_firmware() -> None:
+    def _upgrade_v51_firmware(image: Path | None = None) -> None:
         """Reset the V5.1 app over SMP, then upload its signed image via USB."""
-        image = FIRMWARE_BUILD_DIR / "zephyr.signed.bin"
-        if not image.exists() and V51_PREBUILT_IMAGE.exists():
-            image = V51_PREBUILT_IMAGE
+        if image is None:
+            image = FIRMWARE_BUILD_DIR / "zephyr.signed.bin"
+            if not image.exists() and V51_PREBUILT_IMAGE.exists():
+                image = V51_PREBUILT_IMAGE
         if not image.exists():
             raise RuntimeError(f"找不到 V5.1 签名镜像:{image}")
         if not runtime.is_frozen() and not SMPMGR_EXE.exists():
@@ -1725,8 +1885,9 @@ class SettingsController:
     def _apply_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         settings = self.validate(payload)
         with self.lock:
+            self.settings = settings
             self.state = "applying"
-            self.message = "正在编译并写入硬件参数"
+            self.message = "正在检查设备连接与通用固件"
             self.error = ""
             self.applied = False
         potential_mv = int(round(settings["potential_v"] * 1000))
@@ -1783,23 +1944,27 @@ class SettingsController:
                 _release_stale_measurement_bridge()
             firmware_source = "build"
             prebuilt_dir = (
-                PROJECT_DIR / "software" / "ver5.1"
+                V51_PREBUILT_IMAGE.parent.parent
                 if usb_transport else FIRMWARE_PREBUILT_DIR
             )
             prebuilt_metadata = prebuilt_dir / "firmware.json"
             try:
-                prebuilt_settings = self.validate(json.loads(
-                    prebuilt_metadata.read_text(encoding="utf-8")
-                )["settings"])
+                metadata = json.loads(prebuilt_metadata.read_text(encoding="utf-8"))
+                if not isinstance(metadata, dict):
+                    raise TypeError("firmware metadata must be an object")
+                prebuilt_settings = self.validate(metadata["settings"])
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
                 prebuilt_settings = None
             # Portable packages ship one validated runtime-configurable image.
             # Every supported UI condition uses that image and is committed
             # transactionally over RTT/CDC before START, so the target machine
             # never needs NCS, Zephyr or a compiler. Source checkouts retain the
             # existing compile path for developer firmware changes.
-            can_use_prebuilt = runtime.is_frozen() or (
-                settings == prebuilt_settings and not usb_transport
+            can_use_prebuilt = (
+                runtime.is_frozen()
+                or self._supports_runtime_settings(metadata)
+                or (settings == prebuilt_settings and not usb_transport)
             )
             if can_use_prebuilt:
                 firmware_source = "prebuilt"
@@ -1809,15 +1974,21 @@ class SettingsController:
                     V51_PREBUILT_IMAGE if usb_transport
                     else FIRMWARE_PREBUILT_DIR / "zephyr.hex"
                 )
+                self._set_apply_message("正在校验内置通用固件")
+                firmware_hash = self._verify_prebuilt_artifact(
+                    firmware_hex, metadata
+                )
                 if usb_transport:
-                    self._upgrade_v51_firmware()
+                    self._set_apply_message("正在通过 USB 烧录并校验通用固件")
+                    self._upgrade_v51_firmware(firmware_hex)
                 else:
+                    self._set_apply_message("正在通过 J-Link 烧录并校验通用固件")
                     self._flash_firmware(firmware_hex)
                 SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
                 SETTINGS_PATH.write_text(json.dumps({
                     "settings": settings,
                     "firmware_source": firmware_source,
-                    "firmware_sha256": self._firmware_hash(firmware_hex),
+                    "firmware_sha256": firmware_hash,
                     "transport": "serial" if usb_transport else "rtt",
                 }, indent=2, ensure_ascii=False), encoding="utf-8")
                 with self.lock:
@@ -1826,11 +1997,12 @@ class SettingsController:
                     self.state = "applied"
                     self.message = (
                         "通用固件已就绪；测量前会自动下发并核验当前条件"
-                        if runtime.is_frozen()
-                        else "推荐条件已使用随包固件应用到硬件"
+                        if self._supports_runtime_settings(metadata)
+                        else "推荐条件已使用内置固件应用到硬件"
                     )
                     self.error = ""
                 return self.snapshot()
+            self._set_apply_message("内置固件不支持当前条件，正在准备开发者构建")
             if (not _IS_WIN and (
                 not (NCS_DIR / "zephyr/zephyr-env.sh").exists()
                 or not NCS_VENV_ACTIVATE.exists()
@@ -1842,6 +2014,7 @@ class SettingsController:
                     "当前条件与随包固件不同；请先双击“03-安装固件工具链.command”"
                 )
             FIRMWARE_CONFIG.write_text(header, encoding="utf-8")
+            self._set_apply_message("正在编译开发者固件，请保持设备连接")
             # 🔴 west 装在 NCS 自己的 venv 里(默认 ~/ncs/.venv/bin/west)。
             #    `zephyr-env.sh` 只把 $ZEPHYR_BASE/scripts 塞进 PATH,**不激活该 venv**
             #    ⇒ 不先激活就是 `zsh:1: command not found: west`,按钮看起来"没反应"
@@ -1884,9 +2057,11 @@ class SettingsController:
             firmware_hex = FIRMWARE_BUILD_DIR / "zephyr.hex"
             firmware_artifact = firmware_hex
             if usb_transport:
-                self._upgrade_v51_firmware()
                 firmware_artifact = FIRMWARE_BUILD_DIR / "zephyr.signed.bin"
+                self._set_apply_message("正在通过 USB 烧录并校验开发者固件")
+                self._upgrade_v51_firmware(firmware_artifact)
             else:
+                self._set_apply_message("正在通过 J-Link 烧录并校验开发者固件")
                 self._flash_firmware(firmware_hex)
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps({

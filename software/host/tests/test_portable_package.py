@@ -224,7 +224,7 @@ def test_frozen_custom_conditions_never_invoke_toolchain(
     )
     monkeypatch.setattr(
         gui_server.SettingsController, "_upgrade_v51_firmware",
-        staticmethod(lambda: actions.append(("upgrade", None))),
+        staticmethod(lambda path=None: actions.append(("upgrade", path))),
     )
 
     controller = gui_server.SettingsController()
@@ -241,7 +241,7 @@ def test_frozen_custom_conditions_never_invoke_toolchain(
     assert result["applied"] is True
     assert result["settings"]["potential_v"] == -0.2
     assert actions == (
-        [("upgrade", None)] if transport == "serial"
+        [("upgrade", image)] if transport == "serial"
         else [("flash", v40 / "zephyr.hex")]
     )
     saved = json.loads(settings_path.read_text(encoding="utf-8"))

@@ -776,6 +776,7 @@ def test_apply_writes_configured_working_electrode_to_firmware_header() -> None:
         (prebuilt_dir / "firmware.json").write_text(json.dumps({
             "settings": SettingsController.validate(payload),
         }))
+        (prebuilt_dir / "zephyr.hex").write_text("prebuilt")
 
         with (
             patch("pa_host.gui_server.FIRMWARE_CONFIG", config),
@@ -791,6 +792,90 @@ def test_apply_writes_configured_working_electrode_to_firmware_header() -> None:
         assert "#define GUI_WP_V_WE_MV 250\n" in header
         assert "#define GUI_IT_ADAPTIVE_STOP 1\n" in header
         assert result["settings"]["working_electrode_v"] == 0.25
+
+
+def test_runtime_configurable_custom_apply_uses_verified_prebuilt_without_build() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = root / "measurement_config.h"
+        settings_path = root / "gui_settings.json"
+        prebuilt_dir = root / "prebuilt"
+        prebuilt_dir.mkdir()
+        firmware = prebuilt_dir / "zephyr.hex"
+        firmware.write_bytes(b"runtime-configurable")
+        digest = SettingsController._firmware_hash(firmware)
+        (prebuilt_dir / "firmware.json").write_text(json.dumps({
+            "settings": SettingsController.validate({}),
+            "runtime_configurable": True,
+            "runtime_protocol": {"name": "MEAS", "version": 1},
+            "sha256": {"zephyr.hex": digest},
+        }))
+        controller: SettingsController | None = None
+        observed_messages: list[str] = []
+
+        def flash(path: Path | None = None) -> None:
+            assert controller is not None
+            assert path == firmware
+            observed_messages.append(controller.snapshot()["message"])
+
+        with (
+            patch("pa_host.gui_server.FIRMWARE_CONFIG", config),
+            patch("pa_host.gui_server.SETTINGS_PATH", settings_path),
+            patch("pa_host.gui_server.FIRMWARE_PREBUILT_DIR", prebuilt_dir),
+            patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
+            patch("pa_host.gui_server._refresh_usb_transport"),
+            patch("pa_host.gui_server._release_stale_measurement_bridge"),
+            patch.object(SettingsController, "_run_build") as build,
+            patch.object(SettingsController, "_flash_firmware", side_effect=flash),
+        ):
+            controller = SettingsController()
+            result = controller.apply({"potential_v": 0.1, "duration_s": 321})
+
+        build.assert_not_called()
+        assert observed_messages == ["正在通过 J-Link 烧录并校验通用固件"]
+        saved = json.loads(settings_path.read_text())
+        assert saved["firmware_source"] == "prebuilt"
+        assert saved["firmware_sha256"] == digest
+        assert result["settings"]["potential_v"] == 0.1
+        assert result["applied"] is True
+
+
+def test_corrupt_runtime_prebuilt_is_rejected_before_flash() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config = root / "measurement_config.h"
+        settings_path = root / "gui_settings.json"
+        prebuilt_dir = root / "prebuilt"
+        prebuilt_dir.mkdir()
+        firmware = prebuilt_dir / "zephyr.hex"
+        firmware.write_bytes(b"corrupt")
+        (prebuilt_dir / "firmware.json").write_text(json.dumps({
+            "settings": SettingsController.validate({}),
+            "runtime_configurable": True,
+            "runtime_protocol": {"name": "MEAS", "version": 1},
+            "sha256": {"zephyr.hex": "0" * 64},
+        }))
+
+        with (
+            patch("pa_host.gui_server.FIRMWARE_CONFIG", config),
+            patch("pa_host.gui_server.SETTINGS_PATH", settings_path),
+            patch("pa_host.gui_server.FIRMWARE_PREBUILT_DIR", prebuilt_dir),
+            patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
+            patch("pa_host.gui_server._refresh_usb_transport"),
+            patch("pa_host.gui_server._release_stale_measurement_bridge"),
+            patch.object(SettingsController, "_run_build") as build,
+            patch.object(SettingsController, "_flash_firmware") as flash,
+        ):
+            controller = SettingsController()
+            with pytest.raises(RuntimeError, match="SHA-256 不匹配"):
+                controller.apply({"potential_v": 0.1})
+
+        build.assert_not_called()
+        flash.assert_not_called()
+        snapshot = controller.snapshot()
+        assert snapshot["settings"]["potential_v"] == 0.1
+        assert snapshot["state"] == "error"
+        assert snapshot["applied"] is False
 
 
 def test_custom_apply_uses_the_new_build_after_a_prebuilt_run() -> None:
@@ -1815,32 +1900,94 @@ def test_workflow_write_probe_never_replaces_a_user_file() -> None:
         assert existing.read_text(encoding="utf-8") == "user data"
 
 
-def test_openocd_flash_retries_swd_parity_errors_at_lower_speed() -> None:
+def test_openocd_flash_recovers_nvmc_disconnect_with_page_reconnects() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         firmware = Path(tmp) / "firmware.hex"
-        firmware.write_text(":00000001FF\n", encoding="ascii")
+        firmware.write_text(
+            ":0100000000FF\n:0120000000DF\n:00000001FF\n",
+            encoding="ascii",
+        )
         failed = subprocess.CalledProcessError(
             1, ["openocd"], output="",
-            stderr="Error: SWD: Read data parity mismatch\n** Programming Failed **",
+            stderr="Error waiting NVMC_READY\nfailed erasing sectors 0 to 2",
         )
-        succeeded = subprocess.CompletedProcess(
+        erased_with_disconnect = subprocess.CompletedProcess(
+            ["openocd"], 1, stdout="", stderr="failed to read memory",
+        )
+        checked = subprocess.CompletedProcess(
             ["openocd"], 0,
-            stdout="** Programming Finished **\n** Verified OK **\n",
-            stderr="",
+            stdout=(
+                "successfully checked erase state\n"
+                "# 1: 0x00001000 (0x1000 4kB) not erased\n"
+            ), stderr="",
+        )
+        written = subprocess.CompletedProcess(
+            ["openocd"], 0,
+            stdout="wrote 2 bytes\nverified 2 bytes\n", stderr="",
         )
         with (
             patch("pa_host.gui_server.JLINK_EXE", Path(tmp) / "missing"),
             patch("pa_host.gui_server.OPENOCD_EXE", Path("/usr/bin/true")),
             patch("pa_host.gui_server.subprocess.run",
-                  side_effect=[failed, succeeded]) as run,
+                  side_effect=[
+                      failed, erased_with_disconnect, erased_with_disconnect,
+                      checked, written,
+                  ]) as run,
         ):
             SettingsController._flash_firmware(firmware)
 
-        assert run.call_count == 2
+        assert run.call_count == 5
         first_command = run.call_args_list[0].args[0]
-        second_command = run.call_args_list[1].args[0]
+        first_erase = run.call_args_list[1].args[0]
+        second_erase = run.call_args_list[2].args[0]
+        erase_check = run.call_args_list[3].args[0]
+        write_and_verify = run.call_args_list[4].args[0]
         assert "adapter speed 4000" in first_command
-        assert "adapter speed 2000" in second_command
+        assert any("program {" in item and "verify reset exit" in item
+                   for item in first_command)
+        assert "flash erase_sector 0 0 0" in first_erase
+        assert "flash erase_sector 0 2 2" in second_erase
+        assert "flash erase_check 0" in erase_check
+        assert any("flash write_image {" in item for item in write_and_verify)
+        assert any("verify_image {" in item for item in write_and_verify)
+
+
+def test_openocd_reconnect_flash_rejects_a_page_that_remains_dirty() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        firmware = Path(tmp) / "firmware.hex"
+        firmware.write_text(":0100000000FF\n:00000001FF\n", encoding="ascii")
+        failed = subprocess.CalledProcessError(
+            1, ["openocd"], output="", stderr="failed to erase reg",
+        )
+        erase_attempt = subprocess.CompletedProcess(
+            ["openocd"], 1, stdout="", stderr="failed to read memory",
+        )
+        still_dirty = subprocess.CompletedProcess(
+            ["openocd"], 0,
+            stdout=(
+                "successfully checked erase state\n"
+                "# 0: 0x00000000 (0x1000 4kB) not erased\n"
+            ), stderr="",
+        )
+        with (
+            patch("pa_host.gui_server.JLINK_EXE", Path(tmp) / "missing"),
+            patch("pa_host.gui_server.OPENOCD_EXE", Path("/usr/bin/true")),
+            patch("pa_host.gui_server.subprocess.run",
+                  side_effect=[failed, erase_attempt, still_dirty]) as run,
+            pytest.raises(RuntimeError, match="未擦净页:0"),
+        ):
+            SettingsController._flash_firmware(firmware)
+
+        assert run.call_count == 3
+
+
+def test_intel_hex_sector_parser_rejects_corrupt_checksum() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        firmware = Path(tmp) / "firmware.hex"
+        firmware.write_text(":0100000000FE\n", encoding="ascii")
+
+        with pytest.raises(RuntimeError, match="Intel HEX 校验和错误"):
+            SettingsController._intel_hex_flash_sectors(firmware)
 
 
 def test_control_api_requires_json_and_rejects_cross_origin_posts() -> None:

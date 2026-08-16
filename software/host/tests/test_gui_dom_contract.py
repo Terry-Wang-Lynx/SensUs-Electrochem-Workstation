@@ -54,6 +54,18 @@ def test_gui_exposes_dynamic_transport_and_graceful_exit_controls() -> None:
     assert "J-Link · MAX30131" not in html
 
 
+def test_settings_apply_has_long_timeout_and_reload_safe_progress_polling() -> None:
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "SETTINGS_APPLY_TIMEOUT_MS = 900000" in app
+    assert "timeoutMs:SETTINGS_APPLY_TIMEOUT_MS" in app
+    assert "function ensureSettingsProgressPolling()" in app
+    assert "state.settings?.state!=='applying'" in app
+    assert "api('/api/settings',{timeoutMs:3000})" in app
+    assert "$('applySettings').disabled=applying" in app
+    assert "if(applying)ensureSettingsProgressPolling()" in app
+
+
 def test_gui_exposes_manual_multi_device_picker() -> None:
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
