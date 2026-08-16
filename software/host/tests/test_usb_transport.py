@@ -176,6 +176,7 @@ def test_source_usb_upgrade_pins_upload_to_selected_smp(
     reset = Mock(stdout="reset", stderr="")
     upgraded = Mock(stdout="Upgrade complete.", stderr="")
     monkeypatch.setattr(gui_server.runtime, "is_frozen", lambda: False)
+    monkeypatch.setattr(gui_server, "_IS_WIN", False)
     monkeypatch.setattr(gui_server, "SMPMGR_EXE", smpmgr)
     monkeypatch.setattr(gui_server, "V51_UPLOAD_SCRIPT", upload)
     monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "/dev/cu.usbmodem1101")

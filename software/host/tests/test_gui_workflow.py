@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -2094,7 +2095,7 @@ def test_openocd_flash_recovers_nvmc_disconnect_with_page_reconnects() -> None:
         )
         with (
             patch("pa_host.gui_server.JLINK_EXE", Path(tmp) / "missing"),
-            patch("pa_host.gui_server.OPENOCD_EXE", Path("/usr/bin/true")),
+            patch("pa_host.gui_server.OPENOCD_EXE", Path(sys.executable)),
             patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
             patch("pa_host.gui_server.subprocess.run",
                   side_effect=[
@@ -2147,7 +2148,7 @@ def test_openocd_reconnect_flash_rejects_a_page_that_remains_dirty() -> None:
         )
         with (
             patch("pa_host.gui_server.JLINK_EXE", Path(tmp) / "missing"),
-            patch("pa_host.gui_server.OPENOCD_EXE", Path("/usr/bin/true")),
+            patch("pa_host.gui_server.OPENOCD_EXE", Path(sys.executable)),
             patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
             patch("pa_host.gui_server.subprocess.run",
                   side_effect=[failed, erase_attempt, still_dirty]) as run,
