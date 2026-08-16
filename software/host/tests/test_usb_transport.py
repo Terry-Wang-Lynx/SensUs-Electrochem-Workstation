@@ -57,6 +57,7 @@ def test_jlink_cdc_is_excluded_from_v51_data_candidates(monkeypatch) -> None:
 def test_device_discovery_groups_usb_interfaces_and_lists_jlink(monkeypatch) -> None:
     data = _PortInfo("/dev/cu.usbmodem-data")
     smp = _PortInfo("/dev/cu.usbmodem-smp")
+    data.serial_number = smp.serial_number = "B4122550F6C771BD"
     jlink = _jlink_port()
     monkeypatch.setattr(
         gui_server, "_all_serial_port_infos", lambda: [data, smp, jlink]
@@ -68,10 +69,167 @@ def test_device_discovery_groups_usb_interfaces_and_lists_jlink(monkeypatch) -> 
     assert [device["kind"] for device in devices] == ["usb", "jlink"]
     usb, probe = devices
     assert usb["selectable"] is True
+    assert usb["name"] == "USB 71BD"
     assert usb["data_port"] == data.device
     assert usb["smp_port"] == smp.device
     assert probe["id"] == "jlink:29734569"
     assert probe["probe_serial"] == "29734569"
+
+
+def test_device_discovery_probes_known_data_before_smp(monkeypatch) -> None:
+    smp = _PortInfo("/dev/cu.usbmodem1101")
+    data = _PortInfo("/dev/cu.usbmodem1103")
+    attempts: list[str] = []
+    monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", data.device)
+    monkeypatch.setattr(gui_server, "_all_serial_port_infos", lambda: [smp, data])
+    monkeypatch.setattr(
+        gui_server, "_probe_serial_data_candidate",
+        lambda port: attempts.append(port) is None and port == data.device,
+    )
+
+    devices = gui_server._discover_devices(probe=True)
+
+    assert attempts == [data.device]
+    assert devices[0]["data_port"] == data.device
+    assert devices[0]["smp_port"] == smp.device
+
+
+def test_manual_usb_refresh_prefers_selected_data_over_first_interface(
+    monkeypatch,
+) -> None:
+    smp = _PortInfo("/dev/cu.usbmodem1101")
+    data = _PortInfo("/dev/cu.usbmodem1103")
+    identity = gui_server._usb_identity(data)
+    attempts: list[str] = []
+    diagnostics = Mock()
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT", "serial")
+    monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", data.device)
+    monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", smp.device)
+    monkeypatch.setattr(gui_server, "DIAGNOSTICS", diagnostics)
+    monkeypatch.setattr(gui_server, "_all_serial_port_infos", lambda: [smp, data])
+    monkeypatch.setattr(
+        gui_server, "_probe_serial_data_candidate",
+        lambda port: attempts.append(port) is None and port == data.device,
+    )
+    monkeypatch.setattr(gui_server, "SELECTED_DEVICE", {
+        "id": identity,
+        "kind": "usb",
+        "name": "USB 71BD",
+        "data_port": data.device,
+        "smp_port": smp.device,
+    })
+
+    gui_server._refresh_usb_transport()
+
+    assert attempts == [data.device]
+    assert gui_server.SERIAL_DATA_PORT == data.device
+    assert gui_server.SERIAL_SMP_PORT == smp.device
+    diagnostics.record.assert_called_once_with(
+        "info", "device.selection.validated",
+        "Selected USB DATA and SMP interfaces validated",
+        device_id=identity, device_name="USB 71BD",
+        data_port=data.device, smp_port=smp.device,
+        attempted_ports=[data.device],
+    )
+
+
+def test_manual_usb_refresh_rediscovers_data_after_reenumeration(monkeypatch) -> None:
+    smp = _PortInfo("/dev/cu.usbmodem2101")
+    data = _PortInfo("/dev/cu.usbmodem2103")
+    identity = gui_server._usb_identity(data)
+    attempts: list[str] = []
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT", "serial")
+    monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "/dev/cu.usbmodem1103")
+    monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "/dev/cu.usbmodem1101")
+    monkeypatch.setattr(gui_server, "DIAGNOSTICS", Mock())
+    monkeypatch.setattr(gui_server, "_all_serial_port_infos", lambda: [smp, data])
+    monkeypatch.setattr(
+        gui_server, "_probe_serial_data_candidate",
+        lambda port: attempts.append(port) is None and port == data.device,
+    )
+    monkeypatch.setattr(gui_server, "SELECTED_DEVICE", {
+        "id": identity,
+        "kind": "usb",
+        "name": "USB 71BD",
+        "data_port": "/dev/cu.usbmodem1103",
+        "smp_port": "/dev/cu.usbmodem1101",
+    })
+
+    gui_server._refresh_usb_transport()
+
+    assert attempts == [smp.device, data.device]
+    assert gui_server.SERIAL_DATA_PORT == data.device
+    assert gui_server.SERIAL_SMP_PORT == smp.device
+
+
+def test_source_usb_upgrade_pins_upload_to_selected_smp(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    image = tmp_path / "app.signed.bin"
+    image.write_bytes(b"signed")
+    smpmgr = tmp_path / "smpmgr"
+    smpmgr.write_text("tool", encoding="utf-8")
+    upload = tmp_path / "03-usb-upload.sh"
+    upload.write_text("script", encoding="utf-8")
+    reset = Mock(stdout="reset", stderr="")
+    upgraded = Mock(stdout="Upgrade complete.", stderr="")
+    monkeypatch.setattr(gui_server.runtime, "is_frozen", lambda: False)
+    monkeypatch.setattr(gui_server, "SMPMGR_EXE", smpmgr)
+    monkeypatch.setattr(gui_server, "V51_UPLOAD_SCRIPT", upload)
+    monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "/dev/cu.usbmodem1101")
+    monkeypatch.setattr(gui_server, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(gui_server, "DIAGNOSTICS", Mock())
+    ready = Mock()
+    monkeypatch.setattr(gui_server, "_wait_for_usb_transport_ready", ready)
+    monkeypatch.setattr(
+        gui_server.subprocess, "run", Mock(side_effect=[reset, upgraded]),
+    )
+
+    gui_server.SettingsController._upgrade_v51_firmware(image)
+
+    calls = gui_server.subprocess.run.call_args_list
+    assert calls[0].args[0] == [
+        str(smpmgr), "--port", "/dev/cu.usbmodem1101", "--timeout", "5",
+        "os", "reset",
+    ]
+    assert calls[1].args[0] == ["/bin/bash", str(upload), str(image)]
+    assert calls[1].kwargs["env"]["SENSUS_SMP_PORT"] == (
+        "/dev/cu.usbmodem1101"
+    )
+    ready.assert_called_once_with()
+
+
+def test_usb_upgrade_wait_retries_transient_reenumeration(monkeypatch) -> None:
+    refresh = Mock(side_effect=[RuntimeError("设备已断开"), None])
+    monkeypatch.setattr(gui_server, "_refresh_usb_transport", refresh)
+    sleep = Mock()
+    monkeypatch.setattr(gui_server.time, "sleep", sleep)
+
+    gui_server._wait_for_usb_transport_ready(timeout_s=1)
+
+    assert refresh.call_count == 2
+    sleep.assert_called_once_with(0.2)
+
+
+def test_usb_upgrade_wait_reports_last_transport_error(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gui_server, "_refresh_usb_transport",
+        Mock(side_effect=RuntimeError("DATA CDC 无响应")),
+    )
+    monotonic = iter((0.0, 1.0))
+    monkeypatch.setattr(gui_server.time, "monotonic", lambda: next(monotonic))
+
+    with pytest.raises(RuntimeError, match="应用 DATA CDC 未恢复.*无响应"):
+        gui_server._wait_for_usb_transport_ready(timeout_s=0.5)
+
+
+def test_usb_display_name_falls_back_to_short_data_port() -> None:
+    usb = _PortInfo("/dev/cu.usbmodem1103")
+    usb.serial_number = ""
+
+    assert gui_server._usb_display_name(usb, data_port=usb.device) == "USB 1103"
 
 
 def test_device_discovery_keeps_two_usb_boards_and_two_jlinks_separate(monkeypatch) -> None:

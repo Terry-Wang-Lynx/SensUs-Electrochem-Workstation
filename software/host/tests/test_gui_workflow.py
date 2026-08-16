@@ -17,12 +17,14 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 
+from pa_host.diagnostics import DiagnosticStore
 from pa_host.gui_server import (
     AppState,
     MeasurementController,
     PlateauController,
     RequestHandler,
     SettingsController,
+    _browse_workspace_directory,
     _escape_applescript,
     _notify_measurement_completion,
     _send_system_notification,
@@ -838,6 +840,9 @@ def test_runtime_configurable_custom_apply_uses_verified_prebuilt_without_build(
         assert saved["firmware_sha256"] == digest
         assert result["settings"]["potential_v"] == 0.1
         assert result["applied"] is True
+        assert result["firmware_source"] == "prebuilt"
+        assert result["firmware_sha256"] == digest
+        assert result["firmware_transport"] == "rtt"
 
 
 def test_corrupt_runtime_prebuilt_is_rejected_before_flash() -> None:
@@ -917,6 +922,8 @@ def test_custom_apply_uses_the_new_build_after_a_prebuilt_run() -> None:
         assert saved["firmware_source"] == "build"
         assert saved["firmware_sha256"] == "build-hash"
         assert result["applied"] is True
+        assert result["firmware_source"] == "build"
+        assert result["firmware_sha256"] == "build-hash"
 
 
 def test_failed_flash_revokes_the_previous_applied_state() -> None:
@@ -1900,8 +1907,168 @@ def test_workflow_write_probe_never_replaces_a_user_file() -> None:
         assert existing.read_text(encoding="utf-8") == "user data"
 
 
+def test_startup_without_saved_workspace_stays_blank_and_creates_nothing(
+    tmp_path: Path,
+) -> None:
+    workflow_path = tmp_path / "state" / "workflow.json"
+    history_path = tmp_path / "state" / "history.json"
+    with (
+        patch("pa_host.gui_server.WORKFLOW_PATH", workflow_path),
+        patch("pa_host.gui_server.HISTORY_PATH", history_path),
+    ):
+        app = AppState()
+
+    workflow = app.workflow_snapshot()
+    assert app.save_dir is None
+    assert app.workspace_root is None
+    assert workflow["save_dir"] == ""
+    assert workflow["workspace_root"] == ""
+    assert workflow["workspace_configured"] is False
+    assert workflow["workspace_available"] is False
+    assert not workflow_path.exists()
+    assert not history_path.exists()
+
+
+def test_every_measurement_entry_point_requires_a_workspace(tmp_path: Path) -> None:
+    with (
+        patch("pa_host.gui_server.WORKFLOW_PATH", tmp_path / "workflow.json"),
+        patch("pa_host.gui_server.HISTORY_PATH", tmp_path / "history.json"),
+    ):
+        app = AppState()
+
+    with pytest.raises(RuntimeError, match="请先选择工作区"):
+        app.start_measurement({"sample_name": "sample"})
+    with pytest.raises(RuntimeError, match="请先选择工作区"):
+        app.start_debug_run({"note": "debug"})
+    with pytest.raises(RuntimeError, match="请先选择工作区"):
+        app.start_schedule({"sample_role": "calibration"})
+    with pytest.raises(RuntimeError, match="请先选择工作区"):
+        app.reset_calibration({"batch_name": "blocked"})
+
+
+def test_measurement_payload_cannot_override_the_selected_workspace(
+    tmp_path: Path,
+) -> None:
+    app = AppState()
+    selected = tmp_path / "selected"
+    unselected = tmp_path / "unselected"
+    app.save_dir = selected
+    app._load_workspace()
+    with patch.object(
+        app.measurement, "start_verified", return_value={"state": "running"},
+    ) as start:
+        app.start_measurement({
+            "sample_name": "sample",
+            "sample_role": "calibration",
+            "known_concentration_um": 1,
+            "save_dir": str(unselected),
+        })
+
+    metadata = start.call_args.kwargs["metadata"]
+    assert metadata["save_dir"] == str(selected.resolve())
+    assert Path(metadata["live_raw_path"]).parent == selected.resolve()
+    assert not unselected.exists()
+
+
+def test_selected_workspace_persists_across_restart(tmp_path: Path) -> None:
+    root = tmp_path / "measurements"
+    root.mkdir()
+    workflow_path = tmp_path / "state" / "workflow.json"
+    history_path = tmp_path / "state" / "history.json"
+    with (
+        patch("pa_host.gui_server.WORKFLOW_PATH", workflow_path),
+        patch("pa_host.gui_server.HISTORY_PATH", history_path),
+    ):
+        first = AppState()
+        configured = first.configure_workflow({
+            "save_dir": str(root),
+            "batch_name": "first-batch",
+        })
+        batch_dir = Path(configured["save_dir"])
+        second = AppState()
+
+    assert batch_dir.parent == root.resolve()
+    assert second.save_dir == batch_dir
+    assert second.workspace_root == root.resolve()
+    assert second.workflow_snapshot()["workspace_available"] is True
+
+
+def test_missing_saved_workspace_is_not_recreated(tmp_path: Path) -> None:
+    root = tmp_path / "detached-drive"
+    batch = root / "saved-batch"
+    workflow_path = tmp_path / "workflow.json"
+    workflow_path.write_text(json.dumps({
+        "save_dir": str(batch),
+        "workspace_root": str(root),
+    }), encoding="utf-8")
+    with (
+        patch("pa_host.gui_server.WORKFLOW_PATH", workflow_path),
+        patch("pa_host.gui_server.HISTORY_PATH", tmp_path / "history.json"),
+    ):
+        app = AppState()
+
+    workflow = app.workflow_snapshot()
+    assert app.save_dir == batch.resolve()
+    assert workflow["workspace_configured"] is True
+    assert workflow["workspace_available"] is False
+    assert workflow["workspace_root"] == str(root.resolve())
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("platform, executable", [
+    ("darwin", "/usr/bin/osascript"),
+    ("win32", "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
+])
+def test_native_workspace_picker_passes_unicode_path_without_interpolation(
+    tmp_path: Path, platform: str, executable: str,
+) -> None:
+    initial = tmp_path / "个人数据"
+    initial.mkdir()
+    completed = subprocess.CompletedProcess(
+        [executable], 0, stdout=f"{initial}\n", stderr="",
+    )
+    with (
+        patch("pa_host.gui_server.sys.platform", platform),
+        patch("pa_host.gui_server.shutil.which", return_value=executable),
+        patch("pa_host.gui_server.subprocess.run", return_value=completed) as run,
+    ):
+        result = _browse_workspace_directory(str(initial))
+
+    assert result == {"selected": True, "path": str(initial.resolve())}
+    command = run.call_args.args[0]
+    if platform == "darwin":
+        assert command[-2:] == ["--", str(initial.resolve())]
+        assert "on run argv" in command[2]
+        assert "system attribute" not in command[2]
+        assert "set initialFolder to missing value" in command[2]
+        assert run.call_args.kwargs["env"] is None
+    else:
+        assert str(initial) not in command[-1]
+        assert run.call_args.kwargs["env"]["SENSUS_INITIAL_FOLDER"] == str(
+            initial.resolve()
+        )
+        assert "-STA" in command
+
+
+def test_native_workspace_picker_cancel_keeps_the_current_path(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.CompletedProcess(
+        ["/usr/bin/osascript"], 0, stdout="", stderr="",
+    )
+    with (
+        patch("pa_host.gui_server.sys.platform", "darwin"),
+        patch("pa_host.gui_server.shutil.which", return_value="/usr/bin/osascript"),
+        patch("pa_host.gui_server.subprocess.run", return_value=completed),
+    ):
+        result = _browse_workspace_directory(str(tmp_path))
+
+    assert result == {"selected": False, "path": ""}
+
+
 def test_openocd_flash_recovers_nvmc_disconnect_with_page_reconnects() -> None:
     with tempfile.TemporaryDirectory() as tmp:
+        diagnostics = DiagnosticStore(Path(tmp) / "logs")
         firmware = Path(tmp) / "firmware.hex"
         firmware.write_text(
             ":0100000000FF\n:0120000000DF\n:00000001FF\n",
@@ -1928,6 +2095,7 @@ def test_openocd_flash_recovers_nvmc_disconnect_with_page_reconnects() -> None:
         with (
             patch("pa_host.gui_server.JLINK_EXE", Path(tmp) / "missing"),
             patch("pa_host.gui_server.OPENOCD_EXE", Path("/usr/bin/true")),
+            patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
             patch("pa_host.gui_server.subprocess.run",
                   side_effect=[
                       failed, erased_with_disconnect, erased_with_disconnect,
@@ -1950,10 +2118,18 @@ def test_openocd_flash_recovers_nvmc_disconnect_with_page_reconnects() -> None:
         assert "flash erase_check 0" in erase_check
         assert any("flash write_image {" in item for item in write_and_verify)
         assert any("verify_image {" in item for item in write_and_verify)
+        events = [event["event"] for event in diagnostics.snapshot()["events"]]
+        assert events == [
+            "firmware.flash.started",
+            "firmware.flash.tool_failed",
+            "firmware.flash.reconnect_fallback",
+            "firmware.flash.completed",
+        ]
 
 
 def test_openocd_reconnect_flash_rejects_a_page_that_remains_dirty() -> None:
     with tempfile.TemporaryDirectory() as tmp:
+        diagnostics = DiagnosticStore(Path(tmp) / "logs")
         firmware = Path(tmp) / "firmware.hex"
         firmware.write_text(":0100000000FF\n:00000001FF\n", encoding="ascii")
         failed = subprocess.CalledProcessError(
@@ -1972,6 +2148,7 @@ def test_openocd_reconnect_flash_rejects_a_page_that_remains_dirty() -> None:
         with (
             patch("pa_host.gui_server.JLINK_EXE", Path(tmp) / "missing"),
             patch("pa_host.gui_server.OPENOCD_EXE", Path("/usr/bin/true")),
+            patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
             patch("pa_host.gui_server.subprocess.run",
                   side_effect=[failed, erase_attempt, still_dirty]) as run,
             pytest.raises(RuntimeError, match="未擦净页:0"),
@@ -1979,6 +2156,8 @@ def test_openocd_reconnect_flash_rejects_a_page_that_remains_dirty() -> None:
             SettingsController._flash_firmware(firmware)
 
         assert run.call_count == 3
+        events = [event["event"] for event in diagnostics.snapshot()["events"]]
+        assert events[-1] == "firmware.flash.reconnect_failed"
 
 
 def test_intel_hex_sector_parser_rejects_corrupt_checksum() -> None:
@@ -2304,13 +2483,43 @@ def test_wait_for_completion_joins_watcher_without_a_deadline() -> None:
     watcher.join.assert_called_once_with()
 
 
+def test_watcher_start_failure_reclaims_collector_and_gets_diagnostic_id(
+    tmp_path: Path,
+) -> None:
+    ctrl = MeasurementController()
+    diagnostics = DiagnosticStore(tmp_path / "logs")
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    watcher = Mock()
+    watcher.start.side_effect = RuntimeError("thread unavailable")
+
+    with (
+        patch("pa_host.gui_server.RUNS_DIR", tmp_path / "runs"),
+        patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT_REQUESTED", "rtt"),
+        patch("pa_host.gui_server.subprocess.Popen", return_value=process),
+        patch("pa_host.gui_server.threading.Thread", return_value=watcher),
+        patch.object(MeasurementController, "_terminate_tree") as terminate,
+        pytest.raises(RuntimeError, match="thread unavailable") as exc_info,
+    ):
+        ctrl.start()
+
+    terminate.assert_called_once_with(process)
+    assert ctrl.state == "error"
+    assert ctrl.error == "无法启动采集收尾线程"
+    event = diagnostics.snapshot()["events"][-1]
+    assert event["event"] == "measurement.watcher_start_failed"
+    assert exc_info.value.diagnostic_id == event["event_id"]
+
+
 def test_server_shutdown_waits_for_measurement_finalization() -> None:
     server = Mock(server_port=8769)
     app = Mock()
     app.measurement.process = None
 
     with (
-        patch("pa_host.gui_server.ThreadingHTTPServer", return_value=server),
+        patch("pa_host.gui_server.DiagnosticHTTPServer", return_value=server),
         patch("pa_host.gui_server.APP", app),
         patch("pa_host.gui_server.signal.signal"),
     ):
@@ -2322,8 +2531,12 @@ def test_server_shutdown_waits_for_measurement_finalization() -> None:
     server.server_close.assert_called_once_with()
 
 
-def test_debug_probe_arms_rtt_without_starting_and_begin_queues_set_first() -> None:
+def test_debug_probe_arms_rtt_without_starting_and_begin_queues_set_first(
+    tmp_path: Path,
+) -> None:
     app = AppState()
+    app.save_dir = tmp_path / "workspace"
+    app._load_workspace()
     line = "SET fsr=2 off=4 conv=auto period=4 e=200 vwe=1200 idle=2 sysper=2 cellv=1 ioc=0"
     with patch.object(app.schedule, "snapshot", return_value={"active": False}), \
             patch.object(app.measurement, "snapshot", return_value={"state": "idle"}), \
@@ -3130,6 +3343,7 @@ def test_initial_gate_get_write_failure_still_starts_cleanup_watcher(
     tmp_path: Path,
 ) -> None:
     ctrl = MeasurementController()
+    diagnostics = DiagnosticStore(tmp_path / "logs")
     process = Mock()
     process.poll.return_value = None
     terminator = Mock()
@@ -3143,17 +3357,23 @@ def test_initial_gate_get_write_failure_still_starts_cleanup_watcher(
 
     with (
         patch("pa_host.gui_server.RUNS_DIR", tmp_path),
+        patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
         patch("pa_host.gui_server.subprocess.Popen", return_value=process) as popen,
         patch("pa_host.gui_server.Path.open", autospec=True,
               side_effect=fail_command_append),
         patch("pa_host.gui_server.threading.Thread",
               side_effect=[terminator, watcher]) as thread_cls,
-        pytest.raises(RuntimeError, match="无法下发 AFE 配置"),
+        pytest.raises(RuntimeError, match="无法下发 AFE 配置") as exc_info,
     ):
         ctrl.start_verified()
 
     assert ctrl._config_gate_event.wait(0)
     assert ctrl._config_gate["state"] == "io_error"
+    assert exc_info.value.diagnostic_id == ctrl._config_gate["diagnostic_id"]
+    event = diagnostics.snapshot()["events"][-1]
+    assert event["event"] == "measurement.config_gate_failed"
+    assert event["event_id"] == exc_info.value.diagnostic_id
+    assert event["context"]["gate_state"] == "io_error"
     assert thread_cls.call_args_list[0].kwargs == {
         "target": ctrl._terminate_if_running,
         "args": (process, 0.0),
@@ -3590,8 +3810,12 @@ def test_plateau_apply_rejects_active_schedule_before_persisting() -> None:
         assert status == 409
 
 
-def test_debug_run_forces_it_settings_when_formal_method_is_cv() -> None:
+def test_debug_run_forces_it_settings_when_formal_method_is_cv(
+    tmp_path: Path,
+) -> None:
     app = AppState()
+    app.save_dir = tmp_path / "workspace"
+    app._load_workspace()
     app.settings.settings = SettingsController.validate({"method": "cv"})
     with patch.object(app.schedule, "snapshot", return_value={"active": False}), \
             patch.object(app.measurement, "start", return_value={"state": "running"}) as start:
@@ -3608,3 +3832,33 @@ def test_settings_and_schedule_reject_non_finite_values() -> None:
         app.schedule.start({"interval_minutes": float("nan")})
     with pytest.raises(ValueError, match="整数"):
         SettingsController.validate({"cv_cycles": 1.5})
+
+
+def test_history_curve_select_all_keeps_total_point_budget_bounded(tmp_path: Path) -> None:
+    app = AppState()
+    app.save_dir = tmp_path / "history-curves"
+    app._load_workspace()
+    app.records = [
+        {
+            "run_id": f"run-{index}",
+            "state": "completed",
+            "data_path": f"curve-{index}.csv",
+        }
+        for index in range(20)
+    ]
+    def curve(record: dict[str, object], *, maximum_points: int = 3000):
+        del record
+        maximum_points_seen.append(maximum_points)
+        return {"method": "it", "time_s": [0], "current_nA": [0], "valid": [True]}
+
+    maximum_points_seen: list[int] = []
+    with patch.object(app, "_curve_from_record", side_effect=curve):
+        result = app.load_history_curves({
+            "run_ids": [f"run-{index}" for index in range(20)],
+        })
+
+    assert len(result["curves"]) == 20
+    assert maximum_points_seen == [1800] * 20
+    assert sum(maximum_points_seen) == 36_000
+    with pytest.raises(ValueError, match="最多叠加 80 条"):
+        app.load_history_curves({"run_ids": [f"run-{index}" for index in range(81)]})

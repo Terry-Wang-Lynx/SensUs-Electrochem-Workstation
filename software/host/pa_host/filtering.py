@@ -17,11 +17,11 @@ import numpy as np
 
 
 FILTER_DEFAULTS: dict[str, Any] = {
-    "mode": "display",  # off, display, analysis
-    "lowpass_enabled": False,
-    "lowpass_cutoff_hz": 1.0,
-    "lowpass_auto": True,
-    "lowpass_order": 2,
+    "mode": "analysis",  # off, display, analysis
+    "lowpass_enabled": True,
+    "lowpass_cutoff_hz": 0.3,
+    "lowpass_auto": False,
+    "lowpass_order": 4,
 }
 
 
@@ -34,7 +34,7 @@ def validate_filter_config(payload: dict[str, Any] | None = None) -> dict[str, A
     """
 
     raw = {**FILTER_DEFAULTS, **(payload or {})}
-    mode = str(raw.get("mode", "display")).lower()
+    mode = str(raw.get("mode", FILTER_DEFAULTS["mode"])).lower()
     if mode not in {"off", "display", "analysis"}:
         raise ValueError("滤波模式必须是 off、display 或 analysis")
 
@@ -71,8 +71,8 @@ def validate_filter_config(payload: dict[str, Any] | None = None) -> dict[str, A
                 raise ValueError(f"滤波参数 {name} 必须在 {lo:g} 至 {hi:g} 之间")
         return int(round(value)) if integer else round(value, 6)
 
-    lowpass_enabled = boolean("lowpass_enabled", False)
-    lowpass_auto = boolean("lowpass_auto", True)
+    lowpass_enabled = boolean("lowpass_enabled", FILTER_DEFAULTS["lowpass_enabled"])
+    lowpass_auto = boolean("lowpass_auto", FILTER_DEFAULTS["lowpass_auto"])
     return {
         "mode": mode,
         "lowpass_enabled": lowpass_enabled,

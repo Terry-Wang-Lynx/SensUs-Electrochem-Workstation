@@ -78,6 +78,7 @@ from .live_metrics import (
 from .stability_eta import StabilityEtaEstimator
 from .workspace_history import BATCH_KIND, WORKSPACE_KIND, WorkspaceHistory
 from .frontend_update import FrontendUpdater
+from .diagnostics import DiagnosticStore
 from . import runtime
 
 _IS_WIN = sys.platform == "win32"
@@ -86,6 +87,7 @@ _IS_WIN = sys.platform == "win32"
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = runtime.project_dir()
 STATE_DIR = runtime.state_dir()
+DIAGNOSTICS = DiagnosticStore(runtime.logs_dir())
 FRONTEND_UPDATER = FrontendUpdater(
     PACKAGE_DIR / "gui", STATE_DIR, PROJECT_DIR
 )
@@ -98,6 +100,7 @@ TARGET_RATE_HZ = 10.0
 FIT_WINDOW_S = 20.0
 MAX_PLATEAU_BACKFILL_WINDOWS = 32
 LIVE_ANALYSIS_REFRESH_S = 0.9
+CLIENT_DIAGNOSTIC_MAX_LENGTH = 8_000
 CONFIG_GATE_GET_RETRY_S = 0.75
 CONFIG_GATE_LEGACY_PROBE_DELAY_S = 6.0
 FIRMWARE_BUILD_DIR = PROJECT_DIR / "software" / "firmware" / "build" / "firmware" / "zephyr"
@@ -108,7 +111,6 @@ FILTER_SETTINGS_PATH = STATE_DIR / "filter_settings.json"
 PLATEAU_SETTINGS_PATH = STATE_DIR / "plateau_settings.json"
 WORKFLOW_PATH = STATE_DIR / "gui_workflow.json"
 HISTORY_PATH = STATE_DIR / "workspace_history.json"
-DEFAULT_SAVE_DIR = runtime.default_measurements_dir()
 JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "").strip()
 CONFIGURED_JLINK_SERIAL = JLINK_SERIAL
 SERIAL_DATA_PORT = os.environ.get("SENSUS_SERIAL_PORT", "").strip()
@@ -128,6 +130,8 @@ DEVICE_DISCOVERY_CACHE: list[dict[str, Any]] = []
 DEVICE_DISCOVERY_AT = 0.0
 DEVICE_DISCOVERY_THREAD: threading.Thread | None = None
 DEVICE_DISCOVERY_ERROR = ""
+DEVICE_DISCOVERY_LOG_SIGNATURE: tuple[Any, ...] | None = None
+DEVICE_DISCOVERY_LOG_ERROR = ""
 DEVICE_DISCOVERY_TTL_S = 1.0
 DEVICE_PROBE_LOCK = threading.Lock()
 SMPMGR_EXE = Path(
@@ -177,6 +181,92 @@ def _escape_applescript(value: object) -> str:
             .replace('"', '\\"')
             .replace("\r", " ")
             .replace("\n", " "))
+
+
+def _browse_workspace_directory(initial_path: str = "") -> dict[str, Any]:
+    """Open the platform folder picker without interpolating user input."""
+    initial = Path(os.path.expandvars(os.path.expanduser(initial_path.strip())))
+    if not initial_path.strip() or not initial.is_dir():
+        initial_value = ""
+    else:
+        initial_value = str(initial.resolve())
+    environment: dict[str, str] | None = None
+
+    if sys.platform == "darwin":
+        executable = shutil.which("osascript") or "/usr/bin/osascript"
+        script = """
+use scripting additions
+
+on run argv
+set initialPath to ""
+if (count of argv) > 0 then set initialPath to item 1 of argv
+set initialFolder to missing value
+if initialPath is not "" then
+    try
+        set initialFolder to POSIX file initialPath as alias
+    end try
+end if
+try
+    if initialFolder is missing value then
+        set chosenFolder to choose folder with prompt "选择 SensUs 数据工作区"
+    else
+        set chosenFolder to choose folder with prompt "选择 SensUs 数据工作区" default location initialFolder
+    end if
+    return POSIX path of chosenFolder
+on error number -128
+    return ""
+end try
+end run
+"""
+        command = [executable, "-e", script, "--", initial_value]
+    elif sys.platform == "win32":
+        executable = shutil.which("powershell.exe") or "powershell.exe"
+        environment = {**os.environ, "SENSUS_INITIAL_FOLDER": initial_value}
+        script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '选择 SensUs 数据工作区'
+$dialog.ShowNewFolderButton = $true
+if ($env:SENSUS_INITIAL_FOLDER -and [IO.Directory]::Exists($env:SENSUS_INITIAL_FOLDER)) {
+    $dialog.SelectedPath = $env:SENSUS_INITIAL_FOLDER
+}
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::Write($dialog.SelectedPath)
+}
+"""
+        command = [
+            executable, "-NoProfile", "-STA", "-NonInteractive",
+            "-Command", script,
+        ]
+    else:
+        raise RuntimeError("当前系统暂不支持原生目录浏览，请直接填写绝对路径")
+
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("目录选择窗口等待超时，请重试") from exc
+    except OSError as exc:
+        raise RuntimeError(f"无法打开目录选择窗口：{exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(f"目录选择失败：{detail or '系统选择器返回错误'}")
+    selected = completed.stdout.strip()
+    if not selected:
+        return {"selected": False, "path": ""}
+    selected_path = Path(selected).expanduser().resolve()
+    if not selected_path.is_dir():
+        raise RuntimeError("所选工作区目录不存在")
+    return {"selected": True, "path": str(selected_path)}
 
 
 def _send_system_notification(title: str, body: str) -> None:
@@ -628,13 +718,13 @@ def _usb_identity(info: Any) -> str:
 
 def _usb_display_name(info: Any, *, data_port: str = "") -> str:
     serial = str(getattr(info, "serial_number", "") or "").strip()
-    product = str(getattr(info, "product", "") or "").strip()
-    label = product or "V5.1 USB"
-    if serial:
-        label += f" · SN {serial}"
-    elif data_port:
-        label += f" · {data_port}"
-    return label
+    identifier = re.sub(r"[^0-9a-z]", "", serial, flags=re.IGNORECASE)[-4:]
+    if not identifier and data_port:
+        port_name = re.split(r"[/\\\\]", data_port)[-1]
+        identifier = re.sub(
+            r"[^0-9a-z]", "", port_name, flags=re.IGNORECASE
+        )[-4:]
+    return f"USB {identifier.upper()}" if identifier else "USB"
 
 
 def _jlink_device_id(info: Any) -> str:
@@ -685,7 +775,18 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
     for group in groups:
         data_info: Any | None = None
         if probe:
-            for info in group:
+            # Once a DATA interface has been verified, probe it first. macOS
+            # currently enumerates the sibling SMP interface before DATA; trying
+            # SMP first adds a three-second timeout to every device refresh.
+            ordered_group = sorted(
+                group,
+                key=lambda info: (
+                    str(getattr(info, "device", "") or "")
+                    != SERIAL_DATA_PORT,
+                    str(getattr(info, "device", "") or ""),
+                ),
+            )
+            for info in ordered_group:
                 if _probe_serial_data_candidate(str(getattr(info, "device", "") or "")):
                     data_info = info
                     break
@@ -736,10 +837,24 @@ def _selected_device_copy() -> dict[str, Any] | None:
         return copy.deepcopy(SELECTED_DEVICE) if SELECTED_DEVICE else None
 
 
-def _find_port_for_identity(identity: str) -> Any | None:
-    return next(
-        (info for info in _serial_port_infos() if _usb_identity(info) == identity),
-        None,
+def _ports_for_identity(identity: str) -> list[Any]:
+    """Return every CDC interface belonging to one physical USB board."""
+    return [
+        info for info in _serial_port_infos()
+        if _usb_identity(info) == identity
+    ]
+
+
+def _ordered_usb_interfaces(
+    infos: list[Any], preferred_data_port: str,
+) -> list[Any]:
+    """Try the previously verified DATA interface before sibling CDC ports."""
+    return sorted(
+        infos,
+        key=lambda info: (
+            str(getattr(info, "device", "") or "") != preferred_data_port,
+            str(getattr(info, "device", "") or ""),
+        ),
     )
 
 
@@ -763,16 +878,30 @@ def _set_device_selection(device: dict[str, Any] | None) -> None:
             HARDWARE_TRANSPORT = "rtt"
         else:
             _refresh_usb_transport()
+        DIAGNOSTICS.record(
+            "info", "device.selection.auto", "Device selection returned to auto",
+            transport=HARDWARE_TRANSPORT,
+        )
         return
     if device.get("kind") == "usb":
         SERIAL_DATA_PORT = str(device.get("data_port") or "")
         SERIAL_SMP_PORT = str(device.get("smp_port") or "")
         HARDWARE_TRANSPORT = "serial"
+        DIAGNOSTICS.record(
+            "info", "device.selection.changed", "USB device selected",
+            device_id=device.get("id"), device_name=device.get("name"),
+            transport=HARDWARE_TRANSPORT,
+        )
         return
     JLINK_SERIAL = str(device.get("probe_serial") or "")
     SERIAL_DATA_PORT = ""
     SERIAL_SMP_PORT = ""
     HARDWARE_TRANSPORT = "rtt"
+    DIAGNOSTICS.record(
+        "info", "device.selection.changed", "J-Link device selected",
+        device_id=device.get("id"), device_name=device.get("name"),
+        transport=HARDWARE_TRANSPORT,
+    )
 
 
 def _devices_payload_from_devices(
@@ -789,7 +918,7 @@ def _devices_payload_from_devices(
             (device for device in devices if device.get("id") == selected_id),
             selected,
         )
-    return {
+    payload = {
         "devices": devices,
         "selected_device_id": selected_id,
         "selected_device": selected,
@@ -815,6 +944,7 @@ def _remember_device_discovery(
 
 def _run_device_discovery() -> None:
     global DEVICE_DISCOVERY_THREAD
+    global DEVICE_DISCOVERY_LOG_SIGNATURE, DEVICE_DISCOVERY_LOG_ERROR
     error = ""
     devices: list[dict[str, Any]] = []
     try:
@@ -827,6 +957,32 @@ def _run_device_discovery() -> None:
             devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
     finally:
         _remember_device_discovery(devices, error)
+        signature = tuple(sorted(
+            (
+                str(device.get("id") or ""),
+                bool(device.get("selectable")),
+                str(device.get("data_port") or ""),
+                str(device.get("probe_serial") or ""),
+            )
+            for device in devices
+        ))
+        if error and error != DEVICE_DISCOVERY_LOG_ERROR:
+            DIAGNOSTICS.record(
+                "warning", "device.discovery.failed", "Device discovery failed",
+                error=error, cached_device_count=len(devices),
+            )
+        if not error and signature != DEVICE_DISCOVERY_LOG_SIGNATURE:
+            DIAGNOSTICS.record(
+                "info", "device.discovery.changed", "Detected hardware changed",
+                devices=[{
+                    "id": device.get("id"),
+                    "name": device.get("name"),
+                    "kind": device.get("kind"),
+                    "selectable": device.get("selectable"),
+                } for device in devices],
+            )
+        DEVICE_DISCOVERY_LOG_SIGNATURE = signature
+        DEVICE_DISCOVERY_LOG_ERROR = error
         with DEVICE_DISCOVERY_LOCK:
             DEVICE_DISCOVERY_THREAD = None
 
@@ -900,18 +1056,53 @@ def _refresh_usb_transport() -> None:
                 raise RuntimeError("手动选择的 J-Link 没有可用序列号")
             HARDWARE_TRANSPORT = "rtt"
             return
-        info = _find_port_for_identity(str(selected.get("id") or ""))
-        if info is None:
-            raise RuntimeError(f"手动选择的 {selected.get('name', 'USB 设备')} 已断开")
-        data_port = str(getattr(info, "device", "") or "")
-        if not _probe_serial_data_candidate(data_port):
-            raise RuntimeError(f"手动选择的 {selected.get('name', 'USB 设备')} 未响应 DATA CDC")
-        smp_port = _discover_serial_smp_port(data_port, force=True) or ""
+        identity = str(selected.get("id") or "")
+        preferred_data_port = str(selected.get("data_port") or "")
+        attempted_ports: list[str] = []
+        data_port = ""
+        smp_port = ""
+        # Device discovery also opens CDC ports. Serialize the final validation
+        # so a background refresh cannot make a healthy selected board appear
+        # unresponsive immediately before flashing or measurement.
+        with DEVICE_PROBE_LOCK:
+            infos = _ports_for_identity(identity)
+            if not infos:
+                raise RuntimeError(
+                    f"手动选择的 {selected.get('name', 'USB 设备')} 已断开"
+                )
+            for info in _ordered_usb_interfaces(infos, preferred_data_port):
+                candidate = str(getattr(info, "device", "") or "")
+                if not candidate:
+                    continue
+                attempted_ports.append(candidate)
+                if _probe_serial_data_candidate(candidate):
+                    data_port = candidate
+                    break
+            if data_port:
+                smp_port = _discover_serial_smp_port(data_port, force=True) or ""
+        if not data_port:
+            DIAGNOSTICS.record(
+                "warning", "device.selection.validation_failed",
+                "Selected USB device did not expose a responsive DATA interface",
+                device_id=identity, device_name=selected.get("name"),
+                preferred_data_port=preferred_data_port,
+                attempted_ports=attempted_ports,
+            )
+            raise RuntimeError(
+                f"手动选择的 {selected.get('name', 'USB 设备')} 未响应 DATA CDC"
+            )
         if not smp_port:
             raise RuntimeError("手动选择的 USB 设备缺少同一设备的 SMP CDC")
         SERIAL_DATA_PORT = data_port
         SERIAL_SMP_PORT = smp_port
         HARDWARE_TRANSPORT = "serial"
+        DIAGNOSTICS.record(
+            "info", "device.selection.validated",
+            "Selected USB DATA and SMP interfaces validated",
+            device_id=identity, device_name=selected.get("name"),
+            data_port=data_port, smp_port=smp_port,
+            attempted_ports=attempted_ports,
+        )
         return
     if HARDWARE_TRANSPORT_REQUESTED == "auto":
         candidates = [
@@ -950,6 +1141,24 @@ def _refresh_usb_transport() -> None:
     SERIAL_DATA_PORT = ""
     SERIAL_SMP_PORT = ""
     HARDWARE_TRANSPORT = "rtt"
+
+
+def _wait_for_usb_transport_ready(timeout_s: float = 12.0) -> None:
+    """Wait for the application CDC interfaces after an MCUboot update."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    last_error: RuntimeError | None = None
+    while True:
+        try:
+            _refresh_usb_transport()
+            return
+        except RuntimeError as exc:
+            last_error = exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.2, remaining))
+    detail = str(last_error or "DATA CDC 未出现")
+    raise RuntimeError(f"USB 固件已上传，但应用 DATA CDC 未恢复：{detail}")
 
 
 def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
@@ -1047,8 +1256,12 @@ class FilterController:
                 self.settings = validate_filter_config(
                     loaded.get("settings", loaded) if isinstance(loaded, dict) else {}
                 )
-            except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                pass
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                DIAGNOSTICS.record(
+                    "warning", "settings.filter.restore_failed",
+                    "Saved filter settings could not be restored",
+                    path=FILTER_SETTINGS_PATH, error=str(exc),
+                )
 
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         settings = validate_filter_config(payload)
@@ -1084,8 +1297,12 @@ class PlateauController:
                 loaded = json.loads(PLATEAU_SETTINGS_PATH.read_text(encoding="utf-8"))
                 raw = loaded.get("settings", loaded) if isinstance(loaded, dict) else {}
                 self.settings = PlateauConfig.validate(raw)
-            except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                pass
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                DIAGNOSTICS.record(
+                    "warning", "settings.plateau.restore_failed",
+                    "Saved plateau settings could not be restored",
+                    path=PLATEAU_SETTINGS_PATH, error=str(exc),
+                )
 
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         settings = PlateauConfig.validate(payload)
@@ -1167,8 +1384,12 @@ class SettingsController:
                 self._saved_firmware_hash = str(saved.get("firmware_sha256") or "")
                 self._saved_transport = str(saved.get("transport") or "rtt")
                 self._saved_firmware_source = str(saved.get("firmware_source") or "build")
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                pass
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                DIAGNOSTICS.record(
+                    "warning", "settings.hardware.restore_failed",
+                    "Saved hardware settings could not be restored",
+                    path=SETTINGS_PATH, error=str(exc),
+                )
         self.applied = False
         self.state = "not_applied"
         if loaded_saved:
@@ -1250,6 +1471,11 @@ class SettingsController:
     @staticmethod
     def _run_build(command: list[str], timeout_s: float = 600) -> None:
         """Run a build in its own process group and reclaim every descendant."""
+        started_at = time.monotonic()
+        DIAGNOSTICS.record(
+            "info", "firmware.build.started", "Firmware build command started",
+            command=command, timeout_s=timeout_s,
+        )
         process = subprocess.Popen(
             command, cwd=PROJECT_DIR, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
@@ -1348,13 +1574,34 @@ class SettingsController:
                 except subprocess.TimeoutExpired as forced_timeout:
                     remember_timeout(forced_timeout)
                     close_pipes_and_reap()
+            DIAGNOSTICS.record(
+                "error", "firmware.build.timeout", "Firmware build timed out",
+                command=command,
+                timeout_s=timeout_s,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+            )
             raise subprocess.TimeoutExpired(
                 command, timeout_s, output=stdout, stderr=stderr,
             ) from exc
         if process.returncode:
+            DIAGNOSTICS.record(
+                "error", "firmware.build.failed", "Firmware build command failed",
+                command=command,
+                return_code=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+            )
             raise subprocess.CalledProcessError(
                 process.returncode, command, output=stdout, stderr=stderr,
             )
+        DIAGNOSTICS.record(
+            "info", "firmware.build.completed", "Firmware build completed",
+            command=command,
+            duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+        )
 
     @staticmethod
     def _intel_hex_flash_sectors(
@@ -1498,6 +1745,11 @@ class SettingsController:
         firmware_hex = firmware_hex or _firmware_artifact("zephyr.hex")
         if not firmware_hex.exists():
             raise RuntimeError(f"找不到固件: {firmware_hex}")
+        backend = "jlink" if JLINK_EXE.exists() else "openocd"
+        DIAGNOSTICS.record(
+            "info", "firmware.flash.started", "Firmware flashing started",
+            backend=backend, firmware=firmware_hex, probe_serial=JLINK_SERIAL,
+        )
         if not JLINK_EXE.exists():
             if not OPENOCD_EXE.exists():
                 raise RuntimeError(
@@ -1517,22 +1769,71 @@ class SettingsController:
                 blob = f"{done.stdout}\n{done.stderr}"
             except subprocess.CalledProcessError as exc:
                 blob = f"{exc.stdout or ''}\n{exc.stderr or ''}"
+                DIAGNOSTICS.record(
+                    "error", "firmware.flash.tool_failed",
+                    "OpenOCD flash command failed",
+                    backend="openocd", firmware=firmware_hex,
+                    return_code=exc.returncode, output=blob,
+                )
                 transient = any(marker in blob.lower() for marker in (
                     "parity mismatch", "failed to read memory",
                     "error waiting nvmc_ready", "examination failed",
                     "failed erasing sectors", "failed to erase reg",
                 ))
                 if transient:
-                    cls._flash_openocd_reconnecting(firmware_hex)
+                    DIAGNOSTICS.record(
+                        "warning", "firmware.flash.reconnect_fallback",
+                        "OpenOCD failed transiently; reconnect fallback started",
+                        backend="openocd", firmware=firmware_hex, output=blob,
+                    )
+                    try:
+                        cls._flash_openocd_reconnecting(firmware_hex)
+                    except Exception as reconnect_exc:
+                        DIAGNOSTICS.exception(
+                            "firmware.flash.reconnect_failed",
+                            "OpenOCD reconnect flash failed",
+                            reconnect_exc,
+                            backend="openocd-reconnect", firmware=firmware_hex,
+                        )
+                        raise
+                    DIAGNOSTICS.record(
+                        "info", "firmware.flash.completed",
+                        "OpenOCD reconnect flash and verification completed",
+                        backend="openocd-reconnect", firmware=firmware_hex,
+                    )
                     return
                 tail = [line for line in blob.strip().splitlines()
                         if line.strip()][-5:]
                 raise RuntimeError(
                     "OpenOCD 烧录失败:" + " | ".join(tail)
                 ) from exc
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                DIAGNOSTICS.exception(
+                    "firmware.flash.tool_failed", "OpenOCD flash command failed",
+                    exc,
+                    backend="openocd", firmware=firmware_hex,
+                    stdout=getattr(exc, "stdout", ""),
+                    stderr=getattr(exc, "stderr", ""),
+                )
+                raise
             if "Programming Finished" in blob and "Verified OK" in blob:
+                DIAGNOSTICS.record(
+                    "info", "firmware.flash.completed",
+                    "OpenOCD flash and verification completed",
+                    backend="openocd", firmware=firmware_hex,
+                )
                 return
+            DIAGNOSTICS.record(
+                "warning", "firmware.flash.reconnect_fallback",
+                "OpenOCD direct verification was incomplete; reconnect fallback started",
+                backend="openocd", firmware=firmware_hex, output=blob,
+            )
             cls._flash_openocd_reconnecting(firmware_hex)
+            DIAGNOSTICS.record(
+                "info", "firmware.flash.completed",
+                "OpenOCD reconnect flash and verification completed",
+                backend="openocd-reconnect", firmware=firmware_hex,
+            )
             return
 
         jlink_path = str(firmware_hex.resolve()).replace("\\", "\\\\").replace('"', '\\"')
@@ -1553,17 +1854,38 @@ class SettingsController:
             if JLINK_SERIAL:
                 command += ["-SelectEmuBySN", JLINK_SERIAL]
             command += ["-CommanderScript", str(script_path)]
-            done = subprocess.run(
-                command,
-                cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=120,
-            )
+            try:
+                done = subprocess.run(
+                    command,
+                    cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    OSError) as exc:
+                DIAGNOSTICS.exception(
+                    "firmware.flash.tool_failed", "JLinkExe flash command failed",
+                    exc,
+                    backend="jlink", firmware=firmware_hex,
+                    stdout=getattr(exc, "stdout", ""),
+                    stderr=getattr(exc, "stderr", ""),
+                )
+                raise
         finally:
             script_path.unlink(missing_ok=True)
         blob = f"{done.stdout}\n{done.stderr}"
         if "O.K." not in blob or "Script processing completed." not in blob:
+            DIAGNOSTICS.record(
+                "error", "firmware.flash.verification_missing",
+                "JLinkExe did not confirm programming and verification",
+                backend="jlink", firmware=firmware_hex, output=blob,
+            )
             tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
             raise RuntimeError("JLinkExe 烧录未确认成功:" + " | ".join(tail))
+        DIAGNOSTICS.record(
+            "info", "firmware.flash.completed",
+            "JLinkExe flash and verification completed",
+            backend="jlink", firmware=firmware_hex,
+        )
 
     @staticmethod
     def _upgrade_v51_firmware(image: Path | None = None) -> None:
@@ -1587,29 +1909,65 @@ class SettingsController:
             runtime.module_command("smpmgr")
             if runtime.is_frozen() else [str(SMPMGR_EXE)]
         )
-        subprocess.run(
-            [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "5", "os", "reset"],
-            check=True, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=15,
+        DIAGNOSTICS.record(
+            "info", "firmware.usb_upgrade.started", "USB firmware upgrade started",
+            image=image, smp_port=SERIAL_SMP_PORT,
         )
-        if runtime.is_frozen() or _IS_WIN:
-            done = subprocess.run(
-                [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "10", "upgrade",
-                 str(image)],
+        reset_output = ""
+        try:
+            reset = subprocess.run(
+                [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "5", "os", "reset"],
                 check=True, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=150,
+                encoding="utf-8", errors="replace", timeout=15,
             )
-        else:
-            done = subprocess.run(
-                ["/bin/bash", str(V51_UPLOAD_SCRIPT), str(image)],
-                cwd=PROJECT_DIR,
-                check=True, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=150,
+            reset_output = f"{reset.stdout}\n{reset.stderr}"
+            if runtime.is_frozen() or _IS_WIN:
+                done = subprocess.run(
+                    [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "10", "upgrade",
+                     str(image)],
+                    check=True, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=150,
+                )
+            else:
+                upload_environment = {
+                    **os.environ,
+                    "SENSUS_SMP_PORT": SERIAL_SMP_PORT,
+                }
+                done = subprocess.run(
+                    ["/bin/bash", str(V51_UPLOAD_SCRIPT), str(image)],
+                    cwd=PROJECT_DIR,
+                    check=True, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=150,
+                    env=upload_environment,
+                )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                OSError) as exc:
+            DIAGNOSTICS.exception(
+                "firmware.usb_upgrade.failed", "USB firmware upgrade tool failed",
+                exc,
+                image=image, smp_port=SERIAL_SMP_PORT,
+                reset_output=reset_output,
+                stdout=getattr(exc, "stdout", ""),
+                stderr=getattr(exc, "stderr", ""),
             )
+            raise
         blob = f"{done.stdout}\n{done.stderr}"
         if "Upgrade complete." not in blob:
+            DIAGNOSTICS.record(
+                "error", "firmware.usb_upgrade.verification_missing",
+                "USB firmware tool did not confirm completion",
+                image=image, smp_port=SERIAL_SMP_PORT,
+                reset_output=reset_output, output=blob,
+            )
             tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
             raise RuntimeError("V5.1 USB 更新未确认成功:" + " | ".join(tail))
+        _wait_for_usb_transport_ready()
+        DIAGNOSTICS.record(
+            "info", "firmware.usb_upgrade.completed",
+            "USB firmware upgrade completed and application CDC recovered",
+            image=image, data_port=SERIAL_DATA_PORT,
+            smp_port=SERIAL_SMP_PORT,
+        )
 
     @classmethod
     def same_analysis_protocol(
@@ -1877,8 +2235,38 @@ class SettingsController:
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.apply_lock.acquire(blocking=False):
             raise RuntimeError("已有另一项参数应用正在进行，请等待完成")
+        started_at = time.monotonic()
+        DIAGNOSTICS.record(
+            "info", "settings.apply.started", "Hardware settings apply started",
+            transport=HARDWARE_TRANSPORT,
+            device=_selected_device_copy(),
+            settings=payload,
+        )
         try:
-            return self._apply_locked(payload)
+            result = self._apply_locked(payload)
+            DIAGNOSTICS.record(
+                "info", "settings.apply.completed",
+                "Hardware settings apply completed",
+                transport=HARDWARE_TRANSPORT,
+                firmware_source=self._saved_firmware_source,
+                firmware_sha256=self._saved_firmware_hash,
+                duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+                settings=result.get("settings"),
+            )
+            return result
+        except Exception as exc:
+            diagnostic_id = DIAGNOSTICS.exception(
+                "settings.apply.failed", "Hardware settings apply failed", exc,
+                transport=HARDWARE_TRANSPORT,
+                device=_selected_device_copy(),
+                duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+                settings=payload,
+            )
+            try:
+                setattr(exc, "diagnostic_id", diagnostic_id)
+            except (AttributeError, TypeError):
+                pass
+            raise
         finally:
             self.apply_lock.release()
 
@@ -1993,6 +2381,9 @@ class SettingsController:
                 }, indent=2, ensure_ascii=False), encoding="utf-8")
                 with self.lock:
                     self.settings = settings
+                    self._saved_firmware_hash = firmware_hash
+                    self._saved_transport = "serial" if usb_transport else "rtt"
+                    self._saved_firmware_source = firmware_source
                     self.applied = True
                     self.state = "applied"
                     self.message = (
@@ -2064,10 +2455,11 @@ class SettingsController:
                 self._set_apply_message("正在通过 J-Link 烧录并校验开发者固件")
                 self._flash_firmware(firmware_hex)
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            firmware_hash = self._firmware_hash(firmware_artifact)
             SETTINGS_PATH.write_text(json.dumps({
                 "settings": settings,
                 "firmware_source": firmware_source,
-                "firmware_sha256": self._firmware_hash(firmware_artifact),
+                "firmware_sha256": firmware_hash,
                 "transport": "serial" if usb_transport else "rtt",
             }, indent=2, ensure_ascii=False), encoding="utf-8")
         # RuntimeError:_flash_firmware() 的「exit 0 但没烧成」判据会抛它,
@@ -2087,6 +2479,9 @@ class SettingsController:
             raise RuntimeError(self.error) from exc
         with self.lock:
             self.settings = settings
+            self._saved_firmware_hash = firmware_hash
+            self._saved_transport = "serial" if usb_transport else "rtt"
+            self._saved_firmware_source = firmware_source
             self.applied = True
             self.state = "applied"
             self.message = "参数已写入硬件"
@@ -2100,6 +2495,9 @@ class SettingsController:
                 "state": self.state,
                 "message": self.message,
                 "error": self.error,
+                "firmware_source": self._saved_firmware_source,
+                "firmware_sha256": self._saved_firmware_hash,
+                "firmware_transport": self._saved_transport,
                 "native_rate_hz": (
                     self.settings["cv_scan_rate_v_s"] / self.settings["cv_step_v"]
                     if self.settings["method"] == "cv"
@@ -2219,6 +2617,7 @@ class MeasurementController:
         self._stability_eta: dict[str, Any] = {}
         self._last_complete_rolling_metrics: dict[str, Any] | None = None
         self._last_complete_rolling_epoch: object = None
+        self._diagnostic_completion_logged_run_id = ""
         self._stop_requested_rolling_metrics: dict[str, Any] | None = None
         self._rolling_metrics_frozen: dict[str, Any] | None = None
         self._stability_eta_frozen: dict[str, Any] | None = None
@@ -2762,6 +3161,18 @@ class MeasurementController:
             self.run_dir = RUNS_DIR / self.run_id
             self.run_dir.mkdir(parents=True, exist_ok=False)
             self.metadata = dict(metadata or {})
+            self._diagnostic_completion_logged_run_id = ""
+            DIAGNOSTICS.record(
+                "info", "measurement.starting", "Measurement is starting",
+                run_id=self.run_id,
+                run_dir=self.run_dir,
+                method=method,
+                transport=HARDWARE_TRANSPORT,
+                device=_selected_device_copy(),
+                trigger=trigger,
+                metadata_keys=sorted(self.metadata),
+                settings=self.settings,
+            )
             live_raw_path = str(self.metadata.get("live_raw_path") or "")
             self.raw_path = Path(live_raw_path) if live_raw_path else self.run_dir / "raw.csv"
             self.raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2943,12 +3354,32 @@ class MeasurementController:
                     **(dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
                        if _IS_WIN else dict(start_new_session=True)),
                 )
-            except Exception:
+            except Exception as exc:
                 log_handle.close()
                 self._stop_bridge()
                 self.state = "error"
                 self.error = "无法启动采集进程"
+                diagnostic_id = DIAGNOSTICS.exception(
+                    "measurement.collector_start_failed",
+                    "Collector process could not be started",
+                    exc,
+                    run_id=self.run_id,
+                    run_dir=self.run_dir,
+                    transport=HARDWARE_TRANSPORT,
+                )
+                try:
+                    setattr(exc, "diagnostic_id", diagnostic_id)
+                except (AttributeError, TypeError):
+                    pass
                 raise
+            DIAGNOSTICS.record(
+                "info", "measurement.collector_started",
+                "Collector process started",
+                run_id=self.run_id,
+                process_id=self.process.pid if self.process is not None else None,
+                transport=HARDWARE_TRANSPORT,
+                config_gate=self._config_gate,
+            )
             if verify_runtime_config:
                 # ARMED keeps the firmware idle. The full AFE and measurement
                 # snapshots are committed before a tagged physical GET; START
@@ -2959,9 +3390,33 @@ class MeasurementController:
             # the collector exits. It must keep the process alive until those
             # durable writes finish.
             self.thread = threading.Thread(
-                target=self._watch, args=(log_handle,), daemon=False
+                target=self._watch,
+                args=(log_handle,),
+                name=f"measurement-{self.run_id}",
+                daemon=False,
             )
-            self.thread.start()
+            try:
+                self.thread.start()
+            except Exception as exc:
+                log_handle.close()
+                if self.process is not None and self.process.poll() is None:
+                    self._terminate_tree(self.process)
+                self._stop_bridge()
+                self.state = "error"
+                self.error = "无法启动采集收尾线程"
+                diagnostic_id = DIAGNOSTICS.exception(
+                    "measurement.watcher_start_failed",
+                    "Measurement completion watcher could not be started",
+                    exc,
+                    run_id=self.run_id,
+                    run_dir=self.run_dir,
+                    transport=HARDWARE_TRANSPORT,
+                )
+                try:
+                    setattr(exc, "diagnostic_id", diagnostic_id)
+                except (AttributeError, TypeError):
+                    pass
+                raise
             return self.snapshot()
 
     def start_verified(self, metadata: dict[str, Any] | None = None,
@@ -2986,17 +3441,22 @@ class MeasurementController:
             gate = dict(self._config_gate)
         if gate.get("state") != "matched":
             if gate.get("state") != "mismatch":
-                raise RuntimeError(
+                error = RuntimeError(
                     str(gate.get("message") or "硬件配置回读失败，测量未启动")
                 )
-            details = "、".join(
-                str(item.get("field")) for item in gate.get("mismatches", [])
-            )
-            suffix = f"：{details}" if details else ""
-            raise RuntimeError(
-                f"硬件当前配置与实时页条件不一致{suffix}。"
-                "请重新点击“应用条件并烧录硬件”后再测量"
-            )
+            else:
+                details = "、".join(
+                    str(item.get("field")) for item in gate.get("mismatches", [])
+                )
+                suffix = f"：{details}" if details else ""
+                error = RuntimeError(
+                    f"硬件当前配置与实时页条件不一致{suffix}。"
+                    "请重新点击“应用条件并烧录硬件”后再测量"
+                )
+            diagnostic_id = str(gate.get("diagnostic_id") or "")
+            if diagnostic_id:
+                setattr(error, "diagnostic_id", diagnostic_id)
+            raise error
         return self.snapshot()
 
     def _stop_bridge(self) -> None:
@@ -3258,6 +3718,20 @@ class MeasurementController:
             self.message = message
             self.error = message
             process = self.process
+            diagnostic_id = DIAGNOSTICS.record(
+                "warning" if state == "aborted" else "error",
+                "measurement.config_gate_failed",
+                "Hardware configuration verification did not complete",
+                run_id=self.run_id,
+                run_dir=self.run_dir,
+                gate_state=state,
+                status_message=message,
+                mismatches=self._config_gate.get("mismatches", []),
+                request_id=self._config_gate.get("request_id"),
+                transport=HARDWARE_TRANSPORT,
+                device=_selected_device_copy(),
+            )
+            self._config_gate["diagnostic_id"] = diagnostic_id
             self._config_gate_event.set()
         if process is not None and process.poll() is None:
             threading.Thread(
@@ -4562,6 +5036,37 @@ class MeasurementController:
                                           "at": time.time()}
 
     def _notify_complete(self) -> None:
+        with self.lock:
+            run_id = self.run_id
+            should_log = bool(
+                run_id and run_id != self._diagnostic_completion_logged_run_id
+            )
+            if should_log:
+                self._diagnostic_completion_logged_run_id = run_id
+            completion = {
+                "run_id": run_id,
+                "state": self.state,
+                "status_message": self.message,
+                "error": self.error,
+                "run_dir": str(self.run_dir or ""),
+                "raw_path": str(self.raw_path or ""),
+                "summary_path": str(self.summary_path or ""),
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "transport": HARDWARE_TRANSPORT,
+                "config_gate": dict(self._config_gate),
+            }
+        if should_log:
+            DIAGNOSTICS.record(
+                "info" if completion["state"] == "completed" else "error",
+                (
+                    "measurement.completed"
+                    if completion["state"] == "completed"
+                    else "measurement.failed"
+                ),
+                str(completion["status_message"] or completion["error"]),
+                **completion,
+            )
         callbacks = (self.completion_hook, self.on_complete)
         for callback in callbacks:
             if callback is not None:
@@ -4569,8 +5074,14 @@ class MeasurementController:
                     # The workflow hook records export results on the controller.
                     # Refresh before the schedule hook so it can see export errors.
                     callback(self.snapshot())
-                except Exception:
-                    pass
+                except Exception as exc:
+                    DIAGNOSTICS.exception(
+                        "measurement.completion_callback_failed",
+                        "Measurement completion callback failed",
+                        exc,
+                        run_id=run_id,
+                        callback=getattr(callback, "__name__", type(callback).__name__),
+                    )
 
     def set_workflow_result(self, result: dict[str, Any]) -> None:
         with self.lock:
@@ -4950,9 +5461,21 @@ class ScheduleController:
             self.generation += 1
             generation = self.generation
             self.thread = threading.Thread(
-                target=self._loop, args=(self.stop_event, generation), daemon=True
+                target=self._loop,
+                args=(self.stop_event, generation),
+                name=f"schedule-{generation}",
+                daemon=True,
             )
             self.thread.start()
+            DIAGNOSTICS.record(
+                "info", "schedule.started", "Automatic measurement schedule started",
+                generation=generation,
+                interval_s=self.interval_s,
+                max_runs=self.max_runs,
+                total_minutes=self.total_minutes,
+                sample_role=self.sample_role,
+                workspace=self.save_dir,
+            )
             return self.snapshot()
 
     def stop(self) -> dict[str, Any]:
@@ -4962,6 +5485,13 @@ class ScheduleController:
             self.stop_at = None
             self.message = "自动测量已停止；正在进行的测量会正常完成"
             self.stop_event.set()
+            DIAGNOSTICS.record(
+                "info", "schedule.stopped", "Automatic measurement schedule stopped",
+                generation=self.generation,
+                attempted_runs=self.attempted_runs,
+                completed_runs=self.completed_runs,
+                failed_runs=self.failed_runs,
+            )
             return self.snapshot()
 
     def _loop(self, stop_event: threading.Event, generation: int) -> None:
@@ -5028,6 +5558,14 @@ class ScheduleController:
                     self.stop_at = None
                     self.failed_runs += 1
                     self.stop_event.set()
+                DIAGNOSTICS.exception(
+                    "schedule.run_start_failed",
+                    "Scheduled measurement could not be started",
+                    exc,
+                    generation=generation,
+                    run_number=run_number,
+                    metadata=metadata,
+                )
                 return
 
     def _completed(
@@ -5128,8 +5666,10 @@ class AppState:
         with self.measurement.lock:
             self.measurement._reset_live_analysis_locked()
         self.schedule.set_plateau_config(self.plateau.settings)
-        self.save_dir = DEFAULT_SAVE_DIR
-        self.workspace_root = DEFAULT_SAVE_DIR
+        self.save_dir: Path | None = None
+        self.workspace_root: Path | None = None
+        self.workspace_available = False
+        self.workspace_error = ""
         self.model: CalibrationModel | None = None
         self.model_path: Path | None = None
         self.model_settings: dict[str, Any] | None = None
@@ -5150,26 +5690,38 @@ class AppState:
         self.workspace_runtime_filter: dict[str, Any] | None = None
         self.workspace_runtime_plateau: dict[str, Any] | None = None
         self.latest_workflow_result: dict[str, Any] | None = None
-        saved_workspace_root: Path | None = None
         if WORKFLOW_PATH.exists():
             try:
                 saved = json.loads(WORKFLOW_PATH.read_text(encoding="utf-8"))
-                self.save_dir = self._resolve_save_dir(str(saved.get("save_dir", "")))
+                raw_save_dir = str(saved.get("save_dir") or "").strip()
+                if not raw_save_dir:
+                    raise ValueError("已保存的工作区路径为空")
+                self.save_dir = self._resolve_save_dir(raw_save_dir)
                 raw_workspace_root = str(saved.get("workspace_root") or "").strip()
-                if raw_workspace_root:
-                    saved_workspace_root = self._resolve_save_dir(raw_workspace_root)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                self.save_dir = DEFAULT_SAVE_DIR
-        inferred_root = self._workspace_root_for(self.save_dir)
-        self.workspace_root = (
-            saved_workspace_root
-            if saved_workspace_root is not None and (
-                saved_workspace_root == self.save_dir
-                or self.save_dir.parent == saved_workspace_root
-            )
-            else inferred_root
-        )
-        self._load_workspace()
+                saved_workspace_root = (
+                    self._resolve_save_dir(raw_workspace_root)
+                    if raw_workspace_root else None
+                )
+                inferred_root = self._workspace_root_for(self.save_dir)
+                self.workspace_root = (
+                    saved_workspace_root
+                    if saved_workspace_root is not None and (
+                        saved_workspace_root == self.save_dir
+                        or self.save_dir.parent == saved_workspace_root
+                    )
+                    else inferred_root
+                )
+                self._load_workspace(create=False)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                self.workspace_available = False
+                self.workspace_error = self.workspace_error or (
+                    f"已保存的工作区当前不可用：{exc}"
+                )
+                DIAGNOSTICS.record(
+                    "warning", "workspace.restore_failed",
+                    "Saved workspace could not be restored",
+                    path=WORKFLOW_PATH, error=str(exc),
+                )
         self.schedule.metadata_hook = self._prepare_export_metadata
         self.measurement.completion_hook = self._measurement_completed
 
@@ -5184,10 +5736,48 @@ class AppState:
     @staticmethod
     def _resolve_save_dir(value: str) -> Path:
         raw = os.path.expandvars(os.path.expanduser(value.strip()))
-        path = Path(raw) if raw else DEFAULT_SAVE_DIR
+        if not raw:
+            raise ValueError("请先选择工作区目录")
+        path = Path(raw)
         if not path.is_absolute():
             path = PROJECT_DIR / path
         return path.resolve()
+
+    def _configured_save_dir(self) -> Path:
+        if self.save_dir is None:
+            raise RuntimeError("请先选择工作区，未选择工作区时不能测量或保存数据")
+        return self.save_dir
+
+    def _configured_workspace_root(self) -> Path:
+        save_dir = self._configured_save_dir()
+        if self.workspace_root is None:
+            self.workspace_root = self._workspace_root_for(save_dir)
+        return self.workspace_root
+
+    def _require_workspace(self) -> Path:
+        save_dir = self._configured_save_dir()
+        try:
+            self._probe_workspace(save_dir, create=False)
+        except ValueError as exc:
+            self.workspace_available = False
+            self.workspace_error = str(exc)
+            raise RuntimeError(f"工作区不可用：{exc}") from exc
+        self.workspace_available = True
+        self.workspace_error = ""
+        return save_dir
+
+    def _workspace_is_available(self) -> bool:
+        save_dir = self.save_dir
+        available = bool(
+            save_dir is not None
+            and self.workspace_available
+            and save_dir.is_dir()
+            and os.access(save_dir, os.W_OK)
+        )
+        if self.workspace_available and not available:
+            self.workspace_available = False
+            self.workspace_error = "工作区目录不存在或不可写，请重新选择目录"
+        return available
 
     def _workspace_root_for(self, path: Path) -> Path:
         """Resolve a batch directory back to its selected workspace root."""
@@ -5205,6 +5795,8 @@ class AppState:
         return resolved
 
     def _batch_metadata(self) -> dict[str, str]:
+        if self.save_dir is None:
+            return {"batch_id": "", "batch_label": ""}
         marker = self.history.marker_info(self.save_dir)
         kind = str(marker.get("kind") or WORKSPACE_KIND)
         return {
@@ -5229,17 +5821,18 @@ class AppState:
         return "unknown" if not math.isfinite(numeric) else f"{numeric:g}uM"
 
     def _workspace_paths(self) -> dict[str, Path]:
+        save_dir = self._configured_save_dir()
         return {
-            "points": self.save_dir / "calibration-points.csv",
-            "model": self.save_dir / "calibration-model.json",
-            "settings": self.save_dir / "calibration-settings.json",
-            "plateau": self.save_dir / "calibration-plateau.json",
-            "filter": self.save_dir / "calibration-filter.json",
-            "selection": self.save_dir / "calibration-selection.json",
-            "validation": self.save_dir / "calibration-validation.json",
-            "index": self.save_dir / "measurement-index.csv",
-            "drift": self.save_dir / "calibration-drift.json",
-            "runtime": self.save_dir / "workspace-state.json",
+            "points": save_dir / "calibration-points.csv",
+            "model": save_dir / "calibration-model.json",
+            "settings": save_dir / "calibration-settings.json",
+            "plateau": save_dir / "calibration-plateau.json",
+            "filter": save_dir / "calibration-filter.json",
+            "selection": save_dir / "calibration-selection.json",
+            "validation": save_dir / "calibration-validation.json",
+            "index": save_dir / "measurement-index.csv",
+            "drift": save_dir / "calibration-drift.json",
+            "runtime": save_dir / "workspace-state.json",
         }
 
     def _sync_points(self) -> None:
@@ -5333,8 +5926,21 @@ class AppState:
             )
         return signature
 
-    def _load_workspace(self) -> None:
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+    def _load_workspace(self, *, create: bool = True) -> None:
+        save_dir = self._configured_save_dir()
+        try:
+            self._probe_workspace(save_dir, create=create)
+        except ValueError as exc:
+            self.workspace_available = False
+            self.workspace_error = str(exc)
+            raise
+        if self.workspace_root is None or not (
+            self.workspace_root == save_dir
+            or save_dir.parent == self.workspace_root
+        ):
+            self.workspace_root = self._workspace_root_for(save_dir)
+        self.workspace_available = True
+        self.workspace_error = ""
         paths = self._workspace_paths()
         with self.lock:
             self.points = []
@@ -5522,7 +6128,8 @@ class AppState:
                     self.workspace_runtime_plateau = None
 
     _WORKSPACE_STATE_FIELDS = (
-        "save_dir", "workspace_root", "model", "model_path", "model_settings", "model_plateau",
+        "save_dir", "workspace_root", "workspace_available", "workspace_error",
+        "model", "model_path", "model_settings", "model_plateau",
         "calibration_filter", "calibration_settings", "calibration_plateau",
         "points", "point_records", "selected_point_ids", "model_created_at",
         "validation_started_at", "records", "validation_overrides",
@@ -5665,7 +6272,7 @@ class AppState:
                 if workspace_root is not None
                 else self._workspace_root_for(self.save_dir)
             )
-            self._load_workspace()
+            self._load_workspace(create=False)
             if restore:
                 self._activate_workspace_configuration()
             self._atomic_json_file(WORKFLOW_PATH, {
@@ -5733,6 +6340,7 @@ class AppState:
         return self.workflow_snapshot()
 
     def workflow_snapshot(self) -> dict[str, Any]:
+        workspace_available = self._workspace_is_available()
         current_settings = self.settings.snapshot()["settings"]
         current_plateau = self.plateau.settings
         is_it = current_settings.get("method", "it") == "it"
@@ -5767,8 +6375,13 @@ class AppState:
             stage = "stabilization"
         batch = self._batch_metadata()
         return _json_safe({
-            "save_dir": str(self.save_dir),
-            "workspace_root": str(self.workspace_root),
+            "save_dir": str(self.save_dir) if self.save_dir is not None else "",
+            "workspace_root": (
+                str(self.workspace_root) if self.workspace_root is not None else ""
+            ),
+            "workspace_configured": self.save_dir is not None,
+            "workspace_available": workspace_available,
+            "workspace_error": self.workspace_error,
             **batch,
             "calibration_ready": calibration_ready,
             "settings_match": settings_match,
@@ -5845,13 +6458,14 @@ class AppState:
         ):
             raise RuntimeError("测量或自动任务运行期间不能登记工作区")
         with self.operation_lock:
+            save_dir = self._require_workspace()
             self._persist_workspace_runtime()
-            marker = self.history.marker_info(self.save_dir)
+            marker = self.history.marker_info(save_dir)
             kind = str(marker.get("kind") or WORKSPACE_KIND)
             root_id = str(marker.get("workspace_root_id") or "")
             label = str(payload.get("label") or marker.get("label") or "")
             return self.history.register(
-                self.save_dir,
+                save_dir,
                 self._history_summary(),
                 label,
                 kind=kind,
@@ -5891,14 +6505,17 @@ class AppState:
 
     def _discover_workspace_batches(self) -> None:
         """Register batch directories copied or migrated into the active root."""
-        root = self.workspace_root.resolve()
+        if not self._workspace_is_available():
+            return
+        save_dir = self._configured_save_dir()
+        root = self._configured_workspace_root().resolve()
         root_marker = self.history.marker_info(root)
         root_id = str(root_marker.get("workspace_id") or "")
         if root_marker.get("kind", WORKSPACE_KIND) != WORKSPACE_KIND or not root_id:
             return
         known_ids = {
             str(entry.get("workspace_id") or "")
-            for entry in self.history.list(self.save_dir).get("entries", [])
+            for entry in self.history.list(save_dir).get("entries", [])
         }
         if root_id not in known_ids:
             self.history.register(
@@ -5936,13 +6553,27 @@ class AppState:
             known_ids.add(batch_id)
 
     def history_snapshot(self) -> dict[str, Any]:
+        if not self._workspace_is_available():
+            return {
+                "entries": [],
+                "workspace_root": (
+                    str(self.workspace_root) if self.workspace_root is not None else ""
+                ),
+                "active_workspace_id": "",
+                "workspaces": [],
+                "batches": [],
+                "current_batches": [],
+                "registry_error": self.workspace_error,
+            }
+        save_dir = self._configured_save_dir()
+        workspace_root = self._configured_workspace_root()
         self._discover_workspace_batches()
-        snapshot = self.history.list(self.save_dir)
-        root_marker = self.history.marker_info(self.workspace_root)
+        snapshot = self.history.list(save_dir)
+        root_marker = self.history.marker_info(workspace_root)
         root_id = str(root_marker.get("workspace_id") or "")
         entries = snapshot.get("entries", [])
         snapshot.update({
-            "workspace_root": str(self.workspace_root),
+            "workspace_root": str(workspace_root),
             "active_workspace_id": root_id,
             "workspaces": [
                 entry for entry in entries
@@ -5972,13 +6603,18 @@ class AppState:
         return [values[index].item() if hasattr(values[index], "item") else values[index]
                 for index in indexes]
 
-    def _curve_from_record(self, record: dict[str, Any]) -> dict[str, Any] | None:
+    def _curve_from_record(
+        self, record: dict[str, Any], *, maximum_points: int = 3000,
+    ) -> dict[str, Any] | None:
+        if not self._workspace_is_available():
+            return None
+        save_dir = self._configured_save_dir()
         raw_path = str(record.get("data_path") or "").strip()
         if not raw_path:
             return None
         path = Path(raw_path).resolve()
         try:
-            path.relative_to(self.save_dir.resolve())
+            path.relative_to(save_dir.resolve())
         except ValueError:
             return None
         if not path.is_file():
@@ -5996,18 +6632,22 @@ class AppState:
                 data = load_cv_run(path)
                 return {
                     "method": "cv",
-                    "time_s": self._downsample_curve(data["time_s"]),
-                    "potential_v": self._downsample_curve(data["potential_v"]),
-                    "current_nA": self._downsample_curve(data["current_nA"]),
-                    "cycle": self._downsample_curve(data["cycle"]),
-                    "valid": self._downsample_curve(data["valid"]),
+                    "time_s": self._downsample_curve(data["time_s"], maximum_points),
+                    "potential_v": self._downsample_curve(
+                        data["potential_v"], maximum_points
+                    ),
+                    "current_nA": self._downsample_curve(
+                        data["current_nA"], maximum_points
+                    ),
+                    "cycle": self._downsample_curve(data["cycle"], maximum_points),
+                    "valid": self._downsample_curve(data["valid"], maximum_points),
                 }
             time_s, current_nA, valid = load_run_csv(path)
             return {
                 "method": "it",
-                "time_s": self._downsample_curve(time_s),
-                "current_nA": self._downsample_curve(current_nA),
-                "valid": self._downsample_curve(valid),
+                "time_s": self._downsample_curve(time_s, maximum_points),
+                "current_nA": self._downsample_curve(current_nA, maximum_points),
+                "valid": self._downsample_curve(valid, maximum_points),
             }
         except (OSError, ValueError, csv.Error):
             return None
@@ -6033,8 +6673,14 @@ class AppState:
         if not isinstance(requested, list):
             raise ValueError("历史曲线必须是数组")
         requested_ids = [str(value) for value in requested if str(value)]
-        if len(requested_ids) > 12:
-            raise ValueError("一次最多叠加 12 条历史曲线")
+        if len(requested_ids) > 80:
+            raise ValueError("一次最多叠加 80 条历史曲线")
+        # Keep the aggregate canvas/JSON workload bounded when "select all"
+        # loads a large batch. Up to 12 curves retain the previous 3000-point
+        # detail; larger selections share the same 36k-point budget.
+        maximum_points = min(
+            3000, max(300, 36_000 // max(1, len(requested_ids)))
+        )
         with self.lock:
             records_by_id = {
                 str(record.get("run_id") or ""): dict(record)
@@ -6045,7 +6691,7 @@ class AppState:
             record = records_by_id.get(run_id)
             if record is None:
                 raise ValueError("历史曲线不属于当前批次")
-            curve = self._curve_from_record(record)
+            curve = self._curve_from_record(record, maximum_points=maximum_points)
             if curve is not None:
                 curves.append({
                     "run_id": run_id,
@@ -6101,11 +6747,7 @@ class AppState:
         return self.history_snapshot()
 
     def start_measurement(self, payload: dict[str, Any]) -> dict[str, Any]:
-        requested_dir = str(payload.get("save_dir", "")).strip()
-        if requested_dir and self._resolve_save_dir(requested_dir) not in {
-            self.save_dir, self.workspace_root,
-        }:
-            self.configure_workflow({"save_dir": requested_dir})
+        save_dir = self._require_workspace()
         sample_name = str(payload.get("sample_name", "")).strip()
         if not sample_name:
             raise ValueError("请填写样品名称")
@@ -6139,7 +6781,7 @@ class AppState:
             "sample_name": sample_name,
             "known_concentration_um": concentration,
             "sample_role": role,
-            "save_dir": str(self.save_dir),
+            "save_dir": str(save_dir),
             "source": payload.get("source") or "manual_gui",
         }
         metadata = self._prepare_export_metadata(metadata)
@@ -6148,6 +6790,35 @@ class AppState:
             filter_config=self.filter.snapshot()["settings"],
             plateau_config=self.plateau.settings,
         )
+
+    def start_schedule(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.operation_lock:
+            save_dir = self._require_workspace()
+            if not self.settings.snapshot()["applied"]:
+                raise RuntimeError("请先将当前检测条件应用到硬件")
+            role = str(payload.get("sample_role") or "test")
+            workflow = self.workflow_snapshot()
+            is_it = self.settings.snapshot()["settings"].get("method") == "it"
+            if (
+                is_it
+                and role in {"stabilization", "test"}
+                and not workflow["calibration_ready"]
+            ):
+                raise RuntimeError("请先选择标定点并生成测试曲线")
+            if (
+                role == "calibration"
+                and workflow["points_count"]
+                and not workflow["settings_match"]
+            ):
+                raise RuntimeError("当前 IT 条件与已有标定点不同，请新建标定")
+            prepared = {
+                **payload,
+                "settings": self.settings.snapshot()["settings"],
+                "save_dir": str(save_dir),
+            }
+            self.schedule.set_filter_config(self.filter.snapshot()["settings"])
+            self.schedule.set_plateau_config(self.plateau.settings)
+            return self.schedule.start(prepared)
 
     def start_debug_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         """硬件 DEBUG 模式的「一次 I-t 测量」。
@@ -6160,6 +6831,7 @@ class AppState:
         🔴 但两个门禁必须保留:自动测量运行期间不许插队(会抢探头),
         已有测量在跑时不许再起(同上)。这两条与正式测量同口径。
         """
+        self._require_workspace()
         if self.schedule.snapshot()["active"]:
             raise RuntimeError("自动测量运行期间不能起硬件 DEBUG 轮(探头只有一支)")
         if self.measurement.is_busy():
@@ -6210,19 +6882,21 @@ class AppState:
         sample_name = str(prepared.get("sample_name") or "sample")
         concentration = prepared.get("known_concentration_um")
         with self.lock:
+            save_dir = self._require_workspace()
             stem = self._reserve_export_stem(sample_name, concentration)
             prepared["export_stem"] = stem
-            prepared["live_raw_path"] = str(self.save_dir / f"{stem}-raw.csv")
+            prepared["live_raw_path"] = str(save_dir / f"{stem}-raw.csv")
         return prepared
 
     def _reserve_export_stem(self, sample_name: str, concentration: Any) -> str:
+        save_dir = self._configured_save_dir()
         root = (
             f"{self._safe_filename(sample_name)}-"
             f"{self._concentration_token(concentration)}"
         )
         candidate = root
         number = 2
-        while any((self.save_dir / f"{candidate}{suffix}").exists()
+        while any((save_dir / f"{candidate}{suffix}").exists()
                   for suffix in (".csv", "-raw.csv", "-filtered.csv", "-summary.json", ".png")):
             candidate = f"{root}-r{number}"
             number += 1
@@ -6640,21 +7314,18 @@ class AppState:
         }
         try:
             with self.lock:
-                requested_dir = metadata.get("save_dir")
-                if requested_dir:
-                    self.save_dir = self._resolve_save_dir(str(requested_dir))
-                    self.save_dir.mkdir(parents=True, exist_ok=True)
+                save_dir = self._require_workspace()
                 stem = str(metadata.get("export_stem") or "")
                 if not stem:
                     stem = self._reserve_export_stem(sample_name, concentration)
                 raw_source = Path(str(run.get("raw_path") or ""))
                 data_source = Path(str(run.get("resampled_path") or ""))
                 filtered_source = Path(str(run.get("filtered_path") or ""))
-                raw_target = self.save_dir / f"{stem}-raw.csv"
-                data_target = self.save_dir / f"{stem}.csv"
-                filtered_target = self.save_dir / f"{stem}-filtered.csv"
-                summary_target = self.save_dir / f"{stem}-summary.json"
-                plot_target = self.save_dir / f"{stem}.png"
+                raw_target = save_dir / f"{stem}-raw.csv"
+                data_target = save_dir / f"{stem}.csv"
+                filtered_target = save_dir / f"{stem}-filtered.csv"
+                summary_target = save_dir / f"{stem}-summary.json"
+                plot_target = save_dir / f"{stem}.png"
                 if raw_source.exists():
                     if raw_source.resolve() != raw_target.resolve():
                         shutil.copy2(raw_source, raw_target)
@@ -6815,7 +7486,8 @@ class AppState:
         payload = payload or {}
         label = str(payload.get("batch_name") or "").strip()
         with self.operation_lock:
-            root = self._workspace_root_for(self.save_dir)
+            self._require_workspace()
+            root = self._configured_workspace_root()
             self.workspace_root = root
             self._start_batch(root, label)
             self._refresh_history_best_effort()
@@ -6928,7 +7600,7 @@ class AppState:
                     "当前 IT 条件与候选标定点不一致，不能生成测试曲线"
                 )
             model = fit_calibration(selected_points, degree=degree)
-            self.save_dir.mkdir(parents=True, exist_ok=True)
+            self._require_workspace()
             paths = self._workspace_paths()
             path = paths["model"]
             current_filter = validate_filter_config(
@@ -7308,6 +7980,65 @@ _SHUTDOWN_LOCK = threading.Lock()
 _SHUTDOWN_REQUESTED = False
 
 
+def _diagnostic_runtime_context() -> dict[str, Any]:
+    with APP.measurement.lock:
+        measurement = {
+            "state": APP.measurement.state,
+            "message": APP.measurement.message,
+            "error": APP.measurement.error,
+            "run_id": APP.measurement.run_id,
+            "run_dir": str(APP.measurement.run_dir or ""),
+            "started_at": APP.measurement.started_at,
+            "finished_at": APP.measurement.finished_at,
+            "config_gate": dict(APP.measurement._config_gate),
+        }
+    with APP.lock:
+        workspace = {
+            "workspace_root": str(APP.workspace_root or ""),
+            "save_dir": str(APP.save_dir or ""),
+            "available": APP.workspace_available,
+            "error": APP.workspace_error,
+        }
+    settings = APP.settings.snapshot()
+    schedule = APP.schedule.snapshot()
+    return {
+        "project_dir": str(PROJECT_DIR),
+        "state_dir": str(STATE_DIR),
+        "transport": _transport_status(),
+        "selected_device": _selected_device_copy(),
+        "measurement": measurement,
+        "settings": {
+            "state": settings.get("state"),
+            "message": settings.get("message"),
+            "error": settings.get("error"),
+            "applied": settings.get("applied"),
+            "firmware_source": settings.get("firmware_source"),
+            "firmware_sha256": settings.get("firmware_sha256"),
+            "firmware_transport": settings.get("firmware_transport"),
+            "settings": settings.get("settings"),
+        },
+        "schedule": {
+            "active": schedule.get("active"),
+            "message": schedule.get("message"),
+            "failed_runs": schedule.get("failed_runs"),
+        },
+        "workspace": workspace,
+    }
+
+
+def _diagnostic_current_run_files() -> list[tuple[str, Path]]:
+    with APP.measurement.lock:
+        run_dir = APP.measurement.run_dir
+        candidates = [
+            ("collector.log", run_dir / "collector.log" if run_dir else None),
+            ("firmware-rtt.log", APP.measurement.raw_log),
+            ("hardware-audit.jsonl", APP.measurement.audit_path),
+            ("summary.json", APP.measurement.summary_path),
+            ("commands.txt", APP.measurement.cmd_path),
+        ]
+    return [(name, path) for name, path in candidates if path is not None]
+
+
 def _request_server_shutdown() -> None:
     """Ask the serving loop to enter its existing graceful cleanup path."""
     global _SHUTDOWN_REQUESTED
@@ -7316,6 +8047,10 @@ def _request_server_shutdown() -> None:
             return
         _SHUTDOWN_REQUESTED = True
         server = HTTP_SERVER
+    DIAGNOSTICS.record(
+        "info", "application.shutdown_requested",
+        "Graceful application shutdown was requested",
+    )
     if server is not None:
         # ``shutdown`` must run outside the request/serve thread. Starting it
         # after the response has been written lets the browser receive its ACK.
@@ -7326,6 +8061,38 @@ def _request_server_shutdown() -> None:
         ).start()
 
 
+class DiagnosticHTTPServer(ThreadingHTTPServer):
+    """Keep failures outside an API handler inside the diagnostic timeline."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        del request
+        exc = sys.exc_info()[1]
+        context = {"client_address": client_address}
+        if isinstance(
+            exc,
+            (BrokenPipeError, ConnectionResetError, ConnectionAbortedError),
+        ):
+            DIAGNOSTICS.record(
+                "info", "http.client.disconnected",
+                "Client connection ended while HTTP was being processed",
+                error=str(exc), **context,
+            )
+            return
+        if isinstance(exc, BaseException):
+            DIAGNOSTICS.exception(
+                "http.request.unhandled", "Unhandled HTTP worker failure",
+                exc, **context,
+            )
+            return
+        DIAGNOSTICS.record(
+            "error", "http.request.unhandled",
+            "HTTP worker failed without exception details", **context,
+        )
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -7334,19 +8101,57 @@ class RequestHandler(BaseHTTPRequestHandler):
         return
 
     def _send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
-        data = json.dumps(_json_safe(payload), ensure_ascii=False).encode("utf-8")
+        status_code = int(status)
+        request_id = str(getattr(self, "_request_id", ""))
+        response_payload = payload
+        if (
+            status_code >= 400
+            and isinstance(payload, dict)
+            and payload.get("error")
+        ):
+            diagnostic_id = str(payload.get("diagnostic_id") or "")
+            if not diagnostic_id:
+                diagnostic_id = DIAGNOSTICS.record(
+                    "error" if status_code >= 500 else "warning",
+                    "api.request.error",
+                    str(payload.get("error")),
+                    method=str(getattr(self, "command", "")),
+                    path=str(getattr(self, "path", "")),
+                    status=status_code,
+                    request_id=request_id,
+                    body_keys=getattr(self, "_request_body_keys", []),
+                )
+            response_payload = {**payload, "diagnostic_id": diagnostic_id}
+            setattr(self, "_diagnostic_id", diagnostic_id)
+        data = json.dumps(_json_safe(response_payload), ensure_ascii=False).encode("utf-8")
+        self._response_status = status_code
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        if request_id:
+            self.send_header("X-Request-ID", request_id)
+        diagnostic_id = str(getattr(self, "_diagnostic_id", ""))
+        if diagnostic_id:
+            self.send_header("X-Diagnostic-ID", diagnostic_id)
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_bytes(self, data: bytes, content_type: str) -> None:
+    def _send_bytes(
+        self, data: bytes, content_type: str, *, download_name: str = ""
+    ) -> None:
+        self._response_status = int(HTTPStatus.OK)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        request_id = str(getattr(self, "_request_id", ""))
+        if request_id:
+            self.send_header("X-Request-ID", request_id)
+        if download_name:
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{download_name}"'
+            )
         self.end_headers()
         self.wfile.write(data)
 
@@ -7368,9 +8173,66 @@ class RequestHandler(BaseHTTPRequestHandler):
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("请求必须是 JSON 对象")
+        self._request_body_keys = sorted(str(key) for key in payload)
         return payload
 
+    def _run_request(self, method: str, callback: Any) -> None:
+        started_at = time.monotonic()
+        self._request_id = hashlib.sha256(
+            f"{time.time_ns()}:{threading.get_ident()}:{getattr(self, 'path', '')}".encode()
+        ).hexdigest()[:12]
+        self._response_status = 0
+        self._diagnostic_id = ""
+        self._request_body_keys = []
+        path = str(getattr(self, "path", ""))
+        if method == "POST":
+            DIAGNOSTICS.record(
+                "info", "api.request.started", "Control request started",
+                method=method, path=path, request_id=self._request_id,
+            )
+        try:
+            callback()
+        except (
+            BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+        ) as exc:
+            DIAGNOSTICS.record(
+                "info", "api.client.disconnected",
+                "Client disconnected before the response completed",
+                method=method, path=path, request_id=self._request_id,
+                error=str(exc),
+            )
+        except Exception as exc:  # never let a request thread vanish silently
+            diagnostic_id = DIAGNOSTICS.exception(
+                "api.request.unhandled", "Unhandled API request failure", exc,
+                method=method, path=path, request_id=self._request_id,
+                body_keys=self._request_body_keys,
+            )
+            self._diagnostic_id = diagnostic_id
+            try:
+                self._send_json(
+                    {
+                        "error": "后台发生未预期错误，请根据诊断编号查看日志",
+                        "diagnostic_id": diagnostic_id,
+                    },
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+        finally:
+            status = int(getattr(self, "_response_status", 0) or 0)
+            if method == "POST" and 0 < status < 400:
+                DIAGNOSTICS.record(
+                    "info", "api.request.completed", "Control request completed",
+                    method=method, path=path, status=status,
+                    request_id=self._request_id,
+                    body_keys=self._request_body_keys,
+                    duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+                )
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+        self._run_request("GET", self._do_GET)
+
+    def _do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
             # Keep the workstation usable in embedded browsers that may drop an
@@ -7437,7 +8299,32 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
         if parsed.path == "/api/health":
-            self._send_json({"ok": True, "project": str(PROJECT_DIR)})
+            self._send_json({
+                "ok": True,
+                "project": str(PROJECT_DIR),
+                "diagnostic_session": DIAGNOSTICS.session_id,
+            })
+            return
+        if parsed.path == "/api/diagnostics":
+            raw_limit = parse_qs(parsed.query).get("limit", ["80"])[0]
+            try:
+                limit = max(1, min(int(raw_limit), 300))
+            except (TypeError, ValueError):
+                limit = 80
+            result = DIAGNOSTICS.snapshot(limit=limit)
+            result["runtime"] = _diagnostic_runtime_context()
+            self._send_json(result)
+            return
+        if parsed.path == "/api/diagnostics/download":
+            bundle = DIAGNOSTICS.bundle(
+                context=_diagnostic_runtime_context(),
+                extra_files=_diagnostic_current_run_files(),
+            )
+            self._send_bytes(
+                bundle,
+                "application/zip",
+                download_name=f"SensUs-diagnostics-{DIAGNOSTICS.session_id}.zip",
+            )
             return
         if parsed.path == "/api/frontend":
             self._send_json(FRONTEND_UPDATER.mark_ready())
@@ -7452,11 +8339,30 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        self._run_request("POST", self._do_POST)
+
+    def _do_POST(self) -> None:
         shutdown_requested = False
         try:
             payload = self._body()
             if self.path == "/api/frontend/ready":
                 result = FRONTEND_UPDATER.mark_ready()
+            elif self.path == "/api/diagnostics/client":
+                message = str(payload.get("message") or "Frontend error")[
+                    :CLIENT_DIAGNOSTIC_MAX_LENGTH
+                ]
+                diagnostic_id = DIAGNOSTICS.record(
+                    "error",
+                    "frontend." + str(payload.get("kind") or "error")[:80],
+                    message,
+                    source=str(payload.get("source") or "")[:500],
+                    stack=str(payload.get("stack") or "")[
+                        :CLIENT_DIAGNOSTIC_MAX_LENGTH
+                    ],
+                    page=str(payload.get("page") or "")[:500],
+                    context=payload.get("context") or {},
+                )
+                result = {"ok": True, "diagnostic_id": diagnostic_id}
             elif self.path == "/api/shutdown":
                 # The normal ``serve()`` finalizer stops schedules, ends an
                 # active acquisition,收回采集子进程/J-Link, then closes the HTTP server.
@@ -7543,23 +8449,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/predict":
                 result = APP.predict(payload)
             elif self.path == "/api/schedule/start":
-                with APP.operation_lock:
-                    if not APP.settings.snapshot()["applied"]:
-                        raise RuntimeError("请先将当前检测条件应用到硬件")
-                    role = str(payload.get("sample_role") or "test")
-                    workflow = APP.workflow_snapshot()
-                    is_it = APP.settings.snapshot()["settings"].get("method") == "it"
-                    if (is_it and role in {"stabilization", "test"}
-                            and not workflow["calibration_ready"]):
-                        raise RuntimeError("请先选择标定点并生成测试曲线")
-                    if (role == "calibration" and workflow["points_count"]
-                            and not workflow["settings_match"]):
-                        raise RuntimeError("当前 IT 条件与已有标定点不同，请新建标定")
-                    payload["settings"] = APP.settings.snapshot()["settings"]
-                    payload["save_dir"] = str(APP.save_dir)
-                    APP.schedule.set_filter_config(APP.filter.snapshot()["settings"])
-                    APP.schedule.set_plateau_config(APP.plateau.settings)
-                    result = APP.schedule.start(payload)
+                result = APP.start_schedule(payload)
             elif self.path == "/api/schedule/stop":
                 result = APP.schedule.stop()
             elif self.path == "/api/settings/apply":
@@ -7604,6 +8494,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     result = APP.plateau.apply(payload)
                     APP.schedule.set_plateau_config(result["settings"])
                     APP.measurement.set_plateau_config(result["settings"])
+            elif self.path == "/api/workspace/browse":
+                result = _browse_workspace_directory(
+                    str(payload.get("initial_path") or "")
+                )
             elif self.path == "/api/workflow/config":
                 with APP.operation_lock:
                     result = APP.configure_workflow(payload)
@@ -7630,26 +8524,59 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(result)
             if shutdown_requested:
                 _request_server_shutdown()
+        except (
+            BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+        ):
+            raise
         except (ValueError, KeyError, TypeError, OSError) as exc:
-            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            payload = {"error": str(exc)}
+            diagnostic_id = str(getattr(exc, "diagnostic_id", ""))
+            if diagnostic_id:
+                payload["diagnostic_id"] = diagnostic_id
+            self._send_json(payload, HTTPStatus.BAD_REQUEST)
         except RuntimeError as exc:
-            self._send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
+            payload = {"error": str(exc)}
+            diagnostic_id = str(getattr(exc, "diagnostic_id", ""))
+            if diagnostic_id:
+                payload["diagnostic_id"] = diagnostic_id
+            self._send_json(payload, HTTPStatus.CONFLICT)
 
 
 def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
           open_browser: bool = False) -> None:
     global HTTP_SERVER, _SHUTDOWN_REQUESTED
+    DIAGNOSTICS.install_exception_hooks()
+    DIAGNOSTICS.record(
+        "info", "application.starting", "Workstation backend is starting",
+        host=host,
+        port=port,
+        project_dir=PROJECT_DIR,
+        state_dir=STATE_DIR,
+        log_dir=DIAGNOSTICS.log_dir,
+        transport=HARDWARE_TRANSPORT,
+    )
     # A CDC probe can outlive the browser request during USB re-enumeration.
     # Daemon request threads keep the server responsive and let shutdown
     # finish without waiting for a detached serial read.
-    ThreadingHTTPServer.daemon_threads = True
-    ThreadingHTTPServer.allow_reuse_address = True
-    server = ThreadingHTTPServer((host, port), RequestHandler)
+    try:
+        server = DiagnosticHTTPServer((host, port), RequestHandler)
+    except Exception as exc:
+        DIAGNOSTICS.exception(
+            "application.bind_failed", "Workstation backend could not listen",
+            exc, host=host, port=port,
+        )
+        raise
     with _SHUTDOWN_LOCK:
         HTTP_SERVER = server
         _SHUTDOWN_REQUESTED = False
     FRONTEND_UPDATER.start(APP.hardware_idle)
     url = f"http://{host}:{server.server_port}/"
+    DIAGNOSTICS.record(
+        "info", "application.ready", "Workstation backend is ready",
+        url=url,
+        diagnostic_session=DIAGNOSTICS.session_id,
+        transport=_transport_status(),
+    )
     print(f"i-t GUI: {url}", flush=True)
     if open_browser:
         threading.Timer(0.35, lambda: webbrowser.open(url)).start()
@@ -7660,6 +8587,10 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
     #    collector 让新 run 直接 ConnectionResetError,而现场看起来像"探头坏了"。
     #    Windows 没有 SIGTERM,用 CTRL_BREAK_EVENT 代替(taskkill 会发这个)。
     def _graceful(_sig, _frm):
+        DIAGNOSTICS.record(
+            "info", "application.signal", "Shutdown signal received",
+            signal=int(_sig),
+        )
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     _signals = (signal.SIGBREAK, signal.SIGINT) if _IS_WIN else (signal.SIGTERM, signal.SIGINT)  # type: ignore[attr-defined]
@@ -7672,7 +8603,15 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        DIAGNOSTICS.record(
+            "info", "application.keyboard_interrupt", "Keyboard interrupt received"
+        )
+    except Exception as exc:
+        DIAGNOSTICS.exception(
+            "application.serve_failed", "HTTP serving loop failed", exc,
+            url=url,
+        )
+        raise
     finally:
         FRONTEND_UPDATER.stop()
         APP.schedule.stop()
@@ -7690,6 +8629,10 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
         with _SHUTDOWN_LOCK:
             if HTTP_SERVER is server:
                 HTTP_SERVER = None
+        DIAGNOSTICS.record(
+            "info", "application.stopped", "Workstation backend stopped cleanly",
+            url=url,
+        )
         print("i-t GUI 已退出(采集子进程与 J-Link 已收回)", flush=True)
 
 
@@ -7714,6 +8657,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     SERIAL_SMP_PORT = str(args.smp_port or "").strip()
     APP.settings.restore_for_transport(HARDWARE_TRANSPORT)
+    DIAGNOSTICS.record(
+        "info", "transport.resolved", "Hardware transport resolved",
+        requested=HARDWARE_TRANSPORT_REQUESTED,
+        selected=HARDWARE_TRANSPORT,
+        serial_data_port=SERIAL_DATA_PORT,
+        serial_smp_port=SERIAL_SMP_PORT,
+    )
     serve(args.host, args.port, args.open_browser)
     return 0
 

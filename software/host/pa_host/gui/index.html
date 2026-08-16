@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SensUs 电化学工作站</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20260816-exit-transport-power-resize">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260817-workspace-picker">
 </head>
 <body>
   <div class="app-shell">
@@ -18,7 +18,7 @@
         <button class="nav-item" data-view="debug"><span>⚙</span>硬件 DEBUG</button>
       </nav>
       <div class="sidebar-footer">
-        <div class="device-row"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small id="deviceTransport">连接方式检查中 · MAX30131</small></div></div>
+        <div class="device-row" id="deviceStatus"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small id="deviceTransport">连接方式检查中 · MAX30131</small></div></div>
         <div class="firmware-note" id="firmwareNote">+0.2 V · 500 nA FSR</div>
       </div>
     </aside>
@@ -28,13 +28,18 @@
         <div><h1 id="pageTitle">实时测量</h1><p id="pageSubtitle">180 秒 IT 检测与末 20 秒稳态分析</p></div>
         <div class="topbar-actions"><div class="clock" id="clock"></div><button class="secondary device-picker-button" id="selectDevice" type="button" title="查看并选择当前硬件设备">选择设备</button><button class="exit-button" id="exitApp" type="button" title="关闭当前标签页并退出后端">退出</button></div>
       </header>
+      <div class="app-alert" id="globalError" role="alert" hidden>
+        <div><strong id="globalErrorTitle">应用发生错误</strong><span id="globalErrorMessage"></span></div>
+        <button class="secondary" id="openDiagnostics" type="button">查看诊断</button>
+        <button class="icon-button" id="dismissGlobalError" type="button" title="关闭错误提示" aria-label="关闭错误提示">×</button>
+      </div>
 
       <section class="view active" id="view-measure">
         <section class="panel workflow-bar">
           <div class="workflow-heading"><div><h2>数据流程</h2><p id="workflowMessage">设置保存目录后，先标定再测试</p></div><div class="live-badge" id="workflowBadge">待配置</div></div>
           <div class="workflow-body">
             <div class="workflow-steps"><span class="active" id="calibrationStep"><b>1</b> 采集标定点</span><i></i><span id="selectionStep"><b>2</b> 选择范围</span><i></i><span id="testStep"><b>3</b> 稳定化 / 测试</span></div>
-            <label class="save-directory">工作区目录<div class="directory-row"><input id="saveDirectory" placeholder="例如：/Users/lynx/Documents/实验数据"><button class="secondary" id="applySaveDirectory">切换工作区</button></div></label>
+            <label class="save-directory">工作区目录<div class="directory-row"><input id="saveDirectory" placeholder="请浏览并选择本地数据工作区"><button class="secondary" id="browseWorkspace" type="button">浏览</button></div></label>
             <button class="text-button reset-calibration" id="resetCalibration">新建批次</button>
           </div>
         </section>
@@ -51,17 +56,16 @@
             <div class="filter-panel" data-filter-panel>
               <div class="filter-panel-head"><div><strong>软件滤波</strong><small data-filter-status>未读取设置</small></div></div>
               <div class="filter-form">
-                <label>作用范围<select data-filter-key="mode"><option value="off">关闭</option><option value="display">仅显示</option><option value="analysis">显示 + 分析/标定</option></select></label>
-                <label class="filter-check"><input type="checkbox" data-filter-key="lowpass_enabled"><span>低通</span></label>
-                <label>截止设置<select data-filter-key="lowpass_auto"><option value="true">自动</option><option value="false">手动</option></select></label>
-                <label>截止频率<div class="input-unit"><input type="text" inputmode="decimal" autocomplete="off" data-filter-key="lowpass_cutoff_hz"><span>Hz</span></div></label>
-                <label>阶数<select data-filter-key="lowpass_order"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option></select></label>
+                <label>作用范围<select data-filter-key="mode"><option value="off">关闭</option><option value="display">仅显示</option><option value="analysis" selected>显示 + 分析/标定</option></select></label>
+                <label class="filter-check"><input type="checkbox" data-filter-key="lowpass_enabled" checked><span>低通</span></label>
+                <label>截止设置<select data-filter-key="lowpass_auto"><option value="true">自动</option><option value="false" selected>手动</option></select></label>
+                <label>截止频率<div class="input-unit"><input type="text" inputmode="decimal" autocomplete="off" value="0.3" data-filter-key="lowpass_cutoff_hz"><span>Hz</span></div></label>
+                <label>阶数<select data-filter-key="lowpass_order"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option></select></label>
                 <label class="filter-check"><input type="checkbox" data-show-raw><span>显示原数据</span></label>
-                <button class="secondary" data-filter-apply>保存设置</button>
               </div>
             </div>
             <div class="history-curve-panel" id="historyCurvePanel" hidden>
-              <div class="history-curve-head"><strong>当前批次历史曲线</strong><button class="text-button" id="refreshHistoryCurves" type="button">刷新</button></div>
+              <div class="history-curve-head"><strong>当前批次历史曲线</strong><div class="history-curve-actions"><label class="history-curve-select-all"><input id="selectAllHistoryCurves" type="checkbox"><span>全选</span></label><button class="text-button" id="refreshHistoryCurves" type="button">刷新</button></div></div>
               <div class="history-curve-list" id="historyCurveList"><span>加载中</span></div>
             </div>
           </section>
@@ -82,11 +86,11 @@
             <div class="control-content">
               <section class="measure-control-panel sample-controls" data-control-panel="sample" role="tabpanel">
                 <div class="sample-role-block" id="sampleRoleBlock"><span>本轮用途</span><div class="segmented role-segmented" id="sampleRole"><button class="active" data-role="calibration">标定</button><button data-role="test">测试</button></div></div>
-                <label>样品名称<input id="sampleName" placeholder="例如：未知样品 01"></label>
+                <label>样品名称<input id="sampleName" placeholder="例如：未知样品 01" required></label>
                 <div class="concentration-field" id="concentrationField">
                   <label id="concentrationLabel" for="knownConcentration">已知浓度（标定必填）</label>
                   <div class="concentration-input-row">
-                    <div class="input-unit"><input id="knownConcentration" type="number" min="0" step="any" placeholder="请输入标定浓度"><span>µM</span></div>
+                    <div class="input-unit"><input id="knownConcentration" type="number" min="0" step="any" placeholder="请输入标定浓度" required><span>µM</span></div>
                     <div class="segmented concentration-stepper" role="group" aria-label="快速调整已知浓度">
                       <button id="doubleKnownConcentration" type="button" title="已知浓度乘二" aria-label="已知浓度乘二">×2</button>
                       <button id="halveKnownConcentration" type="button" title="已知浓度除以二" aria-label="已知浓度除以二">÷2</button>
@@ -204,7 +208,7 @@
           </section>
           <section class="panel ap-panel">
             <div class="panel-head"><div><h2>AP 评分区间</h2><p>ETE July IP 算法：蓝区满分，绿区按边界线性插值，灰区 0 分；按测试顺序计算连续稳定性</p></div><div class="ap-score-badge" id="apFinalBadge">Final -- / 200</div></div>
-            <div class="chart-wrap ap-chart"><canvas id="apScoreChart" aria-label="AP 评分区间坐标图，横纵轴 0 至 50 微摩尔每升"></canvas></div>
+            <div class="chart-wrap ap-chart"><canvas id="apScoreChart" aria-label="AP 评分区间坐标图，横纵轴 0 至 60 微摩尔每升"></canvas></div>
             <div class="ap-legend"><span><i class="ap-swatch blue"></i>Blue 满分区</span><span><i class="ap-swatch green"></i>Green 部分分区</span><span><i class="ap-swatch grey"></i>Grey 0 分</span><span><i class="ap-dot"></i>已测点</span><span><i class="ap-missing">?</i>无法反解</span></div>
             <div class="ap-metrics"><div><span>MS</span><strong id="apMs">--</strong><small>/ 10</small></div><div><span>SC</span><strong id="apSc">--</strong><small>/ 10</small></div><div><span>最长加权连续</span><strong id="apStreak">--</strong><small>点</small></div><div><span>已测 / 24</span><strong id="apMeasured">--</strong><small>样品</small></div><div><span>Blue / Green / Grey</span><strong id="apZones">--</strong><small>点</small></div><div><span>平均绝对误差</span><strong id="apMae">--</strong><small>µM</small></div><div><span>平均误差百分比</span><strong id="apMape">--</strong><small>%</small></div><div><span>RMSE</span><strong id="apRmse">--</strong><small>µM</small></div></div>
           </section>
@@ -312,13 +316,12 @@
           <div class="filter-panel" data-filter-panel>
             <div class="filter-panel-head"><div><strong>软件滤波</strong><small data-filter-status>与实时测量共用设置</small></div></div>
             <div class="filter-form filter-form-compact">
-              <label>作用范围<select data-filter-key="mode"><option value="off">关闭</option><option value="display">仅显示</option><option value="analysis">显示 + 分析</option></select></label>
-              <label class="filter-check"><input type="checkbox" data-filter-key="lowpass_enabled"><span>低通</span></label>
-              <label>截止设置<select data-filter-key="lowpass_auto"><option value="true">自动</option><option value="false">手动</option></select></label>
-              <label>截止频率<div class="input-unit"><input type="text" inputmode="decimal" autocomplete="off" data-filter-key="lowpass_cutoff_hz"><span>Hz</span></div></label>
-              <label>阶数<select data-filter-key="lowpass_order"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label>
+              <label>作用范围<select data-filter-key="mode"><option value="off">关闭</option><option value="display">仅显示</option><option value="analysis" selected>显示 + 分析</option></select></label>
+              <label class="filter-check"><input type="checkbox" data-filter-key="lowpass_enabled" checked><span>低通</span></label>
+              <label>截止设置<select data-filter-key="lowpass_auto"><option value="true">自动</option><option value="false" selected>手动</option></select></label>
+              <label>截止频率<div class="input-unit"><input type="text" inputmode="decimal" autocomplete="off" value="0.3" data-filter-key="lowpass_cutoff_hz"><span>Hz</span></div></label>
+              <label>阶数<select data-filter-key="lowpass_order"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option></select></label>
               <label class="filter-check"><input type="checkbox" data-show-raw><span>显示原数据</span></label>
-              <button class="secondary" data-filter-apply>保存设置</button>
             </div>
           </div>
           <div class="dbg-codes" id="dbgCodes">原始 12-bit code:等待数据</div>
@@ -397,6 +400,24 @@
             </div>
           </div>
         </section>
+
+        <section class="panel diagnostics-panel" id="diagnosticsPanel">
+          <div class="panel-head diagnostics-head">
+            <div><h2>应用诊断</h2><p id="diagnosticsSummary">正在读取本次运行日志</p></div>
+            <div class="diagnostics-actions">
+              <div class="live-badge" id="diagnosticsBadge">读取中</div>
+              <button class="secondary" id="refreshDiagnostics" type="button">刷新</button>
+              <a class="secondary diagnostic-download" id="downloadDiagnostics" href="/api/diagnostics/download" download>下载诊断包</a>
+            </div>
+          </div>
+          <div class="diagnostics-meta">
+            <div><span>会话</span><strong id="diagnosticsSession">--</strong></div>
+            <div><span>日志目录</span><strong id="diagnosticsPath">--</strong></div>
+            <div><span>当前运行</span><strong id="diagnosticsRun">--</strong></div>
+          </div>
+          <div class="notice error diagnostics-error" id="diagnosticsError" hidden></div>
+          <div class="diagnostics-events" id="diagnosticsList"><div class="empty-history">暂无诊断事件</div></div>
+        </section>
       </section>
     </main>
   </div>
@@ -409,6 +430,6 @@
     <div id="deviceList" class="device-list"></div>
   </dialog>
   <div class="toast" id="toast"></div>
-  <script src="/assets/app.js?v=20260816-exit-transport-power-resize"></script>
+  <script src="/assets/app.js?v=20260817-workspace-picker"></script>
 </body>
 </html>

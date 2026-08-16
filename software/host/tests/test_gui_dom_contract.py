@@ -9,6 +9,8 @@ GUI_DIR = Path(__file__).parents[1] / "pa_host" / "gui"
 
 def _extract_js_function(source: str, name: str) -> str:
     start = source.index(f"function {name}(")
+    if source[max(0, start - 6):start] == "async ":
+        start -= 6
     opening = source.index("{", start)
     depth = 0
     for offset in range(opening, len(source)):
@@ -54,6 +56,57 @@ def test_gui_exposes_dynamic_transport_and_graceful_exit_controls() -> None:
     assert "J-Link · MAX30131" not in html
 
 
+def test_sidebar_hardware_state_uses_actual_device_discovery() -> None:
+    states = _evaluate_chart_js(
+        ["renderHardwareConnection"],
+        """
+const nodes = {
+  deviceDot: {className: ''},
+  deviceState: {textContent: ''},
+  deviceTransport: {textContent: ''},
+  deviceStatus: {title: ''},
+};
+const $ = id => nodes[id];
+const capture = () => ({
+  dot: nodes.deviceDot.className,
+  title: nodes.deviceState.textContent,
+  detail: nodes.deviceTransport.textContent,
+});
+let state = {
+  measurement: {state: 'idle'},
+  devices: {devices: [{id: 'j1', name: 'J-Link SN 1', selectable: true}], probing: false},
+};
+renderHardwareConnection(); const connected = capture();
+state.devices = {devices: [], probing: false};
+renderHardwareConnection(); const disconnected = capture();
+state.devices = {devices: [
+  {id: 'j1', name: 'J-Link SN 1', selectable: true},
+  {id: 'u1', name: 'USB Board 1', selectable: true},
+], probing: false};
+renderHardwareConnection(); const multiple = capture();
+""",
+        "{connected,disconnected,multiple}",
+    )
+
+    assert states == {
+        "connected": {
+            "dot": "status-dot ok",
+            "title": "硬件已连接",
+            "detail": "J-Link SN 1 · MAX30131",
+        },
+        "disconnected": {
+            "dot": "status-dot",
+            "title": "硬件未连接",
+            "detail": "未发现 USB DATA 或 J-Link · MAX30131",
+        },
+        "multiple": {
+            "dot": "status-dot warning",
+            "title": "已发现 2 个硬件",
+            "detail": "请在右上角选择本次使用的设备 · MAX30131",
+        },
+    }
+
+
 def test_settings_apply_has_long_timeout_and_reload_safe_progress_polling() -> None:
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
 
@@ -64,6 +117,87 @@ def test_settings_apply_has_long_timeout_and_reload_safe_progress_polling() -> N
     assert "api('/api/settings',{timeoutMs:3000})" in app
     assert "$('applySettings').disabled=applying" in app
     assert "if(applying)ensureSettingsProgressPolling()" in app
+
+
+def test_measurement_start_validates_inputs_keeps_errors_and_waits_for_gate() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="sampleName" placeholder="例如：未知样品 01" required' in html
+    assert 'id="knownConcentration" type="number" min="0" step="any"' in html
+    assert 'placeholder="请输入标定浓度" required' in html
+    assert "MEASUREMENT_START_TIMEOUT_MS = 45000" in app
+    assert "timeoutMs:MEASUREMENT_START_TIMEOUT_MS" in app
+    assert "function measurementInputIssue()" in app
+    assert "function clearMeasurementInputState()" in app
+    assert "else if(!state.measureRequestError)$('measureError').hidden=true" in app
+    assert 'input[aria-invalid="true"]' in (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+
+def test_gui_exposes_diagnostics_and_frontend_error_boundaries() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    for element_id in (
+        "globalError", "openDiagnostics", "diagnosticsPanel",
+        "diagnosticsList", "diagnosticsPath", "refreshDiagnostics",
+        "downloadDiagnostics",
+    ):
+        assert f'id="{element_id}"' in html
+    assert 'href="/api/diagnostics/download"' in html
+    assert "/api/diagnostics?limit=120" in app
+    assert "/api/diagnostics/client" in app
+    assert "window.addEventListener('error'" in app
+    assert "window.addEventListener('unhandledrejection'" in app
+    assert "function reportClientIssue(" in app
+    assert ".diagnostic-event{" in styles
+
+
+def test_diagnostic_message_preserves_backend_id() -> None:
+    messages = _evaluate_chart_js(
+        ["diagnosticMessage"],
+        """
+const plain = diagnosticMessage(new Error('plain failure'));
+const backend = new Error('backend failure'); backend.diagnosticId = 'D-123';
+const identified = diagnosticMessage(backend);
+""",
+        "{plain,identified}",
+    )
+
+    assert messages == {
+        "plain": "plain failure",
+        "identified": "backend failure（诊断编号 D-123）",
+    }
+
+
+def test_measurement_input_issue_requires_calibration_metadata() -> None:
+    issues = _evaluate_chart_js(
+        ["measurementInputIssue"],
+        """
+const nodes = {sampleName:{value:''},knownConcentration:{value:''}};
+const $ = id => nodes[id];
+let state = {method:'it',sampleRole:'calibration'};
+const missingName = measurementInputIssue();
+nodes.sampleName.value = 'standard';
+const missingConcentration = measurementInputIssue();
+nodes.knownConcentration.value = '12.5';
+const calibrationReady = measurementInputIssue();
+state.sampleRole = 'test'; nodes.knownConcentration.value = '';
+const testReady = measurementInputIssue();
+""",
+        "{missingName,missingConcentration,calibrationReady,testReady}",
+    )
+
+    assert issues == {
+        "missingName": {"field": "sampleName", "message": "请填写样品名称"},
+        "missingConcentration": {
+            "field": "knownConcentration",
+            "message": "请填写标定样品的已知浓度",
+        },
+        "calibrationReady": None,
+        "testReady": None,
+    }
 
 
 def test_gui_exposes_manual_multi_device_picker() -> None:
@@ -88,7 +222,8 @@ def test_known_concentration_stepper_has_stable_accessible_controls() -> None:
     assert 'id="halveKnownConcentration" type="button"' in html
     assert 'aria-label="已知浓度乘二"' in html
     assert 'aria-label="已知浓度除以二"' in html
-    assert "$('knownConcentration').addEventListener('input',previewFilename)" in app
+    assert "['sampleName','knownConcentration'].forEach" in app
+    assert "clearMeasureError();previewFilename()" in app
     assert "new Event('input',{bubbles:true})" in app
     assert "points_revision:state.calibration?.points_revision??null" in app
     assert ".concentration-input-row{display:grid;grid-template-columns:minmax(0,1fr) auto" in styles
@@ -163,9 +298,14 @@ def test_both_filter_panels_expose_only_the_shared_lowpass_configuration() -> No
     for key in required:
         assert html.count(f'data-filter-key="{key}"') == 2, key
     assert html.count('data-show-raw') == 2
-    assert html.count('data-filter-apply') == 2
+    assert html.count('data-filter-apply') == 0
     assert html.count('>显示原数据</span>') == 2
-    assert html.count('type="text" inputmode="decimal" autocomplete="off" data-filter-key="lowpass_cutoff_hz"') == 2
+    assert html.count('value="0.3" data-filter-key="lowpass_cutoff_hz"') == 2
+    assert "function queueFilterSave(delay=450)" in app
+    assert "async function flushFilterSave()" in app
+    assert "state.filterSaving" in app
+    assert "'/api/filter/apply'" in app
+    assert "已自动保存" in app
     assert "data-filter-note" not in html
     assert "等待足够数据后计算滤波器" not in app
     assert "分析结果另存为 *-filtered.csv" not in app
@@ -205,22 +345,93 @@ def test_workspace_history_view_exposes_current_workspace_batches_and_safe_remov
     assert ".sidebar nav{grid-template-columns:repeat(5,1fr)}" in styles
 
 
+def test_workspace_picker_and_hard_measurement_gate_are_exposed() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="browseWorkspace"' in html
+    assert 'id="applySaveDirectory"' not in html
+    assert "/api/workspace/browse" in app
+    assert "function confirmAndSwitchWorkspace(path)" in app
+    assert "window.confirm('确认切换工作区？')" in app
+    assert "$('saveDirectory').addEventListener('blur'" in app
+    assert "event.key!=='Enter'" in app
+    assert "batch_name:''" in app
+    assert "function workspaceReady()" in app
+    assert "!workspaceReady()" in app
+    assert "workspace_available" in app
+    assert "save_dir:$('saveDirectory').value" not in app
+
+
+def test_workspace_switch_confirmation_is_single_step_and_cancelable() -> None:
+    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    functions = "\n".join(_extract_js_function(source, name) for name in (
+        "configuredWorkspacePath",
+        "restoreConfiguredWorkspacePath",
+        "confirmAndSwitchWorkspace",
+    ))
+    script = f"""
+{functions}
+const nodes={{saveDirectory:{{value:'/old',disabled:false}},browseWorkspace:{{disabled:false}}}};
+const $=id=>nodes[id];
+let state={{workflow:{{workspace_root:'/old',save_dir:'/old/batch'}},workspaceSwitchPromise:null,calibration:null,historyPreview:null,historyCurves:[],historyCurveIds:[]}};
+const confirmations=[false,true],requests=[],toasts=[],errors=[];
+const window={{confirm:()=>confirmations.shift()}};
+const post=async(path,payload)=>{{requests.push({{path,payload}});return {{workspace_root:'/new',save_dir:'/new/batch'}}}};
+const api=async()=>({{points:[]}});
+const renderWorkflow=data=>{{state.workflow=data;nodes.saveDirectory.value=data.workspace_root||data.save_dir||''}};
+const renderCalibration=()=>{{}};
+const refreshWorkspaceHistory=async()=>{{}};
+const toast=message=>toasts.push(message);
+const errorBox=(id,error)=>errors.push(String(error));
+(async()=>{{
+  nodes.saveDirectory.value='/cancelled';
+  const cancelled=await confirmAndSwitchWorkspace('/cancelled');
+  const restoredAfterCancel=nodes.saveDirectory.value;
+  nodes.saveDirectory.value='/new';
+  const switched=await confirmAndSwitchWorkspace('/new');
+  const duplicate=await confirmAndSwitchWorkspace('/new');
+  console.log(JSON.stringify({{cancelled,restoredAfterCancel,switched,duplicate,requests,toasts,errors,finalPath:nodes.saveDirectory.value}}));
+}})().catch(error=>{{console.error(error);process.exit(1)}});
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], check=True, capture_output=True, text=True,
+    )
+    result = json.loads(completed.stdout)
+
+    assert result == {
+        "cancelled": False,
+        "restoredAfterCancel": "/old",
+        "switched": True,
+        "duplicate": False,
+        "requests": [{
+            "path": "/api/workflow/config",
+            "payload": {"save_dir": "/new", "batch_name": ""},
+        }],
+        "toasts": ["已切换工作区并新建批次"],
+        "errors": [],
+        "finalPath": "/new",
+    }
+
+
 def test_gui_exposes_history_curve_overlay_batch_naming_and_cross_add_controls() -> None:
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
 
     for element_id in (
         "toggleHistoryCurves", "historyCurvePanel", "historyCurveList",
-        "refreshHistoryCurves",
+        "refreshHistoryCurves", "selectAllHistoryCurves",
     ):
         assert f'id="{element_id}"' in html
     assert "batch_name" in app
     assert "/api/history/curves" in app
     assert "/api/history/curves/load" in app
+    assert "function selectAllHistoryCurves(selected)" in app
+    assert "toggle.indeterminate=selected>0&&selected<inputs.length" in app
     assert "/api/calibration/promote-validation" in app
     assert "/api/calibration/add-validation" in app
     assert "integerX:true" in app
-    assert '>切换工作区</button>' in html
+    assert '>切换工作区</button>' not in html
     assert '>新建批次</button>' in html
     assert "新建标定批次" not in html
     assert "前后端版本不一致，请退出并重新打开软件" in app
@@ -230,6 +441,35 @@ def test_gui_exposes_history_curve_overlay_batch_naming_and_cross_add_controls()
     assert ".sidebar nav{grid-template-columns:repeat(5,minmax(0,1fr))}" in (
         GUI_DIR / "styles.css"
     ).read_text(encoding="utf-8")
+
+
+def test_history_curve_select_all_reflects_empty_partial_and_complete_states() -> None:
+    states = _evaluate_chart_js(
+        ["syncHistoryCurveSelectAll"],
+        """
+let inputs = [];
+const toggle = {disabled: false, checked: false, indeterminate: false};
+const list = {querySelectorAll: () => inputs};
+const $ = id => id === 'selectAllHistoryCurves' ? toggle : list;
+const capture = () => ({
+  disabled: toggle.disabled,
+  checked: toggle.checked,
+  indeterminate: toggle.indeterminate,
+});
+syncHistoryCurveSelectAll(); const empty = capture();
+inputs = [{checked: true}, {checked: false}];
+syncHistoryCurveSelectAll(); const partial = capture();
+inputs[1].checked = true;
+syncHistoryCurveSelectAll(); const complete = capture();
+""",
+        "{empty,partial,complete}",
+    )
+
+    assert states == {
+        "empty": {"disabled": True, "checked": False, "indeterminate": False},
+        "partial": {"disabled": False, "checked": False, "indeterminate": True},
+        "complete": {"disabled": False, "checked": True, "indeterminate": False},
+    }
 
 
 def test_history_status_label_maps_missing_and_corrupt_entries() -> None:
@@ -258,7 +498,7 @@ def test_ap_chart_zone_colors_keep_green_and_blue_distinct() -> None:
     assert ".ap-swatch.blue{background:#cfe1e8}.ap-swatch.green{background:#cfe8dc}" in styles
 
 
-def test_ap_chart_uses_a_fixed_zero_to_fifty_domain() -> None:
+def test_ap_chart_uses_a_fixed_zero_to_sixty_domain() -> None:
     domain = _evaluate_chart_js(
         ["apChartDomain"],
         """
@@ -271,7 +511,7 @@ const domain = apChartDomain(candidates, candidates);
         "domain",
     )
 
-    assert domain == {"xMax": 50, "yMax": 50, "minValue": 0}
+    assert domain == {"xMax": 60, "yMax": 60, "minValue": 0}
 
 
 def test_ap_chart_is_square_and_visible_without_test_points() -> None:
@@ -571,7 +811,7 @@ def test_debug_overlay_controls_remain_clickable_in_empty_and_narrow_states() ->
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
 
-    assert html.count("20260816-exit-transport") == 2
+    assert html.count("20260817-workspace-picker") == 2
     assert ".empty-chart{position:absolute;inset:0;display:grid;place-items:center;color:#8a969a;font-size:12px;pointer-events:none}" in css
     assert ".chart-legend{position:absolute;z-index:2;" in css
     assert "@media(max-width:900px)" in css

@@ -17,6 +17,7 @@ a = Analysis(
         "pa_host.collect",
         "pa_host.analyze",
         "pa_host.cv",
+        "pa_host.diagnostics",
         "pa_host.filtering",
         "pa_host.frontend_update",
         "pa_host.it",

@@ -438,6 +438,7 @@ def test_platform_evaluation_exposes_signed_fit_diagnostics() -> None:
     current = 5.0 - 0.001 * time_s
     result = evaluate_platform(
         time_s, current, np.ones(len(time_s), dtype=bool),
+        filter_config={"mode": "off"},
     )
 
     assert result is not None

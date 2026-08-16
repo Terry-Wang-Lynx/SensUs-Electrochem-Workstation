@@ -1,6 +1,7 @@
 #!/bin/bash
 # 经 USB 上传 app(全程不需要调试器)。
 # 用法:03-usb-upload.sh [镜像.bin]     默认 ../images/app.signed.bin
+# 上位机会通过 SENSUS_SMP_PORT 锁定用户选中的那块板。
 #
 # 窗口规则:slot0 为空 ⇒ 永久等待;已有可引导 app ⇒ 只有上电后 5 秒。
 # 本脚本会**轮询等口出现**,所以你不用掐时间 —— 需要重上电时拔插一次 USB-C 即可。

@@ -26,6 +26,16 @@ def _trace(fs: float = 8.0, n: int = 400):
     return t, y, np.ones(n, dtype=bool)
 
 
+def test_default_filter_matches_the_workstation_baseline() -> None:
+    assert validate_filter_config() == {
+        "mode": "analysis",
+        "lowpass_enabled": True,
+        "lowpass_cutoff_hz": 0.3,
+        "lowpass_auto": False,
+        "lowpass_order": 4,
+    }
+
+
 def test_off_is_bit_for_bit_and_does_not_change_invalid_rows() -> None:
     t, y, valid = _trace()
     valid[120] = False

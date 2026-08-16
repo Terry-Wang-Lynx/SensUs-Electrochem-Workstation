@@ -32,5 +32,9 @@ jlink_run() {   # 用法:jlink_run <<'EOF' ...命令... EOF
 }
 
 board_cdc() {   # 打印板端 CDC 口(排除探头自己的);没有就空
+    if [ -n "${SENSUS_SMP_PORT:-}" ]; then
+        [ -e "$SENSUS_SMP_PORT" ] && printf '%s\n' "$SENSUS_SMP_PORT"
+        return
+    fi
     ls /dev/cu.usbmodem* 2>/dev/null | grep -v "$JLINK_CDC_SERIAL" | head -1
 }
