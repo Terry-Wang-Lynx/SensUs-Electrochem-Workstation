@@ -1606,7 +1606,7 @@ class SettingsController:
 
     @classmethod
     def runtime_afe_contract(cls, payload: dict[str, Any]) -> dict[str, Any]:
-        """Return the complete persistent AFE state expected after flashing."""
+        """Return the persistent AFE state required before a measurement."""
         settings = cls.validate(payload)
         fsr_codes = {50: 0, 100: 1, 250: 2, 500: 3, 1000: 4, 2000: 5}
         offset_codes = {
@@ -1616,6 +1616,7 @@ class SettingsController:
         # Wide-range IT uses the EIS ADC for samples, but the persistent DC AFE
         # baseline still boots at 2 uA and must not inherit Debug changes.
         fsr_nA = settings["fsr_nA"]
+        cv = settings["method"] == "cv"
         return {
             "fsr": fsr_codes.get(fsr_nA, 5),
             "off": offset_codes[settings["offset_mode"]],
@@ -1625,16 +1626,72 @@ class SettingsController:
             "clk40": 0,
             "ioc": 0,
             "e_mv": int(round(settings["potential_v"] * 1000)),
-            "vwe_mv": cls.working_electrode_mv(settings),
+            # CV's EIS path has always used an 800 mV common-mode voltage.
+            # Keep the DC baseline on the same valid DAC window while the
+            # visible IT working-electrode control remains fully adjustable.
+            "vwe_mv": 800 if cv else cls.working_electrode_mv(settings),
             "idle": 2,
             "cellv": 1,
             "chop": 1,
             "rs": 0,
             "ios": 1,
             "satpct": 5,
-            "sel": 1,
-            "amps": 1,
         }
+
+    @classmethod
+    def runtime_afe_command(cls, payload: dict[str, Any]) -> str:
+        contract = cls.runtime_afe_contract(payload)
+        return "SET " + " ".join((
+            f"fsr={contract['fsr']}", f"off={contract['off']}",
+            "conv=auto", f"period={contract['period']}",
+            f"sysper={contract['sysper']}", f"clk40={contract['clk40']}",
+            f"ioc={contract['ioc']}", f"chop={contract['chop']}",
+            f"rs={contract['rs']}", f"ios={contract['ios']}",
+            f"e={contract['e_mv']}", f"vwe={contract['vwe_mv']}",
+            f"idle={contract['idle']}", f"cellv={contract['cellv']}",
+            f"satpct={contract['satpct']}",
+        ))
+
+    @classmethod
+    def runtime_measurement_contract(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        settings = cls.validate(payload)
+        eis_codes = {4: 0, 8: 1, 20: 2, 40: 3}
+        wide_eis_codes = {4000: 0, 8000: 1, 20000: 2, 40000: 3}
+        return {
+            "mode": 1 if settings["method"] == "cv" else 0,
+            "start_mv": int(round(settings["initial_potential_v"] * 1000)),
+            "target_mv": int(round(settings["potential_v"] * 1000)),
+            "quiet_ms": int(round(
+                (settings["cv_quiet_s"] if settings["method"] == "cv"
+                 else settings["prestep_s"]) * 1000
+            )),
+            "duration_ms": int(round(settings["duration_s"] * 1000)),
+            "adaptive": 1 if settings["adaptive_stop"] else 0,
+            "sample_interval_ms": int(round(1000 / settings["target_rate_hz"])),
+            "cv_low_mv": int(round(settings["cv_low_v"] * 1000)),
+            "cv_high_mv": int(round(settings["cv_high_v"] * 1000)),
+            "cv_rate_mv_s": int(round(settings["cv_scan_rate_v_s"] * 1000)),
+            "cv_cycles": settings["cv_cycles"],
+            "cv_step_mv": int(round(settings["cv_step_v"] * 1000)),
+            "cv_eis": eis_codes[settings["cv_eis_fsr_uA"]],
+            "it_use_eis": 1 if settings["fsr_nA"] in IT_WIDE_FSR_OPTIONS else 0,
+            "it_eis": wide_eis_codes.get(settings["fsr_nA"], 3),
+        }
+
+    @classmethod
+    def runtime_measurement_command(
+        cls, payload: dict[str, Any], request_id: str
+    ) -> str:
+        contract = cls.runtime_measurement_contract(payload)
+        values = (
+            "mode", "start_mv", "target_mv", "quiet_ms", "duration_ms",
+            "adaptive", "sample_interval_ms", "cv_low_mv", "cv_high_mv",
+            "cv_rate_mv_s", "cv_cycles", "cv_step_mv", "cv_eis",
+            "it_use_eis", "it_eis",
+        )
+        return "MEAS " + " ".join(
+            [*(str(contract[key]) for key in values), request_id]
+        )
 
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.apply_lock.acquire(blocking=False):
@@ -1715,8 +1772,13 @@ class SettingsController:
                 )["settings"])
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                 prebuilt_settings = None
-            can_use_prebuilt = settings == prebuilt_settings and (
-                not usb_transport or runtime.is_frozen()
+            # Portable packages ship one validated runtime-configurable image.
+            # Every supported UI condition uses that image and is committed
+            # transactionally over RTT/CDC before START, so the target machine
+            # never needs NCS, Zephyr or a compiler. Source checkouts retain the
+            # existing compile path for developer firmware changes.
+            can_use_prebuilt = runtime.is_frozen() or (
+                settings == prebuilt_settings and not usb_transport
             )
             if can_use_prebuilt:
                 firmware_source = "prebuilt"
@@ -1741,13 +1803,13 @@ class SettingsController:
                     self.settings = settings
                     self.applied = True
                     self.state = "applied"
-                    self.message = "推荐条件已使用随包固件应用到硬件"
+                    self.message = (
+                        "通用固件已就绪；测量前会自动下发并核验当前条件"
+                        if runtime.is_frozen()
+                        else "推荐条件已使用随包固件应用到硬件"
+                    )
                     self.error = ""
                 return self.snapshot()
-            if runtime.is_frozen():
-                raise RuntimeError(
-                    "便携版只能烧录随包稳定固件；自定义条件请使用源码版工具链"
-                )
             if (not _IS_WIN and (
                 not (NCS_DIR / "zephyr/zephyr-env.sh").exists()
                 or not NCS_VENV_ACTIVATE.exists()
@@ -2573,18 +2635,30 @@ class MeasurementController:
             self._debug_pending_cfg = None
             self._prestart_gate_failed = False
             self._config_gate_event = threading.Event()
+            gate_request_id = hashlib.sha256(
+                f"{self.run_id}:{time.time_ns()}".encode("ascii")
+            ).hexdigest()[:12]
             self._config_gate = (
                 {
                     "state": "checking",
                     "expected": SettingsController.runtime_afe_contract(self.settings),
+                    "afe_command": SettingsController.runtime_afe_command(self.settings),
+                    "measurement_expected": (
+                        SettingsController.runtime_measurement_contract(self.settings)
+                    ),
+                    "measurement_command": (
+                        SettingsController.runtime_measurement_command(
+                            self.settings, gate_request_id
+                        )
+                    ),
+                    "measurement_confirmed": False,
+                    "measurement_actual": {},
                     "actual": {},
                     "mismatches": [],
                     "started_at": time.time(),
                     "verified_at": None,
                     "verification_level": None,
-                    "request_id": hashlib.sha256(
-                        f"{self.run_id}:{time.time_ns()}".encode("ascii")
-                    ).hexdigest()[:12],
+                    "request_id": gate_request_id,
                     "last_tagged_get_at": 0.0,
                     "tagged_get_attempts": 0,
                     "legacy_fallback_sent": False,
@@ -2680,11 +2754,11 @@ class MeasurementController:
                 self.error = "无法启动采集进程"
                 raise
             if verify_runtime_config:
-                # ARMED keeps the firmware idle. GET is forwarded only after the
-                # collector owns the RTT downlink, and START is written later by
-                # the configuration gate after a complete confirmed snapshot.
-                if self._send_tagged_gate_get_locked():
-                    self.message = "正在回读并核对硬件配置"
+                # ARMED keeps the firmware idle. The full AFE and measurement
+                # snapshots are committed before a tagged physical GET; START
+                # is emitted only after both confirmations match the UI.
+                if self._send_runtime_gate_commands_locked():
+                    self.message = "正在下发并核对硬件测量条件"
             # This thread owns analysis, exports, and completion callbacks after
             # the collector exits. It must keep the process alive until those
             # durable writes finish.
@@ -3025,6 +3099,18 @@ class MeasurementController:
         )
         return True
 
+    def _send_runtime_gate_commands_locked(self) -> bool:
+        """Commit full runtime settings, then request a physical AFE snapshot."""
+        for command, failure in (
+            (self._config_gate.get("afe_command"), "无法下发 AFE 配置"),
+            (self._config_gate.get("measurement_command"), "无法下发测量时序配置"),
+        ):
+            if command and not self._write_config_gate_command_locked(
+                str(command), failure,
+            ):
+                return False
+        return self._send_tagged_gate_get_locked()
+
     def _maybe_retry_tagged_gate_get_locked(self) -> None:
         """Retry the exact GET while J-Link may accept TCP before RTT downlink is ready."""
         if (self._config_gate.get("state") != "checking"
@@ -3037,7 +3123,7 @@ class MeasurementController:
         if (now - started_at >= CONFIG_GATE_LEGACY_PROBE_DELAY_S
                 or now - last_sent < CONFIG_GATE_GET_RETRY_S):
             return
-        self._send_tagged_gate_get_locked()
+        self._send_runtime_gate_commands_locked()
 
     @staticmethod
     def _config_mismatches(expected: dict[str, Any],
@@ -3062,6 +3148,19 @@ class MeasurementController:
                 "actual": actual.get("verify_ok"),
             })
         return mismatches
+
+    @staticmethod
+    def _measurement_mismatches(expected: dict[str, Any],
+                                actual: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "field": f"measurement.{field}",
+                "expected": wanted,
+                "actual": actual.get(field),
+            }
+            for field, wanted in expected.items()
+            if actual.get(field) != wanted
+        ]
 
     def _advance_config_gate_locked(self) -> None:
         if self._config_gate.get("state") != "checking":
@@ -3111,9 +3210,18 @@ class MeasurementController:
                 "固件不支持完整物理配置核验，请重新应用条件并烧录硬件",
             )
             return
+        measurement_expected = self._config_gate.get("measurement_expected") or {}
+        if (measurement_expected
+                and not self._config_gate.get("measurement_confirmed")):
+            return
         mismatches = self._config_mismatches(
             self._config_gate["expected"], actual,
         )
+        if measurement_expected:
+            mismatches.extend(self._measurement_mismatches(
+                measurement_expected,
+                self._config_gate.get("measurement_actual") or {},
+            ))
         if record["faults"]:
             mismatches.append({
                 "field": "config_integrity",
@@ -3145,6 +3253,10 @@ class MeasurementController:
         self.metadata["hardware_config"] = {
             "expected": dict(self._config_gate["expected"]),
             "actual": actual,
+            "measurement_expected": dict(measurement_expected),
+            "measurement_actual": dict(
+                self._config_gate.get("measurement_actual") or {}
+            ),
             "epoch": epoch,
             "verification_level": self._config_gate["verification_level"],
             "verified_at": self._config_gate["verified_at"],
@@ -3199,6 +3311,24 @@ class MeasurementController:
                 self._audit_cache.append(event)
                 kind = event.get("kind")
                 epoch = event.get("ep")
+                if kind == "MEAS_CONFIRMED" and (
+                    str(event.get("req") or "")
+                    == str(self._config_gate.get("request_id") or "")
+                ):
+                    expected_measurement = (
+                        self._config_gate.get("measurement_expected") or {}
+                    )
+                    self._config_gate["measurement_actual"] = {
+                        key: event.get(key) for key in expected_measurement
+                    }
+                    self._config_gate["measurement_confirmed"] = True
+                elif (kind == "MEAS_REJECT"
+                      and self._config_gate.get("state") == "checking"):
+                    reason = str(event.get("reason") or "unknown")
+                    self._fail_config_gate(
+                        "measurement_rejected",
+                        f"固件拒绝测量条件（{reason}），测量未启动",
+                    )
                 if (isinstance(epoch, int)
                         and kind in ("CFG_APPLIED", "CFG_DERIVED", "CFG_BOOT",
                                      "CFG_CONFIRMED")):

@@ -21,7 +21,11 @@
 #include "afe_cfg.h"
 #include "max30131.h"
 #include "max30131_regs.h"
-#if __has_include("measurement_config.h")
+#include "measurement_cfg.h"
+#if defined(SENSUS_USE_DEFAULT_MEASUREMENT_CONFIG) || \
+	defined(CONFIG_SENSUS_USE_DEFAULT_MEASUREMENT_CONFIG)
+#include "measurement_config.default.h"
+#elif __has_include("measurement_config.h")
 #include "measurement_config.h"
 #else
 #include "measurement_config.default.h"
@@ -63,6 +67,7 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
  */
 static afe_cfg_t     cfg_live;   /* 唯一权威的生效配置 */
 static afe_derived_t drv_live;   /* 它的全部派生量(审计行逐字段打印) */
+static measurement_cfg_t measurement_live; /* 方法与测量时序的生效快照 */
 /*
  * 配置纪元。每次真正写寄存器前 +1,并进入**每一个样本行**(`S ... ep=`)。
  * 🔴 为什么必须进样本行而不是靠"事件行 + 主机插值":`counts` 与 `sat` 的量纲
@@ -95,10 +100,10 @@ static void handle_command_line(const char *line);
 static bool afe_status_poll(const char *why, bool force);
 static void replay_state(const char *src, const char *req);
 #define WP_REF        MAX30131_REF_1536MV      /* 内部 1.536V;CR2032 EOL 2.0V 只此档 */
-#define WP_METHOD_CV  GUI_MEASUREMENT_MODE_CV
-#define WP_IT_USE_EIS GUI_IT_USE_EIS
-#define WP_IT_EIS_FSR GUI_IT_EIS_FSR
-#define WP_IT_SAMPLE_INTERVAL_MS GUI_IT_SAMPLE_INTERVAL_MS
+#define WP_METHOD_CV  measurement_live.cv
+#define WP_IT_USE_EIS measurement_live.it_use_eis
+#define WP_IT_EIS_FSR ((max30131_eis_fsr_t)measurement_live.it_eis_fsr)
+#define WP_IT_SAMPLE_INTERVAL_MS measurement_live.it_sample_interval_ms
 
 /*
  * WE 静态电位。**它不是自由参数,是被两头夹住的**(datasheet p11 电气特性 +
@@ -128,8 +133,8 @@ static void replay_state(const char *src, const char *req);
 #define WP_DEFAULT_V_WE_MV GUI_WP_V_WE_MV      /* 实时测量页生成;可 SET vwe= 改 */
 #define WP_V_WE_MV    cfg_live.vwe_mv
 #define WP_E_MV       cfg_live.e_mv            /* E = V_WE - V_RE(测量电位) */
-#define WP_STARTUP_E_MV GUI_WP_START_E_MV      /* 用户可见的阶跃起始电位 */
-#define WP_PRESTEP_DURATION_MS GUI_PRESTEP_DURATION_MS
+#define WP_STARTUP_E_MV measurement_live.start_mv /* 用户可见的阶跃起始电位 */
+#define WP_PRESTEP_DURATION_MS measurement_live.quiet_ms
 #define WP_RUN_STARTUP_DIAGNOSTIC false         /* i-t 正式测量不扫其他电位 */
 /*
  * 双档增益标定开关。🔴 **保持 false —— 2026-08-09 实测它当前产不出有效结果。**
@@ -394,8 +399,8 @@ static uint8_t sysadc_gain = WP_SYSADC_GAIN_FIXED;
 #define WP_BATCH_SAMPLES 16U
 
 /* 本轮 i-t 试验的电位保持时间。到时后固件停转换并保持配置的空闲电位。 */
-#define WP_MEASUREMENT_DURATION_MS GUI_MEASUREMENT_DURATION_MS
-#define WP_IT_ADAPTIVE_STOP GUI_IT_ADAPTIVE_STOP
+#define WP_MEASUREMENT_DURATION_MS measurement_live.duration_ms
+#define WP_IT_ADAPTIVE_STOP measurement_live.adaptive
 /*
  * 🔴 采样周期现在是运行时量 ⇒ 期望样本数也必须运行时算,不能再用 GUI_SENS_PERIOD_MS
  *    这个编译期常量。`SET period=` 改完周期而样本数还按旧周期算,会让一轮的时长
@@ -410,14 +415,15 @@ static uint32_t expected_sample_count(void)
 
 /* CV 使用 EIS ADC 的双向宽量程。IT 默认仍使用上面的 DC 通道。 */
 #define WP_CV_V_WE_MV GUI_CV_V_WE_MV
-#define WP_CV_LOW_E_MV GUI_CV_LOW_E_MV
-#define WP_CV_HIGH_E_MV GUI_CV_HIGH_E_MV
-#define WP_CV_SCAN_RATE_MV_S GUI_CV_SCAN_RATE_MV_S
-#define WP_CV_CYCLES GUI_CV_CYCLES
-#define WP_CV_STEP_MV GUI_CV_STEP_MV
-#define WP_CV_STEP_INTERVAL_MS GUI_CV_STEP_INTERVAL_MS
-#define WP_CV_QUIET_DURATION_MS GUI_CV_QUIET_DURATION_MS
-#define WP_CV_EIS_FSR GUI_CV_EIS_FSR
+#define WP_CV_LOW_E_MV measurement_live.cv_low_mv
+#define WP_CV_HIGH_E_MV measurement_live.cv_high_mv
+#define WP_CV_SCAN_RATE_MV_S measurement_live.cv_rate_mv_s
+#define WP_CV_CYCLES measurement_live.cv_cycles
+#define WP_CV_STEP_MV measurement_live.cv_step_mv
+#define WP_CV_STEP_INTERVAL_MS \
+	((1000U * measurement_live.cv_step_mv) / measurement_live.cv_rate_mv_s)
+#define WP_CV_QUIET_DURATION_MS measurement_live.quiet_ms
+#define WP_CV_EIS_FSR ((max30131_eis_fsr_t)measurement_live.cv_eis_fsr)
 #define WP_EIS_OFFSET 0U
 #define WP_CV_EXPECTED_SAMPLE_COUNT \
 	(2U * ((WP_CV_HIGH_E_MV - WP_CV_LOW_E_MV) / WP_CV_STEP_MV) * WP_CV_CYCLES)
@@ -2458,6 +2464,38 @@ static void handle_command_line(const char *line)
 {
 	afe_cmd_t cmd;
 	afe_reject_t why;
+	measurement_cmd_t measurement_cmd;
+	measurement_reject_t measurement_reason;
+
+	if (strncmp(line, "MEAS", 4) == 0 &&
+	    (line[4] == '\0' || line[4] == ' ' || line[4] == '\t')) {
+		if (!measurement_cfg_parse(line, &measurement_cmd,
+					   &measurement_reason)) {
+			printk("MEAS_REJECT reason=%s\n",
+			       measurement_reject_name(measurement_reason));
+			return;
+		}
+		if (acquiring) {
+			printk("MEAS_REJECT req=%s reason=busy\n", measurement_cmd.req);
+			return;
+		}
+		if (measurement_cmd.cfg.target_mv != cfg_live.e_mv) {
+			printk("MEAS_REJECT req=%s reason=target_mismatch target_mv=%d "
+			       "afe_e_mv=%d\n", measurement_cmd.req,
+			       measurement_cmd.cfg.target_mv, cfg_live.e_mv);
+			return;
+		}
+		measurement_live = measurement_cmd.cfg;
+		if (measurement_cfg_format("MEAS_CONFIRMED", &measurement_live,
+					   measurement_cmd.req, audit_line,
+					   sizeof(audit_line)) > 0U) {
+			printk("%s\n", audit_line);
+		} else {
+			printk("MEAS_REJECT req=%s reason=audit_overflow\n",
+			       measurement_cmd.req);
+		}
+		return;
+	}
 
 	if (!afe_cfg_parse(line, &cfg_live, &cmd, &why)) {
 		if (afe_cfg_fmt_reject(cfg_epoch, k_uptime_get(), &why, line,
@@ -2884,6 +2922,23 @@ static uint16_t drain_fifo(uint16_t max_emit)
 static void cfg_load_defaults(void)
 {
 	memset(&cfg_live, 0, sizeof(cfg_live));
+	memset(&measurement_live, 0, sizeof(measurement_live));
+	measurement_live.cv = GUI_MEASUREMENT_MODE_CV != 0;
+	measurement_live.start_mv = GUI_WP_START_E_MV;
+	measurement_live.target_mv = GUI_WP_E_MV;
+	measurement_live.quiet_ms = measurement_live.cv
+		? GUI_CV_QUIET_DURATION_MS : GUI_PRESTEP_DURATION_MS;
+	measurement_live.duration_ms = GUI_MEASUREMENT_DURATION_MS;
+	measurement_live.adaptive = GUI_IT_ADAPTIVE_STOP != 0;
+	measurement_live.it_sample_interval_ms = GUI_IT_SAMPLE_INTERVAL_MS;
+	measurement_live.cv_low_mv = GUI_CV_LOW_E_MV;
+	measurement_live.cv_high_mv = GUI_CV_HIGH_E_MV;
+	measurement_live.cv_rate_mv_s = GUI_CV_SCAN_RATE_MV_S;
+	measurement_live.cv_cycles = GUI_CV_CYCLES;
+	measurement_live.cv_step_mv = GUI_CV_STEP_MV;
+	measurement_live.cv_eis_fsr = (uint8_t)GUI_CV_EIS_FSR;
+	measurement_live.it_use_eis = GUI_IT_USE_EIS != 0;
+	measurement_live.it_eis_fsr = (uint8_t)GUI_IT_EIS_FSR;
 	cfg_live.fsr = GUI_WP_FSR;
 	cfg_live.off = GUI_WP_OFFSET_SEL;
 	cfg_live.conv_pinned = false;          /* ⇒ 由 auto 派生 */
@@ -2912,6 +2967,10 @@ static void cfg_load_defaults(void)
 	       "v4-dbg1"
 #endif
 	);
+	if (measurement_cfg_format("MEAS_BOOT", &measurement_live, "boot",
+				   audit_line, sizeof(audit_line)) > 0U) {
+		printk("%s\n", audit_line);
+	}
 }
 
 int main(void)

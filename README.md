@@ -82,7 +82,10 @@ App 直接加载本分支的完整工作站页面，并提供置顶主窗口和�
 DEBUG 分支与 App 外壳的边界、硬件换算约束和推荐配置见
 [docs/DEBUG_APP_INTEGRATION.md](docs/DEBUG_APP_INTEGRATION.md)。
 
-硬件控制模式需要从完整源码仓库运行，因为应用条件时会现场生成配置、编译 Zephyr 固件并烧录。纯数据分析与界面资源也可从 wheel 安装。
+源码目录支持现场生成配置、编译 Zephyr 固件并烧录；但给同学分发的便携版内置
+V4/V5.1 通用运行时固件，应用任意合法 I-T/CV 条件时由上位机运行时下发，不要求目标
+电脑安装 Python、NCS、Zephyr、west、编译器或 SEGGER 软件。便携版的烧录、USB/J-Link
+采集、测量和自定义设置均在包内完成。
 
 ## 实验流程
 

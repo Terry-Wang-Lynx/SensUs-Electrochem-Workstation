@@ -22,5 +22,19 @@
     "cv_eis_fsr_uA": 40
   },
   "image": "images/app.signed.bin",
-  "sha256": "24a3284f2057c754b4c745c74303fc4e7dc41905febb423faba361f2290482e4"
+  "sha256": "7c5a8cb055a31d472cf1c9aa263d8059f48fae526af719490eb28bf5509ea619",
+  "name": "SensUs pA-Converter V5.1 runtime-configurable firmware",
+  "board": "pa_converter_v51/nrf52833",
+  "ncs_version": "v3.4.0",
+  "runtime_configurable": true,
+  "runtime_protocol": {
+    "name": "MEAS",
+    "version": 1
+  },
+  "artifacts_sha256": {
+    "app.signed.bin": "7c5a8cb055a31d472cf1c9aa263d8059f48fae526af719490eb28bf5509ea619",
+    "app.signed.hex": "686d60e5e9ffab3836c6be43adc6db74c74908ec33fc0748b86f296e50e6c181",
+    "dfu_application.zip": "2c3e28a8065900e9c9083443467b19854e5b36c69a8c59fe9aca448421799af9",
+    "mcuboot.hex": "2cb22f495c2739a24faef222b7817048f270036ba12a8ed040e9e137a3d136dd"
+  }
 }

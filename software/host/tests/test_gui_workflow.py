@@ -2618,6 +2618,8 @@ def test_tainted_formal_run_never_enters_calibration_or_measurement_index() -> N
 def _cfg_gate_events(expected: dict[str, object], *, request_id: str,
                      epoch: int = 7, **overrides: object) -> list[dict[str, object]]:
     actual = {**expected, **overrides}
+    actual.setdefault("sel", 1)
+    actual.setdefault("amps", 1)
     applied_keys = {
         "fsr", "off", "conv_src", "period", "sysper", "clk40", "ioc",
         "e_mv", "vwe_mv", "idle", "cellv", "chop", "rs", "ios", "satpct",
@@ -2671,6 +2673,104 @@ def test_formal_config_gate_requires_one_confirmed_request_snapshot() -> None:
         assert ctrl.metadata["hardware_config"]["verification_level"] == "physical_registers"
 
 
+def test_formal_gate_waits_for_runtime_measurement_confirmation() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.audit_path = Path(tmp) / "audit.jsonl"
+        expected = SettingsController.runtime_afe_contract({})
+        measurement = SettingsController.runtime_measurement_contract({})
+        ctrl._config_gate = {
+            "state": "checking", "expected": expected, "request_id": "runtime1",
+            "measurement_expected": measurement,
+            "measurement_confirmed": False, "measurement_actual": {},
+            "legacy_fallback_sent": False, "mismatches": [],
+        }
+        ctrl.audit_path.write_text(
+            "".join(
+                json.dumps(event) + "\n"
+                for event in _cfg_gate_events(expected, request_id="runtime1")
+            ),
+            encoding="utf-8",
+        )
+
+        ctrl._audit_events()
+        assert ctrl._config_gate["state"] == "checking"
+        assert not ctrl.cmd_path.exists()
+
+        with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "kind": "MEAS_CONFIRMED", "req": "runtime1", **measurement,
+            }) + "\n")
+        ctrl._audit_events()
+
+        assert ctrl._config_gate["state"] == "matched"
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "START\n"
+        assert ctrl.metadata["hardware_config"]["measurement_actual"] == measurement
+
+
+def test_formal_gate_blocks_runtime_measurement_mismatch() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ctrl = MeasurementController()
+        ctrl.state = "running"
+        ctrl.cmd_path = Path(tmp) / "cmd.txt"
+        ctrl.audit_path = Path(tmp) / "audit.jsonl"
+        expected = SettingsController.runtime_afe_contract({})
+        measurement = SettingsController.runtime_measurement_contract({})
+        ctrl._config_gate = {
+            "state": "checking", "expected": expected, "request_id": "runtime2",
+            "measurement_expected": measurement,
+            "measurement_confirmed": False, "measurement_actual": {},
+            "legacy_fallback_sent": False, "mismatches": [],
+        }
+        events = [
+            {"kind": "MEAS_CONFIRMED", "req": "runtime2", **measurement,
+             "duration_ms": int(measurement["duration_ms"]) + 1},
+            *_cfg_gate_events(expected, request_id="runtime2"),
+        ]
+        ctrl.audit_path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+        ctrl._audit_events()
+
+        assert ctrl._config_gate["state"] == "mismatch"
+        assert not ctrl.cmd_path.exists()
+        assert {item["field"] for item in ctrl._config_gate["mismatches"]} == {
+            "measurement.duration_ms",
+        }
+
+
+def test_runtime_commands_cover_custom_it_and_cv_conditions() -> None:
+    request_id = "abc123def456"
+    custom_it = {
+        "potential_v": -0.2, "initial_potential_v": 0.2,
+        "prestep_s": 180, "duration_s": 600, "target_rate_hz": 5,
+        "sens_period_code": 1, "fsr_nA": 40000,
+        "offset_mode": "80nA",
+    }
+    afe = SettingsController.runtime_afe_command(custom_it)
+    measurement = SettingsController.runtime_measurement_command(custom_it, request_id)
+    assert len(afe) < 128
+    assert len(measurement) < 128
+    assert "period=1" in afe and "e=-200" in afe
+    assert measurement == (
+        "MEAS 0 200 -200 180000 600000 0 200 -600 600 50 30 1 3 1 3 "
+        + request_id
+    )
+
+    cv_contract = SettingsController.runtime_afe_contract({"method": "cv"})
+    assert cv_contract["e_mv"] == -600
+    assert cv_contract["vwe_mv"] == 800
+    cv_measurement = SettingsController.runtime_measurement_contract({
+        "method": "cv", "cv_quiet_s": 9,
+    })
+    assert cv_measurement["mode"] == 1
+    assert cv_measurement["quiet_ms"] == 9000
+
+
 def test_formal_config_gate_never_mixes_epochs_or_request_ids() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         ctrl = MeasurementController()
@@ -2720,7 +2820,7 @@ def test_formal_config_gate_blocks_every_runtime_mismatch() -> None:
         assert not ctrl.cmd_path.exists()
         assert ctrl._config_gate["state"] == "mismatch"
         assert {item["field"] for item in ctrl._config_gate["mismatches"]} == {
-            "conv_src", "sysper", "ioc", "idle", "cellv", "sel", "amps",
+            "conv_src", "sysper", "ioc", "idle", "cellv",
         }
 
 
@@ -2839,7 +2939,7 @@ def test_initial_gate_get_write_failure_still_starts_cleanup_watcher(
               side_effect=fail_command_append),
         patch("pa_host.gui_server.threading.Thread",
               side_effect=[terminator, watcher]) as thread_cls,
-        pytest.raises(RuntimeError, match="无法下发硬件配置回读命令"),
+        pytest.raises(RuntimeError, match="无法下发 AFE 配置"),
     ):
         ctrl.start_verified()
 

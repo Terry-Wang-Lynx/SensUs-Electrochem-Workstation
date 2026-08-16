@@ -1,0 +1,12 @@
+source "Kconfig.zephyr"
+
+menu "SensUs firmware"
+
+config SENSUS_USE_DEFAULT_MEASUREMENT_CONFIG
+	bool "Use the checked-in runtime firmware defaults"
+	help
+	  Select the checked-in measurement_config.default.h instead of the
+	  developer-only ignored measurement_config.h. Portable runtime images
+	  enable this symbol so local settings cannot leak into a release build.
+
+endmenu

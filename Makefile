@@ -18,7 +18,7 @@ else
 	NULL := /dev/null
 endif
 
-.PHONY: install run app portable-macos dmg test firmware-test package clean-package clean help
+.PHONY: install run app portable-macos dmg runtime-firmware test firmware-test package clean-package clean help
 
 help:
 	@echo SensUs Electrochem Workstation build targets:
@@ -27,6 +27,7 @@ help:
 	@echo   make app              Build macOS native app (macOS only)
 	@echo   make portable-macos   Build self-contained macOS arm64 app
 	@echo   make dmg              Build self-contained macOS arm64 DMG
+	@echo   make runtime-firmware Build and stage runtime-configurable V4/V5.1 firmware
 	@echo   make test             Run host tests
 	@echo   make firmware-test    Run firmware logic tests
 	@echo   make package          Build wheel and source distribution
@@ -64,6 +65,9 @@ ifeq ($(OS),Windows_NT)
 else
 	./packaging/create_dmg.sh
 endif
+
+runtime-firmware:
+	$(PYTHON) packaging/build_runtime_firmware.py
 
 test:
 	$(VENV_PYTHON) -m pytest -q software/host/tests

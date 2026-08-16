@@ -15,6 +15,12 @@ list(APPEND DTS_ROOT ${CMAKE_CURRENT_LIST_DIR})
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(pa_converter_fw)
 
+option(SENSUS_USE_DEFAULT_MEASUREMENT_CONFIG
+  "Build the portable runtime firmware from source-tree defaults" OFF)
+if(SENSUS_USE_DEFAULT_MEASUREMENT_CONFIG OR CONFIG_SENSUS_USE_DEFAULT_MEASUREMENT_CONFIG)
+	target_compile_definitions(app PRIVATE SENSUS_USE_DEFAULT_MEASUREMENT_CONFIG=1)
+endif()
+
 target_sources(app PRIVATE
   src/main.c
   src/max30131_spi.c
@@ -22,6 +28,7 @@ target_sources(app PRIVATE
   src/control_transport.c
   lib/max30131/max30131.c        # 纯逻辑层,与单测同源
   lib/max30131/afe_cfg.c         # 命令解析/校验/写序/审计格式化,同源单测
+  lib/max30131/measurement_cfg.c # 通用固件的运行时测量条件事务
 )
 
 zephyr_include_directories(

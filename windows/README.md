@@ -63,11 +63,10 @@ V4/V5.1 稳定固件资源。
 
 输出：`artifacts\releases\<version>\SensUs-Workstation-Windows-x64-<version>.zip`
 
-> **注意**：便携版可以采集并使用随包稳定固件；如果要编译自定义条件，仍需从完整
-> 源码仓库运行，并安装：
-> - [nRF Connect SDK](https://www.nordicsemi.com/Products/Development-software/nRF-Connect-SDK) (Zephyr RTOS + west)
-> - [SEGGER J-Link](https://www.segger.com/downloads/jlink/) (V8.80 推荐)
-> - [GNU Arm Embedded Toolchain](https://developer.arm.com/tools-and-software/open-source-software/developer-tools/gnu-toolchain)
+便携版内置 V4 RTT/J-Link 与 V5.1 USB CDC 的通用运行时固件。点击“应用条件”时，
+软件会自动准备随包镜像；开始测量前再把当前 I-T/CV 条件整组下发并核验，所以修改
+电位、时序、量程、CV 范围/速度/圈数和 EIS 档位都不需要安装 NCS、Zephyr、west 或
+编译器。源码目录仍可安装这些工具来开发和编译全新固件协议，但不是使用便携版的前置条件。
 
 ## 硬件控制
 
@@ -97,7 +96,8 @@ V4/V5.1 稳定固件资源。
 | 窗口置顶 | ✅ 工具栏按钮 | ❌ |
 | 浏览器界面 | ✅ | ✅ |
 | Python 命令行 | ✅ | ✅ |
-| 固件编译 | ✅ | ✅ (需 NCS + Zephyr) |
+| 通用固件烧录与自定义条件 | ✅ | ✅ (便携版零工具链) |
+| 新增固件协议的现场编译 | ✅ (需 NCS) | ✅ (需 NCS) |
 | 硬件采集 | ✅ | ✅ (需 J-Link) |
 | CV 分析 | ✅ | ✅ |
 | I-T 分析 | ✅ | ✅ |

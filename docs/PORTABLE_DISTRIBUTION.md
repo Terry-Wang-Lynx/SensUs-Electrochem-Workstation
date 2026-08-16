@@ -66,7 +66,15 @@ PYTHONPATH=software/host .venv/bin/python packaging/sign_frontend.py \
 
 ## 固件资源边界
 
-便携包包含当前受版本控制的 V4 预编译固件，以及已归档到
-`packaging/resources/v51/` 的 V5.1 MCUboot/签名镜像。便携版只允许烧录与随包元数据
-完全一致的稳定条件；自定义条件仍从源码版和现有 NCS 工具链编译，避免 App 包内
-写源码或覆盖开发构建。打包和测试过程不会连接、复位或烧录任何板卡。
+便携包包含两套“通用运行时固件”：V4 的 RTT/J-Link 镜像和 V5.1 的 USB CDC + MCUboot
+签名镜像。它们把 AFE、I-T/CV 方法、电位、时序、采样率、量程、扫描范围、扫描速度、
+圈数和 EIS 档位留给运行时协议；点击“应用条件”时，软件只烧录随包镜像（首次或用户
+明确重新应用时），开始测量前再把当前整组条件通过 RTT/USB 下发，并等待
+`MEAS_CONFIRMED` 与物理寄存器回读完全匹配后才发送 `START`。
+
+因此便携版的自定义条件不再需要 NCS、Zephyr、west、编译器或 SEGGER/J-Link 软件：
+目标电脑只需解压/拖入应用即可修改条件、烧录、采集和测量。源码目录仍保留现场编译
+路径，供固件开发和新增协议使用；它不是便携版的运行前置条件。通用固件构建入口为
+`python packaging/build_runtime_firmware.py`，脚本会检查运行时配置确实传进应用子镜像。
+
+打包和测试过程不会连接、复位或烧录任何板卡。

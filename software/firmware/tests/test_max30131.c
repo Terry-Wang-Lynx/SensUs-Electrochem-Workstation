@@ -17,6 +17,7 @@
 
 #include "../lib/max30131/max30131.h"
 #include "../lib/max30131/afe_cfg.h"
+#include "../lib/max30131/measurement_cfg.h"
 #include "minitest.h"
 
 #define ARRAY_SIZE_LOCAL(a) (sizeof(a) / sizeof((a)[0]))
@@ -1461,6 +1462,58 @@ static void test_audit_line_formats(void)
 	CHECK_EQ(afe_cfg_fmt_derived(7, &b, &db, buf, 20), 0u);
 }
 
+static void test_measurement_runtime_command_is_full_snapshot(void)
+{
+	measurement_cmd_t cmd;
+	measurement_reject_t reason;
+	char line[320];
+
+	CHECK_TRUE(measurement_cfg_parse(
+		"MEAS 0 200 -200 180000 3600000 1 100 -600 600 50 30 1 3 0 3 Gate-A9",
+		&cmd, &reason));
+	CHECK_FALSE(cmd.cfg.cv);
+	CHECK_EQ(cmd.cfg.start_mv, 200);
+	CHECK_EQ(cmd.cfg.target_mv, -200);
+	CHECK_EQ(cmd.cfg.quiet_ms, 180000u);
+	CHECK_EQ(cmd.cfg.duration_ms, 3600000u);
+	CHECK_TRUE(cmd.cfg.adaptive);
+	CHECK_EQ(cmd.cfg.it_sample_interval_ms, 100u);
+	CHECK_EQ(cmd.cfg.cv_cycles, 30u);
+	CHECK_FALSE(cmd.cfg.it_use_eis);
+	CHECK_TRUE(strcmp(cmd.req, "Gate-A9") == 0);
+
+	CHECK_TRUE(measurement_cfg_format("MEAS_CONFIRMED", &cmd.cfg, cmd.req,
+					  line, sizeof(line)) > 0U);
+	CHECK_TRUE(strstr(line, "req=Gate-A9 mode=0") != NULL);
+	CHECK_TRUE(strstr(line, "duration_ms=3600000") != NULL);
+	CHECK_TRUE(strstr(line, "it_use_eis=0 it_eis=3") != NULL);
+}
+
+static void test_measurement_runtime_command_rejects_bad_settings(void)
+{
+	measurement_cmd_t cmd;
+	measurement_reject_t reason;
+
+	CHECK_FALSE(measurement_cfg_parse("MEAS 0 200", &cmd, &reason));
+	CHECK_EQ(reason, MEAS_REJ_FORMAT);
+	CHECK_FALSE(measurement_cfg_parse(
+		"MEAS 0 900 200 0 180000 0 100 -600 600 50 30 1 3 0 3 req",
+		&cmd, &reason));
+	CHECK_EQ(reason, MEAS_REJ_POTENTIAL);
+	CHECK_FALSE(measurement_cfg_parse(
+		"MEAS 1 -600 -600 2000 240000 1 100 -600 600 50 30 1 3 0 3 req",
+		&cmd, &reason));
+	CHECK_EQ(reason, MEAS_REJ_ADAPTIVE);
+	CHECK_FALSE(measurement_cfg_parse(
+		"MEAS 1 -600 -600 2000 240000 0 100 -600 600 50 30 2 3 0 3 req",
+		&cmd, &reason));
+	CHECK_EQ(reason, MEAS_REJ_CV_STEP);
+	CHECK_FALSE(measurement_cfg_parse(
+		"MEAS 0 200 200 0 180000 0 100 -600 600 50 30 1 3 0 3 bad_req",
+		&cmd, &reason));
+	CHECK_EQ(reason, MEAS_REJ_REQUEST);
+}
+
 int main(void)
 {
 	printf("=== MAX30131 纯逻辑层单测 ===\n");
@@ -1512,5 +1565,7 @@ int main(void)
 	RUN(test_expected_register_snapshot);
 	RUN(test_get_verify_rejects_stale_status_after_read_failure);
 	RUN(test_audit_line_formats);
+	RUN(test_measurement_runtime_command_is_full_snapshot);
+	RUN(test_measurement_runtime_command_rejects_bad_settings);
 	return mt_report();
 }
