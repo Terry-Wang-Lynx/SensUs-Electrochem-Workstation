@@ -110,11 +110,16 @@ WORKFLOW_PATH = STATE_DIR / "gui_workflow.json"
 HISTORY_PATH = STATE_DIR / "workspace_history.json"
 DEFAULT_SAVE_DIR = runtime.default_measurements_dir()
 JLINK_SERIAL = os.environ.get("SENSUS_JLINK_SERIAL", "").strip()
+CONFIGURED_JLINK_SERIAL = JLINK_SERIAL
 SERIAL_DATA_PORT = os.environ.get("SENSUS_SERIAL_PORT", "").strip()
 SERIAL_SMP_PORT = os.environ.get("SENSUS_SMP_PORT", "").strip()
 HARDWARE_TRANSPORT = os.environ.get("SENSUS_TRANSPORT", "auto").lower()
 HARDWARE_TRANSPORT_REQUESTED = HARDWARE_TRANSPORT
 JLINK_CDC_SERIAL = os.environ.get("SENSUS_JLINK_CDC_SERIAL", "0000297345691")
+# A manual selection is intentionally process-local. It is cleared by the
+# "自动检测" choice and is never changed while a hardware operation is busy.
+DEVICE_SELECTION_LOCK = threading.RLock()
+SELECTED_DEVICE: dict[str, Any] | None = None
 SMPMGR_EXE = Path(
     os.environ.get("SENSUS_SMPMGR")
     or shutil.which("smpmgr")
@@ -129,7 +134,7 @@ V51_PREBUILT_IMAGE = (
 )
 
 
-def _transport_status(transport: str | None = None) -> dict[str, str]:
+def _transport_status(transport: str | None = None) -> dict[str, Any]:
     """Expose the transport selected for the next/current acquisition."""
     actual = str(transport or HARDWARE_TRANSPORT or "unknown").lower()
     labels = {
@@ -137,11 +142,19 @@ def _transport_status(transport: str | None = None) -> dict[str, str]:
         "rtt": "RTT / J-Link",
         "auto": "自动检测",
     }
-    return {
+    payload: dict[str, Any] = {
         "transport": actual,
         "transport_label": labels.get(actual, "连接方式未知"),
         "transport_requested": str(HARDWARE_TRANSPORT_REQUESTED or "auto").lower(),
     }
+    with DEVICE_SELECTION_LOCK:
+        if SELECTED_DEVICE is not None:
+            payload.update({
+                "device_id": SELECTED_DEVICE.get("id", ""),
+                "device_name": SELECTED_DEVICE.get("name", ""),
+                "device_selection": "manual",
+            })
+    return payload
 
 
 def _escape_applescript(value: object) -> str:
@@ -401,8 +414,8 @@ def _port_accepts_connections(port: int) -> bool:
         return False
 
 
-def _serial_port_infos() -> list[Any]:
-    """Return USB serial candidates while keeping their descriptor metadata."""
+def _all_serial_port_infos() -> list[Any]:
+    """Return all USB serial candidates while keeping descriptor metadata."""
     try:
         from serial.tools import list_ports
     except ImportError:
@@ -412,15 +425,6 @@ def _serial_port_infos() -> list[Any]:
         device = str(getattr(info, "device", "") or "")
         if not device:
             return False
-        descriptor = " ".join(
-            str(getattr(info, field, "") or "")
-            for field in (
-                "device", "description", "hwid", "manufacturer", "product",
-                "serial_number", "location",
-            )
-        )
-        if JLINK_CDC_SERIAL and JLINK_CDC_SERIAL in descriptor:
-            return False
         lowered = device.lower()
         return (
             "usbmodem" in lowered
@@ -429,6 +433,60 @@ def _serial_port_infos() -> list[Any]:
         )
 
     return [info for info in list_ports.comports() if is_candidate(info)]
+
+
+def _port_descriptor(info: Any) -> str:
+    return " ".join(
+        str(getattr(info, field, "") or "")
+        for field in (
+            "device", "description", "hwid", "manufacturer", "product",
+            "serial_number", "location",
+        )
+    )
+
+
+def _is_jlink_port(info: Any) -> bool:
+    """Identify every SEGGER CDC interface, not only the historical serial."""
+    descriptor = _port_descriptor(info).lower()
+    manufacturer = str(getattr(info, "manufacturer", "") or "").lower()
+    product = str(getattr(info, "product", "") or "").lower()
+    vid = getattr(info, "vid", None)
+    if vid == 0x1366:
+        return True
+    if "segger" in manufacturer or "j-link" in product or "jlink" in product:
+        return True
+    if JLINK_CDC_SERIAL:
+        configured = re.sub(r"[^0-9a-f]", "", str(JLINK_CDC_SERIAL).lower())
+        if configured and configured in re.sub(r"[^0-9a-f]", "", descriptor):
+            return True
+    return "j-link" in descriptor or "jlink" in descriptor
+
+
+def _serial_port_infos() -> list[Any]:
+    """Return non-J-Link USB CDC candidates for V5.1 DATA/SMP discovery."""
+    return [info for info in _all_serial_port_infos() if not _is_jlink_port(info)]
+
+
+def _normalise_probe_serial(value: object) -> str:
+    """Map a J-Link CDC serial such as 000029734569 to probe SN 29734569."""
+    raw = str(value or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return ""
+    try:
+        return str(int(digits, 10))
+    except ValueError:
+        return digits.lstrip("0") or "0"
+
+
+def _jlink_probe_serial(info: Any) -> str:
+    serial = _normalise_probe_serial(getattr(info, "serial_number", ""))
+    if serial:
+        return serial
+    # Some macOS descriptors only expose the serial in the device path.
+    device = str(getattr(info, "device", "") or "")
+    match = re.search(r"usbmodem(\d+)", device, flags=re.IGNORECASE)
+    return _normalise_probe_serial(match.group(1) if match else "")
 
 
 def _meaningful_process_tail(*outputs: object, limit: int = 6) -> list[str]:
@@ -447,58 +505,71 @@ def _meaningful_process_tail(*outputs: object, limit: int = 6) -> list[str]:
     return lines[-limit:]
 
 
+def _probe_serial_data_candidate(candidate: str) -> bool:
+    """Read-only probe for one CDC candidate; never resets or writes firmware."""
+    try:
+        import serial
+    except ImportError:
+        return False
+    try:
+        with serial.Serial(candidate, 115200, timeout=0.1,
+                           write_timeout=0.5) as stream:
+            stream.dtr = True
+            # USB1 firmware predates request IDs and only understands a bare
+            # GET. Both forms are read-only and do not alter hardware state.
+            for probe in (b"GET req=workstation-probe\n", b"GET\n"):
+                try:
+                    stream.reset_input_buffer()
+                except (AttributeError, OSError, ValueError):
+                    pass
+                stream.write(probe)
+                stream.flush()
+                deadline = time.monotonic() + 1.5
+                received = bytearray()
+                while time.monotonic() < deadline:
+                    chunk = stream.read(256)
+                    if chunk:
+                        received.extend(chunk)
+                        text = received.decode("utf-8", "replace")
+                        if "CFG_CONFIRMED" in text:
+                            return True
+    except (OSError, ValueError, serial.SerialException):
+        return False
+    return False
+
+
 def _discover_serial_data_port(*, force: bool = False) -> str | None:
     """Find the V5.1 DATA CDC without confusing it with SMP or J-Link CDC."""
     if SERIAL_DATA_PORT and not force:
         return SERIAL_DATA_PORT
-    try:
-        import serial
-    except ImportError:
-        return None
-
-    candidates = sorted(
-        str(info.device) for info in _serial_port_infos()
-    )
+    candidates = sorted(str(info.device) for info in _serial_port_infos())
     for candidate in candidates:
-        try:
-            with serial.Serial(candidate, 115200, timeout=0.1,
-                               write_timeout=0.5) as stream:
-                stream.dtr = True
-                # USB1 firmware predates request IDs and only understands a
-                # bare GET. Try the tagged request first, then fall back to
-                # the legacy form while accepting either response format.
-                for probe in (b"GET req=workstation-probe\n", b"GET\n"):
-                    try:
-                        stream.reset_input_buffer()
-                    except (AttributeError, OSError, ValueError):
-                        pass
-                    stream.write(probe)
-                    stream.flush()
-                    deadline = time.monotonic() + 1.5
-                    received = bytearray()
-                    while time.monotonic() < deadline:
-                        chunk = stream.read(256)
-                        if chunk:
-                            received.extend(chunk)
-                            text = received.decode("utf-8", "replace")
-                            if "CFG_CONFIRMED" in text:
-                                return candidate
-        except (OSError, ValueError, serial.SerialException):
-            continue
+        if _probe_serial_data_candidate(candidate):
+            return candidate
     return None
 
 
 def _same_usb_device(left: Any, right: Any) -> bool:
     """Match CDC interfaces by stable USB identity, never by device suffix."""
-    fields = ("vid", "pid", "serial_number", "location")
-    known = [
-        field for field in fields
-        if getattr(left, field, None) not in (None, "")
-        and getattr(right, field, None) not in (None, "")
-    ]
-    return bool(known) and all(
-        getattr(left, field, None) == getattr(right, field, None)
-        for field in known
+    # VID/PID alone cannot distinguish two identical boards. Prefer a shared
+    # serial or physical location; without either, keep interfaces separate
+    # rather than accidentally merging two USB devices into one choice.
+    for field in ("serial_number", "location"):
+        left_value = getattr(left, field, None)
+        right_value = getattr(right, field, None)
+        if left_value not in (None, "") and right_value not in (None, ""):
+            if left_value != right_value:
+                return False
+    stable = any(
+        getattr(item, field, None) not in (None, "")
+        for item in (left, right)
+        for field in ("serial_number", "location")
+    )
+    if not stable:
+        return str(getattr(left, "device", "")) == str(getattr(right, "device", ""))
+    return (
+        getattr(left, "vid", None) == getattr(right, "vid", None)
+        and getattr(left, "pid", None) == getattr(right, "pid", None)
     )
 
 
@@ -523,11 +594,225 @@ def _discover_serial_smp_port(
     return siblings[0] if len(siblings) == 1 else None
 
 
+def _usb_identity(info: Any) -> str:
+    """Build an ID that survives CDC interface renumbering and reboots."""
+    location = str(getattr(info, "location", "") or "").strip()
+    # Linux may append an interface suffix (for example :1.0/:1.1) to the
+    # same physical USB location; it must not split DATA and SMP into devices.
+    location = re.sub(r":\d+(?:\.\d+)?$", "", location)
+    fields = (
+        str(getattr(info, "vid", "") or "").lower(),
+        str(getattr(info, "pid", "") or "").lower(),
+        str(getattr(info, "serial_number", "") or "").strip(),
+        location,
+    )
+    stable = "|".join(fields)
+    if not any(fields[2:]):
+        stable = f"{stable}|{getattr(info, 'device', '')}"
+    digest = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
+    return f"usb:{digest}"
+
+
+def _usb_display_name(info: Any, *, data_port: str = "") -> str:
+    serial = str(getattr(info, "serial_number", "") or "").strip()
+    product = str(getattr(info, "product", "") or "").strip()
+    label = product or "V5.1 USB"
+    if serial:
+        label += f" · SN {serial}"
+    elif data_port:
+        label += f" · {data_port}"
+    return label
+
+
+def _jlink_device_id(info: Any) -> str:
+    serial = _jlink_probe_serial(info)
+    if serial:
+        return f"jlink:{serial}"
+    digest = hashlib.sha256(_port_descriptor(info).encode("utf-8")).hexdigest()[:16]
+    return f"jlink:{digest}"
+
+
+def _jlink_display_name(info: Any) -> str:
+    serial = _jlink_probe_serial(info)
+    return f"J-Link · SN {serial}" if serial else "J-Link · 未读取序列号"
+
+
+def _device_sort_key(device: dict[str, Any]) -> tuple[int, str]:
+    return (0 if device.get("kind") == "usb" else 1, str(device.get("name", "")))
+
+
+def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
+    """Enumerate J-Link probes and V5.1 USB boards without flashing/resetting."""
+    devices: list[dict[str, Any]] = []
+    for info in _all_serial_port_infos():
+        if not _is_jlink_port(info):
+            continue
+        probe_serial = _jlink_probe_serial(info)
+        devices.append({
+            "id": _jlink_device_id(info),
+            "kind": "jlink",
+            "transport": "rtt",
+            "transport_label": "RTT / J-Link",
+            "name": _jlink_display_name(info),
+            "probe_serial": probe_serial,
+            "cdc_port": str(getattr(info, "device", "") or ""),
+            "serial_number": str(getattr(info, "serial_number", "") or ""),
+            "location": str(getattr(info, "location", "") or ""),
+            "selectable": bool(probe_serial),
+        })
+
+    candidates = _serial_port_infos()
+    groups: list[list[Any]] = []
+    for info in candidates:
+        group = next((items for items in groups if _same_usb_device(items[0], info)), None)
+        if group is None:
+            groups.append([info])
+        else:
+            group.append(info)
+    for group in groups:
+        data_info: Any | None = None
+        if probe:
+            for info in group:
+                if _probe_serial_data_candidate(str(getattr(info, "device", "") or "")):
+                    data_info = info
+                    break
+        data_port = str(getattr(data_info, "device", "") or "") if data_info else ""
+        representative = data_info or group[0]
+        smp_port = (
+            _discover_serial_smp_port(data_port, force=True)
+            if data_port else ""
+        )
+        identity = _usb_identity(representative)
+        devices.append({
+            "id": identity,
+            "kind": "usb",
+            "transport": "serial",
+            "transport_label": "USB DATA CDC",
+            "name": _usb_display_name(representative, data_port=data_port),
+            "serial_number": str(getattr(representative, "serial_number", "") or ""),
+            "vid": getattr(representative, "vid", None),
+            "pid": getattr(representative, "pid", None),
+            "location": str(getattr(representative, "location", "") or ""),
+            "data_port": data_port,
+            "smp_port": smp_port or "",
+            "interfaces": [str(getattr(info, "device", "") or "") for info in group],
+            "selectable": bool(data_port and smp_port),
+            "probe_required": not probe,
+        })
+    return sorted(devices, key=_device_sort_key)
+
+
+def _selected_device_copy() -> dict[str, Any] | None:
+    with DEVICE_SELECTION_LOCK:
+        return copy.deepcopy(SELECTED_DEVICE) if SELECTED_DEVICE else None
+
+
+def _find_port_for_identity(identity: str) -> Any | None:
+    return next(
+        (info for info in _serial_port_infos() if _usb_identity(info) == identity),
+        None,
+    )
+
+
+def _find_jlink_for_id(device_id: str) -> Any | None:
+    return next(
+        (info for info in _all_serial_port_infos()
+         if _is_jlink_port(info) and _jlink_device_id(info) == device_id),
+        None,
+    )
+
+
+def _set_device_selection(device: dict[str, Any] | None) -> None:
+    """Apply a manual device to the transport globals while the app is idle."""
+    global HARDWARE_TRANSPORT, SERIAL_DATA_PORT, SERIAL_SMP_PORT, JLINK_SERIAL
+    with DEVICE_SELECTION_LOCK:
+        global SELECTED_DEVICE
+        SELECTED_DEVICE = copy.deepcopy(device) if device else None
+    if device is None:
+        JLINK_SERIAL = CONFIGURED_JLINK_SERIAL
+        if HARDWARE_TRANSPORT_REQUESTED == "rtt":
+            HARDWARE_TRANSPORT = "rtt"
+        else:
+            _refresh_usb_transport()
+        return
+    if device.get("kind") == "usb":
+        SERIAL_DATA_PORT = str(device.get("data_port") or "")
+        SERIAL_SMP_PORT = str(device.get("smp_port") or "")
+        HARDWARE_TRANSPORT = "serial"
+        return
+    JLINK_SERIAL = str(device.get("probe_serial") or "")
+    SERIAL_DATA_PORT = ""
+    SERIAL_SMP_PORT = ""
+    HARDWARE_TRANSPORT = "rtt"
+
+
+def _devices_payload(*, probe: bool = True) -> dict[str, Any]:
+    devices = _discover_devices(probe=probe)
+    selected = _selected_device_copy()
+    selected_id = selected.get("id") if selected else None
+    if selected_id:
+        selected = next(
+            (device for device in devices if device.get("id") == selected_id),
+            selected,
+        )
+    return {
+        "devices": devices,
+        "selected_device_id": selected_id,
+        "selected_device": selected,
+        "selection_mode": "manual" if selected_id else "auto",
+        "busy": False,
+        **_transport_status(),
+    }
+
+
 def _refresh_usb_transport() -> None:
     """Refresh USB CDC paths immediately before an idle hardware operation."""
-    global HARDWARE_TRANSPORT, SERIAL_DATA_PORT, SERIAL_SMP_PORT
-    if HARDWARE_TRANSPORT_REQUESTED == "rtt":
+    global HARDWARE_TRANSPORT, SERIAL_DATA_PORT, SERIAL_SMP_PORT, JLINK_SERIAL
+    selected = _selected_device_copy()
+    if HARDWARE_TRANSPORT_REQUESTED == "rtt" and selected is None:
         return
+    if selected is not None:
+        if selected.get("kind") == "jlink":
+            info = _find_jlink_for_id(str(selected.get("id") or ""))
+            if info is None:
+                raise RuntimeError(f"手动选择的 {selected.get('name', 'J-Link')} 已断开")
+            JLINK_SERIAL = _jlink_probe_serial(info)
+            if not JLINK_SERIAL:
+                raise RuntimeError("手动选择的 J-Link 没有可用序列号")
+            HARDWARE_TRANSPORT = "rtt"
+            return
+        info = _find_port_for_identity(str(selected.get("id") or ""))
+        if info is None:
+            raise RuntimeError(f"手动选择的 {selected.get('name', 'USB 设备')} 已断开")
+        data_port = str(getattr(info, "device", "") or "")
+        if not _probe_serial_data_candidate(data_port):
+            raise RuntimeError(f"手动选择的 {selected.get('name', 'USB 设备')} 未响应 DATA CDC")
+        smp_port = _discover_serial_smp_port(data_port, force=True) or ""
+        if not smp_port:
+            raise RuntimeError("手动选择的 USB 设备缺少同一设备的 SMP CDC")
+        SERIAL_DATA_PORT = data_port
+        SERIAL_SMP_PORT = smp_port
+        HARDWARE_TRANSPORT = "serial"
+        return
+    if HARDWARE_TRANSPORT_REQUESTED == "auto":
+        candidates = [
+            device for device in _discover_devices(probe=True)
+            if device.get("selectable")
+        ]
+        if len(candidates) > 1:
+            raise RuntimeError("检测到多个可用设备，请先点击“选择设备”")
+        if len(candidates) == 1:
+            device = candidates[0]
+            if device.get("kind") == "jlink":
+                JLINK_SERIAL = str(device.get("probe_serial") or "")
+                SERIAL_DATA_PORT = ""
+                SERIAL_SMP_PORT = ""
+                HARDWARE_TRANSPORT = "rtt"
+            else:
+                SERIAL_DATA_PORT = str(device.get("data_port") or "")
+                SERIAL_SMP_PORT = str(device.get("smp_port") or "")
+                HARDWARE_TRANSPORT = "serial"
+            return
     discovered = _discover_serial_data_port(force=True)
     if discovered:
         SERIAL_DATA_PORT = discovered
@@ -2079,7 +2364,7 @@ class MeasurementController:
         # V5.1 re-enumerates both CDC interfaces after firmware upload. Probe
         # immediately before opening the collector so a stale DATA path from
         # the pre-flash device cannot become a misleading exit-code-1 failure.
-        if HARDWARE_TRANSPORT_REQUESTED != "rtt":
+        if HARDWARE_TRANSPORT_REQUESTED != "rtt" or _selected_device_copy() is not None:
             _refresh_usb_transport()
         with self.lock:
             if self.state == "running" or (
@@ -6348,6 +6633,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             self._send_json(APP.measurement.snapshot())
             return
+        if parsed.path == "/api/devices":
+            busy = not APP.hardware_idle()
+            # Never open a CDC port while the collector owns it. During a
+            # running measurement the list is descriptive only; selection is
+            # rejected until the operation is idle.
+            result = _devices_payload(probe=not busy)
+            result["busy"] = busy
+            self._send_json(result)
+            return
         if parsed.path == "/api/calibration":
             self._send_json(APP.model_payload())
             return
@@ -6406,6 +6700,34 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # active acquisition,收回采集子进程/J-Link, then closes the HTTP server.
                 result = {"ok": True, "message": "后端正在退出"}
                 shutdown_requested = True
+            elif self.path == "/api/devices/select":
+                with APP.operation_lock:
+                    if not APP.hardware_idle():
+                        raise RuntimeError("测量或自动任务运行期间不能切换设备")
+                    requested_id = str(payload.get("device_id") or "").strip()
+                    if requested_id in {"", "auto"}:
+                        _set_device_selection(None)
+                        APP.settings.restore_for_transport(HARDWARE_TRANSPORT)
+                        result = _devices_payload(probe=True)
+                        result["message"] = "已恢复自动检测"
+                    else:
+                        devices = _discover_devices(probe=True)
+                        device = next(
+                            (item for item in devices if item.get("id") == requested_id),
+                            None,
+                        )
+                        if device is None:
+                            raise ValueError("设备已断开，请刷新设备列表")
+                        if not device.get("selectable"):
+                            if device.get("kind") == "usb":
+                                raise RuntimeError(
+                                    "该 USB 设备尚未同时识别 DATA 和 SMP CDC，请重新插拔后刷新"
+                                )
+                            raise RuntimeError("该 J-Link 没有可用的探头序列号")
+                        _set_device_selection(device)
+                        APP.settings.restore_for_transport(HARDWARE_TRANSPORT)
+                        result = _devices_payload(probe=False)
+                        result["message"] = f"已选择 {device.get('name', '设备')}"
             elif self.path == "/api/measurement/start":
                 with APP.operation_lock:
                     if APP.schedule.snapshot()["active"]:

@@ -54,6 +54,18 @@ def test_gui_exposes_dynamic_transport_and_graceful_exit_controls() -> None:
     assert "J-Link · MAX30131" not in html
 
 
+def test_gui_exposes_manual_multi_device_picker() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    for element_id in ("selectDevice", "deviceDialog", "refreshDevices", "deviceList"):
+        assert f'id="{element_id}"' in html
+    assert "/api/devices" in app
+    assert "/api/devices/select" in app
+    assert "device-card" in styles
+
+
 def test_known_concentration_stepper_has_stable_accessible_controls() -> None:
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")

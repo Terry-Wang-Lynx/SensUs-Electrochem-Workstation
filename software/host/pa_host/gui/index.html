@@ -26,7 +26,7 @@
     <main>
       <header class="topbar">
         <div><h1 id="pageTitle">实时测量</h1><p id="pageSubtitle">180 秒 IT 检测与末 20 秒稳态分析</p></div>
-        <div class="topbar-actions"><div class="clock" id="clock"></div><button class="exit-button" id="exitApp" type="button" title="关闭当前标签页并退出后端">退出</button></div>
+        <div class="topbar-actions"><div class="clock" id="clock"></div><button class="secondary device-picker-button" id="selectDevice" type="button" title="查看并选择当前硬件设备">选择设备</button><button class="exit-button" id="exitApp" type="button" title="关闭当前标签页并退出后端">退出</button></div>
       </header>
 
       <section class="view active" id="view-measure">
@@ -404,6 +404,14 @@
       </section>
     </main>
   </div>
+  <dialog id="deviceDialog" class="device-dialog">
+    <form method="dialog" class="device-dialog-head">
+      <div><h2>选择设备</h2><p id="deviceDialogSummary">正在读取 USB / J-Link</p></div>
+      <button class="icon-button" value="cancel" aria-label="关闭设备选择">×</button>
+    </form>
+    <div class="device-dialog-actions"><button class="secondary" id="refreshDevices" type="button">刷新设备</button><span id="deviceDialogBusy" class="notice error" hidden></span></div>
+    <div id="deviceList" class="device-list"></div>
+  </dialog>
   <div class="toast" id="toast"></div>
   <script src="/assets/app.js?v=20260816-exit-transport"></script>
 </body>

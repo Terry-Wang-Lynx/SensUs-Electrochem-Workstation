@@ -21,6 +21,19 @@ class _PortInfo:
         self.location = "1-1"
 
 
+def _jlink_port(device: str = "/dev/cu.usbmodem0000297345691") -> _PortInfo:
+    info = _PortInfo(device)
+    info.description = "J-Link"
+    info.hwid = "USB VID:PID=1366:0105 SER=000029734569 LOCATION=1-1.4"
+    info.manufacturer = "SEGGER"
+    info.product = "J-Link"
+    info.serial_number = "000029734569"
+    info.vid = 0x1366
+    info.pid = 0x0105
+    info.location = "1-1.4"
+    return info
+
+
 def test_transport_auto_prefers_discovered_data_cdc(monkeypatch) -> None:
     monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "")
     monkeypatch.setattr(
@@ -30,6 +43,70 @@ def test_transport_auto_prefers_discovered_data_cdc(monkeypatch) -> None:
 
     assert gui_server._resolve_hardware_transport("auto", "") == "serial"
     assert gui_server.SERIAL_DATA_PORT == "/dev/cu.usbmodem1103"
+
+
+def test_jlink_cdc_is_excluded_from_v51_data_candidates(monkeypatch) -> None:
+    jlink = _jlink_port()
+    usb = _PortInfo("/dev/cu.usbmodem1103")
+    monkeypatch.setattr(gui_server, "_all_serial_port_infos", lambda: [jlink, usb])
+
+    assert gui_server._serial_port_infos() == [usb]
+    assert gui_server._jlink_probe_serial(jlink) == "29734569"
+
+
+def test_device_discovery_groups_usb_interfaces_and_lists_jlink(monkeypatch) -> None:
+    data = _PortInfo("/dev/cu.usbmodem-data")
+    smp = _PortInfo("/dev/cu.usbmodem-smp")
+    jlink = _jlink_port()
+    monkeypatch.setattr(
+        gui_server, "_all_serial_port_infos", lambda: [data, smp, jlink]
+    )
+    monkeypatch.setattr(gui_server, "_probe_serial_data_candidate", lambda port: port == data.device)
+
+    devices = gui_server._discover_devices(probe=True)
+
+    assert [device["kind"] for device in devices] == ["usb", "jlink"]
+    usb, probe = devices
+    assert usb["selectable"] is True
+    assert usb["data_port"] == data.device
+    assert usb["smp_port"] == smp.device
+    assert probe["id"] == "jlink:29734569"
+    assert probe["probe_serial"] == "29734569"
+
+
+def test_device_discovery_keeps_two_usb_boards_and_two_jlinks_separate(monkeypatch) -> None:
+    usb1_data = _PortInfo("/dev/cu.usbmodem-board1-data")
+    usb1_smp = _PortInfo("/dev/cu.usbmodem-board1-smp")
+    usb2_data = _PortInfo("/dev/cu.usbmodem-board2-data")
+    usb2_smp = _PortInfo("/dev/cu.usbmodem-board2-smp")
+    for info, serial, location in (
+        (usb1_data, "board-1", "1-1"), (usb1_smp, "board-1", "1-1"),
+        (usb2_data, "board-2", "1-2"), (usb2_smp, "board-2", "1-2"),
+    ):
+        info.serial_number, info.location = serial, location
+    jlink1 = _jlink_port()
+    jlink2 = _jlink_port("/dev/cu.usbmodem0000123456791")
+    jlink2.serial_number = "000012345679"
+    jlink2.location = "1-1.5"
+    monkeypatch.setattr(
+        gui_server, "_all_serial_port_infos",
+        lambda: [usb1_data, usb1_smp, usb2_data, usb2_smp, jlink1, jlink2],
+    )
+    monkeypatch.setattr(
+        gui_server, "_probe_serial_data_candidate",
+        lambda port: port in {usb1_data.device, usb2_data.device},
+    )
+
+    devices = gui_server._discover_devices(probe=True)
+
+    assert len(devices) == 4
+    assert len({device["id"] for device in devices}) == 4
+    assert {device["probe_serial"] for device in devices if device["kind"] == "jlink"} == {
+        "29734569", "12345679",
+    }
+    assert {device["serial_number"] for device in devices if device["kind"] == "usb"} == {
+        "board-1", "board-2",
+    }
 
 
 def test_transport_status_exposes_selected_backend_label(monkeypatch) -> None:
@@ -62,6 +139,7 @@ def test_auto_transport_refreshes_after_usb_is_inserted(monkeypatch) -> None:
     monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
     monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "")
     monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "")
+    monkeypatch.setattr(gui_server, "_discover_devices", lambda *, probe=True: [])
     monkeypatch.setattr(
         gui_server,
         "_discover_serial_data_port",
@@ -80,11 +158,27 @@ def test_auto_transport_refreshes_after_usb_is_inserted(monkeypatch) -> None:
     assert gui_server.SERIAL_SMP_PORT == "/dev/cu.usbmodem1101"
 
 
+def test_auto_transport_rejects_multiple_usable_devices(monkeypatch) -> None:
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT", "rtt")
+    monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
+    monkeypatch.setattr(gui_server, "_discover_devices", lambda *, probe=True: [
+        {"id": "jlink:1", "kind": "jlink", "selectable": True,
+         "probe_serial": "1", "name": "J-Link 1"},
+        {"id": "usb:2", "kind": "usb", "selectable": True,
+         "data_port": "/dev/cu.usbmodem2", "smp_port": "/dev/cu.usbmodem2-smp",
+         "name": "USB 2"},
+    ])
+
+    with pytest.raises(RuntimeError, match="多个可用设备"):
+        gui_server._refresh_usb_transport()
+
+
 def test_refresh_rejects_a_stale_serial_path_after_usb_reenumeration(monkeypatch) -> None:
     monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT", "serial")
     monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
     monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "/dev/cu.usbmodem1103")
     monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "/dev/cu.usbmodem1101")
+    monkeypatch.setattr(gui_server, "_discover_devices", lambda *, probe=True: [])
     monkeypatch.setattr(
         gui_server, "_discover_serial_data_port",
         lambda *, force=False: None,

@@ -3,7 +3,7 @@ const $ = (id) => {
   if (!node) throw new Error(`界面资源版本不一致（缺少 ${id}），请刷新页面后重试`);
   return node;
 };
-const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, driftDirty: false, exiting: false };
+const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, devices: {devices: [], selected_device_id: null, busy: false}, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, driftDirty: false, exiting: false };
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
   calibrate: ['标定与漂移', '选择标定范围并管理过渡期 bias'],
@@ -773,7 +773,8 @@ function updateMeasurement(data){
   const transportLabel=String(data.transport_label||(
     data.transport==='serial'?'USB DATA CDC':data.transport==='rtt'?'RTT / J-Link':'连接方式未知'
   ));
-  $('deviceTransport').textContent=`${transportLabel} · MAX30131`;
+  const deviceName=String(data.device_name||state.devices?.selected_device?.name||'');
+  $('deviceTransport').textContent=`${deviceName||transportLabel} · MAX30131`;
   if(data.error){$('measureError').textContent=data.error;$('measureError').hidden=false}else $('measureError').hidden=true; updateStartState();drawAll();void handleWorkflowCompletion(data);
 }
 async function refreshMeasurement(){if(state.exiting)return;try{updateMeasurement(await api('/api/status'))}catch(e){$('deviceState').textContent='服务未连接';$('deviceTransport').textContent='连接方式未知 · MAX30131';$('deviceDot').className='status-dot'}}
@@ -804,6 +805,54 @@ $('exitApp').addEventListener('click',async()=>{
     button.textContent=acknowledged?'后端已退出，请关闭标签页':'后端未响应，请检查运行进程';
   },350);
 });
+function deviceCardDetail(device){
+  if(device.kind==='jlink')return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探头 SN ${device.probe_serial}`:''}`;
+  const ports=[device.data_port&&`DATA ${device.data_port}`,device.smp_port&&`SMP ${device.smp_port}`].filter(Boolean);
+  if(device.probe_required)return '测量进行中，暂不打开 CDC 探测';
+  return ports.length?ports.join(' · '):'未识别 DATA/SMP 接口';
+}
+function renderDeviceList(payload=state.devices){
+  state.devices=payload||{devices:[],selected_device_id:null,busy:false};
+  const devices=Array.isArray(state.devices.devices)?state.devices.devices:[];
+  const selected=state.devices.selected_device_id;
+  const list=$('deviceList'); list.replaceChildren();
+  const auto=document.createElement('article'); auto.className=`device-card ${selected?'':'selected'}`;
+  auto.innerHTML='<div><strong>自动检测</strong><small>只有一个设备时自动使用；多个设备时保留当前选择</small></div><button class="secondary" type="button" data-device-id="auto">使用自动检测</button>';
+  const autoButton=auto.querySelector('button'); autoButton.disabled=Boolean(state.devices.busy)||!selected;
+  list.append(auto);
+  devices.forEach(device=>{
+    const card=document.createElement('article'); card.className=`device-card ${device.id===selected?'selected':''}${device.selectable?'':' unavailable'}`;
+    const title=document.createElement('div'); title.innerHTML=`<strong>${escapeHtml(device.name||'未命名设备')}</strong><small>${escapeHtml(deviceCardDetail(device))}</small>`;
+    const action=document.createElement('button'); action.type='button'; action.className='secondary'; action.dataset.deviceId=device.id;
+    action.textContent=device.id===selected?'当前使用':'选择'; action.disabled=Boolean(state.devices.busy)||device.id===selected||!device.selectable;
+    card.append(title,action);
+    const note=document.createElement('small'); note.className='device-state'; note.textContent=device.id===selected?'当前测量将使用此设备':device.selectable?'空闲时可选择':'设备尚未准备好'; card.append(note);
+    list.append(card);
+  });
+  if(!devices.length){const empty=document.createElement('div');empty.className='device-empty';empty.textContent='没有发现可识别的 USB DATA 或 J-Link。';list.append(empty)}
+  const count=devices.length?`${devices.length} 个设备`:'未发现设备';
+  $('deviceDialogSummary').textContent=state.devices.busy?`${count} · 测量进行中，暂不能切换`:`${count} · 选择后会锁定该设备`;
+  $('deviceDialogBusy').hidden=!state.devices.busy;
+  $('deviceDialogBusy').textContent=state.devices.busy?'测量或自动任务运行期间不能切换设备':'';
+}
+async function refreshDevices(open=false){
+  const dialog=$('deviceDialog');
+  if(open){if(typeof dialog.showModal==='function')dialog.showModal();else dialog.setAttribute('open','')}
+  try{renderDeviceList(await api('/api/devices'))}
+  catch(e){$('deviceDialogSummary').textContent='设备列表读取失败';$('deviceDialogBusy').textContent=e.message;$('deviceDialogBusy').hidden=false}
+}
+async function chooseDevice(deviceId){
+  const buttons=$('deviceList').querySelectorAll('button');buttons.forEach(button=>{button.disabled=true});
+  try{
+    const data=await post('/api/devices/select',{device_id:deviceId});
+    renderDeviceList(data); await refreshMeasurement();
+    const dialog=$('deviceDialog');if(typeof dialog.close==='function')dialog.close();else dialog.removeAttribute('open');
+    toast(data.message||'设备选择已更新');
+  }catch(e){buttons.forEach(button=>{button.disabled=false});$('deviceDialogBusy').textContent=e.message;$('deviceDialogBusy').hidden=false}
+}
+$('selectDevice').addEventListener('click',()=>void refreshDevices(true));
+$('refreshDevices').addEventListener('click',()=>void refreshDevices(false));
+$('deviceList').addEventListener('click',event=>{const button=event.target.closest('button[data-device-id]');if(button&&!button.disabled)void chooseDevice(button.dataset.deviceId)});
 $('chartWindow').addEventListener('click', event => {
   const button = event.target.closest('button[data-window]');
   if (!button) return;
@@ -1006,7 +1055,7 @@ $('scheduleRole').addEventListener('change',renderScheduleMode);
 $('startSchedule').onclick=async()=>{try{$('scheduleError').hidden=true;updateSchedule(await post('/api/schedule/start',{interval_minutes:$('intervalMinutes').value,max_runs:$('maxRuns').value,total_minutes:$('totalMinutes').value,sample_prefix:$('schedulePrefix').value,known_concentration_um:$('scheduleConcentration').value===''?null:$('scheduleConcentration').value,sample_role:$('scheduleRole').value,start_now:$('startNow').checked}))}catch(e){errorBox('scheduleError',e)}};
 $('stopSchedule').onclick=async()=>{try{updateSchedule(await post('/api/schedule/stop'))}catch(e){errorBox('scheduleError',e)}};
 
-async function init(){setInterval(()=>$('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);await loadFilter();await loadPlateau();try{state.settingsDirty=false;renderSettings(await api('/api/settings'))}catch{}try{renderWorkflow(await api('/api/workflow'))}catch{}try{state.calibration=await api('/api/calibration');renderCalibration()}catch{}try{renderDrift(await api('/api/drift'))}catch{}try{updateSchedule(await api('/api/schedule'))}catch{}try{await refreshWorkspaceHistory()}catch{}setSampleRole(state.workflow?.calibration_ready?'test':'calibration',true);previewFilename();measurementRefreshLoop();setInterval(async()=>{if(!state.exiting){try{updateSchedule(await api('/api/schedule'))}catch{}}},1000);try{await post('/api/frontend/ready')}catch{}}
+async function init(){setInterval(()=>$('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);await loadFilter();await loadPlateau();try{state.settingsDirty=false;renderSettings(await api('/api/settings'))}catch{}try{renderWorkflow(await api('/api/workflow'))}catch{}try{state.calibration=await api('/api/calibration');renderCalibration()}catch{}try{renderDrift(await api('/api/drift'))}catch{}try{updateSchedule(await api('/api/schedule'))}catch{}try{await refreshWorkspaceHistory()}catch{}try{await refreshDevices(false)}catch{}setSampleRole(state.workflow?.calibration_ready?'test':'calibration',true);previewFilename();measurementRefreshLoop();setInterval(async()=>{if(!state.exiting){try{updateSchedule(await api('/api/schedule'))}catch{}}},1000);try{await post('/api/frontend/ready')}catch{}}
 
 // ══════════════════════════════════════════════════════════════════════════
 // 硬件 DEBUG 模式
