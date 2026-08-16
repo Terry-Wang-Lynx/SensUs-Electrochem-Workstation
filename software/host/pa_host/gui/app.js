@@ -1009,6 +1009,8 @@ $('exitApp').addEventListener('click',async()=>{
   button.disabled=true;button.textContent='退出中…';
   let acknowledged=false;
   try{await post('/api/shutdown');acknowledged=true}catch{}
+  const nativeApp=window.webkit?.messageHandlers?.sensusApp;
+  if(nativeApp){nativeApp.postMessage('quit');return}
   try{window.open('','_self');window.close()}catch{}
   setTimeout(()=>{
     if(window.closed)return;

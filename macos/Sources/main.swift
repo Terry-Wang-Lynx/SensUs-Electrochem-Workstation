@@ -12,6 +12,7 @@ private final class BackendManager {
     private var watchdogTimer: Timer?
     private var consecutiveHealthFailures = 0
     private var recoveryInProgress = false
+    private var intentionalShutdown = false
     let projectRoot: URL
     let stateURL: URL
     let logURL: URL
@@ -217,6 +218,7 @@ private final class BackendManager {
     }
 
     func stopServer() {
+        intentionalShutdown = true
         watchdogTimer?.invalidate()
         watchdogTimer = nil
         if let process, process.isRunning {
@@ -227,8 +229,31 @@ private final class BackendManager {
         logHandle = nil
     }
 
+    func beginApplicationShutdown(completion: @escaping () -> Void) {
+        intentionalShutdown = true
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        waitForServerExit(
+            deadline: Date().addingTimeInterval(12),
+            completion: completion
+        )
+    }
+
+    private func waitForServerExit(
+        deadline: Date,
+        completion: @escaping () -> Void
+    ) {
+        guard process?.isRunning == true, Date() < deadline else {
+            completion()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.waitForServerExit(deadline: deadline, completion: completion)
+        }
+    }
+
     private func beginHealthMonitoring() {
-        guard watchdogTimer == nil else { return }
+        guard watchdogTimer == nil, !intentionalShutdown else { return }
         let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.checkForRecovery()
         }
@@ -240,6 +265,7 @@ private final class BackendManager {
         healthCheck { [weak self] available in
             guard let self else { return }
             DispatchQueue.main.async {
+                guard !self.intentionalShutdown else { return }
                 if available {
                     self.consecutiveHealthFailures = 0
                     return
@@ -252,7 +278,7 @@ private final class BackendManager {
     }
 
     private func recoverServer() {
-        guard !recoveryInProgress else { return }
+        guard !recoveryInProgress, !intentionalShutdown else { return }
         recoveryInProgress = true
         if let process, process.isRunning {
             process.terminate()
@@ -352,7 +378,7 @@ private final class OverlayPanel: NSPanel {
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
-    NSToolbarDelegate, WKNavigationDelegate {
+    NSToolbarDelegate, WKNavigationDelegate, WKScriptMessageHandler {
 
     private let backend = BackendManager()
     private var mainWindow: NSWindow!
@@ -409,10 +435,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func makeWebView() -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        configuration.userContentController.add(self, name: "sensusApp")
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.allowsMagnification = true
         return webView
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "sensusApp",
+              let action = message.body as? String,
+              action == "quit" else { return }
+        mainWindow.orderOut(nil)
+        overlayPanel.orderOut(nil)
+        backend.beginApplicationShutdown {
+            NSApp.terminate(nil)
+        }
     }
 
     private func configureMainWindow() {

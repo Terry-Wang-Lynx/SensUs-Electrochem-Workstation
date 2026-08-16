@@ -1187,11 +1187,13 @@ def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
             _discover_serial_smp_port(discovered) or SERIAL_SMP_PORT
         )
         return "serial"
-    if _serial_port_infos():
-        raise ValueError(
-            "检测到 USB CDC，但未找到可用的 V5.1 DATA CDC；"
-            "请确认固件已更新并重新插拔 USB"
-        )
+    # Auto mode must keep the workstation reachable when a board enumerates
+    # its CDC interfaces but fails before its DATA command loop starts.  The
+    # device list still exposes that USB board as unavailable, while an
+    # attached J-Link remains usable for diagnosis and recovery.  Explicit
+    # serial mode above continues to fail fast with a concrete DATA CDC error.
+    SERIAL_DATA_PORT = ""
+    SERIAL_SMP_PORT = ""
     return "rtt"
 
 

@@ -365,15 +365,19 @@ def test_serial_transport_requires_a_data_port(monkeypatch) -> None:
         gui_server._resolve_hardware_transport("serial", "")
 
 
-def test_auto_transport_rejects_an_unidentified_usb_cdc(monkeypatch) -> None:
+def test_auto_transport_keeps_gui_available_for_unidentified_usb_cdc(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "")
+    monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "/dev/cu.usbmodem1101")
     monkeypatch.setattr(gui_server, "_discover_serial_data_port", lambda: None)
     monkeypatch.setattr(gui_server, "_serial_port_infos", lambda: [_PortInfo(
         "/dev/cu.usbmodem1101"
     )])
 
-    with pytest.raises(ValueError, match="未找到可用的 V5.1 DATA CDC"):
-        gui_server._resolve_hardware_transport("auto", "")
+    assert gui_server._resolve_hardware_transport("auto", "") == "rtt"
+    assert gui_server.SERIAL_DATA_PORT == ""
+    assert gui_server.SERIAL_SMP_PORT == ""
 
 
 def test_process_tail_omits_openocd_shutdown_banner() -> None:
