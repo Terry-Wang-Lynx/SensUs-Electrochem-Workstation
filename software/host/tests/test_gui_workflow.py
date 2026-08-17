@@ -3128,6 +3128,46 @@ def test_watcher_start_failure_reclaims_collector_and_gets_diagnostic_id(
     assert exc_info.value.diagnostic_id == event["event_id"]
 
 
+def test_windows_terminate_tree_releases_openocd_before_forcing() -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    process.wait.return_value = 0
+
+    with (
+        patch("pa_host.gui_server._IS_WIN", True),
+        patch("pa_host.gui_server._port_accepts_connections", return_value=True),
+        patch("pa_host.gui_server._release_stale_measurement_bridge") as release,
+        patch("pa_host.gui_server.subprocess.run") as taskkill,
+    ):
+        MeasurementController._terminate_tree(process)
+
+    release.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=6)
+    taskkill.assert_not_called()
+
+
+def test_windows_terminate_tree_forces_after_bridge_release_failure() -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+
+    with (
+        patch("pa_host.gui_server._IS_WIN", True),
+        patch("pa_host.gui_server._port_accepts_connections", return_value=True),
+        patch(
+            "pa_host.gui_server._release_stale_measurement_bridge",
+            side_effect=RuntimeError("bridge stuck"),
+        ),
+        patch("pa_host.gui_server.subprocess.run") as taskkill,
+    ):
+        MeasurementController._terminate_tree(process)
+
+    taskkill.assert_called_once_with(
+        ["taskkill", "/F", "/T", "/PID", "4321"],
+        capture_output=True,
+        timeout=10,
+    )
+
+
 def test_server_shutdown_waits_for_measurement_finalization() -> None:
     server = Mock(server_port=8769)
     app = Mock()

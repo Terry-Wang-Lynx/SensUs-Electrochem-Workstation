@@ -519,6 +519,25 @@ def test_measure_forwards_early_sigterm_waits_and_returns_stop_code(monkeypatch)
     assert active_handler[signal.SIGTERM] is original_handler
 
 
+def test_measure_forwards_explicit_no_reset_to_jlink_collector(monkeypatch) -> None:
+    child = Mock()
+    child.wait.return_value = 0
+    monkeypatch.setattr(it_tool.subprocess, "Popen", Mock(return_value=child))
+    args = SimpleNamespace(
+        out=Path("run.csv"), duration=120.0, idle_timeout=25.0,
+        cv=False, start_jlink=True, socket=None, serial=None,
+        elf=Path("firmware.elf"), probe_serial="123456",
+        reset_before_read=False, cmd_file=None, cell_v=None, audit=None,
+        raw_log=None, trigger="ARMED",
+    )
+
+    assert it_tool._cmd_measure(args) == 0
+
+    command = it_tool.subprocess.Popen.call_args.args[0]
+    assert "--no-reset-before-read" in command
+    assert "--reset-before-read" not in command
+
+
 def _cfg_snapshot(
     *, epoch: int, request_id: str | None, fsr: int = 2,
     verify_ok: int | None = 1,

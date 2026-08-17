@@ -5843,7 +5843,7 @@ class MeasurementController:
         it_tool → pa_host.collect → JLinkExe,`terminate` 只打到 it_tool,
         collect 与 JLinkExe 会一直活着占住探头和 telnet 19021(实测 60s 不自愈)。
 
-        Windows: 用 taskkill /T 整棵收掉。
+        Windows: 先让 RTT 后端释放探头,超时后才用 taskkill /T 整棵收掉。
         macOS/Linux: 配合 Popen(start_new_session=True) 才能用 killpg 一次收完。
         JLinkExe 本身**不理 SIGTERM**(实测),但它父进程 collect 一退、stdin 管道
         EOF,它就会自己退 —— 所以关键是让 collect 收到信号并跑完它的 finally。
@@ -5851,7 +5851,20 @@ class MeasurementController:
         if process.poll() is not None:
             return
         if _IS_WIN:
-            # Windows: taskkill /T 会杀掉整个进程树
+            # Older ARM-OB probes can remain in LIBUSB_ERROR_TIMEOUT until a
+            # physical replug if OpenOCD is killed while it owns WinUSB.  The
+            # collector normally sends this shutdown itself, but GUI timeout
+            # and startup-failure paths arrive here before that finally block.
+            # Release the current workstation bridge first, then let the
+            # wrapper/collector unwind.  Forced taskkill remains bounded as a
+            # fallback for a broken child tree.
+            if _port_accepts_connections(19021):
+                try:
+                    _release_stale_measurement_bridge()
+                    process.wait(timeout=6)
+                    return
+                except (RuntimeError, subprocess.TimeoutExpired, OSError):
+                    pass
             try:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],

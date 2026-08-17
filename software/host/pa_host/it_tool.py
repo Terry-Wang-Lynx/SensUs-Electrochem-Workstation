@@ -116,6 +116,12 @@ def _cmd_measure(args: argparse.Namespace) -> int:
             cmd += ["--probe-serial", args.probe_serial]
         if args.reset_before_read:
             cmd += ["--reset-before-read"]
+        else:
+            # collect.py keeps a reset-on-connect default for its standalone
+            # CLI.  The workstation's ARMED gate deliberately preserves the
+            # running firmware and separates stale RTT bytes with a unique
+            # request id, so the wrapper must forward False explicitly.
+            cmd += ["--no-reset-before-read"]
     else:
         cmd += ["--socket", args.socket or "127.0.0.1:19021"]
     if getattr(args, "cmd_file", None):
