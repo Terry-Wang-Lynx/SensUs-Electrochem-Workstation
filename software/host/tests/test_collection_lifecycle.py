@@ -16,6 +16,7 @@ from pa_host import collect, it_tool
 class _CommandSocket:
     def __init__(self) -> None:
         self.sent: list[bytes] = []
+        self.chunks: list[bytes] = []
 
     def __enter__(self):
         return self
@@ -30,6 +31,8 @@ class _CommandSocket:
         self.sent.append(payload)
 
     def recv(self, _size: int) -> bytes:
+        if self.chunks:
+            return self.chunks.pop(0)
         return b"IT_READY\n"
 
 
@@ -48,6 +51,58 @@ def test_command_file_rejects_non_ascii_line_and_forwards_the_next(
     assert next(lines) == "IT_READY"
     assert sock.sent == [b"GET\n"]
     assert "拒绝命令文件中的非 ASCII 命令" in capsys.readouterr().err
+
+
+def test_armed_rtt_start_is_sent_once_while_waiting_for_delayed_marker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cmd_file = tmp_path / "commands.txt"
+    cmd_file.write_text("START\n", encoding="utf-8")
+    sock = _CommandSocket()
+    monkeypatch.setattr(collect.socket, "create_connection", lambda *_args, **_kw: sock)
+    now = 0.0
+
+    def advancing_clock() -> float:
+        nonlocal now
+        now += collect.TRIGGER_RESEND_INTERVAL_S + 0.1
+        return now
+
+    monkeypatch.setattr(collect.time, "monotonic", advancing_clock)
+    lines = collect.read_socket_lines(
+        "127.0.0.1", 19021, trigger="ARMED", cmd_file=cmd_file
+    )
+
+    assert next(lines) == "IT_READY"
+    assert next(lines) == "IT_READY"
+    lines.close()
+
+    assert sock.sent == [b"START\n"]
+
+
+def test_armed_rtt_recovers_start_marker_glued_to_config_line(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cmd_file = tmp_path / "commands.txt"
+    cmd_file.write_text("START\n", encoding="utf-8")
+    sock = _CommandSocket()
+    sock.chunks = [
+        b"CFG_CONFIRMED ep=1 req=32a66IT_START run=5 target_mv=200\n"
+        b"S seq=1 ms=100 counts=7000 fa=-1 tag=0 auto=1 ovf=0 sat=0 ep=1\n"
+        b"IT_DONE native=1 expected=1 elapsed_ms=100 ep=1 tainted=0\n"
+    ]
+    monkeypatch.setattr(collect.socket, "create_connection", lambda *_args, **_kw: sock)
+
+    lines = collect.read_socket_lines(
+        "127.0.0.1", 19021, trigger="ARMED", cmd_file=cmd_file
+    )
+
+    assert next(lines) == "CFG_CONFIRMED ep=1 req=32a66"
+    assert next(lines) == "IT_START run=5 target_mv=200"
+    assert next(lines).startswith("S seq=1 ")
+    assert next(lines).startswith("IT_DONE native=1 ")
+    lines.close()
+
+    assert sock.sent == [b"START\n"]
 
 
 def test_trigger_argument_rejects_non_ascii_before_collection_starts() -> None:
@@ -276,6 +331,118 @@ def test_interruptible_jlink_script_terminates_active_commander(
         )
 
     assert process.terminated is True
+
+
+def test_jlink_rtt_prefers_ready_openocd_without_probing_commander(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    openocd = tmp_path / "openocd"
+    openocd.touch()
+    scripts = tmp_path / "scripts"
+    (scripts / "interface").mkdir(parents=True)
+    (scripts / "target").mkdir()
+    (scripts / "interface/jlink.cfg").touch()
+    (scripts / "target/nrf52.cfg").touch()
+    commander = tmp_path / "JLinkExe"
+    commander.touch()
+
+    class Process:
+        stdin = None
+
+        def poll(self):
+            return None
+
+    class ProbeSocket:
+        def close(self) -> None:
+            pass
+
+    process = Process()
+    commands: list[list[str]] = []
+    monkeypatch.setattr(collect, "OPENOCD_EXE", openocd)
+    monkeypatch.setattr(collect, "OPENOCD_SCRIPTS", scripts)
+    monkeypatch.setattr(collect, "JLINK_EXE", commander)
+    monkeypatch.setattr(
+        collect.subprocess, "Popen",
+        lambda command, **_kwargs: commands.append(command) or process,
+    )
+    monkeypatch.setattr(
+        collect.socket, "create_connection", lambda *_args, **_kwargs: ProbeSocket()
+    )
+    monkeypatch.setattr(
+        collect, "probe_jlink_target",
+        lambda *_args, **_kwargs: pytest.fail("Commander should not be probed"),
+    )
+
+    result = collect.start_jlink_rtt(0x20001100, "29734569", 19021)
+
+    assert result is process
+    command = commands[0]
+    assert command[0] == str(openocd)
+    assert "adapter serial 29734569" in command[-1]
+    assert "rtt server start 19021 0" in command[-1]
+
+
+def test_jlink_rtt_falls_back_after_openocd_startup_failure(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    openocd = tmp_path / "openocd"
+    openocd.touch()
+    scripts = tmp_path / "scripts"
+    (scripts / "interface").mkdir(parents=True)
+    (scripts / "target").mkdir()
+    (scripts / "interface/jlink.cfg").touch()
+    (scripts / "target/nrf52.cfg").touch()
+    commander = tmp_path / "JLinkExe"
+    commander.touch()
+
+    class FailedProcess:
+        stdin = None
+        returncode = 23
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    class Transport:
+        def __init__(self, *args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+            self.discarded = False
+
+        def discard_pending_up(self) -> None:
+            self.discarded = True
+
+    bridge = object()
+    transports: list[Transport] = []
+    monkeypatch.setattr(collect, "OPENOCD_EXE", openocd)
+    monkeypatch.setattr(collect, "OPENOCD_SCRIPTS", scripts)
+    monkeypatch.setattr(collect, "JLINK_EXE", commander)
+    monkeypatch.setattr(
+        collect.subprocess, "Popen", lambda *_args, **_kwargs: FailedProcess()
+    )
+    monkeypatch.setattr(
+        collect, "probe_jlink_target", lambda *_args, **_kwargs: (True, "ready")
+    )
+    monkeypatch.setattr(
+        collect, "JLinkMemoryRTT",
+        lambda *args, **kwargs: transports.append(Transport(*args, **kwargs))
+        or transports[-1],
+    )
+    monkeypatch.setattr(
+        collect, "JLinkMemoryRTTBridge",
+        lambda transport, port, control_port=None: bridge,
+    )
+
+    result = collect.start_jlink_rtt(
+        0x20001100, "29734569", 19021, reset_before_read=True,
+    )
+
+    assert result is bridge
+    assert len(transports) == 1
+    assert transports[0].discarded is True
+    assert transports[0].kwargs["executable"] == commander
 
 
 def test_measure_forwards_early_sigterm_waits_and_returns_stop_code(monkeypatch) -> None:

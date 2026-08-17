@@ -310,8 +310,10 @@ main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hi
 .it-settings.measure-control-panel label{margin:0}
 .it-settings.measure-control-panel>.field-pair{display:contents}
 .it-settings.measure-control-panel .method-switch{grid-column:1/-1;display:flex;align-items:center;
-  justify-content:space-between;gap:12px;color:#4f5b60;font-size:11px}
-.it-settings.measure-control-panel .method-switch .segmented{min-width:180px}
+  justify-content:space-between;gap:8px 18px;flex-wrap:wrap;color:#4f5b60;font-size:11px}
+.method-picker,.it-preset-picker{display:flex;align-items:center;gap:9px;min-width:0}
+.it-settings.measure-control-panel .method-picker .segmented{min-width:180px}
+.it-preset-picker .segmented button{min-width:108px;white-space:nowrap}
 .it-settings.measure-control-panel #itSettings{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));grid-auto-rows:min-content;gap:8px 12px}
 .it-settings.measure-control-panel #cvSettings{display:contents}
 .it-settings.measure-control-panel #itSettings[hidden],
@@ -379,6 +381,8 @@ main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hi
   #concentrationField,.sample-controls .action-row,.sample-controls .auto-save-preview,.sample-controls>.full,
   .sample-controls .prediction-result,.sample-controls .saved-result{grid-column:1/-1}
   .it-settings.measure-control-panel .sampling-note,.it-settings.measure-control-panel .apply-settings{grid-column:1/-1}
+  .method-picker,.it-preset-picker{flex:1 1 100%;justify-content:space-between}
+  .it-preset-picker .segmented{flex:1}.it-preset-picker .segmented button{flex:1;min-width:0}
 }
 
 /* Keep the primary IT plot at its normal working height on desktop.  The

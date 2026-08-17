@@ -22,12 +22,12 @@
 
 两个必须知道的坑
     1. 部分探头不接受 JLinkExe 的命令行 ``-autoconnect`` 初始化，但可以用
-       Commander 脚本中的 ``si/speed/device/connect`` 顺序稳定连接。因此烧录、
-       目标核对和 RTT 都统一使用这条显式连接路径；SEGGER 工具不可用时回退到
-       随包的 libjaylink OpenOCD。
+       Commander 脚本中的 ``si/speed/device/connect`` 顺序稳定连接。因此烧录和
+       目标核对使用这条显式连接路径；RTT 则优先使用随包的 libjaylink
+       OpenOCD 保持一个长连接会话。
     2. 部分兼容探头可执行 Commander 的短内存事务，但新版 SEGGER DLL 的异步
-       RTT 轮询持续报 memory read error。系统 J-Link 可用时，本模块直接按公开的
-       SEGGER RTT 环形缓冲布局做带回读校验的短事务；否则使用随包 OpenOCD。
+       RTT 轮询持续报 memory read error。OpenOCD 无法建链时，本模块才按公开的
+       SEGGER RTT 环形缓冲布局做带回读校验的 Commander 短事务作为回退。
        🔴 该地址**每次重新编译都可能变**,所以默认从 ELF 的 `_SEGGER_RTT` 符号自动提取,
        别硬编码。
 
@@ -260,6 +260,8 @@ RTT_RAM_END = 0x20020000
 RTT_MAX_CHANNELS = 16
 RTT_MAX_BUFFER_SIZE = 64 * 1024
 RTT_BRIDGE_POLL_INTERVAL_S = 0.08
+OPENOCD_RTT_START_TIMEOUT_S = 8.0
+OPENOCD_RTT_START_POLL_INTERVAL_S = 0.1
 # 触发命令未被固件确认前的重发间隔与最大次数。
 # 🔴 按**挂钟时间**重发,不依赖 socket 空闲 —— 固件仍在吐上一轮数据时永不空闲。
 TRIGGER_RESEND_INTERVAL_S = 1.0
@@ -984,59 +986,64 @@ def find_rtt_address(elf: Path) -> int:
 # --------------------------------------------------------------------------
 # 取数来源
 # --------------------------------------------------------------------------
-def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
-                    port: int, reset_before_read: bool = False) -> Any:
-    """起 RTT 桥，数据出到 telnet ``port``。
+def _openocd_rtt_available() -> bool:
+    return (
+        OPENOCD_EXE.is_file()
+        and (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
+        and (OPENOCD_SCRIPTS / "target/nrf52.cfg").is_file()
+    )
 
-    系统 Commander 可到达目标时，使用带回读校验的内存桥。它不存在或无法
-    到达目标时，使用 libjaylink OpenOCD 建立等价的 RTT server。
-    """
-    jlink_ready = False
-    if JLINK_EXE.is_file():
-        jlink_ready, probe_output = probe_jlink_target(
-            probe_serial, executable=JLINK_EXE, timeout_s=10,
-        )
-        if not jlink_ready:
-            tail = [line.strip() for line in probe_output.splitlines()
-                    if line.strip()][-3:]
-            print(
-                "[collect] 系统 JLinkExe 未能连接目标，改用随包 OpenOCD: "
-                + " | ".join(tail),
-                file=sys.stderr,
-            )
-    if jlink_ready:
-        print(
-            f"[collect] 启动 J-Link RTT 内存桥,控制块 @ 0x{rtt_addr:08X},"
-            f"本地端口 {port}",
-            file=sys.stderr,
-        )
+
+def _stop_rtt_process(process: Any) -> None:
+    """Release a failed RTT backend before another driver opens the probe."""
+    try:
+        stream = getattr(process, "stdin", None)
+        if stream:
+            stream.close()
+    except OSError:
+        pass
+    try:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _wait_for_rtt_server(
+    process: Any,
+    port: int,
+    timeout_s: float = OPENOCD_RTT_START_TIMEOUT_S,
+) -> tuple[bool, str]:
+    """Wait until OpenOCD actually accepts RTT clients, not merely until spawn."""
+    deadline = time.monotonic() + timeout_s
+    last_error = "RTT server 尚未监听"
+    while time.monotonic() < deadline:
+        returncode = process.poll()
+        if returncode is not None:
+            return False, f"OpenOCD 启动期退出（代码 {returncode}）"
+        probe: socket.socket | None = None
         try:
-            transport = JLinkMemoryRTT(
-                rtt_addr,
-                probe_serial,
-                executable=JLINK_EXE,
-            )
-            # Clearing the up-channel pointer is both more reliable and less
-            # intrusive than resetting the board: only bytes predating this
-            # collector are discarded, while AFE polarization remains intact.
-            if reset_before_read:
-                transport.discard_pending_up()
-            return JLinkMemoryRTTBridge(
-                transport, port, control_port=19022 if port == 19021 else None,
-            )
-        except Exception:
-            # A reachable Commander followed by an invalid or unverifiable RTT
-            # layout is a hard failure. Falling through to another backend would
-            # turn data corruption into an apparently successful measurement.
-            raise
+            probe = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+            # START is sent only by the real collector connection, so this
+            # readiness handshake cannot consume measurement samples.
+            return True, ""
+        except OSError as exc:
+            last_error = str(exc)
+        finally:
+            if probe is not None:
+                probe.close()
+        time.sleep(OPENOCD_RTT_START_POLL_INTERVAL_S)
+    return False, f"{timeout_s:g} 秒内未建立 RTT server：{last_error}"
 
-    if not OPENOCD_EXE.is_file() or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").exists():
-        sys.exit(
-            f"{JLINK_EXE} 未能连接目标，也找不到可用的 libjaylink OpenOCD\n"
-            "→ 设 SENSUS_JLINK_EXE 指向系统 JLinkExe，或设 SENSUS_OPENOCD_EXE/"
-            "SENSUS_OPENOCD_SCRIPTS。"
-        )
 
+def _start_openocd_rtt(
+    rtt_addr: int,
+    probe_serial: str | None,
+    port: int,
+    reset_before_read: bool,
+) -> subprocess.Popen:
     adapter_serial = f"adapter serial {probe_serial}; " if probe_serial else ""
     reset_cmds = "reset halt; reset run; sleep 500; " if reset_before_read else ""
     server_commands = (
@@ -1049,13 +1056,84 @@ def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
         "-f", "interface/jlink.cfg", "-c", "transport select swd",
         "-f", "target/nrf52.cfg", "-c", server_commands,
     ]
-    print(f"[collect] 启动 libjaylink OpenOCD,RTT 控制块 @ "
-          f"0x{rtt_addr:08X},telnet {port}",
-          file=sys.stderr)
     return subprocess.Popen(
         cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace",
+    )
+
+
+def _start_commander_memory_rtt(
+    rtt_addr: int,
+    probe_serial: str | None,
+    port: int,
+    reset_before_read: bool,
+) -> Any:
+    transport = JLinkMemoryRTT(
+        rtt_addr,
+        probe_serial,
+        executable=JLINK_EXE,
+    )
+    # Only bytes predating this collector are dropped; AFE polarization stays.
+    if reset_before_read:
+        transport.discard_pending_up()
+    return JLinkMemoryRTTBridge(
+        transport, port, control_port=19022 if port == 19021 else None,
+    )
+
+
+def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
+                    port: int, reset_before_read: bool = False) -> Any:
+    """起 RTT 桥，数据出到 telnet ``port``。
+
+    优先启动长连接的 libjaylink OpenOCD RTT server，避免每读一批数据都
+    重启 Commander 导致 0.4–0.5 秒的批处理卡顿。OpenOCD 启动或建链失败时，
+    先完整释放探头，再自动回退到带回读校验的 Commander 内存桥。
+    """
+    openocd_failure = "未找到完整的 OpenOCD 及 scripts"
+    if _openocd_rtt_available():
+        print(
+            f"[collect] 启动常驻 libjaylink OpenOCD,RTT 控制块 @ "
+            f"0x{rtt_addr:08X},telnet {port}",
+            file=sys.stderr,
+        )
+        process = _start_openocd_rtt(
+            rtt_addr, probe_serial, port, reset_before_read,
+        )
+        ready, openocd_failure = _wait_for_rtt_server(process, port)
+        if ready:
+            print("[collect] OpenOCD RTT server 已就绪", file=sys.stderr)
+            return process
+        _stop_rtt_process(process)
+        print(
+            f"[collect] OpenOCD RTT 不可用（{openocd_failure}），"
+            "改用 Commander 内存桥",
+            file=sys.stderr,
+        )
+
+    commander_failure = f"找不到 {JLINK_EXE}"
+    if JLINK_EXE.is_file():
+        jlink_ready, probe_output = probe_jlink_target(
+            probe_serial, executable=JLINK_EXE, timeout_s=10,
+        )
+        if jlink_ready:
+            print(
+                f"[collect] 启动 J-Link RTT 内存桥,"
+                f"控制块 @ 0x{rtt_addr:08X},本地端口 {port}",
+                file=sys.stderr,
+            )
+            return _start_commander_memory_rtt(
+                rtt_addr, probe_serial, port, reset_before_read,
+            )
+        tail = [line.strip() for line in probe_output.splitlines()
+                if line.strip()][-3:]
+        commander_failure = " | ".join(tail) or "Commander 无法连接目标"
+
+    sys.exit(
+        "J-Link RTT 后端均不可用\n"
+        f"→ OpenOCD: {openocd_failure}\n"
+        f"→ Commander: {commander_failure}\n"
+        "请检查板卡供电、SWD 排线和探头选择。"
     )
 
 
@@ -1096,6 +1174,7 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
         _encode_firmware_command(trigger_command) if trigger_command else None
     )
     trigger_pending = trigger_bytes is not None
+    trigger_resends_enabled = trigger_pending
     resends = 0
     # 🔴 复位后必须能**重新武装** trigger。2026-08-10 实测的坑:残留缓冲里带着
     #    上一次开机的 IT_START,重发循环见到它就停了;随后检测到复位、门禁被重置,
@@ -1156,10 +1235,15 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                             if armed_only and raw_cmd == "START":
                                 armed_start_sent = True
                                 trigger_command = "START"
-                                # RTT 已由 GET 确认，但 START 仍按普通 trigger 的规则
-                                # 重发到看见 IT_START 为止，不能把一次 sendall 当确认。
+                                # ARMED 只会在带标识的 GET/CFG 回读已经证明
+                                # 下行可用后写 START。此时重发会把命令堆在 RTT
+                                # 下行队列里；固件稍后依次收到时会把每一条
+                                # 解释为“重新开始”，导致采集每隔约 1 s 中止。
+                                # 仍保留 trigger_pending 以等待唯一启动回执，
+                                # 但这条已核验的通道上不再重发。
                                 trigger_bytes = b"START\n"
                                 trigger_pending = True
+                                trigger_resends_enabled = False
                                 resends = 0
                                 warned_unacked = False
                                 last_trigger_at = time.monotonic()
@@ -1178,7 +1262,8 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                 warned_unacked = False
                 last_trigger_at = 0.0   # 立刻重发,不等下一个间隔
                 print("[collect] 复位后重新武装 START", file=sys.stderr)
-            if trigger_pending and time.monotonic() - last_trigger_at >= TRIGGER_RESEND_INTERVAL_S:
+            if (trigger_pending and trigger_resends_enabled
+                    and time.monotonic() - last_trigger_at >= TRIGGER_RESEND_INTERVAL_S):
                 if resends < TRIGGER_MAX_RESENDS:
                     try:
                         sock.sendall(trigger_bytes)
@@ -1203,32 +1288,27 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                 buf += chunk
                 while b"\n" in buf:
                     raw, buf = buf.split(b"\n", 1)
-                    line = raw.decode("utf-8", "replace")
-                    # 🔴 必须用与下游门禁**完全相同**的判据 parse_it_start()。
-                    #    2026-08-09 踩过:这里原本写 `"IT_START" in line`(子串),
-                    #    而固件上一轮样本流未停时,`IT_START` printk 会和样本行的
-                    #    `S` 前缀在 RTT 里交织成 `SIT_START run=1 target_mv=200`。
-                    #    子串判据匹配上了 ⇒ 停止重发并打印「固件已确认」,可是
-                    #    IT_START_RE 是 `^IT_START…` 锚定的、匹配不上 ⇒
-                    #    acquisition_started 一直 False,734 个样本被静默丢弃,
-                    #    界面上就是「设备测量中」但曲线永远空着。**日志在骗人。**
-                    #    判据一致后,残行不算确认 ⇒ 继续重发 ⇒ 固件打出干净的
-                    #    `IT_START run=2 …`,门禁才真的开。
-                    start_seen = (
-                        parse_it_start(line) is not None
-                        or parse_cv_start(line) is not None
-                    )
-                    # ARMED 阶段允许 GET/CFG/CELL_V 上行通过，但忽略 RTT 缓冲里
-                    # 早于本次 START 的旧 IT_START。否则 outer collector 会提前
-                    # 打开采样门禁，把上一轮残留 S 行归到这轮。
-                    if armed_only and start_seen and not armed_start_sent:
-                        print("[collect] 忽略 ARMED 前的旧 START 标记", file=sys.stderr)
-                        continue
-                    if trigger_pending and start_seen:
-                        trigger_pending = False
-                        print(f"[collect] 固件已确认 {trigger_command}"
-                              f"(重发 {resends} 次)", file=sys.stderr)
-                    yield line
+                    physical_line = raw.decode("utf-8", "replace")
+                    logical_lines = _split_glued_lifecycle_line(physical_line)
+                    if len(logical_lines) > 1:
+                        print("[collect] ⚠️ RTT 生命周期标记与上一行粘连，"
+                              "已恢复行边界", file=sys.stderr)
+                    for line in logical_lines:
+                        start_seen = (
+                            parse_it_start(line) is not None
+                            or parse_cv_start(line) is not None
+                        )
+                        # ARMED 阶段允许 GET/CFG/CELL_V 上行通过，但忽略
+                        # 缓冲里早于本次 START 的旧启动标记。
+                        if armed_only and start_seen and not armed_start_sent:
+                            print("[collect] 忽略 ARMED 前的旧 START 标记",
+                                  file=sys.stderr)
+                            continue
+                        if trigger_pending and start_seen:
+                            trigger_pending = False
+                            print(f"[collect] 固件已确认 {trigger_command}"
+                                  f"(重发 {resends} 次)", file=sys.stderr)
+                        yield line
             except socket.timeout:
                 # 重发已移到循环顶部按时间判(见上),这里只管空闲超时。
                 if idle_timeout is not None and time.monotonic() - last_data > idle_timeout:
@@ -1289,6 +1369,7 @@ def read_serial_lines(port: str, baudrate: int = 115200,
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     trigger_pending = trigger_bytes is not None
+    trigger_resends_enabled = trigger_pending
     resends = 0
     warned_unacked = False
     last_trigger_at = 0.0
@@ -1359,6 +1440,9 @@ def read_serial_lines(port: str, baudrate: int = 115200,
                                 trigger_command = "START"
                                 trigger_bytes = b"START\n"
                                 trigger_pending = True
+                                # 配置闸门已经通过同一 DATA CDC 往返核验。
+                                # 重发 START 只会在固件输出拥塞时造成重复启动。
+                                trigger_resends_enabled = False
                                 resends = 0
                                 warned_unacked = False
                                 last_trigger_at = time.monotonic()
@@ -1367,7 +1451,8 @@ def read_serial_lines(port: str, baudrate: int = 115200,
                 except (OSError, ValueError) as exc:
                     print(f"[collect] ⚠️ DATA CDC 命令失败:{exc}", file=sys.stderr)
 
-            if trigger_pending and now - last_trigger_at >= SERIAL_TRIGGER_RESEND_INTERVAL_S:
+            if (trigger_pending and trigger_resends_enabled
+                    and now - last_trigger_at >= SERIAL_TRIGGER_RESEND_INTERVAL_S):
                 if resends < TRIGGER_MAX_RESENDS:
                     stream.write(trigger_bytes)
                     stream.flush()
@@ -1387,20 +1472,25 @@ def read_serial_lines(port: str, baudrate: int = 115200,
                 buf += chunk
                 while b"\n" in buf:
                     raw, buf = buf.split(b"\n", 1)
-                    line = raw.decode("utf-8", "replace")
-                    start_seen = (
-                        parse_it_start(line) is not None
-                        or parse_cv_start(line) is not None
-                    )
-                    if armed_only and start_seen and not armed_start_sent:
-                        print("[collect] 忽略 ARMED 前的旧 START 标记",
-                              file=sys.stderr)
-                        continue
-                    if trigger_pending and start_seen:
-                        trigger_pending = False
-                        print(f"[collect] 固件已确认 {trigger_command}"
-                              f"(DATA CDC 重发 {resends} 次)", file=sys.stderr)
-                    yield line
+                    physical_line = raw.decode("utf-8", "replace")
+                    logical_lines = _split_glued_lifecycle_line(physical_line)
+                    if len(logical_lines) > 1:
+                        print("[collect] ⚠️ DATA CDC 生命周期标记与上一行粘连，"
+                              "已恢复行边界", file=sys.stderr)
+                    for line in logical_lines:
+                        start_seen = (
+                            parse_it_start(line) is not None
+                            or parse_cv_start(line) is not None
+                        )
+                        if armed_only and start_seen and not armed_start_sent:
+                            print("[collect] 忽略 ARMED 前的旧 START 标记",
+                                  file=sys.stderr)
+                            continue
+                        if trigger_pending and start_seen:
+                            trigger_pending = False
+                            print(f"[collect] 固件已确认 {trigger_command}"
+                                  f"(DATA CDC 重发 {resends} 次)", file=sys.stderr)
+                        yield line
             elif idle_timeout is not None and time.monotonic() - last_data > idle_timeout:
                 return
 
@@ -1663,6 +1753,55 @@ def parse_cv_aborted(line: str) -> tuple[str, int, int] | None:
         return None
     reason, native, elapsed_ms = match.groups()
     return reason, int(native), int(elapsed_ms)
+
+
+_LIFECYCLE_TOKENS = (
+    "IT_START ", "IT_DONE ", "IT_ABORTED ",
+    "CV_START ", "CV_DONE ", "CV_ABORTED ",
+)
+
+
+def _is_lifecycle_line(line: str) -> bool:
+    return any((
+        parse_it_start(line) is not None,
+        parse_it_done(line) is not None,
+        parse_it_aborted(line) is not None,
+        parse_cv_start(line) is not None,
+        parse_cv_done(line) is not None,
+        parse_cv_aborted(line) is not None,
+    ))
+
+
+def _split_glued_lifecycle_line(line: str) -> list[str]:
+    """Recover a machine marker whose preceding newline was lost in transit.
+
+    Lifecycle parsers remain strictly anchored: recovery is accepted only when
+    the complete suffix is itself a valid marker. A diagnostic sentence that
+    merely mentions ``IT_START`` therefore cannot open the acquisition gate.
+    """
+
+    cleaned = ANSI_RE.sub("", line)
+    if _is_lifecycle_line(cleaned):
+        return [cleaned.strip()]
+
+    positions = sorted(
+        {
+            index
+            for token in _LIFECYCLE_TOKENS
+            for index in [cleaned.rfind(token)]
+            if index > 0
+        },
+        reverse=True,
+    )
+    for index in positions:
+        suffix = cleaned[index:].strip()
+        if not _is_lifecycle_line(suffix):
+            continue
+        prefix = cleaned[:index].rstrip()
+        if not prefix:
+            return [suffix]
+        return [*_split_glued_lifecycle_line(prefix), suffix]
+    return [line]
 
 
 def main(argv: list[str] | None = None) -> int:

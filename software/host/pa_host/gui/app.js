@@ -3,7 +3,7 @@ const $ = (id) => {
   if (!node) throw new Error(`界面资源版本不一致（缺少 ${id}），请刷新页面后重试`);
   return node;
 };
-const state = { measurement: null, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, historyCurveCatalog: [], historyCurves: [], historyCurveIds: [], historyPreview: null, devices: {devices: [], selected_device_id: null, busy: false, probing: true}, deviceRefreshPromise: null, workspaceSwitchPromise: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, measureRequestError: '', showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, settingsPollActive: false, driftDirty: false, exiting: false };
+const state = { measurement: null, measurementDrawRevision: null, measurementDrawPending: false, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, historyCurveCatalog: [], historyCurves: [], historyCurveIds: [], historyPreview: null, devices: {devices: [], selected_device_id: null, busy: false, probing: true}, deviceRefreshPromise: null, workspaceSwitchPromise: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, measureRequestError: '', showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, settingsApplyActive: false, settingsApplyRequestPending: false, settingsApplySequence: 0, settingsPollSequence: 0, driftDirty: false, exiting: false };
 state.diagnostics=null;state.diagnosticsRefreshPromise=null;state.clientIssueLast=new Map();
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
@@ -76,7 +76,91 @@ async function api(path, options = {}) {
 function post(path, body = {}) { return api(path, {method: 'POST', body: JSON.stringify(body)}); }
 const SETTINGS_APPLY_TIMEOUT_MS = 900000;
 const MEASUREMENT_START_TIMEOUT_MS = 45000;
+const WORKSPACE_BROWSE_TIMEOUT_MS = 125000;
+const nativeWorkspaceBrowseRequests = new Map();
+
+function handleNativeWorkspaceBrowseResult(payload) {
+  payload = payload || {};
+  const requestId = String(payload.request_id || '');
+  const pending = nativeWorkspaceBrowseRequests.get(requestId);
+  if (!pending) return;
+  nativeWorkspaceBrowseRequests.delete(requestId);
+  clearTimeout(pending.timer);
+  if (payload.error) {
+    pending.reject(new Error(String(payload.error)));
+    return;
+  }
+  pending.resolve({
+    selected: Boolean(payload.selected),
+    path: String(payload.path || ''),
+  });
+}
+window.sensusNativeWorkspaceBrowseResult = handleNativeWorkspaceBrowseResult;
+
+function browseWorkspaceDirectory(initialPath) {
+  const nativeApp = window.webkit?.messageHandlers?.sensusApp;
+  if (!nativeApp) {
+    return api('/api/workspace/browse', {
+      method: 'POST',
+      body: JSON.stringify({initial_path: initialPath}),
+      timeoutMs: WORKSPACE_BROWSE_TIMEOUT_MS,
+    });
+  }
+  const requestId = globalThis.crypto?.randomUUID?.()
+    || `workspace-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      nativeWorkspaceBrowseRequests.delete(requestId);
+      reject(new Error('目录选择窗口等待超时，请重试'));
+    }, WORKSPACE_BROWSE_TIMEOUT_MS);
+    nativeWorkspaceBrowseRequests.set(requestId, {resolve, reject, timer});
+    try {
+      nativeApp.postMessage({
+        action: 'browseWorkspace',
+        request_id: requestId,
+        initial_path: String(initialPath || ''),
+      });
+    } catch (error) {
+      nativeWorkspaceBrowseRequests.delete(requestId);
+      clearTimeout(timer);
+      reject(error);
+    }
+  });
+}
+
 const SETTINGS_INPUT_IDS = ['potentialV','workingElectrodeV','durationS','adaptiveStop','sensPeriodCode','sampleRateHz','fitWindowS','fsrNA','offsetNA','cvLowV','cvHighV','cvScanRate','cvCycles','cvQuietS','cvEisFsrUA'];
+function itPresetSettings(name){
+  const common={method:'it',prestep_s:0,duration_s:180,adaptive_stop:false,sens_period_code:0,target_rate_hz:10,fit_window_s:20};
+  const preset={
+    oxidation:{...common,label:'+0.4V 氧化',initial_potential_v:.4,potential_v:.4,working_electrode_v:1.2,fsr_nA:50,offset_nA:9,offset_mode:'9nA'},
+    reduction:{...common,label:'-0.2V 还原',initial_potential_v:-.2,potential_v:-.2,working_electrode_v:.25,fsr_nA:100,offset_nA:80,offset_mode:'80nA'},
+  }[name];
+  return preset?{...preset}:null;
+}
+function itPresetMatches(settings,name){
+  const preset=itPresetSettings(name);
+  if(!preset||settings?.method!=='it')return false;
+  return ['initial_potential_v','potential_v','working_electrode_v','duration_s','sens_period_code','target_rate_hz','fit_window_s','fsr_nA']
+    .every(key=>Number(settings[key])===Number(preset[key]))
+    && Boolean(settings.adaptive_stop)===preset.adaptive_stop
+    && String(settings.offset_mode||'')===preset.offset_mode;
+}
+function renderItPresetState(settings){
+  $('itPresets').querySelectorAll('button[data-it-preset]').forEach(button=>{
+    const active=itPresetMatches(settings,button.dataset.itPreset);
+    button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active));
+  });
+}
+function applyItPreset(name){
+  const preset=itPresetSettings(name);
+  if(!preset||!state.settings||state.settingsApplyActive)return false;
+  state.method='it';
+  $('potentialV').value=preset.potential_v;$('workingElectrodeV').value=preset.working_electrode_v;
+  $('durationS').value=preset.duration_s;$('adaptiveStop').checked=preset.adaptive_stop;
+  $('sensPeriodCode').value=String(preset.sens_period_code);$('sampleRateHz').value=preset.target_rate_hz;
+  $('fitWindowS').value=preset.fit_window_s;$('fsrNA').value=String(preset.fsr_nA);$('offsetNA').value=preset.offset_mode;
+  settingsChanged();toast(`${preset.label} 已载入，请点击“应用条件”`);return true;
+}
 function toast(message) { const node = $('toast'); node.textContent = message; node.classList.add('show'); setTimeout(() => node.classList.remove('show'), 2600); }
 function errorBox(id, error) {
   const message = diagnosticMessage(error);
@@ -397,8 +481,13 @@ function setSampleRole(role, quiet=false){
   $('predictionResult').hidden=role!=='test';
   updateStartState();previewFilename();
 }
-function renderWorkflow(data){
-  state.workflow=data;$('saveDirectory').value=data.workspace_root||data.save_dir||'';
+function syncWorkspacePathInput(data, force = false) {
+  const input = $('saveDirectory');
+  if (!force && (document.activeElement === input || state.workspaceSwitchPromise)) return;
+  input.value = data.workspace_root || data.save_dir || '';
+}
+function renderWorkflow(data, forceWorkspacePath = false){
+  state.workflow=data;syncWorkspacePathInput(data,forceWorkspacePath);
   const cv=state.method==='cv';
   const configured=data.workspace_configured??Boolean(data.save_dir),available=data.workspace_available??Boolean(data.save_dir);
   document.querySelector('.workflow-steps').hidden=cv;
@@ -613,6 +702,13 @@ function finiteBounds(points, index) {
   for(const point of points){const value=Number(point[index]);if(!Number.isFinite(value))continue;min=Math.min(min,value);max=Math.max(max,value)}
   return min===Infinity?null:[min,max];
 }
+function paddedBounds(points) {
+  if (!points.length) return [0, 1];
+  let [lo, hi] = finiteBounds(points, 1);
+  if (hi === lo) {lo -= 1; hi += 1;}
+  const pad = (hi - lo) * .12;
+  return [lo - pad, hi + pad];
+}
 /* 双轴是 **opt-in 扩展**:series 里带 `axis:'right'` 的走右轴,
  * options 可给 y2label / y2Digits / yDigits。不传 `axis` 时行为与改动前**像素级相同**
  * ⇒ 现有两个调用点(itChart / calibrationChart)一个字都不用改。
@@ -628,14 +724,8 @@ function drawChart(canvas, series, options = {}) {
   const xBounds=finiteBounds(all,0);
   let xmin = options.xmin ?? xBounds[0], xmax = options.xmax ?? xBounds[1];
   if(options.integerX){xmin=Math.floor(xmin);xmax=Math.ceil(xmax);if(xmin===xmax){xmin-=1;xmax+=1}}
-  const span = list => {
-    if (!list.length) return [0, 1];
-    const bounds=finiteBounds(list,1),lo=bounds[0],hi=bounds[1];
-    if (hi === lo) {lo -= 1; hi += 1;}
-    const pad = (hi - lo) * .12; return [lo - pad, hi + pad];
-  };
-  let [ymin, ymax] = span(allL);
-  const [y2min, y2max] = span(allR);
+  let [ymin, ymax] = paddedBounds(allL);
+  const [y2min, y2max] = paddedBounds(allR);
   if (xmax === xmin) xmax = xmin + 1;
   const m = {l:56, r: hasRight ? 56 : 18, t:18, b:38};
   const px = x => m.l+(x-xmin)/(xmax-xmin)*(w-m.l-m.r);
@@ -1009,6 +1099,26 @@ function renderHardwareConnection(data=state.measurement){
   const diagnostics=String(activeDevice?.target_diagnostics||'');
   $('deviceStatus').title=diagnostics||`${title}：${detail}`;
 }
+function measurementChartRevision(data){
+  const series=data?.data||{},current=series.current_nA||[],time=series.time_s||[],potential=series.potential_v||[];
+  const last=current.length-1;
+  return JSON.stringify([
+    data?.run_id||'',data?.state||'',current.length,
+    last>=0?time[last]:null,last>=0?current[last]:null,
+    last>=0?potential[last]:null,
+  ]);
+}
+function scheduleMeasurementDraw(data){
+  const revision=measurementChartRevision(data);
+  if(revision===state.measurementDrawRevision)return;
+  state.measurementDrawRevision=revision;
+  if(state.measurementDrawPending)return;
+  state.measurementDrawPending=true;
+  requestAnimationFrame(()=>{
+    state.measurementDrawPending=false;
+    drawAll();
+  });
+}
 function updateMeasurement(data){
   syncChartWindowRun(data.run_id);
   state.measurement=data; const running=data.state==='running', complete=data.state==='completed';
@@ -1026,7 +1136,7 @@ function updateMeasurement(data){
   $('liveCurrentTime').textContent=live?(cv?`${fmt(live.potential_v,3)} V · 第 ${live.cycle} 圈 · 点 ${Number(live.index)+1}`:`t = ${fmt(live.time_s,2)} s · 点 ${Number(live.index)+1}`):'尚无数据';
   $('liveCurrentBox').classList.toggle('invalid',Boolean(displayLive&&!displayLive.valid));
   renderHardwareConnection(data);
-  if(data.error){$('measureError').textContent=data.error;$('measureError').hidden=false}else if(!state.measureRequestError)$('measureError').hidden=true; updateStartState();updateScheduleStartState();if(state.settings)updateSettingsApplyState();drawAll();void handleWorkflowCompletion(data);
+  if(data.error){$('measureError').textContent=data.error;$('measureError').hidden=false}else if(!state.measureRequestError)$('measureError').hidden=true; updateStartState();updateScheduleStartState();if(state.settings)updateSettingsApplyState();scheduleMeasurementDraw(data);void handleWorkflowCompletion(data);
 }
 async function refreshMeasurement(){if(state.exiting)return;try{updateMeasurement(await api('/api/status',{timeoutMs:1500}))}catch(e){$('deviceState').textContent=e.message.includes('超时')?'设备正在重新连接':'服务未连接';$('deviceTransport').textContent='连接状态未知';$('deviceDot').className='status-dot error'}}
 async function measurementRefreshLoop(){
@@ -1163,7 +1273,7 @@ async function confirmAndSwitchWorkspace(path){
   input.disabled=true; browse.disabled=true;
   state.workspaceSwitchPromise=(async()=>{
     try{
-      renderWorkflow(await post('/api/workflow/config',{save_dir:saveDir,batch_name:''}));
+      renderWorkflow(await post('/api/workflow/config',{save_dir:saveDir,batch_name:''}),true);
       state.calibration=await api('/api/calibration');state.historyPreview=null;state.historyCurves=[];state.historyCurveIds=[];
       renderCalibration();await refreshWorkspaceHistory();toast('已切换工作区并新建批次');return true;
     }catch(e){restoreConfiguredWorkspacePath();errorBox('measureError',e);return false}
@@ -1171,23 +1281,77 @@ async function confirmAndSwitchWorkspace(path){
   })();
   try{return await state.workspaceSwitchPromise}finally{state.workspaceSwitchPromise=null}
 }
-$('browseWorkspace').onclick=async()=>{const button=$('browseWorkspace'),label=button.textContent;try{button.disabled=true;button.textContent='浏览中…';const data=await api('/api/workspace/browse',{method:'POST',body:JSON.stringify({initial_path:$('saveDirectory').value}),timeoutMs:125000});if(data.selected){$('saveDirectory').value=data.path;await confirmAndSwitchWorkspace(data.path)}else restoreConfiguredWorkspacePath()}catch(e){restoreConfiguredWorkspacePath();errorBox('measureError',e)}finally{button.disabled=false;button.textContent=label}};
-$('saveDirectory').addEventListener('blur',event=>{if(event.relatedTarget===$('browseWorkspace'))return;void confirmAndSwitchWorkspace(event.currentTarget.value)});
+const browseWorkspaceButton=$('browseWorkspace');
+browseWorkspaceButton.addEventListener('pointerdown',()=>{state.workspaceBrowsePointerDown=true});
+browseWorkspaceButton.onclick=async()=>{const button=browseWorkspaceButton,label=button.textContent;try{button.disabled=true;button.textContent='浏览中…';const data=await browseWorkspaceDirectory($('saveDirectory').value);if(data.selected){$('saveDirectory').value=data.path;await confirmAndSwitchWorkspace(data.path)}else restoreConfiguredWorkspacePath()}catch(e){restoreConfiguredWorkspacePath();errorBox('measureError',e)}finally{state.workspaceBrowsePointerDown=false;button.disabled=false;button.textContent=label}};
+$('saveDirectory').addEventListener('blur',event=>{if(state.workspaceBrowsePointerDown||event.relatedTarget===browseWorkspaceButton)return;void confirmAndSwitchWorkspace(event.currentTarget.value)});
 $('saveDirectory').addEventListener('keydown',event=>{if(event.key!=='Enter')return;event.preventDefault();void confirmAndSwitchWorkspace(event.currentTarget.value)});
 $('resetCalibration').onclick=async()=>{const batchName=requestedBatchName('请输入新批次名称');if(batchName===null)return;try{renderWorkflow(await post('/api/workflow/reset-calibration',{batch_name:batchName}));state.calibration=await api('/api/calibration');state.historyPreview=null;state.historyCurves=[];state.historyCurveIds=[];renderCalibration();setSampleRole('calibration',true);toast('已新建批次并切换到新目录')}catch(e){errorBox('measureError',e)}};
 
 function readSettings(){const potential=Number($('potentialV').value),low=Number($('cvLowV').value),high=Number($('cvHighV').value),rate=Number($('cvScanRate').value),cycles=Number($('cvCycles').value),cv=state.method==='cv',duration=cv?2*(high-low)/rate*cycles:Number($('durationS').value);return {method:state.method,initial_potential_v:cv?low:potential,potential_v:cv?low:potential,working_electrode_v:Number($('workingElectrodeV').value),prestep_s:cv?Number($('cvQuietS').value):0,duration_s:duration,adaptive_stop:!cv&&$('adaptiveStop').checked,sens_period_code:Number($('sensPeriodCode').value),target_rate_hz:Number($('sampleRateHz').value),fit_window_s:Number($('fitWindowS').value),fsr_nA:Number($('fsrNA').value),offset_mode:$('offsetNA').value,cv_low_v:low,cv_high_v:high,cv_scan_rate_v_s:rate,cv_cycles:cycles,cv_step_v:.001,cv_quiet_s:Number($('cvQuietS').value),cv_eis_fsr_uA:Number($('cvEisFsrUA').value)}}
 function renderOffsetLabels(fsr){$('offsetNA').querySelectorAll('option[data-pct]').forEach(option=>{const pct=Number(option.dataset.pct);option.textContent=`${pct}% FSR (${fsr*pct/100} nA)`})}
 function signedPotential(value){const number=Number(value);return `${number>0?'+':''}${number.toFixed(2)}`}
+function settingsInputIssue(settings){
+  if(settings.method!=='it')return null;
+  const referenceElectrodeV=Number(settings.working_electrode_v)-Number(settings.potential_v);
+  if(Number.isFinite(referenceElectrodeV)&&(referenceElectrodeV<.008||referenceElectrodeV>1.535)){
+    return {fields:['potentialV','workingElectrodeV'],message:`当前组合对应 RE=${referenceElectrodeV.toFixed(3)} V，超出硬件可实现范围 0.008 至 1.535 V；请调整测试电位或 WE 电位`};
+  }
+  return null;
+}
+function settingsErrorFieldIds(message){
+  const text=String(message||'');
+  if(/RE=|WE 电位/.test(text))return ['potentialV','workingElectrodeV'];
+  if(/起始电位|测试电位/.test(text))return ['potentialV'];
+  if(/输出采样频率/.test(text))return ['sampleRateHz'];
+  if(/拟合窗口/.test(text))return ['fitWindowS'];
+  if(/I-T 时长|测量时长/.test(text))return ['durationS'];
+  if(/电流量程/.test(text))return ['fsrNA'];
+  if(/偏置电流/.test(text))return ['offsetNA'];
+  if(/CV 电位范围/.test(text))return ['cvLowV','cvHighV'];
+  if(/CV 扫描速度/.test(text))return ['cvScanRate'];
+  if(/CV 循环圈数/.test(text))return ['cvCycles'];
+  if(/CV 静置时间/.test(text))return ['cvQuietS'];
+  return [];
+}
+function clearSettingsError(){
+  const box=$('settingsError');box.textContent='';box.hidden=true;
+  SETTINGS_INPUT_IDS.forEach(id=>$(id).removeAttribute('aria-invalid'));
+}
+function showSettingsError(error,fieldIds=null){
+  const message=diagnosticMessage(error),ids=fieldIds||settingsErrorFieldIds(message),box=$('settingsError');
+  box.textContent=message;box.hidden=false;
+  ids.forEach(id=>$(id).setAttribute('aria-invalid','true'));
+}
+function settingsFailureState(current,requested,errorMessage){
+  return {...(current||{}),settings:{...requested},state:'error',message:'条件未应用，请修改标红参数后重试',error:errorMessage,applied:false};
+}
 function ensureSettingsProgressPolling(){
-  if(state.settingsPollActive||state.exiting||state.settings?.state!=='applying')return;
-  state.settingsPollActive=true;
+  if(state.exiting)return;
+  if(!state.settingsApplyActive){
+    if(state.settings?.state!=='applying')return;
+    state.settingsApplyActive=true;state.settingsApplyRequestPending=false;state.settingsApplySequence+=1;
+  }
+  const sequence=state.settingsApplySequence;
+  if(state.settingsPollSequence===sequence)return;
+  state.settingsPollSequence=sequence;
   const poll=async()=>{
-    if(state.exiting||state.settings?.state!=='applying'){state.settingsPollActive=false;return}
-    try{state.settingsDirty=false;renderSettings(await api('/api/settings',{timeoutMs:3000}))}catch{}
-    if(!state.exiting&&state.settings?.state==='applying')setTimeout(poll,1000);else state.settingsPollActive=false;
+    if(state.exiting||!state.settingsApplyActive||state.settingsApplySequence!==sequence){if(state.settingsPollSequence===sequence)state.settingsPollSequence=0;return}
+    try{
+      const data=await api('/api/settings',{timeoutMs:3000});
+      if(state.settingsApplyActive&&state.settingsApplySequence===sequence){
+        if(data.state==='applying')renderSettings({...data,settings:readSettings()});
+        else if(!state.settingsApplyRequestPending){
+          state.settingsApplyActive=false;state.settingsDirty=data.state==='error';renderSettings(data);
+          if(data.state==='error')showSettingsError(new Error(data.error||data.message||'参数应用失败'));
+          else clearSettingsError();
+        }
+      }
+    }catch{}
+    if(!state.exiting&&state.settingsApplyActive&&state.settingsApplySequence===sequence)setTimeout(poll,1000);
+    else if(state.settingsPollSequence===sequence)state.settingsPollSequence=0;
   };
-  setTimeout(poll,0);
+  setTimeout(poll,250);
 }
 function renderSettings(data){
   state.settings=data; const s=data.settings, periods=[124,242,476,945,1882,3757];
@@ -1205,7 +1369,7 @@ function renderSettings(data){
   $('outputPoints').textContent=cv?`${s.cv_cycles} 圈 · ${s.cv_cycles*2} 段 · 约 ${points} 个原生电流点`:adaptive?`持续采集 · 原生 ${fmt(nativeRate,2)} Hz`:`${points} 点 · 原生 ${fmt(nativeRate,2)} Hz`;
   $('outputPoints').nextElementSibling.textContent=cv?'波形按 1 mV 步进；每个 EIS ADC 原生电流点实时显示并保存':wideIt?'宽量程 I-T 使用 EIS ADC；单次电位扰动小于 0.4 mV':`MAX30131 原生约 ${fmt(nativeRate,2)} Hz；更高输出频率由时间戳重采样生成`;
   pages.measure[1]=cv?`${signedPotential(s.cv_low_v)} 至 ${signedPotential(s.cv_high_v)} V · ${s.cv_scan_rate_v_s} V/s · ${s.cv_cycles} 圈`:adaptive?`I-T 智能平台检测与末 ${s.fit_window_s} 秒稳态分析`:`${s.duration_s} 秒 I-T 检测与末 ${s.fit_window_s} 秒稳态分析`; if($('view-measure').classList.contains('active'))$('pageSubtitle').textContent=pages.measure[1];
-  const applying=data.state==='applying',settingsFailed=data.state==='error', failDetail=String(data.error||'').trim();
+  const applying=state.settingsApplyActive||data.state==='applying',settingsFailed=data.state==='error', failDetail=String(data.error||'').trim();
   $('settingsMessage').textContent=settingsFailed&&failDetail?failDetail:data.message; $('settingsMessage').title=settingsFailed&&failDetail?failDetail:''; $('settingsMessage').classList.toggle('error-text',settingsFailed&&!!failDetail);
   $('settingsBadge').textContent=applying?'应用中':settingsFailed?'失败':data.applied?'已准备':'未应用'; $('settingsBadge').className=`live-badge ${settingsFailed?'error':data.applied?'running':''}`;
   const itCommonMode=`V_WE ${fmt(s.working_electrode_v,3)} V · V_RE ${fmt(s.working_electrode_v-s.potential_v,3)} V`;
@@ -1219,21 +1383,43 @@ function renderSettings(data){
   const minInterval=adaptive?adaptiveMinimum/60:(s.prestep_s+s.duration_s+10)/60; $('intervalMinutes').min=minInterval.toFixed(2); if(Number($('intervalMinutes').value)<minInterval)$('intervalMinutes').value=Math.ceil(minInterval*4)/4;
   SETTINGS_INPUT_IDS.forEach(id=>{$(id).disabled=applying||(id==='durationS'&&adaptive)});
   $('methodMode').querySelectorAll('button').forEach(button=>button.disabled=applying);
+  $('itPresets').querySelectorAll('button').forEach(button=>button.disabled=applying);renderItPresetState(s);
   $('applySettings').textContent=applying?'正在应用…':'应用条件';updateSettingsApplyState();
   if(applying)ensureSettingsProgressPolling();
   renderWorkflow(state.workflow||{save_dir:'',stage:'collect',calibration_ready:false,points_count:0,selected_points_count:0,settings_match:true});renderScheduleMode();drawAll();
   updateStartState();updateScheduleStartState();
 }
 function updateSettingsApplyState(){
-  const button=$('applySettings'),applying=state.settings?.state==='applying',hardware=hardwareOperationStatus();
+  const button=$('applySettings'),applying=state.settingsApplyActive||state.settings?.state==='applying',hardware=hardwareOperationStatus();
   const measurementBusy=Boolean(state.measurement?.busy),scheduleBusy=Boolean(state.schedule?.active),deviceBusy=Boolean(state.devices?.busy);
   button.disabled=applying||measurementBusy||scheduleBusy||deviceBusy||!hardware.ready;
   button.title=measurementBusy?'测量进行中，不能修改硬件条件':scheduleBusy?'自动任务进行中，不能修改硬件条件':deviceBusy?'硬件操作进行中':!applying&&!hardware.ready?hardware.message:'';
 }
-function settingsChanged(){if(!state.settings)return;state.settingsDirty=true;state.settings.applied=false;state.settings.state='not_applied';state.settings.message='参数已修改，请重新应用';const s=readSettings();state.settings.settings=s;renderSettings(state.settings)}
+function settingsChanged(){if(!state.settings)return;clearSettingsError();state.settingsDirty=true;state.settings.applied=false;state.settings.state='not_applied';state.settings.message='参数已修改，请重新应用';state.settings.error='';const s=readSettings();state.settings.settings=s;renderSettings(state.settings)}
 ['potentialV','workingElectrodeV','durationS','adaptiveStop','sensPeriodCode','sampleRateHz','fitWindowS','fsrNA','offsetNA','cvLowV','cvHighV','cvScanRate','cvCycles','cvQuietS','cvEisFsrUA'].forEach(id=>$(id).addEventListener('change',settingsChanged));
 $('methodMode').addEventListener('click',event=>{const button=event.target.closest('button[data-method]');if(!button||button.dataset.method===state.method)return;state.method=button.dataset.method;settingsChanged()});
-$('applySettings').onclick=async()=>{const requested=readSettings();try{clearMeasureError();renderSettings({...state.settings,settings:requested,state:'applying',message:'正在检查设备连接与通用固件',error:'',applied:false});const data=await api('/api/settings/apply',{method:'POST',body:JSON.stringify(requested),timeoutMs:SETTINGS_APPLY_TIMEOUT_MS});state.settingsDirty=false;renderSettings(data);renderWorkflow(await api('/api/workflow'));toast(`${state.method.toUpperCase()} 条件已准备，测量前将自动核验`)}catch(e){errorBox('measureError',e);try{state.settingsDirty=false;renderSettings(await api('/api/settings'))}catch{}}finally{if(state.settings)renderSettings(state.settings)}};
+$('itPresets').addEventListener('click',event=>{const button=event.target.closest('button[data-it-preset]');if(button)applyItPreset(button.dataset.itPreset)});
+$('applySettings').onclick=async()=>{
+  if(state.settingsApplyActive)return;
+  const requested=readSettings(),issue=settingsInputIssue(requested);
+  clearMeasureError();clearSettingsError();
+  if(issue){state.settingsDirty=true;renderSettings(settingsFailureState(state.settings,requested,issue.message));showSettingsError(new Error(issue.message),issue.fields);return}
+  const sequence=++state.settingsApplySequence;state.settingsApplyActive=true;state.settingsApplyRequestPending=true;state.settingsDirty=true;
+  let data=null;
+  try{
+    renderSettings({...state.settings,settings:requested,state:'applying',message:'正在检查设备连接与通用固件',error:'',applied:false});
+    data=await api('/api/settings/apply',{method:'POST',body:JSON.stringify(requested),timeoutMs:SETTINGS_APPLY_TIMEOUT_MS});
+  }catch(e){
+    if(sequence!==state.settingsApplySequence)return;
+    state.settingsApplyActive=false;state.settingsApplyRequestPending=false;state.settingsDirty=true;renderSettings(settingsFailureState(state.settings,requested,diagnosticMessage(e)));showSettingsError(e);
+    return;
+  }finally{
+    if(sequence===state.settingsApplySequence){state.settingsApplyActive=false;state.settingsApplyRequestPending=false;updateSettingsApplyState()}
+  }
+  if(sequence!==state.settingsApplySequence||!data)return;
+  state.settingsDirty=false;clearSettingsError();renderSettings(data);toast(`${state.method.toUpperCase()} 条件已准备，测量前将自动核验`);
+  try{renderWorkflow(await api('/api/workflow'))}catch(e){reportClientIssue('workflow_refresh_failed',e,{source:'settings_apply'})}
+};
 
 function makeCell(tr,content){const td=document.createElement('td');if(content instanceof Node)td.appendChild(content);else td.textContent=content;tr.appendChild(td);return td}
 function pointInput(key,value,type='text'){const input=document.createElement('input');input.dataset.k=key;input.type=type;input.value=value??'';if(type==='number')input.step='0.001';return input}

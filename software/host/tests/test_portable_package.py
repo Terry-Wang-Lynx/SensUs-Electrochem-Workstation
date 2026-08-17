@@ -51,6 +51,17 @@ def test_portable_builds_pin_python_and_enforce_macos_compatibility() -> None:
         assert command_name in verifier
 
 
+def test_macos_openocd_bundler_reuses_already_relocated_libraries() -> None:
+    root = Path(__file__).parents[3]
+    bundler = (root / "packaging" / "bundle_macos_openocd.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "@executable_path/../lib/*|@loader_path/*" in bundler
+    assert 'source_lib_dir="$prefix/lib"' in bundler
+    assert 'source_dependency="$source_lib_dir/${dependency:t}"' in bundler
+
+
 def test_macos_bundle_verifier_ignores_otool_header_path() -> None:
     root = Path(__file__).parents[3]
     verifier = runpy.run_path(str(root / "packaging" / "verify_macos_bundle.py"))

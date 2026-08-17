@@ -393,13 +393,14 @@ private final class OverlayPanel: NSPanel {
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
-    NSToolbarDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+    NSToolbarDelegate, WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate {
 
     private let backend = BackendManager()
     private var mainWindow: NSWindow!
     private var mainWebView: WKWebView!
     private var overlayPanel: OverlayPanel!
     private var overlayWebView: WKWebView!
+    private var workspacePanel: NSOpenPanel?
     private weak var pinButton: NSButton?
     private var pinned: Bool = {
         if UserDefaults.standard.object(forKey: "alwaysOnTop") == nil {
@@ -454,6 +455,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         configuration.userContentController.add(self, name: "sensusApp")
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         webView.allowsMagnification = true
         return webView
     }
@@ -462,14 +464,81 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        guard message.name == "sensusApp",
-              let action = message.body as? String,
-              action == "quit" else { return }
-        mainWindow.orderOut(nil)
-        overlayPanel.orderOut(nil)
-        backend.beginApplicationShutdown {
-            NSApp.terminate(nil)
+        guard message.name == "sensusApp" else { return }
+        if let action = message.body as? String, action == "quit" {
+            mainWindow.orderOut(nil)
+            overlayPanel.orderOut(nil)
+            backend.beginApplicationShutdown {
+                NSApp.terminate(nil)
+            }
+            return
         }
+        guard let payload = message.body as? [String: Any],
+              payload["action"] as? String == "browseWorkspace",
+              let requestID = payload["request_id"] as? String,
+              !requestID.isEmpty else { return }
+        presentWorkspacePanel(
+            requestID: requestID,
+            initialPath: payload["initial_path"] as? String ?? ""
+        )
+    }
+
+    private func presentWorkspacePanel(requestID: String, initialPath: String) {
+        guard workspacePanel == nil else {
+            completeWorkspaceBrowse(
+                requestID: requestID,
+                error: "已有目录选择窗口正在打开"
+            )
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "选择 SensUs 数据工作区"
+        panel.message = "选择一个文件夹作为数据工作区"
+        panel.prompt = "选择"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+        if !initialPath.isEmpty {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(
+                atPath: initialPath,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue {
+                panel.directoryURL = URL(
+                    fileURLWithPath: initialPath,
+                    isDirectory: true
+                )
+            }
+        }
+        workspacePanel = panel
+        mainWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        panel.beginSheetModal(for: mainWindow) { [weak self, weak panel] response in
+            guard let self else { return }
+            let path = response == .OK ? panel?.url?.path : nil
+            self.workspacePanel = nil
+            self.completeWorkspaceBrowse(requestID: requestID, path: path)
+        }
+    }
+
+    private func completeWorkspaceBrowse(
+        requestID: String,
+        path: String? = nil,
+        error: String? = nil
+    ) {
+        var payload: [String: Any] = [
+            "request_id": requestID,
+            "selected": path != nil,
+            "path": path ?? "",
+        ]
+        if let error { payload["error"] = error }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8) else { return }
+        mainWebView.evaluateJavaScript(
+            "window.sensusNativeWorkspaceBrowseResult(\(json));"
+        )
     }
 
     private func configureMainWindow() {
@@ -802,6 +871,68 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         </style>
         <main class="\(isError ? "error" : "")"><i></i><h1>\(escapedTitle)</h1><p>\(escapedDetail)</p></main>
         """
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptAlertPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping () -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.addButton(withTitle: "确定")
+        presentJavaScriptAlert(alert, for: webView) { _ in
+            completionHandler()
+        }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+        presentJavaScriptAlert(alert, for: webView) { response in
+            completionHandler(response == .alertFirstButtonReturn)
+        }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptTextInputPanelWithPrompt prompt: String,
+        defaultText: String?,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (String?) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = prompt
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+        let input = NSTextField(string: defaultText ?? "")
+        input.frame = NSRect(x: 0, y: 0, width: 380, height: 24)
+        alert.accessoryView = input
+        presentJavaScriptAlert(alert, for: webView) { response in
+            completionHandler(
+                response == .alertFirstButtonReturn ? input.stringValue : nil
+            )
+        }
+    }
+
+    private func presentJavaScriptAlert(
+        _ alert: NSAlert,
+        for webView: WKWebView,
+        completion: @escaping (NSApplication.ModalResponse) -> Void
+    ) {
+        if let window = webView.window ?? mainWindow {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
     }
 
     func webView(

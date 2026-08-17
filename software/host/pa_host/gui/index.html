@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SensUs 电化学工作站</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20260817-jlink-target-gate">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260817-v045">
 </head>
 <body>
   <div class="app-shell">
@@ -106,10 +106,13 @@
               </section>
 
               <section class="measure-control-panel it-settings active" data-control-panel="settings" role="tabpanel">
-                <div class="method-switch"><span>测量方法</span><div class="segmented" id="methodMode"><button class="active" data-method="it">I-T</button><button data-method="cv">CV</button></div></div>
+                <div class="method-switch">
+                  <div class="method-picker"><span>测量方法</span><div class="segmented" id="methodMode"><button class="active" data-method="it">I-T</button><button data-method="cv">CV</button></div></div>
+                  <div class="it-preset-picker"><span>快速预设</span><div class="segmented" id="itPresets" role="group" aria-label="I-T 快速预设"><button type="button" data-it-preset="oxidation" aria-pressed="false">+0.4V 氧化</button><button type="button" data-it-preset="reduction" aria-pressed="false">-0.2V 还原</button></div></div>
+                </div>
                 <div id="itSettings">
                   <div class="field-pair">
-                    <label>测试电位<div class="input-unit"><input id="potentialV" type="number" min="-0.4" max="0.39" step="0.01" value="0.2"><span>V</span></div></label>
+                    <label>测试电位<div class="input-unit"><input id="potentialV" type="number" min="-0.4" max="0.4" step="0.01" value="0.2"><span>V</span></div></label>
                     <label>WE 电位<div class="input-unit"><input id="workingElectrodeV" type="number" min="0.25" max="1.535" step="0.01" value="1.2"><span>V</span></div></label>
                     <label>输出采样频率<div class="input-unit"><input id="sampleRateHz" type="number" min="0.5" max="10" step="0.5" value="10"><span>Hz</span></div></label>
                   </div>
@@ -147,6 +150,7 @@
                 <label id="dcOffsetField">偏置电流<select id="offsetNA"><option value="9nA">9 nA</option><option value="19nA">19 nA</option><option value="40nA">40 nA</option><option value="80nA">80 nA</option><option value="10pct" data-pct="10" selected>10% FSR</option><option value="20pct" data-pct="20">20% FSR</option><option value="50pct" data-pct="50">50% FSR</option></select></label>
                 <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
                 <div class="notice warn" id="reflashWarn" hidden></div>
+                <div class="notice error" id="settingsError" role="alert" hidden></div>
                 <button class="secondary full apply-settings" id="applySettings">应用条件</button>
               </section>
 
@@ -430,6 +434,6 @@
     <div id="deviceList" class="device-list"></div>
   </dialog>
   <div class="toast" id="toast"></div>
-  <script src="/assets/app.js?v=20260817-jlink-target-gate"></script>
+  <script src="/assets/app.js?v=20260817-v045"></script>
 </body>
 </html>

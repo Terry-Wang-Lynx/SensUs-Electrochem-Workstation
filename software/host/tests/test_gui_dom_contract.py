@@ -59,6 +59,12 @@ def test_gui_exposes_dynamic_transport_and_graceful_exit_controls() -> None:
     assert "nativeApp.postMessage('quit')" in app
     assert 'name: "sensusApp"' in swift
     assert 'action == "quit"' in swift
+    assert 'payload["action"] as? String == "browseWorkspace"' in swift
+    assert "let panel = NSOpenPanel()" in swift
+    assert "panel.canChooseDirectories = true" in swift
+    assert "webView.uiDelegate = self" in swift
+    assert "runJavaScriptConfirmPanelWithMessage" in swift
+    assert "runJavaScriptTextInputPanelWithPrompt" in swift
     assert "var onServerRecovered: ((URL) -> Void)?" in swift
     assert "self.onServerRecovered?(url)" in swift
     assert "backend.onServerRecovered = { [weak self] url in" in swift
@@ -186,15 +192,226 @@ const disconnected = hardwareOperationStatus();
 
 def test_settings_apply_has_long_timeout_and_reload_safe_progress_polling() -> None:
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
 
     assert "SETTINGS_APPLY_TIMEOUT_MS = 900000" in app
     assert "timeoutMs:SETTINGS_APPLY_TIMEOUT_MS" in app
     assert "function ensureSettingsProgressPolling()" in app
-    assert "state.settings?.state!=='applying'" in app
+    assert "state.settingsApplyActive" in app
+    assert "state.settingsApplySequence" in app
+    assert "data.state==='applying'" in app
     assert "api('/api/settings',{timeoutMs:3000})" in app
+    assert "settingsFailureState(state.settings,requested" in app
+    assert 'id="settingsError"' in html
     assert "function updateSettingsApplyState()" in app
     assert "button.disabled=applying||measurementBusy||scheduleBusy||deviceBusy||!hardware.ready" in app
     assert "if(applying)ensureSettingsProgressPolling()" in app
+
+
+def test_it_quick_presets_match_verified_historical_conditions() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    presets = _evaluate_chart_js(
+        ["itPresetSettings", "itPresetMatches"],
+        "const oxidation=itPresetSettings('oxidation');const reduction=itPresetSettings('reduction');",
+        "{oxidation,reduction,oxidationMatches:itPresetMatches(oxidation,'oxidation'),reductionMatches:itPresetMatches(reduction,'reduction')}",
+    )
+
+    assert 'data-it-preset="oxidation"' in html
+    assert 'data-it-preset="reduction"' in html
+    assert "+0.4V 氧化" in html
+    assert "-0.2V 还原" in html
+    assert presets == {
+        "oxidation": {
+            "method": "it", "prestep_s": 0, "duration_s": 180,
+            "adaptive_stop": False, "sens_period_code": 0,
+            "target_rate_hz": 10, "fit_window_s": 20,
+            "label": "+0.4V 氧化", "initial_potential_v": 0.4,
+            "potential_v": 0.4, "working_electrode_v": 1.2,
+            "fsr_nA": 50, "offset_nA": 9, "offset_mode": "9nA",
+        },
+        "reduction": {
+            "method": "it", "prestep_s": 0, "duration_s": 180,
+            "adaptive_stop": False, "sens_period_code": 0,
+            "target_rate_hz": 10, "fit_window_s": 20,
+            "label": "-0.2V 还原", "initial_potential_v": -0.2,
+            "potential_v": -0.2, "working_electrode_v": 0.25,
+            "fsr_nA": 100, "offset_nA": 80, "offset_mode": "80nA",
+        },
+        "oxidationMatches": True,
+        "reductionMatches": True,
+    }
+    preset_handler = _extract_js_function(app, "applyItPreset")
+    assert "settingsChanged()" in preset_handler
+    assert "/api/settings/apply" not in preset_handler
+
+
+def test_it_quick_preset_populates_the_form_without_applying_hardware() -> None:
+    result = _evaluate_chart_js(
+        ["itPresetSettings", "applyItPreset"],
+        """
+const nodes={potentialV:{},workingElectrodeV:{},durationS:{},adaptiveStop:{},sensPeriodCode:{},sampleRateHz:{},fitWindowS:{},fsrNA:{},offsetNA:{}};
+const $=id=>nodes[id];const state={settings:{},settingsApplyActive:false,method:'cv'};
+let changed=0;const notices=[];const settingsChanged=()=>{changed+=1};const toast=message=>notices.push(message);
+const applied=applyItPreset('reduction');
+const values=Object.fromEntries(Object.entries(nodes).map(([key,node])=>[key,key==='adaptiveStop'?node.checked:node.value]));
+""",
+        "{applied,method:state.method,changed,notices,values}",
+    )
+
+    assert result == {
+        "applied": True,
+        "method": "it",
+        "changed": 1,
+        "notices": ["-0.2V 还原 已载入，请点击“应用条件”"],
+        "values": {
+            "potentialV": -0.2,
+            "workingElectrodeV": 0.25,
+            "durationS": 180,
+            "adaptiveStop": False,
+            "sensPeriodCode": "0",
+            "sampleRateHz": 10,
+            "fitWindowS": 20,
+            "fsrNA": "100",
+            "offsetNA": "80nA",
+        },
+    }
+
+
+def test_settings_validation_failure_preserves_the_user_draft() -> None:
+    result = _evaluate_chart_js(
+        ["settingsInputIssue", "settingsErrorFieldIds", "settingsFailureState"],
+        """
+const current={settings:{method:'it',potential_v:.2,working_electrode_v:1.2},state:'applied',applied:true};
+const requested={method:'it',potential_v:.4,working_electrode_v:.25,fsr_nA:50,offset_mode:'40nA'};
+const issue=settingsInputIssue(requested);
+const failure=settingsFailureState(current,requested,issue.message);
+const mappedFields=settingsErrorFieldIds(issue.message);
+""",
+        "{issue,failure,mappedFields}",
+    )
+
+    assert result["issue"]["fields"] == ["potentialV", "workingElectrodeV"]
+    assert "RE=-0.150 V" in result["issue"]["message"]
+    assert result["failure"]["settings"] == {
+        "method": "it",
+        "potential_v": 0.4,
+        "working_electrode_v": 0.25,
+        "fsr_nA": 50,
+        "offset_mode": "40nA",
+    }
+    assert result["failure"]["state"] == "error"
+    assert result["failure"]["applied"] is False
+    assert result["mappedFields"] == ["potentialV", "workingElectrodeV"]
+
+
+def test_settings_progress_polling_ignores_a_stale_pre_apply_snapshot() -> None:
+    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    function = _extract_js_function(source, "ensureSettingsProgressPolling")
+    script = f"""
+{function}
+const state={{
+  exiting:false,settingsApplyActive:true,settingsApplySequence:7,
+  settingsApplyRequestPending:true,settingsPollSequence:0,
+}};
+const replies=[
+  {{state:'applied',settings:{{potential_v:.2}}}},
+  {{state:'applying',settings:{{potential_v:.2}}}},
+];
+const timers=[],renders=[];
+const setTimeout=(callback,delay)=>timers.push({{callback,delay}});
+const api=async()=>replies.shift();
+const readSettings=()=>({{potential_v:.4,working_electrode_v:.25}});
+const renderSettings=data=>renders.push(data);
+(async()=>{{
+  ensureSettingsProgressPolling();
+  const initialDelay=timers[0].delay;
+  await timers.shift().callback();
+  const afterStale=renders.length;
+  const retryDelay=timers[0].delay;
+  await timers.shift().callback();
+  const appliedDraft=renders[0].settings;
+  state.settingsApplyActive=false;
+  await timers.shift().callback();
+  console.log(JSON.stringify({{initialDelay,afterStale,retryDelay,appliedDraft,pollSequence:state.settingsPollSequence}}));
+}})().catch(error=>{{console.error(error);process.exit(1)}});
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], check=True, capture_output=True, text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "initialDelay": 250,
+        "afterStale": 0,
+        "retryDelay": 1000,
+        "appliedDraft": {"potential_v": 0.4, "working_electrode_v": 0.25},
+        "pollSequence": 0,
+    }
+
+
+def test_settings_progress_polling_resumes_an_apply_after_page_reload() -> None:
+    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    function = _extract_js_function(source, "ensureSettingsProgressPolling")
+    script = f"""
+{function}
+const state={{
+  exiting:false,settings:{{state:'applying'}},settingsApplyActive:false,
+  settingsApplyRequestPending:false,settingsApplySequence:0,
+  settingsPollSequence:0,settingsDirty:false,
+}};
+const replies=[
+  {{state:'applying',settings:{{potential_v:.4,working_electrode_v:1.2}}}},
+  {{state:'applied',applied:true,error:'',settings:{{potential_v:.4,working_electrode_v:1.2}}}},
+];
+const timers=[],renders=[],errors=[];let clears=0;
+const setTimeout=(callback,delay)=>timers.push({{callback,delay}});
+const api=async()=>replies.shift();
+const readSettings=()=>({{potential_v:.4,working_electrode_v:1.2}});
+const renderSettings=data=>{{renders.push(data);state.settings=data}};
+const showSettingsError=error=>errors.push(error.message);
+const clearSettingsError=()=>{{clears+=1}};
+(async()=>{{
+  ensureSettingsProgressPolling();
+  const resumed={{active:state.settingsApplyActive,sequence:state.settingsApplySequence,delay:timers[0].delay}};
+  await timers.shift().callback();
+  await timers.shift().callback();
+  console.log(JSON.stringify({{
+    resumed,renders:renders.map(item=>item.state),errors,clears,
+    active:state.settingsApplyActive,pending:state.settingsApplyRequestPending,
+    dirty:state.settingsDirty,pollSequence:state.settingsPollSequence,
+  }}));
+}})().catch(error=>{{console.error(error);process.exit(1)}});
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], check=True, capture_output=True, text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "resumed": {"active": True, "sequence": 1, "delay": 250},
+        "renders": ["applying", "applied"],
+        "errors": [],
+        "clears": 1,
+        "active": False,
+        "pending": False,
+        "dirty": False,
+        "pollSequence": 0,
+    }
+
+
+def test_settings_apply_error_path_never_reloads_old_values() -> None:
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    start = app.index("$('applySettings').onclick")
+    end = app.index("function makeCell", start)
+    handler = app[start:end]
+
+    assert "settingsFailureState" in handler
+    assert "showSettingsError" in handler
+    assert "if(state.settingsApplyActive)return" in handler
+    assert "state.settingsApplyRequestPending=true" in handler
+    assert "await api('/api/settings')" not in handler
+    assert "try{renderWorkflow(await api('/api/workflow'))}" in handler
+    assert "reportClientIssue('workflow_refresh_failed'" in handler
+    assert handler.index("}finally{") < handler.index("try{renderWorkflow")
 
 
 def test_schedule_and_settings_buttons_share_the_hardware_gate() -> None:
@@ -478,6 +695,8 @@ def test_workspace_picker_and_hard_measurement_gate_are_exposed() -> None:
     assert 'id="browseWorkspace"' in html
     assert 'id="applySaveDirectory"' not in html
     assert "/api/workspace/browse" in app
+    assert "browseWorkspaceDirectory" in app
+    assert "sensusNativeWorkspaceBrowseResult" in app
     assert "function confirmAndSwitchWorkspace(path)" in app
     assert "window.confirm('确认切换工作区？')" in app
     assert "$('saveDirectory').addEventListener('blur'" in app
@@ -487,6 +706,76 @@ def test_workspace_picker_and_hard_measurement_gate_are_exposed() -> None:
     assert "!workspaceReady()" in app
     assert "workspace_available" in app
     assert "save_dir:$('saveDirectory').value" not in app
+
+
+def test_workspace_path_refresh_preserves_the_active_draft() -> None:
+    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    function = _extract_js_function(source, "syncWorkspacePathInput")
+    script = f"""
+{function}
+const input={{value:'/draft'}};
+const $=()=>input;
+const state={{workspaceSwitchPromise:null}};
+const document={{activeElement:input}};
+syncWorkspacePathInput({{workspace_root:'/server'}});
+const whileFocused=input.value;
+document.activeElement={{}};
+syncWorkspacePathInput({{workspace_root:'/server'}});
+const afterBlur=input.value;
+input.value='/switching';
+state.workspaceSwitchPromise=Promise.resolve();
+syncWorkspacePathInput({{workspace_root:'/stale'}});
+const whileSwitching=input.value;
+syncWorkspacePathInput({{workspace_root:'/confirmed'}},true);
+console.log(JSON.stringify({{whileFocused,afterBlur,whileSwitching,forced:input.value}}));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], check=True, capture_output=True, text=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "whileFocused": "/draft",
+        "afterBlur": "/server",
+        "whileSwitching": "/switching",
+        "forced": "/confirmed",
+    }
+
+
+def test_workspace_picker_uses_native_bridge_with_backend_fallback() -> None:
+    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    functions = "\n".join(_extract_js_function(source, name) for name in (
+        "handleNativeWorkspaceBrowseResult",
+        "browseWorkspaceDirectory",
+    ))
+    script = f"""
+{functions}
+const WORKSPACE_BROWSE_TIMEOUT_MS=1000;
+const nativeWorkspaceBrowseRequests=new Map();
+const messages=[],requests=[];
+const window={{webkit:{{messageHandlers:{{sensusApp:{{postMessage:value=>messages.push(value)}}}}}}}};
+const api=async(path,options)=>{{requests.push({{path,options}});return {{selected:false,path:''}}}};
+(async()=>{{
+  const pending=browseWorkspaceDirectory('/initial');
+  const message=messages[0];
+  handleNativeWorkspaceBrowseResult({{request_id:message.request_id,selected:true,path:'/selected'}});
+  const nativeResult=await pending;
+  window.webkit=null;
+  const fallbackResult=await browseWorkspaceDirectory('/fallback');
+  console.log(JSON.stringify({{message,nativeResult,fallbackResult,requests}}));
+}})().catch(error=>{{console.error(error);process.exit(1)}});
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], check=True, capture_output=True, text=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["message"]["action"] == "browseWorkspace"
+    assert result["message"]["initial_path"] == "/initial"
+    assert result["message"]["request_id"]
+    assert result["nativeResult"] == {"selected": True, "path": "/selected"}
+    assert result["fallbackResult"] == {"selected": False, "path": ""}
+    assert result["requests"][0]["path"] == "/api/workspace/browse"
+    assert json.loads(result["requests"][0]["options"]["body"]) == {
+        "initial_path": "/fallback",
+    }
 
 
 def test_workspace_switch_confirmation_is_single_step_and_cancelable() -> None:
@@ -933,11 +1222,56 @@ def test_gui_javascript_passes_node_syntax_check() -> None:
     )
 
 
+def test_flat_chart_bounds_expand_without_reassigning_constants() -> None:
+    result = _evaluate_chart_js(
+        ["finiteBounds", "paddedBounds"],
+        "const flat=paddedBounds([[0,5],[1,5]]);const empty=paddedBounds([]);",
+        "{flat,empty}",
+    )
+
+    assert result == {"flat": [3.76, 6.24], "empty": [0, 1]}
+
+
+def test_measurement_chart_redraws_only_for_new_data_or_state() -> None:
+    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    functions = "\n".join(_extract_js_function(source, name) for name in (
+        "measurementChartRevision", "scheduleMeasurementDraw",
+    ))
+    script = f"""
+{functions}
+const state={{measurementDrawRevision:null,measurementDrawPending:false}};
+const frames=[];let draws=0;
+const requestAnimationFrame=callback=>frames.push(callback);
+const drawAll=()=>{{draws+=1}};
+const first={{run_id:'run-1',state:'running',data:{{time_s:[.1],current_nA:[2]}}}};
+scheduleMeasurementDraw(first);
+scheduleMeasurementDraw(first);
+const second={{run_id:'run-1',state:'running',data:{{time_s:[.1,.2],current_nA:[2,3]}}}};
+scheduleMeasurementDraw(second);
+const queued={{frames:frames.length,draws}};
+frames.shift()();
+scheduleMeasurementDraw(second);
+const unchanged={{frames:frames.length,draws}};
+scheduleMeasurementDraw({{...second,state:'completed'}});
+const completed={{frames:frames.length,draws}};
+console.log(JSON.stringify({{queued,unchanged,completed}}));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], check=True, capture_output=True, text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "queued": {"frames": 1, "draws": 0},
+        "unchanged": {"frames": 0, "draws": 1},
+        "completed": {"frames": 1, "draws": 1},
+    }
+
+
 def test_debug_overlay_controls_remain_clickable_in_empty_and_narrow_states() -> None:
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
 
-    assert html.count("20260817-jlink-target-gate") == 2
+    assert html.count("20260817-v045") == 2
     assert ".empty-chart{position:absolute;inset:0;display:grid;place-items:center;color:#8a969a;font-size:12px;pointer-events:none}" in css
     assert ".chart-legend{position:absolute;z-index:2;" in css
     assert "@media(max-width:900px)" in css

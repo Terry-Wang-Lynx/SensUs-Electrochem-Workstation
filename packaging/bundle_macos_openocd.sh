@@ -3,6 +3,8 @@ set -euo pipefail
 
 SOURCE="${1:?openocd executable required}"
 DEST="${2:?destination required}"
+prefix="${SOURCE:h:h}"
+source_lib_dir="$prefix/lib"
 mkdir -p "$DEST/bin" "$DEST/lib" "$DEST/share/openocd"
 cp "$SOURCE" "$DEST/bin/openocd"
 
@@ -12,11 +14,25 @@ while (( ${#queue[@]} )); do
   current="${queue[1]}"
   queue[1]=()
   while IFS= read -r dependency; do
-    [[ "$dependency" == /opt/homebrew/* || "$dependency" == /usr/local/* ]] || continue
+    case "$dependency" in
+      /opt/homebrew/*|/usr/local/*)
+        source_dependency="$dependency"
+        ;;
+      @executable_path/../lib/*|@loader_path/*)
+        source_dependency="$source_lib_dir/${dependency:t}"
+        [[ -f "$source_dependency" ]] || {
+          echo "Missing bundled OpenOCD dependency: $source_dependency" >&2
+          exit 1
+        }
+        ;;
+      *)
+        continue
+        ;;
+    esac
     name="${dependency:t}"
     target="$DEST/lib/$name"
     if [[ ! -e "$target" ]]; then
-      cp -L "$dependency" "$target"
+      cp -L "$source_dependency" "$target"
       chmod u+w "$target"
       queue+=("$target")
     fi
@@ -32,7 +48,6 @@ while (( ${#queue[@]} )); do
   fi
 done
 
-prefix="${SOURCE:h:h}"
 scripts="$prefix/share/openocd/scripts"
 [[ -d "$scripts" ]] || { echo "Missing OpenOCD scripts: $scripts" >&2; exit 1; }
 ditto "$scripts" "$DEST/share/openocd/scripts"
