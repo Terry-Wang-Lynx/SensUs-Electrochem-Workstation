@@ -7,6 +7,7 @@ import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -380,6 +381,40 @@ def test_jlink_rtt_prefers_ready_openocd_without_probing_commander(
     assert command[0] == str(openocd)
     assert "adapter serial 29734569" in command[-1]
     assert "rtt server start 19021 0" in command[-1]
+    assert "telnet_port 4444" in command
+    assert process._sensus_openocd_control_port == 4444
+
+
+def test_stop_jlink_rtt_requests_clean_openocd_shutdown(monkeypatch) -> None:
+    process = Mock()
+    process.poll.return_value = None
+    process._sensus_openocd_control_port = 4444
+    sent: list[bytes] = []
+
+    class ControlSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def sendall(self, payload: bytes) -> None:
+            sent.append(payload)
+
+    monkeypatch.setattr(
+        collect.socket, "create_connection",
+        lambda address, timeout: (
+            ControlSocket()
+            if address == ("127.0.0.1", 4444) and timeout == 1
+            else pytest.fail(f"unexpected control endpoint: {address}")
+        ),
+    )
+
+    collect.stop_jlink_rtt(process)
+
+    assert sent == [b"shutdown\n"]
+    process.wait.assert_called_once_with(timeout=5)
+    process.terminate.assert_not_called()
 
 
 def test_jlink_rtt_falls_back_after_openocd_startup_failure(
