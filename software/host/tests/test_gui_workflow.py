@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 import pytest
@@ -2396,6 +2396,126 @@ def test_runtime_response_requires_one_complete_matching_request() -> None:
     assert gui_server._runtime_response_state(mixed, request_id) == "incomplete"
 
 
+def _fake_openocd_layout(tmp_path: Path) -> tuple[Path, Path]:
+    openocd = tmp_path / "openocd"
+    scripts = tmp_path / "scripts"
+    (scripts / "interface").mkdir(parents=True)
+    (scripts / "target").mkdir(parents=True)
+    (scripts / "interface/jlink.cfg").touch()
+    (scripts / "target/nrf52.cfg").touch()
+    openocd.touch()
+    return openocd, scripts
+
+
+def test_openocd_target_probe_accepts_explicit_read_memory_identity(
+    tmp_path: Path,
+) -> None:
+    openocd, scripts = _fake_openocd_layout(tmp_path)
+    completed = subprocess.CompletedProcess(
+        [str(openocd)], 0,
+        stdout=(
+            "Info : [nrf52.cpu] Cortex-M4 r0p1 processor detected\n"
+            "SENSUS_INFO_PART=0x00052833\n"
+        ),
+        stderr="shutdown command invoked\n",
+    )
+    with (
+        patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+        patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+        patch("pa_host.gui_server.subprocess.run", return_value=completed) as run,
+    ):
+        reachable, output = gui_server._openocd_target_probe("29734569")
+
+    assert reachable is True
+    assert "SENSUS_INFO_PART=0x00052833" in output
+    command = run.call_args.args[0]
+    assert any("read_memory 0x10000100 32 1" in arg for arg in command)
+    assert not any("mdw " in arg for arg in command)
+
+
+def test_openocd_target_probe_rejects_connection_log_without_identity(
+    tmp_path: Path,
+) -> None:
+    openocd, scripts = _fake_openocd_layout(tmp_path)
+    completed = subprocess.CompletedProcess(
+        [str(openocd)], 0,
+        stdout=(
+            "Info : [nrf52.cpu] Cortex-M4 r0p1 processor detected\n"
+            "Info : [nrf52.cpu] target has 6 breakpoints, 4 watchpoints\n"
+        ),
+        stderr="shutdown command invoked\n",
+    )
+    with (
+        patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+        patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+        patch("pa_host.gui_server.subprocess.run", return_value=completed),
+    ):
+        reachable, _output = gui_server._openocd_target_probe("29734569")
+
+    assert reachable is False
+
+
+def test_openocd_rtt_layout_probe_accepts_unpadded_signature_words(
+    tmp_path: Path,
+) -> None:
+    openocd, scripts = _fake_openocd_layout(tmp_path)
+    completed = subprocess.CompletedProcess(
+        [str(openocd)], 0,
+        stdout=(
+            "SENSUS_INFO_PART=0x52833\n"
+            "SENSUS_RTT_SIGNATURE=0x47474553 0x52205245 0x5454\n"
+        ),
+        stderr="shutdown command invoked\n",
+    )
+    with (
+        patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+        patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+        patch("pa_host.gui_server.subprocess.run", return_value=completed) as run,
+    ):
+        reachable, layout_ready, output = gui_server._openocd_rtt_layout_probe(
+            0x20001100, "29734569",
+        )
+
+    assert (reachable, layout_ready) == (True, True)
+    assert "SENSUS_RTT_SIGNATURE" in output
+    command = run.call_args.args[0]
+    assert any("read_memory 0x20001100 32 3" in arg for arg in command)
+
+
+def test_openocd_runtime_probe_retries_tagged_get_until_verified() -> None:
+    process = Mock()
+    process.poll.return_value = None
+    client = Mock()
+    response = "\n".join((
+        "CFG_APPLIED req=probe-1 src=get",
+        "CFG_DERIVED req=probe-1",
+        "CFG_CONFIRMED req=probe-1 src=get verify_ok=1 "
+        "invalid_cfg=0 vdd_oor=0",
+    )).encode("ascii")
+    client.recv.side_effect = [gui_server.socket.timeout, response]
+    clock = iter([0.0, 0.0, 0.0, 0.0, 0.0, 1.1, 1.1])
+    with (
+        patch("pa_host.gui_server._runtime_probe_request_id",
+              return_value="probe-1"),
+        patch("pa_host.gui_server.start_jlink_rtt", return_value=process),
+        patch("pa_host.gui_server.socket.create_connection",
+              return_value=client),
+        patch("pa_host.gui_server.time.monotonic",
+              side_effect=lambda: next(clock, 1.1)),
+    ):
+        state, detail = gui_server._probe_openocd_runtime_firmware(
+            0x20001100, "29734569", timeout_s=5.0,
+        )
+
+    assert state == "ready"
+    assert "CFG_CONFIRMED" in detail
+    assert client.sendall.call_args_list == [
+        call(b"GET req=probe-1\n"), call(b"GET req=probe-1\n"),
+    ]
+    client.close.assert_called_once_with()
+    process.terminate.assert_called_once_with()
+
+
 def test_missing_jlink_rtt_layout_requires_readable_nrf52833() -> None:
     metadata = {"rtt_address": "0x20001000"}
     unavailable = gui_server.RTTControlBlockUnavailable("no control block")
@@ -2578,7 +2698,7 @@ def test_openocd_fallback_uses_one_bounded_write_verify_run_session() -> None:
         openocd.write_text("openocd", encoding="ascii")
         openocd.chmod(0o755)
         output = (
-            "0x10000100: 00052833\n"
+            "SENSUS_INFO_PART=0x00052833\n"
             "wrote 1 bytes from file\nverified 1 bytes in 0.1s\n"
         )
         with (
@@ -3600,6 +3720,8 @@ def test_formal_gate_waits_for_runtime_measurement_confirmation() -> None:
         ctrl._config_gate = {
             "state": "checking", "expected": expected, "request_id": "runtime1",
             "measurement_expected": measurement,
+            "measurement_command": "MEAS staged runtime1",
+            "measurement_sent": False,
             "measurement_confirmed": False, "measurement_actual": {},
             "legacy_fallback_sent": False, "mismatches": [],
         }
@@ -3613,7 +3735,7 @@ def test_formal_gate_waits_for_runtime_measurement_confirmation() -> None:
 
         ctrl._audit_events()
         assert ctrl._config_gate["state"] == "checking"
-        assert not ctrl.cmd_path.exists()
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "MEAS staged runtime1\n"
 
         with ctrl.audit_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({
@@ -3622,7 +3744,9 @@ def test_formal_gate_waits_for_runtime_measurement_confirmation() -> None:
         ctrl._audit_events()
 
         assert ctrl._config_gate["state"] == "matched"
-        assert ctrl.cmd_path.read_text(encoding="utf-8") == "START\n"
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+            "MEAS staged runtime1\nSTART\n"
+        )
         assert ctrl.metadata["hardware_config"]["measurement_actual"] == measurement
 
 
@@ -3637,23 +3761,31 @@ def test_formal_gate_blocks_runtime_measurement_mismatch() -> None:
         ctrl._config_gate = {
             "state": "checking", "expected": expected, "request_id": "runtime2",
             "measurement_expected": measurement,
+            "measurement_command": "MEAS staged runtime2",
+            "measurement_sent": False,
             "measurement_confirmed": False, "measurement_actual": {},
             "legacy_fallback_sent": False, "mismatches": [],
         }
-        events = [
-            {"kind": "MEAS_CONFIRMED", "req": "runtime2", **measurement,
-             "duration_ms": int(measurement["duration_ms"]) + 1},
-            *_cfg_gate_events(expected, request_id="runtime2"),
-        ]
         ctrl.audit_path.write_text(
-            "".join(json.dumps(event) + "\n" for event in events),
+            "".join(
+                json.dumps(event) + "\n"
+                for event in _cfg_gate_events(expected, request_id="runtime2")
+            ),
             encoding="utf-8",
         )
 
         ctrl._audit_events()
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "MEAS staged runtime2\n"
+
+        with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "kind": "MEAS_CONFIRMED", "req": "runtime2", **measurement,
+                "duration_ms": int(measurement["duration_ms"]) + 1,
+            }) + "\n")
+        ctrl._audit_events()
 
         assert ctrl._config_gate["state"] == "mismatch"
-        assert not ctrl.cmd_path.exists()
+        assert ctrl.cmd_path.read_text(encoding="utf-8") == "MEAS staged runtime2\n"
         assert {item["field"] for item in ctrl._config_gate["mismatches"]} == {
             "measurement.duration_ms",
         }
@@ -3858,7 +3990,7 @@ def test_initial_gate_get_write_failure_still_starts_cleanup_watcher(
               side_effect=fail_command_append),
         patch("pa_host.gui_server.threading.Thread",
               side_effect=[terminator, watcher]) as thread_cls,
-        pytest.raises(RuntimeError, match="无法下发 AFE 配置") as exc_info,
+        pytest.raises(RuntimeError, match="无法下发硬件配置回读命令") as exc_info,
     ):
         ctrl.start_verified()
 
@@ -3884,31 +4016,152 @@ def test_tagged_gate_get_retries_before_legacy_probe(tmp_path: Path) -> None:
     ctrl = MeasurementController()
     ctrl.state = "running"
     ctrl.cmd_path = tmp_path / "cmd.txt"
-    ctrl.cmd_path.write_text("GET req=retry1\n", encoding="utf-8")
+    ctrl.cmd_path.write_text(
+        "SET fsr=1\nGET req=retry1\n", encoding="utf-8",
+    )
     ctrl._config_gate = {
         "state": "checking", "request_id": "retry1", "started_at": 100.0,
         "last_tagged_get_at": 100.0, "tagged_get_attempts": 1,
+        "afe_command": "SET fsr=1", "afe_command_sent": True,
         "legacy_fallback_sent": False, "mismatches": [],
     }
 
     with patch("pa_host.gui_server.time.time", return_value=100.5):
         ctrl._maybe_retry_tagged_gate_get_locked()
-    assert ctrl.cmd_path.read_text(encoding="utf-8") == "GET req=retry1\n"
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+        "SET fsr=1\nGET req=retry1\n"
+    )
 
     with patch("pa_host.gui_server.time.time", return_value=100.8):
         ctrl._maybe_retry_tagged_gate_get_locked()
     assert ctrl._config_gate["tagged_get_attempts"] == 2
     assert ctrl.cmd_path.read_text(encoding="utf-8") == (
-        "GET req=retry1\nGET req=retry1\n"
+        "SET fsr=1\nGET req=retry1\nGET req=retry1\n"
     )
 
     with patch("pa_host.gui_server.time.time", return_value=106.1):
         ctrl._maybe_retry_tagged_gate_get_locked()
         ctrl._maybe_send_legacy_gate_get_locked()
     assert ctrl.cmd_path.read_text(encoding="utf-8") == (
-        "GET req=retry1\nGET req=retry1\nGET\n"
+        "SET fsr=1\nGET req=retry1\nGET req=retry1\nGET\n"
     )
     assert ctrl._config_gate["legacy_fallback_sent"] is True
+
+
+def test_formal_gate_never_sends_meas_before_physical_afe_confirmation(
+    tmp_path: Path,
+) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.audit_path = tmp_path / "audit.jsonl"
+    ctrl.audit_path.write_text("", encoding="utf-8")
+    expected = SettingsController.runtime_afe_contract({})
+    measurement = SettingsController.runtime_measurement_contract({})
+    ctrl._config_gate = {
+        "state": "checking", "expected": expected, "request_id": "staged1",
+        "afe_command": "SET fsr=1 e=400", "afe_command_sent": False,
+        "link_ready": False,
+        "measurement_expected": measurement,
+        "measurement_command": "MEAS staged staged1",
+        "measurement_sent": False, "measurement_confirmed": False,
+        "measurement_actual": {}, "legacy_fallback_sent": False,
+        "last_tagged_get_at": 0.0, "tagged_get_attempts": 0,
+        "mismatches": [],
+    }
+
+    ctrl._send_runtime_gate_commands_locked()
+
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == "GET req=staged1\n"
+    assert ctrl._config_gate["measurement_sent"] is False
+
+    ctrl.audit_path.write_text("".join(
+        json.dumps(event) + "\n"
+        for event in _cfg_gate_events(expected, request_id="staged1")
+    ), encoding="utf-8")
+    ctrl._audit_events()
+
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+        "GET req=staged1\nSET fsr=1 e=400\n"
+    )
+    assert ctrl._config_gate["link_ready"] is True
+    assert ctrl._config_gate["measurement_sent"] is False
+
+    last_get = float(ctrl._config_gate["last_tagged_get_at"])
+    with patch("pa_host.gui_server.time.time", return_value=last_get + 0.8):
+        ctrl._maybe_retry_tagged_gate_get_locked()
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+        "GET req=staged1\nSET fsr=1 e=400\nGET req=staged1\n"
+    )
+
+    with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(
+            json.dumps(event) + "\n"
+            for event in _cfg_gate_events(expected, request_id="staged1")
+        ))
+    ctrl._audit_events()
+
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+        "GET req=staged1\nSET fsr=1 e=400\n"
+        "GET req=staged1\nMEAS staged staged1\n"
+    )
+    assert ctrl._config_gate["measurement_sent"] is True
+    assert ctrl._config_gate["state"] == "checking"
+
+
+def test_formal_gate_retries_transient_afe_status_before_sending_meas(
+    tmp_path: Path,
+) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.audit_path = tmp_path / "audit.jsonl"
+    expected = SettingsController.runtime_afe_contract({})
+    measurement = SettingsController.runtime_measurement_contract({})
+    ctrl._config_gate = {
+        "state": "checking", "expected": expected, "request_id": "settle1",
+        "afe_command": "SET fsr=1", "afe_command_sent": False,
+        "link_ready": True,
+        "measurement_expected": measurement,
+        "measurement_command": "MEAS staged settle1",
+        "measurement_sent": False, "measurement_confirmed": False,
+        "measurement_actual": {}, "legacy_fallback_sent": False,
+        "exact_response_seen": False, "started_at": 100.0,
+        "last_tagged_get_at": 0.0, "tagged_get_attempts": 0,
+        "mismatches": [],
+    }
+    with patch("pa_host.gui_server.time.time", return_value=100.0):
+        ctrl._send_runtime_gate_commands_locked()
+    ctrl.audit_path.write_text("".join(
+        json.dumps(event) + "\n"
+        for event in _cfg_gate_events(
+            expected, request_id="settle1", invalid_cfg=1,
+        )
+    ), encoding="utf-8")
+
+    ctrl._audit_events()
+
+    assert ctrl._config_gate["state"] == "checking"
+    assert ctrl._config_gate["phase"] == "waiting_for_clean_afe"
+    assert ctrl._config_gate["measurement_sent"] is False
+    assert "MEAS" not in ctrl.cmd_path.read_text(encoding="utf-8")
+
+    with patch("pa_host.gui_server.time.time", return_value=100.8):
+        ctrl._maybe_retry_tagged_gate_get_locked()
+    assert ctrl.cmd_path.read_text(encoding="utf-8").count("SET ") == 1
+    assert ctrl.cmd_path.read_text(encoding="utf-8").count("GET req=settle1") == 2
+
+    with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(
+            json.dumps(event) + "\n"
+            for event in _cfg_gate_events(expected, request_id="settle1")
+        ))
+    ctrl._audit_events()
+
+    assert ctrl._config_gate["measurement_sent"] is True
+    assert ctrl.cmd_path.read_text(encoding="utf-8").endswith(
+        "MEAS staged settle1\n"
+    )
 
 
 def test_start_write_failure_fails_gate_without_escaping_audit_poll(

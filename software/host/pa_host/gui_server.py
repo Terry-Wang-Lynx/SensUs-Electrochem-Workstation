@@ -666,11 +666,34 @@ def _cached_jlink_target_status(probe_serial: str) -> dict[str, Any]:
         )
 
 
+def _openocd_jlink_available() -> bool:
+    return bool(
+        OPENOCD_EXE.is_file()
+        and (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
+        and (OPENOCD_SCRIPTS / "target/nrf52.cfg").is_file()
+    )
+
+
+def _openocd_identity_command() -> str:
+    return (
+        "set sensus_info [read_memory "
+        f"0x{NRF52833_INFO_PART_ADDRESS:08X} 32 1]; "
+        "echo \"SENSUS_INFO_PART=[format 0x%08X "
+        "[lindex $sensus_info 0]]\""
+    )
+
+
+def _openocd_identity_verified(output: str) -> bool:
+    return bool(re.search(
+        rf"\bSENSUS_INFO_PART\s*=\s*(?:0x)?0*"
+        rf"{NRF52833_INFO_PART_VALUE:X}\b",
+        output,
+        flags=re.IGNORECASE,
+    ))
+
+
 def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
-    if (
-        not OPENOCD_EXE.is_file()
-        or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
-    ):
+    if not _openocd_jlink_available():
         return False, "随包 OpenOCD 不可用"
     command = [
         str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
@@ -681,9 +704,7 @@ def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
         command += ["-c", f"adapter serial {probe_serial}"]
     command += [
         "-c", f"adapter speed {JLINK_SPEED_KHZ}",
-        "-c", (
-            f"init; mdw 0x{NRF52833_INFO_PART_ADDRESS:08X} 1; shutdown"
-        ),
+        "-c", f"init; {_openocd_identity_command()}; shutdown",
     ]
     try:
         done = subprocess.run(
@@ -699,22 +720,14 @@ def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     output = f"{done.stdout}\n{done.stderr}"
-    expected = re.compile(
-        rf"(?:0x)?{NRF52833_INFO_PART_ADDRESS:08X}\s*(?:=|:)\s*"
-        rf"(?:0x)?{NRF52833_INFO_PART_VALUE:08X}\b",
-        flags=re.IGNORECASE,
-    )
-    return done.returncode == 0 and bool(expected.search(output)), output
+    return done.returncode == 0 and _openocd_identity_verified(output), output
 
 
 def _openocd_rtt_layout_probe(
     rtt_address: int, probe_serial: str,
 ) -> tuple[bool, bool, str]:
     """Read chip identity and the RTT signature without resetting or writing."""
-    if (
-        not OPENOCD_EXE.is_file()
-        or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
-    ):
+    if not _openocd_jlink_available():
         return False, False, "随包 OpenOCD 不可用"
     command = [
         str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
@@ -726,8 +739,16 @@ def _openocd_rtt_layout_probe(
     command += [
         "-c", f"adapter speed {JLINK_SPEED_KHZ}",
         "-c", (
-            f"init; mdw 0x{NRF52833_INFO_PART_ADDRESS:08X} 1; "
-            f"mdw 0x{rtt_address:08X} 3; shutdown"
+            "init; set sensus_info [read_memory "
+            f"0x{NRF52833_INFO_PART_ADDRESS:08X} 32 1]; "
+            "set sensus_rtt [read_memory "
+            f"0x{rtt_address:08X} 32 3]; "
+            "echo \"SENSUS_INFO_PART=[format 0x%08X "
+            "[lindex $sensus_info 0]]\"; "
+            "echo \"SENSUS_RTT_SIGNATURE=[format 0x%08X "
+            "[lindex $sensus_rtt 0]] [format 0x%08X "
+            "[lindex $sensus_rtt 1]] [format 0x%08X "
+            "[lindex $sensus_rtt 2]]\"; shutdown"
         ),
     ]
     try:
@@ -738,15 +759,10 @@ def _openocd_rtt_layout_probe(
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, False, str(exc)
     output = f"{done.stdout}\n{done.stderr}"
-    part_pattern = re.compile(
-        rf"(?:0x)?{NRF52833_INFO_PART_ADDRESS:08X}\s*(?:=|:)\s*"
-        rf"(?:0x)?{NRF52833_INFO_PART_VALUE:08X}\b",
-        flags=re.IGNORECASE,
-    )
-    target_ready = done.returncode == 0 and bool(part_pattern.search(output))
+    target_ready = done.returncode == 0 and _openocd_identity_verified(output)
     rtt_pattern = re.compile(
-        rf"(?:0x)?{rtt_address:08X}\s*(?:=|:)\s*"
-        r"(?:0x)?47474553\s+(?:0x)?52205245\s+(?:0x)?00005454\b",
+        r"\bSENSUS_RTT_SIGNATURE\s*=\s*"
+        r"(?:0x)?0*47474553\s+(?:0x)?0*52205245\s+(?:0x)?0*5454\b",
         flags=re.IGNORECASE,
     )
     return target_ready, target_ready and bool(rtt_pattern.search(output)), output
@@ -1028,8 +1044,15 @@ def _probe_openocd_runtime_firmware(
         if client is None:
             return "transport_error", "OpenOCD RTT 服务未就绪"
         client.settimeout(0.2)
-        client.sendall(f"GET req={request_id}\n".encode("ascii"))
+        request = f"GET req={request_id}\n".encode("ascii")
+        next_request_at = 0.0
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_request_at:
+                # The TCP listener can appear before the RTT downlink is ready.
+                # Repeating this tagged GET is read-only and bounded by deadline.
+                client.sendall(request)
+                next_request_at = now + 1.0
             try:
                 chunk = client.recv(4096)
             except socket.timeout:
@@ -1067,42 +1090,36 @@ def _probe_jlink_runtime_firmware(
     except (TypeError, ValueError):
         return "transport_error", "固件元数据缺少有效 RTT 地址"
 
-    if not JLINK_EXE.is_file():
+    # The portable package owns this OpenOCD build and uses it for collection
+    # and flashing. Prefer it so an unrelated system Commander version cannot
+    # alter old-firmware detection.
+    openocd_failure = ""
+    if _openocd_jlink_available():
         reachable, layout_ready, output = _openocd_rtt_layout_probe(
             rtt_address, JLINK_SERIAL,
         )
         detail = " | ".join(_meaningful_process_tail(output, limit=5))
-        if not reachable:
-            return "transport_error", detail or "OpenOCD 无法读取 nRF52833 身份"
-        if not layout_ready:
-            return "missing", detail or "未找到通用固件 RTT 控制块"
-        return _probe_openocd_runtime_firmware(
-            rtt_address, JLINK_SERIAL, timeout_s=timeout_s,
-        )
+        if reachable:
+            if not layout_ready:
+                return "missing", detail or "未找到通用固件 RTT 控制块"
+            return _probe_openocd_runtime_firmware(
+                rtt_address, JLINK_SERIAL, timeout_s=timeout_s,
+            )
+        openocd_failure = detail or "OpenOCD 无法读取 nRF52833 身份"
+
+    if not JLINK_EXE.is_file():
+        return "transport_error", openocd_failure or "没有可用的 J-Link 读取后端"
 
     reachable, probe_output = probe_jlink_target(
         JLINK_SERIAL or None, executable=JLINK_EXE, timeout_s=10,
     )
     if not reachable:
-        if (
-            OPENOCD_EXE.is_file()
-            and (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
-        ):
-            reachable, layout_ready, layout_output = _openocd_rtt_layout_probe(
-                rtt_address, JLINK_SERIAL,
-            )
-            detail = " | ".join(
-                _meaningful_process_tail(layout_output, limit=5)
-            )
-            if reachable and not layout_ready:
-                return "missing", detail or "未找到通用固件 RTT 控制块"
-            if not reachable:
-                return "transport_error", detail or "OpenOCD 无法读取 nRF52833 身份"
-            return _probe_openocd_runtime_firmware(
-                rtt_address, JLINK_SERIAL, timeout_s=timeout_s,
-            )
         detail = " | ".join(_meaningful_process_tail(probe_output, limit=5))
-        return "transport_error", detail or "J-Link 无法读取 nRF52833 身份"
+        failures = [item for item in (
+            openocd_failure,
+            detail or "J-Link 无法读取 nRF52833 身份",
+        ) if item]
+        return "transport_error", " || ".join(failures)
 
     request_id = _runtime_probe_request_id()
     transport: JLinkMemoryRTT | None = None
@@ -2639,11 +2656,7 @@ class SettingsController:
     def _select_swd_flash_backend(cls) -> str:
         """Select one backend using read-only chip identity checks."""
         failures: list[str] = []
-        if (
-            OPENOCD_EXE.is_file()
-            and (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
-            and (OPENOCD_SCRIPTS / "target/nrf52.cfg").is_file()
-        ):
+        if _openocd_jlink_available():
             reachable, output = _openocd_target_probe(JLINK_SERIAL)
             if reachable:
                 return "openocd"
@@ -2744,23 +2757,19 @@ class SettingsController:
             return_code, blob = cls._run_openocd_once(
                 100,
                 "init", "reset halt",
-                f"mdw 0x{NRF52833_INFO_PART_ADDRESS:08X} 1",
+                _openocd_identity_command(),
                 f"flash write_image erase {firmware_path}",
                 f"verify_image {firmware_path}",
                 "reset run", "shutdown",
                 timeout_s=300,
             )
-            try:
-                part = cls._parse_openocd_words(
-                    blob, NRF52833_INFO_PART_ADDRESS, 1
-                )[0]
-            except RuntimeError as exc:
-                part = -1
-                failures.append(str(exc))
+            identity_verified = _openocd_identity_verified(blob)
+            if not identity_verified:
+                failures.append("OpenOCD 未返回 nRF52833 身份标记")
             lowered = blob.lower()
             success = (
                 return_code == 0
-                and part == NRF52833_INFO_PART_VALUE
+                and identity_verified
                 and "wrote " in lowered
                 and "verified " in lowered
                 and not any(marker in lowered for marker in (
@@ -4272,6 +4281,12 @@ class MeasurementController:
                     ),
                     "measurement_confirmed": False,
                     "measurement_actual": {},
+                    "measurement_sent": False,
+                    "afe_command_sent": False,
+                    "afe_confirmed": False,
+                    "link_ready": False,
+                    "exact_response_seen": False,
+                    "phase": "probing_link",
                     "actual": {},
                     "mismatches": [],
                     "started_at": time.time(),
@@ -4782,30 +4797,81 @@ class MeasurementController:
         return True
 
     def _send_runtime_gate_commands_locked(self) -> bool:
-        """Commit full runtime settings, then request a physical AFE snapshot."""
-        for command, failure in (
-            (self._config_gate.get("afe_command"), "无法下发 AFE 配置"),
-            (self._config_gate.get("measurement_command"), "无法下发测量时序配置"),
-        ):
-            if command and not self._write_config_gate_command_locked(
-                str(command), failure,
-            ):
+        """Prove the downlink first; only then apply the AFE exactly once."""
+        if self._config_gate.get("link_ready") is False:
+            self._config_gate["phase"] = "probing_link"
+            return self._send_tagged_gate_get_locked()
+        if not self._config_gate.get("afe_command_sent"):
+            if not self._apply_afe_after_link_probe_locked():
                 return False
         return self._send_tagged_gate_get_locked()
+
+    def _apply_afe_after_link_probe_locked(self) -> bool:
+        """Commit SET after one tagged GET has proved RTT/CDC downlink readiness."""
+        if self._config_gate.get("afe_command_sent"):
+            return True
+        command = self._config_gate.get("afe_command")
+        if not command:
+            self._fail_config_gate("internal_error", "测量门禁缺少 AFE 配置命令")
+            return False
+        if not self._write_config_gate_command_locked(
+            str(command), "无法下发 AFE 配置",
+        ):
+            return False
+        request_id = str(self._config_gate.get("request_id") or "")
+        self._cfg_epochs = {
+            key: record for key, record in self._cfg_epochs.items()
+            if str(key[1] or "") != request_id
+        }
+        now = time.time()
+        self._config_gate.update({
+            "link_ready": True,
+            "afe_command_sent": True,
+            "last_tagged_get_at": now,
+            "phase": "applying_afe",
+            "actual": {},
+            "mismatches": [],
+        })
+        self.message = "硬件通道已就绪，正在应用 AFE 配置"
+        return True
 
     def _maybe_retry_tagged_gate_get_locked(self) -> None:
         """Retry the exact GET while J-Link may accept TCP before RTT downlink is ready."""
         if (self._config_gate.get("state") != "checking"
+                or self._config_gate.get("afe_confirmed")
                 or self._config_gate.get("legacy_fallback_sent")
                 or self.cmd_path is None or self.user_stop_requested):
             return
         now = time.time()
         started_at = float(self._config_gate.get("started_at") or now)
         last_sent = float(self._config_gate.get("last_tagged_get_at") or 0.0)
-        if (now - started_at >= CONFIG_GATE_LEGACY_PROBE_DELAY_S
+        if ((not self._config_gate.get("exact_response_seen")
+             and now - started_at >= CONFIG_GATE_LEGACY_PROBE_DELAY_S)
                 or now - last_sent < CONFIG_GATE_GET_RETRY_S):
             return
-        self._send_runtime_gate_commands_locked()
+        self._send_tagged_gate_get_locked()
+
+    def _send_measurement_gate_command_locked(self) -> bool:
+        """Send MEAS only after a clean, matching physical AFE snapshot."""
+        if self._config_gate.get("measurement_sent"):
+            return True
+        command = self._config_gate.get("measurement_command")
+        if not command:
+            self._fail_config_gate(
+                "internal_error", "测量门禁缺少测量时序命令",
+            )
+            return False
+        if not self._write_config_gate_command_locked(
+            str(command), "硬件 AFE 配置已匹配，但无法下发测量时序",
+        ):
+            return False
+        self._config_gate.update({
+            "measurement_sent": True,
+            "measurement_sent_at": time.time(),
+            "phase": "checking_measurement",
+        })
+        self.message = "AFE 配置已确认，正在核对测量时序"
+        return True
 
     @staticmethod
     def _config_mismatches(expected: dict[str, Any],
@@ -4877,6 +4943,8 @@ class MeasurementController:
         exact_physical_response = (
             bool(exact_candidates) and record.get("confirmed_has_verify_ok") is True
         )
+        if exact_candidates:
+            self._config_gate["exact_response_seen"] = True
         self._config_gate.update({
             "actual": actual,
             "ep": epoch,
@@ -4892,32 +4960,78 @@ class MeasurementController:
                 "固件不支持完整物理配置核验，请重新应用条件并烧录硬件",
             )
             return
-        measurement_expected = self._config_gate.get("measurement_expected") or {}
-        if (measurement_expected
-                and not self._config_gate.get("measurement_confirmed")):
+        if self._config_gate.get("link_ready") is False:
+            probe_mismatches: list[dict[str, Any]] = []
+            if actual.get("verify_ok") != 1:
+                probe_mismatches.append({
+                    "field": "verify_ok", "expected": 1,
+                    "actual": actual.get("verify_ok"),
+                })
+            if record["faults"]:
+                probe_mismatches.append({
+                    "field": "config_integrity", "expected": "confirmed",
+                    "actual": record["faults"][-1].get("kind"),
+                })
+            if probe_mismatches:
+                self._fail_config_gate(
+                    "mismatch", "AFE 物理寄存器校验失败，未启动测量",
+                    probe_mismatches,
+                )
+                return
+            self._apply_afe_after_link_probe_locked()
             return
         mismatches = self._config_mismatches(
             self._config_gate["expected"], actual,
         )
-        if measurement_expected:
-            mismatches.extend(self._measurement_mismatches(
-                measurement_expected,
-                self._config_gate.get("measurement_actual") or {},
-            ))
         if record["faults"]:
             mismatches.append({
                 "field": "config_integrity",
                 "expected": "confirmed",
                 "actual": record["faults"][-1].get("kind"),
             })
+        transient_fields = {"invalid_cfg", "vdd_oor"}
+        hard_mismatches = [
+            item for item in mismatches if item["field"] not in transient_fields
+        ]
+        transient_mismatches = [
+            item for item in mismatches if item["field"] in transient_fields
+        ]
         self._config_gate["mismatches"] = mismatches
-        if mismatches:
-            fields = "、".join(str(item["field"]) for item in mismatches)
+        if hard_mismatches:
+            fields = "、".join(str(item["field"]) for item in hard_mismatches)
             self._fail_config_gate(
                 "mismatch", f"硬件配置不一致（{fields}），未启动测量",
                 mismatches,
             )
             return
+        if transient_mismatches:
+            self._config_gate["phase"] = "waiting_for_clean_afe"
+            self.message = "AFE 状态正在稳定，正在自动复核"
+            return
+        self._config_gate["afe_confirmed"] = True
+        self._config_gate["phase"] = "afe_matched"
+        measurement_expected = self._config_gate.get("measurement_expected") or {}
+        if measurement_expected and not self._config_gate.get("measurement_sent"):
+            self._send_measurement_gate_command_locked()
+            return
+        if (measurement_expected
+                and not self._config_gate.get("measurement_confirmed")):
+            return
+        if measurement_expected:
+            measurement_mismatches = self._measurement_mismatches(
+                measurement_expected,
+                self._config_gate.get("measurement_actual") or {},
+            )
+            self._config_gate["mismatches"] = measurement_mismatches
+            if measurement_mismatches:
+                fields = "、".join(
+                    str(item["field"]) for item in measurement_mismatches
+                )
+                self._fail_config_gate(
+                    "mismatch", f"测量时序不一致（{fields}），未启动测量",
+                    measurement_mismatches,
+                )
+                return
         if (self.state != "running" or self.cmd_path is None
                 or self.user_stop_requested):
             self._fail_config_gate("aborted", "配置核对期间测量已取消")
@@ -4949,6 +5063,8 @@ class MeasurementController:
     def _maybe_send_legacy_gate_get_locked(self) -> None:
         """Fall back to bare GET for already-flashed firmware without req support."""
         if (self._config_gate.get("state") != "checking"
+                or self._config_gate.get("afe_confirmed")
+                or self._config_gate.get("exact_response_seen")
                 or self._config_gate.get("legacy_fallback_sent")
                 or time.time() - float(self._config_gate.get("started_at") or 0)
                 < CONFIG_GATE_LEGACY_PROBE_DELAY_S
@@ -4993,10 +5109,13 @@ class MeasurementController:
                 self._audit_cache.append(event)
                 kind = event.get("kind")
                 epoch = event.get("ep")
-                if kind == "MEAS_CONFIRMED" and (
+                if (kind == "MEAS_CONFIRMED"
+                    and self._config_gate.get("state") == "checking"
+                    and self._config_gate.get("measurement_sent")
+                    and (
                     str(event.get("req") or "")
                     == str(self._config_gate.get("request_id") or "")
-                ):
+                    )):
                     expected_measurement = (
                         self._config_gate.get("measurement_expected") or {}
                     )
@@ -5005,7 +5124,10 @@ class MeasurementController:
                     }
                     self._config_gate["measurement_confirmed"] = True
                 elif (kind == "MEAS_REJECT"
-                      and self._config_gate.get("state") == "checking"):
+                      and self._config_gate.get("state") == "checking"
+                      and self._config_gate.get("measurement_sent")
+                      and str(event.get("req") or "")
+                      == str(self._config_gate.get("request_id") or "")):
                     reason = str(event.get("reason") or "unknown")
                     self._fail_config_gate(
                         "measurement_rejected",
