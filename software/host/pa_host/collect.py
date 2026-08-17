@@ -41,6 +41,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
@@ -52,6 +53,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -255,6 +257,8 @@ DEVICE = "nRF52833_xxAA"
 SPEED_KHZ = 100
 JLINK_PROBE_ATTEMPTS = 2
 RTT_TELNET_PORT = 19021
+RTT_MAX_PARTIAL_LINE_BYTES = 64 * 1024
+OPENOCD_TELNET_PORT = 4444
 RTT_RAM_START = 0x20000000
 RTT_RAM_END = 0x20020000
 RTT_MAX_CHANNELS = 16
@@ -318,6 +322,7 @@ def run_jlink_script(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **runtime.hidden_subprocess_kwargs(),
             )
             deadline = time.monotonic() + max(1.0, timeout_s)
             while True:
@@ -359,6 +364,7 @@ def run_jlink_script(
             encoding="utf-8",
             errors="replace",
             timeout=max(1.0, timeout_s),
+            **runtime.hidden_subprocess_kwargs(),
         )
     finally:
         script_path.unlink(missing_ok=True)
@@ -971,7 +977,8 @@ def find_rtt_address(elf: Path) -> int:
 
     out = subprocess.run(
         [str(ZEPHYR_SDK_NM), str(elf)], capture_output=True, text=True,
-        encoding="utf-8", errors="replace", check=False
+        encoding="utf-8", errors="replace", check=False,
+        **runtime.hidden_subprocess_kwargs(),
     ).stdout
     for line in out.splitlines():
         parts = line.split()
@@ -994,21 +1001,59 @@ def _openocd_rtt_available() -> bool:
     )
 
 
-def _stop_rtt_process(process: Any) -> None:
-    """Release a failed RTT backend before another driver opens the probe."""
+def stop_jlink_rtt(process: Any) -> None:
+    """Release an RTT backend without leaving older probes wedged on USB."""
     try:
-        stream = getattr(process, "stdin", None)
-        if stream:
-            stream.close()
-    except OSError:
-        pass
-    try:
-        if process.poll() is None:
-            process.terminate()
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
+        try:
+            stream = getattr(process, "stdin", None)
+            if stream:
+                stream.close()
+        except OSError:
+            pass
+
+        control_port = getattr(process, "_sensus_openocd_control_port", None)
+        if isinstance(control_port, int) and process.poll() is None:
+            try:
+                with socket.create_connection(
+                    ("127.0.0.1", control_port), timeout=1
+                ) as control:
+                    control.sendall(b"shutdown\n")
+                process.wait(timeout=5)
+                return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        try:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+    finally:
+        output_thread = getattr(process, "_sensus_openocd_output_thread", None)
+        if output_thread is not None and output_thread is not threading.current_thread():
+            output_thread.join(timeout=2)
+
+
+def _openocd_output_tail(process: Any, limit: int = 8) -> str:
+    lines = getattr(process, "_sensus_openocd_output_tail", None)
+    if lines is None:
+        return ""
+    return " | ".join(
+        str(line).strip()
+        for line in list(lines)[-limit:]
+        if str(line).strip()
+    )
+
+
+def _rtt_backend_exit_message(process: Any, returncode: int) -> str:
+    detail = _openocd_output_tail(process)
+    if not detail:
+        error = getattr(process, "_error", None)
+        detail = str(error).strip() if error is not None else ""
+    suffix = f"：{detail}" if detail else ""
+    return f"RTT 后端提前退出（代码 {returncode}）{suffix}"
 
 
 def _wait_for_rtt_server(
@@ -1019,15 +1064,23 @@ def _wait_for_rtt_server(
     """Wait until OpenOCD actually accepts RTT clients, not merely until spawn."""
     deadline = time.monotonic() + timeout_s
     last_error = "RTT server 尚未监听"
+    ready_event = getattr(process, "_sensus_rtt_ready_event", None)
     while time.monotonic() < deadline:
         returncode = process.poll()
         if returncode is not None:
-            return False, f"OpenOCD 启动期退出（代码 {returncode}）"
+            return False, _rtt_backend_exit_message(process, returncode)
+        if ready_event is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            if ready_event.wait(min(OPENOCD_RTT_START_POLL_INTERVAL_S, remaining)):
+                return True, ""
+            continue
         probe: socket.socket | None = None
         try:
             probe = socket.create_connection(("127.0.0.1", port), timeout=0.2)
-            # START is sent only by the real collector connection, so this
-            # readiness handshake cannot consume measurement samples.
+            # Test doubles and nonstandard launchers may not expose OpenOCD's
+            # output stream. Real OpenOCD uses its readiness log event above,
+            # because a disposable RTT client can become the active consumer
+            # and starve the following collector on older builds.
             return True, ""
         except OSError as exc:
             last_error = str(exc)
@@ -1035,7 +1088,10 @@ def _wait_for_rtt_server(
             if probe is not None:
                 probe.close()
         time.sleep(OPENOCD_RTT_START_POLL_INTERVAL_S)
-    return False, f"{timeout_s:g} 秒内未建立 RTT server：{last_error}"
+    detail = _openocd_output_tail(process)
+    return False, (
+        f"{timeout_s:g} 秒内未建立 RTT server：{detail or last_error}"
+    )
 
 
 def _start_openocd_rtt(
@@ -1043,6 +1099,7 @@ def _start_openocd_rtt(
     probe_serial: str | None,
     port: int,
     reset_before_read: bool,
+    backend_log: Path | None = None,
 ) -> subprocess.Popen:
     adapter_serial = f"adapter serial {probe_serial}; " if probe_serial else ""
     reset_cmds = "reset halt; reset run; sleep 500; " if reset_before_read else ""
@@ -1053,14 +1110,59 @@ def _start_openocd_rtt(
     )
     cmd = [
         str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+        "-c", f"telnet_port {OPENOCD_TELNET_PORT}",
         "-f", "interface/jlink.cfg", "-c", "transport select swd",
         "-f", "target/nrf52.cfg", "-c", server_commands,
     ]
-    return subprocess.Popen(
-        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    process = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace",
+        **runtime.hidden_subprocess_kwargs(),
     )
+    setattr(process, "_sensus_openocd_control_port", OPENOCD_TELNET_PORT)
+    stream = getattr(process, "stdout", None)
+    if isinstance(stream, io.TextIOBase):
+        ready_event = threading.Event()
+        output_tail: deque[str] = deque(maxlen=80)
+        setattr(process, "_sensus_rtt_ready_event", ready_event)
+        setattr(process, "_sensus_openocd_output_tail", output_tail)
+        if backend_log is not None:
+            setattr(process, "_sensus_openocd_log_path", backend_log)
+
+        def drain_output() -> None:
+            log_handle = None
+            try:
+                if backend_log is not None:
+                    try:
+                        backend_log.parent.mkdir(parents=True, exist_ok=True)
+                        log_handle = backend_log.open(
+                            "w", buffering=1, encoding="utf-8", errors="replace",
+                        )
+                    except OSError:
+                        # Diagnostics must never prevent the RTT reader from
+                        # draining OpenOCD's pipe.
+                        log_handle = None
+                for raw_line in stream:
+                    line = raw_line.rstrip("\r\n")
+                    output_tail.append(line)
+                    if log_handle is not None:
+                        log_handle.write(line + "\n")
+                    if f"Listening on port {port} for rtt connections" in line:
+                        ready_event.set()
+            finally:
+                if log_handle is not None:
+                    log_handle.close()
+                stream.close()
+
+        output_thread = threading.Thread(
+            target=drain_output,
+            name=f"openocd-rtt-log-{port}",
+            daemon=True,
+        )
+        setattr(process, "_sensus_openocd_output_thread", output_thread)
+        output_thread.start()
+    return process
 
 
 def _start_commander_memory_rtt(
@@ -1083,7 +1185,8 @@ def _start_commander_memory_rtt(
 
 
 def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
-                    port: int, reset_before_read: bool = False) -> Any:
+                    port: int, reset_before_read: bool = False,
+                    backend_log: Path | None = None) -> Any:
     """起 RTT 桥，数据出到 telnet ``port``。
 
     优先启动长连接的 libjaylink OpenOCD RTT server，避免每读一批数据都
@@ -1098,13 +1201,13 @@ def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
             file=sys.stderr,
         )
         process = _start_openocd_rtt(
-            rtt_addr, probe_serial, port, reset_before_read,
+            rtt_addr, probe_serial, port, reset_before_read, backend_log,
         )
         ready, openocd_failure = _wait_for_rtt_server(process, port)
         if ready:
             print("[collect] OpenOCD RTT server 已就绪", file=sys.stderr)
             return process
-        _stop_rtt_process(process)
+        stop_jlink_rtt(process)
         print(
             f"[collect] OpenOCD RTT 不可用（{openocd_failure}），"
             "改用 Commander 内存桥",
@@ -1141,11 +1244,19 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                       idle_timeout: float | None = None,
                       trigger: str | None = None,
                       cmd_file: Path | None = None,
-                      trigger_state: dict[str, Any] | None = None):
+                      trigger_state: dict[str, Any] | None = None,
+                      backend_process: Any | None = None,
+                      duration_s: float | None = None):
     """连 RTT telnet 服务,按行 yield。"""
     deadline = time.monotonic() + connect_timeout
     sock = None
     while time.monotonic() < deadline:
+        if backend_process is not None:
+            returncode = backend_process.poll()
+            if returncode is not None:
+                raise RuntimeError(
+                    _rtt_backend_exit_message(backend_process, returncode)
+                )
         try:
             sock = socket.create_connection((host, port), timeout=3)
             break
@@ -1189,6 +1300,8 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
     sock.settimeout(1.0)
     buf = b""
     last_data = time.monotonic()
+    last_complete_line = last_data
+    acquisition_started_at = last_data if trigger is None else None
     last_trigger_at = time.monotonic()
     # 🔴 命令转发通道(方案 C 的主机侧)。
     #    为什么需要它:JLinkExe 的 RTT telnet **只把采集器持有的那个连接**的输入
@@ -1204,6 +1317,32 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
     armed_start_sent = False
     with sock:
         while True:
+            now = time.monotonic()
+            if backend_process is not None:
+                returncode = backend_process.poll()
+                if returncode is not None:
+                    raise RuntimeError(
+                        _rtt_backend_exit_message(backend_process, returncode)
+                    )
+            if (
+                duration_s is not None
+                and duration_s > 0
+                and acquisition_started_at is not None
+                and now - acquisition_started_at >= duration_s
+            ):
+                return
+            if len(buf) > RTT_MAX_PARTIAL_LINE_BYTES:
+                raise RuntimeError(
+                    "RTT 数据连续超过 64 KiB 没有换行，无法可靠解析样本"
+                )
+            if (
+                buf
+                and idle_timeout is not None
+                and now - last_complete_line > idle_timeout
+            ):
+                raise RuntimeError(
+                    f"RTT 连续 {idle_timeout:g} 秒没有完整数据行，连接已失去同步"
+                )
             # 与重发同理:必须在循环顶部按**挂钟时间**判。数据以 8 样本/秒连续流入时
             # recv 永不超时,挂在超时分支上的轮询一次都不会执行。
             if cmd_file is not None and \
@@ -1288,6 +1427,7 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                 buf += chunk
                 while b"\n" in buf:
                     raw, buf = buf.split(b"\n", 1)
+                    last_complete_line = time.monotonic()
                     physical_line = raw.decode("utf-8", "replace")
                     logical_lines = _split_glued_lifecycle_line(physical_line)
                     if len(logical_lines) > 1:
@@ -1308,6 +1448,8 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
                             trigger_pending = False
                             print(f"[collect] 固件已确认 {trigger_command}"
                                   f"(重发 {resends} 次)", file=sys.stderr)
+                        if start_seen and acquisition_started_at is None:
+                            acquisition_started_at = time.monotonic()
                         yield line
             except socket.timeout:
                 # 重发已移到循环顶部按时间判(见上),这里只管空闲超时。
@@ -1319,7 +1461,7 @@ def tail_lines(path: Path, idle_timeout: float | None = None):
     """跟读文件新增行(类似 tail -f)。文件尚未出现时等待。"""
     while not path.exists():
         time.sleep(0.2)
-    with path.open("r", errors="replace") as fh:
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
         buf = ""
         last_data = time.monotonic()
         while True:
@@ -1867,18 +2009,25 @@ def main(argv: list[str] | None = None) -> int:
     proc: subprocess.Popen | None = None
     if args.start_jlink:
         addr = args.rtt_address or find_rtt_address(args.elf)
+        backend_log = (
+            args.raw_log.with_name(args.raw_log.stem + "-backend.log")
+            if args.raw_log is not None else None
+        )
         proc = start_jlink_rtt(addr, args.probe_serial, args.port,
-                               args.reset_before_read)
+                               args.reset_before_read, backend_log)
         lines = read_socket_lines("127.0.0.1", args.port, cmd_file=args.cmd_file,
                                   idle_timeout=args.idle_timeout,
-                                  trigger=args.trigger)
+                                  trigger=args.trigger,
+                                  backend_process=proc,
+                                  duration_s=args.duration)
     elif args.socket:
         host, _, port_s = args.socket.partition(":")
         lines = read_socket_lines(host or "127.0.0.1", int(port_s or args.port),
                                   cmd_file=args.cmd_file,
                                   idle_timeout=args.idle_timeout,
                                   trigger=args.trigger,
-                                  trigger_state=trigger_state)
+                                  trigger_state=trigger_state,
+                                  duration_s=args.duration)
     elif args.serial:
         lines = read_serial_lines(args.serial, cmd_file=args.cmd_file,
                                   idle_timeout=args.idle_timeout,
@@ -1960,11 +2109,18 @@ def main(argv: list[str] | None = None) -> int:
     else:
         signal.signal(signal.SIGTERM, _on_sigint)
 
-    raw_out = args.raw_log.open("w", buffering=1) if args.raw_log else None
+    raw_out = (
+        args.raw_log.open(
+            "w", buffering=1, encoding="utf-8", errors="replace",
+        )
+        if args.raw_log else None
+    )
     # 电极电压独立 CSV,默认放在电流 CSV 旁边(<stem>-cellv.csv)。
     cell_v_path = args.cell_v or args.out.with_name(args.out.stem + "-cellv.csv")
     cell_v_new = not cell_v_path.exists() or cell_v_path.stat().st_size == 0
-    cell_v_out = cell_v_path.open("a", buffering=1)
+    cell_v_out = cell_v_path.open(
+        "a", buffering=1, encoding="utf-8", errors="replace",
+    )
     cell_v_rows = 0
     if cell_v_new:
         cell_v_out.write("# pA-Converter V4.0 电极电压连采(System ADC,与电流并行)\n")
@@ -1976,14 +2132,20 @@ def main(argv: list[str] | None = None) -> int:
     audit_path = args.audit or args.out.with_name(args.out.stem + "-audit.jsonl")
     cfg_csv_path = audit_path.with_name(audit_path.stem + "-cfg.csv")
     audit_new = not cfg_csv_path.exists() or cfg_csv_path.stat().st_size == 0
-    audit_out = audit_path.open("a", buffering=1)
-    cfg_csv_out = cfg_csv_path.open("a", buffering=1)
+    audit_out = audit_path.open(
+        "a", buffering=1, encoding="utf-8", errors="replace",
+    )
+    cfg_csv_out = cfg_csv_path.open(
+        "a", buffering=1, encoding="utf-8", errors="replace",
+    )
     audit_acc = CfgEventAccumulator()
     audit_rows = 0
     if audit_new:
         cfg_csv_out.write(",".join(CFG_EVENT_COLUMNS) + "\n")
     try:
-        with args.out.open("a", buffering=1) as out:
+        with args.out.open(
+            "a", buffering=1, encoding="utf-8", errors="replace",
+        ) as out:
             out_ref["cur"] = out
             if new_file:
                 method = "CV" if args.cv else "IT"
@@ -2128,17 +2290,9 @@ def main(argv: list[str] | None = None) -> int:
             print("[collect] ⚠️ 未收到任何 CELL_V 行 —— 若固件 WP_CELLV_ENABLE=true,"
                   "首查 0x55 的 SYS_SELECT 位号假设", file=sys.stderr)
         if proc is not None:
-            # 🔴 用 terminate,别用 pkill —— pkill 会把这支克隆探头打掉线
-            try:
-                if proc.stdin:
-                    proc.stdin.close()
-            except OSError:
-                pass
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            # A clean OpenOCD shutdown matters on older ARM-OB probes: killing
+            # the process can leave their WinUSB endpoint timed out until replug.
+            stop_jlink_rtt(proc)
 
     # ---- 收尾完整性检查 ----
     print(f"\n[collect] 共 {len(samples)} 样本,忽略 {junk} 行非数据输出 → {args.out}",

@@ -68,6 +68,7 @@ from .collect import (
     probe_jlink_target,
     run_jlink_script,
     start_jlink_rtt,
+    stop_jlink_rtt,
 )
 from .cv import (
     export_cv_csv,
@@ -97,6 +98,7 @@ from .windows_jlink import (
     JLINK_VENDOR_ID,
     install_winusb_driver,
     openocd_reports_missing_driver,
+    openocd_reports_probe_communication_error,
     repairable_interfaces,
     resolve_helper as resolve_winusb_helper,
 )
@@ -290,6 +292,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             errors="replace",
             timeout=120,
             env=environment,
+            **runtime.hidden_subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("目录选择窗口等待超时，请重试") from exc
@@ -752,6 +755,7 @@ def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
             encoding="utf-8",
             errors="replace",
             timeout=10,
+            **runtime.hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
@@ -791,6 +795,7 @@ def _openocd_rtt_layout_probe(
         done = subprocess.run(
             command, cwd=PROJECT_DIR, check=False, capture_output=True,
             text=True, encoding="utf-8", errors="replace", timeout=10,
+            **runtime.hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, False, str(exc)
@@ -837,6 +842,7 @@ def _probe_jlink_target_status(
         reachable = False
         backend = ""
         openocd_driver_missing = False
+        openocd_probe_communication_error = False
         if JLINK_EXE.is_file():
             reachable, output = probe_jlink_target(
                 probe_serial,
@@ -855,6 +861,9 @@ def _probe_jlink_target_status(
                 and openocd_reports_missing_driver(output)
                 and _jlink_requires_winusb(probe_serial)
             )
+            openocd_probe_communication_error = bool(
+                openocd_reports_probe_communication_error(output)
+            )
             if reachable:
                 backend = "OpenOCD / libjaylink"
             else:
@@ -866,6 +875,7 @@ def _probe_jlink_target_status(
                 "target_state": "reachable",
                 "target_detail": f"nRF52833 已响应（{backend}）",
                 "target_backend": backend,
+                "target_failure": "",
                 "target_diagnostics": "",
                 "driver_state": "ready",
                 "driver_action": "",
@@ -874,17 +884,31 @@ def _probe_jlink_target_status(
         else:
             diagnostics = "；".join(attempts)
             helper_available = WINUSB_HELPER.is_file()
+            target_failure = (
+                "driver_missing"
+                if openocd_driver_missing else (
+                    "probe_communication"
+                    if openocd_probe_communication_error else (
+                        "target_unreachable" if attempts else "tool_unavailable"
+                    )
+                )
+            )
             result = {
                 "target_state": "unreachable" if attempts else "unknown",
                 "target_detail": (
                     "J-Link 已识别，但 Windows 调试接口驱动尚未准备"
                     if openocd_driver_missing else (
-                        "J-Link 探针在线，但 nRF52833 未响应；"
-                        "请检查板卡供电、SWD 排线和接口方向"
-                        if attempts else "没有可用的 SWD 核对工具"
+                        "J-Link USB 通信超时；请断开 J-Link、目标板供电及 "
+                        "3V3/VTref 10 秒后重插"
+                        if openocd_probe_communication_error else (
+                            "J-Link 探针在线，但 nRF52833 未响应；"
+                            "请检查板卡供电、SWD 排线和接口方向"
+                            if attempts else "没有可用的 SWD 核对工具"
+                        )
                     )
                 ),
                 "target_backend": "",
+                "target_failure": target_failure,
                 "target_diagnostics": diagnostics,
                 "driver_state": "missing" if openocd_driver_missing else "unknown",
                 "driver_action": (
@@ -1044,18 +1068,7 @@ def _free_local_tcp_port() -> int:
 
 
 def _stop_runtime_probe_bridge(process: Any) -> None:
-    try:
-        process.terminate()
-    except (AttributeError, OSError):
-        return
-    try:
-        process.wait(timeout=3)
-    except (AttributeError, OSError, subprocess.TimeoutExpired):
-        try:
-            process.kill()
-            process.wait(timeout=2)
-        except (AttributeError, OSError, subprocess.TimeoutExpired):
-            pass
+    stop_jlink_rtt(process)
 
 
 def _probe_openocd_runtime_firmware(
@@ -2288,7 +2301,7 @@ class SettingsController:
             command, cwd=PROJECT_DIR, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             **(
-                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                runtime.hidden_subprocess_kwargs(new_process_group=True)
                 if _IS_WIN else {"start_new_session": True}
             ),
         )
@@ -2317,6 +2330,7 @@ class SettingsController:
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=10,
+                    **runtime.hidden_subprocess_kwargs(),
                 )
                 killed = result.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
@@ -2587,6 +2601,7 @@ class SettingsController:
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_s,
+                **runtime.hidden_subprocess_kwargs(),
             )
             return done.returncode, f"{done.stdout}\n{done.stderr}"
         except subprocess.TimeoutExpired as exc:
@@ -2914,6 +2929,7 @@ class SettingsController:
                 [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "5", "os", "reset"],
                 check=True, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=15,
+                **runtime.hidden_subprocess_kwargs(),
             )
             reset_output = f"{reset.stdout}\n{reset.stderr}"
             if runtime.is_frozen() or _IS_WIN:
@@ -2922,6 +2938,7 @@ class SettingsController:
                      str(image)],
                     check=True, capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=150,
+                    **runtime.hidden_subprocess_kwargs(),
                 )
             else:
                 upload_environment = {
@@ -3649,6 +3666,7 @@ class MeasurementController:
         self.bridge_log_handle: Any = None
         self.user_stop_requested = False
         self.auto_stop_requested = False
+        self._bridge_stop_forced = False
         self._auto_stop_evidence: dict[str, Any] | None = None
         self._plateau_last_segment = 0
         self._plateau_consecutive_passes = 0
@@ -4293,6 +4311,7 @@ class MeasurementController:
             self.error = ""
             self.user_stop_requested = False
             self.auto_stop_requested = False
+            self._bridge_stop_forced = False
             self._auto_stop_evidence = None
             self._reset_plateau_monitor_locked()
             self._plateau_context_start_s = 0.0
@@ -4357,6 +4376,10 @@ class MeasurementController:
             self.on_complete = on_complete
 
             env = os.environ.copy()
+            # Frozen Windows child processes otherwise buffer stderr when it
+            # is redirected to collector.log, hiding the only actionable RTT
+            # backend details until after a forced stop.
+            env["PYTHONUNBUFFERED"] = "1"
             if not runtime.is_frozen():
                 host_dir = str(PROJECT_DIR / "software" / "host")
                 env["PYTHONPATH"] = host_dir + os.pathsep + env.get("PYTHONPATH", "")
@@ -4419,7 +4442,7 @@ class MeasurementController:
                     #    (2026-08-09 实测:停止 60s 后两者仍在跑、19021 仍被占,
                     #    下一次烧录/测量就会撞上探头被占)。有了进程组才能整棵收掉。
                     # Windows: CREATE_NEW_PROCESS_GROUP 代替 start_new_session。
-                    **(dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                    **(runtime.hidden_subprocess_kwargs(new_process_group=True)
                        if _IS_WIN else dict(start_new_session=True)),
                 )
             except Exception as exc:
@@ -5867,7 +5890,7 @@ class MeasurementController:
         it_tool → pa_host.collect → JLinkExe,`terminate` 只打到 it_tool,
         collect 与 JLinkExe 会一直活着占住探头和 telnet 19021(实测 60s 不自愈)。
 
-        Windows: 用 taskkill /T 整棵收掉。
+        Windows: 先让 RTT 后端释放探头,超时后才用 taskkill /T 整棵收掉。
         macOS/Linux: 配合 Popen(start_new_session=True) 才能用 killpg 一次收完。
         JLinkExe 本身**不理 SIGTERM**(实测),但它父进程 collect 一退、stdin 管道
         EOF,它就会自己退 —— 所以关键是让 collect 收到信号并跑完它的 finally。
@@ -5875,29 +5898,55 @@ class MeasurementController:
         if process.poll() is not None:
             return
         if _IS_WIN:
-            # Windows: taskkill /T 会杀掉整个进程树
+            # Older ARM-OB probes can remain in LIBUSB_ERROR_TIMEOUT until a
+            # physical replug if OpenOCD is killed while it owns WinUSB.  The
+            # collector normally sends this shutdown itself, but GUI timeout
+            # and startup-failure paths arrive here before that finally block.
+            # Release the current workstation bridge first, then let the
+            # wrapper/collector unwind.  Forced taskkill remains bounded as a
+            # fallback for a broken child tree.
+            if _port_accepts_connections(19021):
+                try:
+                    _release_stale_measurement_bridge()
+                    process.wait(timeout=6)
+                    return
+                except (RuntimeError, subprocess.TimeoutExpired, OSError):
+                    pass
+            killed = False
             try:
-                subprocess.run(
+                result = subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True, timeout=10,
+                    **runtime.hidden_subprocess_kwargs(),
                 )
+                killed = result.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
-                process.kill()
+                pass
+            if not killed:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
         else:
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError, OSError):
                 process.terminate()
 
-    @classmethod
-    def _terminate_if_running(cls, process: subprocess.Popen[str], delay_s: float) -> None:
+    def _terminate_if_running(
+        self, process: subprocess.Popen[str], delay_s: float
+    ) -> None:
         time.sleep(delay_s)
         if process.poll() is None:
-            cls._terminate_tree(process)
+            with self.lock:
+                self._bridge_stop_forced = bool(
+                    self.user_stop_requested or self.auto_stop_requested
+                )
+            self._terminate_tree(process)
             try:
                 process.wait(timeout=6)
             except subprocess.TimeoutExpired:
-                cls._kill_tree(process)
+                self._kill_tree(process)
 
     @staticmethod
     def _kill_tree(process: subprocess.Popen[str]) -> None:
@@ -5905,13 +5954,21 @@ class MeasurementController:
         if process.poll() is not None:
             return
         if _IS_WIN:
+            killed = False
             try:
-                subprocess.run(
+                result = subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True, timeout=10,
+                    **runtime.hidden_subprocess_kwargs(),
                 )
+                killed = result.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
-                process.kill()
+                pass
+            if not killed:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
         else:
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
@@ -5960,7 +6017,9 @@ class MeasurementController:
                 self.error = "" if gate_state == "aborted" else self.message
                 return
             terminal_data = self._data(update_monitor=False)
-            requested_stop_exit = return_code in (3, -15)
+            requested_stop_exit = return_code in (3, -15) or (
+                self._bridge_stop_forced and return_code in (0, 1)
+            )
             if self.user_stop_requested and requested_stop_exit:
                 self._freeze_live_analysis_locked(
                     terminal_data, completed=False,
@@ -9251,9 +9310,16 @@ def _diagnostic_runtime_context() -> dict[str, Any]:
 def _diagnostic_current_run_files() -> list[tuple[str, Path]]:
     with APP.measurement.lock:
         run_dir = APP.measurement.run_dir
+        backend_log = (
+            APP.measurement.raw_log.with_name(
+                APP.measurement.raw_log.stem + "-backend.log"
+            )
+            if APP.measurement.raw_log is not None else None
+        )
         candidates = [
             ("collector.log", run_dir / "collector.log" if run_dir else None),
             ("firmware-rtt.log", APP.measurement.raw_log),
+            ("rtt-backend.log", backend_log),
             ("hardware-audit.jsonl", APP.measurement.audit_path),
             ("summary.json", APP.measurement.summary_path),
             ("commands.txt", APP.measurement.cmd_path),

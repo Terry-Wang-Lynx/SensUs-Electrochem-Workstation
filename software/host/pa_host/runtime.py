@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 
 APP_DIR_NAME = "SensUs Workstation"
+
+
+def hidden_subprocess_kwargs(*, new_process_group: bool = False) -> dict[str, int]:
+    """Keep command-line helpers off the Windows desktop."""
+    if sys.platform != "win32":
+        return {}
+    flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if new_process_group:
+        flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    return {"creationflags": flags}
 
 
 def is_frozen() -> bool:

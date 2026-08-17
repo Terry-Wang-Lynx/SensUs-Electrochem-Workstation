@@ -111,8 +111,10 @@ state.devices = {devices: [], selected_device:{id:'u1',kind:'usb',name:'USB Boar
 renderHardwareConnection(); const staleSelected = capture();
 state.devices = {devices: [{id:'j1',kind:'jlink',name:'J-Link SN 1',selectable:true,target_state:'unknown'}], probing:true};
 renderHardwareConnection(); const checking = capture();
+state.devices = {devices: [{id:'j1',kind:'jlink',name:'J-Link SN 1',selectable:true,target_state:'unreachable',target_failure:'probe_communication',target_detail:'探头 USB 通信超时'}], probing:false};
+renderHardwareConnection(); const probeTimeout = capture();
 """,
-        "{probeOnly,connected,disconnected,multiple,selectedMultiple,staleSelected,checking}",
+        "{probeOnly,connected,disconnected,multiple,selectedMultiple,staleSelected,checking,probeTimeout}",
     )
 
     assert states == {
@@ -151,6 +153,11 @@ renderHardwareConnection(); const checking = capture();
             "title": "正在核对目标板",
             "detail": "J-Link SN 1",
         },
+        "probeTimeout": {
+            "dot": "status-dot error",
+            "title": "J-Link 通信异常",
+            "detail": "探头 USB 通信超时",
+        },
     }
 
 
@@ -160,7 +167,7 @@ def test_hardware_actions_require_a_verified_target() -> None:
         """
 let state = {devices: {devices: [], probing: true}};
 const probing = hardwareOperationStatus();
-state.devices = {devices: [{id:'j1',kind:'jlink',selectable:true,target_state:'unreachable'}], probing:false};
+state.devices = {devices: [{id:'j1',kind:'jlink',selectable:true,target_state:'unreachable',target_detail:'探头 USB 通信超时'}], probing:false};
 const unreachable = hardwareOperationStatus();
 state.devices.devices[0].target_state = 'reachable';
 const jlink = hardwareOperationStatus();
@@ -181,7 +188,7 @@ const disconnected = hardwareOperationStatus();
 
     assert states["probing"] == {"ready": False, "message": "正在核对硬件连接"}
     assert states["unreachable"]["ready"] is False
-    assert "目标板无响应" in states["unreachable"]["message"]
+    assert states["unreachable"]["message"] == "探头 USB 通信超时"
     assert states["jlink"] == {"ready": True, "message": ""}
     assert states["usb"] == {"ready": True, "message": ""}
     assert states["multiple"] == {

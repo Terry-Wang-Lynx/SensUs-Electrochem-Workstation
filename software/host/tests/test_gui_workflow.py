@@ -2464,6 +2464,10 @@ def test_openocd_target_probe_accepts_explicit_read_memory_identity(
     with (
         patch("pa_host.gui_server.OPENOCD_EXE", openocd),
         patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+        patch(
+            "pa_host.gui_server.runtime.hidden_subprocess_kwargs",
+            return_value={"creationflags": 0x08000000},
+        ),
         patch("pa_host.gui_server.subprocess.run", return_value=completed) as run,
     ):
         reachable, output = gui_server._openocd_target_probe("29734569")
@@ -2473,6 +2477,7 @@ def test_openocd_target_probe_accepts_explicit_read_memory_identity(
     command = run.call_args.args[0]
     assert any("read_memory 0x10000100 32 1" in arg for arg in command)
     assert not any("mdw " in arg for arg in command)
+    assert run.call_args.kwargs["creationflags"] == 0x08000000
 
 
 def test_openocd_target_probe_rejects_connection_log_without_identity(
@@ -2930,13 +2935,20 @@ def test_adaptive_stop_rejects_unexpected_exit(return_code: int) -> None:
     log_handle.close.assert_called_once_with()
 
 
-def test_manual_known_stop_is_not_promoted_to_a_completed_measurement() -> None:
+@pytest.mark.parametrize(
+    ("return_code", "bridge_stop_forced"),
+    [(3, False), (0, True), (1, True)],
+)
+def test_manual_known_stop_is_not_promoted_to_a_completed_measurement(
+    return_code: int, bridge_stop_forced: bool,
+) -> None:
     ctrl = MeasurementController()
     ctrl.state = "running"
     ctrl.user_stop_requested = True
+    ctrl._bridge_stop_forced = bridge_stop_forced
     ctrl.process = Mock()
-    ctrl.process.poll.return_value = 3
-    ctrl.process.wait.return_value = 3
+    ctrl.process.poll.return_value = return_code
+    ctrl.process.wait.return_value = return_code
     completed: list[dict[str, object]] = []
     ctrl.on_complete = completed.append
 
@@ -2947,6 +2959,24 @@ def test_manual_known_stop_is_not_promoted_to_a_completed_measurement() -> None:
     assert ctrl.summary is None
     assert completed and completed[0]["state"] == "idle"
     log_handle.close.assert_called_once_with()
+
+
+def test_stop_timeout_marks_bridge_shutdown_before_termination() -> None:
+    ctrl = MeasurementController()
+    ctrl.user_stop_requested = True
+    process = Mock()
+    process.poll.return_value = None
+    process.wait.return_value = 0
+
+    with (
+        patch("pa_host.gui_server.time.sleep"),
+        patch.object(ctrl, "_terminate_tree") as terminate,
+    ):
+        ctrl._terminate_if_running(process, 1.5)
+
+    assert ctrl._bridge_stop_forced is True
+    terminate.assert_called_once_with(process)
+    process.wait.assert_called_once_with(timeout=6)
 
 
 def test_natural_finish_falls_back_to_last_complete_rolling_window() -> None:
@@ -3168,6 +3198,105 @@ def test_watcher_start_failure_reclaims_collector_and_gets_diagnostic_id(
     event = diagnostics.snapshot()["events"][-1]
     assert event["event"] == "measurement.watcher_start_failed"
     assert exc_info.value.diagnostic_id == event["event_id"]
+
+
+def test_windows_terminate_tree_releases_openocd_before_forcing() -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    process.wait.return_value = 0
+
+    with (
+        patch("pa_host.gui_server._IS_WIN", True),
+        patch("pa_host.gui_server._port_accepts_connections", return_value=True),
+        patch("pa_host.gui_server._release_stale_measurement_bridge") as release,
+        patch("pa_host.gui_server.subprocess.run") as taskkill,
+    ):
+        MeasurementController._terminate_tree(process)
+
+    release.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=6)
+    taskkill.assert_not_called()
+
+
+def test_windows_terminate_tree_forces_after_bridge_release_failure() -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+
+    with (
+        patch("pa_host.gui_server._IS_WIN", True),
+        patch("pa_host.gui_server._port_accepts_connections", return_value=True),
+        patch(
+            "pa_host.gui_server._release_stale_measurement_bridge",
+            side_effect=RuntimeError("bridge stuck"),
+        ),
+        patch("pa_host.gui_server.subprocess.run") as taskkill,
+    ):
+        MeasurementController._terminate_tree(process)
+
+    taskkill.assert_called_once_with(
+        ["taskkill", "/F", "/T", "/PID", "4321"],
+        capture_output=True,
+        timeout=10,
+        **gui_server.runtime.hidden_subprocess_kwargs(),
+    )
+
+
+def test_windows_terminate_tree_forces_after_bridge_wait_timeout() -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired(["collector"], 6)
+    taskkill_result = subprocess.CompletedProcess(["taskkill"], returncode=0)
+
+    with (
+        patch("pa_host.gui_server._IS_WIN", True),
+        patch("pa_host.gui_server._port_accepts_connections", return_value=True),
+        patch("pa_host.gui_server._release_stale_measurement_bridge") as release,
+        patch(
+            "pa_host.gui_server.subprocess.run", return_value=taskkill_result,
+        ) as taskkill,
+    ):
+        MeasurementController._terminate_tree(process)
+
+    release.assert_called_once_with()
+    taskkill.assert_called_once()
+    process.kill.assert_not_called()
+
+
+def test_windows_terminate_tree_falls_back_when_taskkill_fails() -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    taskkill_result = subprocess.CompletedProcess(["taskkill"], returncode=1)
+
+    with (
+        patch("pa_host.gui_server._IS_WIN", True),
+        patch("pa_host.gui_server._port_accepts_connections", return_value=False),
+        patch("pa_host.gui_server._release_stale_measurement_bridge") as release,
+        patch(
+            "pa_host.gui_server.subprocess.run", return_value=taskkill_result,
+        ) as taskkill,
+    ):
+        MeasurementController._terminate_tree(process)
+
+    release.assert_not_called()
+    taskkill.assert_called_once()
+    process.kill.assert_called_once_with()
+
+
+def test_windows_kill_tree_falls_back_when_taskkill_fails() -> None:
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    taskkill_result = subprocess.CompletedProcess(["taskkill"], returncode=1)
+
+    with (
+        patch("pa_host.gui_server._IS_WIN", True),
+        patch(
+            "pa_host.gui_server.subprocess.run", return_value=taskkill_result,
+        ) as taskkill,
+    ):
+        MeasurementController._kill_tree(process)
+
+    taskkill.assert_called_once()
+    process.kill.assert_called_once_with()
 
 
 def test_server_shutdown_waits_for_measurement_finalization() -> None:

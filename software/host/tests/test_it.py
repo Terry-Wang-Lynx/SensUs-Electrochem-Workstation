@@ -188,6 +188,24 @@ def test_firmware_fa_column_is_signed_nA() -> None:
     assert abs(t[-1] - 2.9) < 1e-12
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "gb18030"])
+def test_run_loader_supports_utf8_and_legacy_windows_csv(
+    tmp_path: Path, encoding: str,
+) -> None:
+    path = tmp_path / f"run-{encoding}.csv"
+    path.write_bytes((
+        "# 固件状态 ⇒ 已应用\n"
+        "dev_ms,fa_fw,sat\n"
+        "0,-1000000,0\n100,-2000000,0\n200,-3000000,0\n"
+    ).encode(encoding))
+
+    time_s, current_nA, valid = load_run_csv(path)
+
+    assert time_s.tolist() == pytest.approx([0.0, 0.1, 0.2])
+    assert current_nA.tolist() == pytest.approx([-1.0, -2.0, -3.0])
+    assert valid.tolist() == [True, True, True]
+
+
 def test_loader_keeps_final_segment_after_firmware_reset() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "run.csv"

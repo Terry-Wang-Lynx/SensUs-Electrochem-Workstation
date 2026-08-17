@@ -68,7 +68,10 @@ def _windows_app() -> int:
             child = subprocess.Popen(
                 [sys.executable, "gui", "--host", "127.0.0.1", "--port", "8765"],
                 env=child_environment,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                ),
             )
             # Windows Defender may inspect every native dependency on the
             # first launch of an unsigned portable ZIP. The verified clean

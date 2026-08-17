@@ -22,6 +22,12 @@ _DRIVER_ERROR_MARKERS = (
     "libusb_error_not_supported",
     "no j-link device found",
 )
+_PROBE_COMMUNICATION_ERROR_MARKERS = (
+    "libusb_error_timeout",
+    "sending data to device timed out",
+    "jaylink_get_firmware_version() failed",
+    "transport_write() failed: timeout occurred",
+)
 # Driver replacement must be interface-specific. Rebinding the composite
 # parent or CDC interface would make the probe disappear from device discovery.
 _SUPPORTED_WINUSB_INTERFACES = {
@@ -48,6 +54,12 @@ class JLinkUsbInterface:
 def openocd_reports_missing_driver(output: object) -> bool:
     text = str(output or "").lower()
     return any(marker in text for marker in _DRIVER_ERROR_MARKERS)
+
+
+def openocd_reports_probe_communication_error(output: object) -> bool:
+    """Identify failures that happen before OpenOCD reaches the SWD target."""
+    text = str(output or "").lower()
+    return any(marker in text for marker in _PROBE_COMMUNICATION_ERROR_MARKERS)
 
 
 def resolve_helper(project_dir: Path) -> Path:

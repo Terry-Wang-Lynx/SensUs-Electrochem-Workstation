@@ -7,6 +7,7 @@ import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -103,6 +104,87 @@ def test_armed_rtt_recovers_start_marker_glued_to_config_line(
     lines.close()
 
     assert sock.sent == [b"START\n"]
+
+
+def test_rtt_reader_reports_backend_exit_with_openocd_tail(monkeypatch) -> None:
+    sock = _CommandSocket()
+    monkeypatch.setattr(
+        collect.socket, "create_connection", lambda *_args, **_kwargs: sock,
+    )
+
+    class Backend:
+        _sensus_openocd_output_tail = [
+            "Info : Listening on port 19021 for rtt connections",
+            "Error: libusb_bulk_transfer failed with LIBUSB_ERROR_TIMEOUT",
+        ]
+
+        def __init__(self) -> None:
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 17
+
+    lines = collect.read_socket_lines(
+        "127.0.0.1", 19021, backend_process=Backend(),
+    )
+
+    with pytest.raises(RuntimeError, match="LIBUSB_ERROR_TIMEOUT"):
+        next(lines)
+
+
+def test_rtt_reader_duration_expires_without_receiving_another_line(
+    monkeypatch,
+) -> None:
+    class TimeoutSocket(_CommandSocket):
+        def recv(self, _size: int) -> bytes:
+            raise socket.timeout
+
+    sock = TimeoutSocket()
+    monkeypatch.setattr(
+        collect.socket, "create_connection", lambda *_args, **_kwargs: sock,
+    )
+    now = 0.0
+
+    def advancing_clock() -> float:
+        nonlocal now
+        now += 1.0
+        return now
+
+    monkeypatch.setattr(collect.time, "monotonic", advancing_clock)
+    lines = collect.read_socket_lines(
+        "127.0.0.1", 19021, trigger=None, duration_s=2.0,
+    )
+
+    with pytest.raises(StopIteration):
+        next(lines)
+
+
+def test_collector_writes_non_gbk_firmware_text_as_utf8(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    source = tmp_path / "firmware.log"
+    source.write_text(
+        "IT_START run=1 target_mv=400\n"
+        "固件状态 ⇒ 已应用\n"
+        "S seq=1 ms=100 counts=1 fa=-1 tag=0 auto=1 ovf=0 sat=0 ep=1\n"
+        "IT_DONE native=1 expected=1 elapsed_ms=100 ep=1 tainted=0\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "raw.csv"
+    raw_log = tmp_path / "rtt.log"
+    monkeypatch.setattr(collect.signal, "signal", lambda *_args: None)
+
+    result = collect.main([
+        "--out", str(output), "--tail", str(source),
+        "--raw-log", str(raw_log), "--it-10hz", "--progress-every", "0",
+    ])
+
+    assert result == 0
+    assert "固件状态 ⇒ 已应用" in raw_log.read_text(encoding="utf-8")
+    assert output.read_text(encoding="utf-8").startswith(
+        "# pA-Converter V4.0 IT 实时采集"
+    )
 
 
 def test_trigger_argument_rejects_non_ascii_before_collection_starts() -> None:
@@ -380,6 +462,90 @@ def test_jlink_rtt_prefers_ready_openocd_without_probing_commander(
     assert command[0] == str(openocd)
     assert "adapter serial 29734569" in command[-1]
     assert "rtt server start 19021 0" in command[-1]
+    assert "reset halt" not in command[-1]
+    assert "reset run" not in command[-1]
+    assert "telnet_port 4444" in command
+    assert process._sensus_openocd_control_port == 4444
+
+
+def test_openocd_rtt_reset_commands_follow_explicit_option(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    openocd = tmp_path / "openocd"
+    scripts = tmp_path / "scripts"
+    process = Mock()
+    monkeypatch.setattr(collect, "OPENOCD_EXE", openocd)
+    monkeypatch.setattr(collect, "OPENOCD_SCRIPTS", scripts)
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(collect.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        collect.runtime, "hidden_subprocess_kwargs",
+        lambda **_kwargs: {"creationflags": 0x08000000},
+    )
+
+    collect._start_openocd_rtt(
+        0x20001100, "29734569", 19021, reset_before_read=True,
+    )
+
+    command = popen.call_args.args[0]
+    assert "reset halt; reset run; sleep 500" in command[-1]
+    assert popen.call_args.kwargs["creationflags"] == 0x08000000
+
+
+def test_openocd_readiness_log_does_not_open_disposable_rtt_client(
+    monkeypatch,
+) -> None:
+    ready = threading.Event()
+    ready.set()
+
+    class Process:
+        _sensus_rtt_ready_event = ready
+
+        @staticmethod
+        def poll():
+            return None
+
+    monkeypatch.setattr(
+        collect.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "OpenOCD readiness must not consume an RTT client connection"
+        ),
+    )
+
+    assert collect._wait_for_rtt_server(Process(), 19021) == (True, "")
+
+
+def test_stop_jlink_rtt_requests_clean_openocd_shutdown(monkeypatch) -> None:
+    process = Mock()
+    process.poll.return_value = None
+    process._sensus_openocd_control_port = 4444
+    sent: list[bytes] = []
+
+    class ControlSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def sendall(self, payload: bytes) -> None:
+            sent.append(payload)
+
+    monkeypatch.setattr(
+        collect.socket, "create_connection",
+        lambda address, timeout: (
+            ControlSocket()
+            if address == ("127.0.0.1", 4444) and timeout == 1
+            else pytest.fail(f"unexpected control endpoint: {address}")
+        ),
+    )
+
+    collect.stop_jlink_rtt(process)
+
+    assert sent == [b"shutdown\n"]
+    process.wait.assert_called_once_with(timeout=5)
+    process.terminate.assert_not_called()
 
 
 def test_jlink_rtt_falls_back_after_openocd_startup_failure(
@@ -465,7 +631,7 @@ def test_measure_forwards_early_sigterm_waits_and_returns_stop_code(monkeypatch)
         active_handler[signum] = handler
         return previous
 
-    def start_child(command):
+    def start_child(command, **_kwargs):
         events.append(("spawn", command))
         # Exercise the race between OS process creation and assignment to ``child``.
         active_handler[signal.SIGTERM](signal.SIGTERM, None)
@@ -482,6 +648,25 @@ def test_measure_forwards_early_sigterm_waits_and_returns_stop_code(monkeypatch)
     assert it_tool._cmd_measure(args) == 3
     assert events[1:] == [("signal", signal.SIGTERM), "wait"]
     assert active_handler[signal.SIGTERM] is original_handler
+
+
+def test_measure_forwards_explicit_no_reset_to_jlink_collector(monkeypatch) -> None:
+    child = Mock()
+    child.wait.return_value = 0
+    monkeypatch.setattr(it_tool.subprocess, "Popen", Mock(return_value=child))
+    args = SimpleNamespace(
+        out=Path("run.csv"), duration=120.0, idle_timeout=25.0,
+        cv=False, start_jlink=True, socket=None, serial=None,
+        elf=Path("firmware.elf"), probe_serial="123456",
+        reset_before_read=False, cmd_file=None, cell_v=None, audit=None,
+        raw_log=None, trigger="ARMED",
+    )
+
+    assert it_tool._cmd_measure(args) == 0
+
+    command = it_tool.subprocess.Popen.call_args.args[0]
+    assert "--no-reset-before-read" in command
+    assert "--reset-before-read" not in command
 
 
 def _cfg_snapshot(
