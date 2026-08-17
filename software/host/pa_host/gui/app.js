@@ -451,7 +451,7 @@ function hardwareOperationStatus(){
   if(active.kind==='jlink'){
     if(active.target_state==='reachable')return {ready:true,message:''};
     if(active.driver_state==='missing')return {ready:false,message:'请先在“选择设备”中准备 J-Link Windows 驱动'};
-    return {ready:false,message:active.target_state==='unreachable'?'目标板无响应，请检查板卡供电和 SWD 排线':'正在核对 J-Link 目标板'};
+    return {ready:false,message:active.target_state==='unreachable'?String(active.target_detail||'目标板无响应，请检查板卡供电和 SWD 排线'):'正在核对 J-Link 目标板'};
   }
   return active.selectable
     ?{ready:true,message:''}
@@ -1082,7 +1082,7 @@ function renderHardwareConnection(data=state.measurement){
     }else if(targetState==='checking'){
       dotClass='probing';title='正在核对目标板';detail=String(activeDevice.name||'J-Link 探头已连接');
     }else if(targetState==='unreachable'){
-      dotClass='error';title='目标板无响应';detail='请检查板卡供电和 SWD 排线';
+      dotClass='error';title=activeDevice.target_failure==='probe_communication'?'J-Link 通信异常':'目标板无响应';detail=String(activeDevice.target_detail||'请检查板卡供电和 SWD 排线');
     }else{
       dotClass='warning';title='J-Link 探头已连接';detail=String(activeDevice.target_detail||'目标板连接尚未确认');
     }
@@ -1174,7 +1174,7 @@ $('exitApp').addEventListener('click',async()=>{
 function deviceCardDetail(device){
   if(device.kind==='jlink'){
     if(device.driver_state==='missing')return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探针 SN ${device.probe_serial}`:''} · Windows 驱动待准备`;
-    const stateText=device.target_state==='reachable'?'目标板已响应':device.target_state==='unreachable'?'目标板无响应':state.devices.probing?'正在核对目标板':'目标板尚未核对';
+    const stateText=device.target_state==='reachable'?'目标板已响应':device.target_failure==='probe_communication'?'探头 USB 通信超时':device.target_state==='unreachable'?'目标板无响应':state.devices.probing?'正在核对目标板':'目标板尚未核对';
     return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探头 SN ${device.probe_serial}`:''} · ${stateText}`;
   }
   const ports=[device.data_port&&`DATA ${device.data_port}`,device.smp_port&&`SMP ${device.smp_port}`].filter(Boolean);
@@ -1201,7 +1201,7 @@ function renderDeviceList(payload=state.devices){
     }
     card.append(title,action);
     const note=document.createElement('small'); note.className='device-state';
-    note.textContent=device.driver_state==='missing'?(device.driver_message||'需要准备 Windows WinUSB 驱动'):device.target_state==='unreachable'?(device.id===selected?'已选中，但目标板无响应':'探针在线，但目标板无响应'):device.id===selected?'当前测量将使用此设备':device.selectable?'空闲时可选择':'设备尚未准备好'; card.append(note);
+    note.textContent=device.driver_state==='missing'?(device.driver_message||'需要准备 Windows WinUSB 驱动'):device.target_state==='unreachable'?(device.target_detail||(device.id===selected?'已选中，但目标板无响应':'探针在线，但目标板无响应')):device.id===selected?'当前测量将使用此设备':device.selectable?'空闲时可选择':'设备尚未准备好'; card.append(note);
     list.append(card);
   });
   if(!devices.length){const empty=document.createElement('div');empty.className='device-empty';empty.textContent='没有发现可识别的 USB DATA 或 J-Link。';list.append(empty)}

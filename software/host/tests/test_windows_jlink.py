@@ -50,6 +50,24 @@ def test_openocd_target_error_is_not_a_missing_driver() -> None:
     ) is False
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "LIBUSB_ERROR_TIMEOUT",
+        "Error: Sending data to device timed out",
+        "jaylink_get_firmware_version() failed: timeout occurred",
+    ],
+)
+def test_openocd_probe_communication_markers(output: str) -> None:
+    assert windows_jlink.openocd_reports_probe_communication_error(output) is True
+
+
+def test_target_swd_error_is_not_a_probe_communication_error() -> None:
+    assert windows_jlink.openocd_reports_probe_communication_error(
+        "Error: Could not find MEM-AP to control the core"
+    ) is False
+
+
 def test_repairable_interfaces_only_selects_verified_debug_interface(
     monkeypatch,
 ) -> None:
@@ -335,6 +353,30 @@ def test_jlink_driver_is_missing_only_after_pnp_confirmation(
     assert status["driver_action"] == (
         "install_winusb" if pnp_problem else ""
     )
+
+
+def test_jlink_probe_timeout_is_not_reported_as_a_target_wiring_fault(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(gui_server, "JLINK_EXE", tmp_path / "missing-jlink")
+    monkeypatch.setattr(
+        gui_server,
+        "_openocd_target_probe",
+        lambda _serial: (
+            False,
+            "LIBUSB_ERROR_TIMEOUT\njaylink_get_firmware_version() failed",
+        ),
+    )
+    monkeypatch.setattr(gui_server, "_jlink_requires_winusb", lambda _serial: False)
+    with gui_server.JLINK_TARGET_CACHE_LOCK:
+        gui_server.JLINK_TARGET_CACHE.clear()
+
+    status = gui_server._probe_jlink_target_status("123456", force=True)
+
+    assert status["target_state"] == "unreachable"
+    assert status["target_failure"] == "probe_communication"
+    assert "J-Link USB 通信超时" in status["target_detail"]
+    assert "SWD 排线" not in status["target_detail"]
 
 
 def test_jlink_pnp_confirmation_uses_the_discovered_vid_pid(monkeypatch) -> None:

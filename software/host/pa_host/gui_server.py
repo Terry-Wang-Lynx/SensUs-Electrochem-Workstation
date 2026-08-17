@@ -96,6 +96,7 @@ from .windows_jlink import (
     JLINK_VENDOR_ID,
     install_winusb_driver,
     openocd_reports_missing_driver,
+    openocd_reports_probe_communication_error,
     repairable_interfaces,
     resolve_helper as resolve_winusb_helper,
 )
@@ -824,6 +825,7 @@ def _probe_jlink_target_status(
         reachable = False
         backend = ""
         openocd_driver_missing = False
+        openocd_probe_communication_error = False
         if JLINK_EXE.is_file():
             reachable, output = probe_jlink_target(
                 probe_serial,
@@ -842,6 +844,9 @@ def _probe_jlink_target_status(
                 and openocd_reports_missing_driver(output)
                 and _jlink_requires_winusb(probe_serial)
             )
+            openocd_probe_communication_error = bool(
+                openocd_reports_probe_communication_error(output)
+            )
             if reachable:
                 backend = "OpenOCD / libjaylink"
             else:
@@ -853,6 +858,7 @@ def _probe_jlink_target_status(
                 "target_state": "reachable",
                 "target_detail": f"nRF52833 已响应（{backend}）",
                 "target_backend": backend,
+                "target_failure": "",
                 "target_diagnostics": "",
                 "driver_state": "ready",
                 "driver_action": "",
@@ -861,17 +867,31 @@ def _probe_jlink_target_status(
         else:
             diagnostics = "；".join(attempts)
             helper_available = WINUSB_HELPER.is_file()
+            target_failure = (
+                "driver_missing"
+                if openocd_driver_missing else (
+                    "probe_communication"
+                    if openocd_probe_communication_error else (
+                        "target_unreachable" if attempts else "tool_unavailable"
+                    )
+                )
+            )
             result = {
                 "target_state": "unreachable" if attempts else "unknown",
                 "target_detail": (
                     "J-Link 已识别，但 Windows 调试接口驱动尚未准备"
                     if openocd_driver_missing else (
-                        "J-Link 探针在线，但 nRF52833 未响应；"
-                        "请检查板卡供电、SWD 排线和接口方向"
-                        if attempts else "没有可用的 SWD 核对工具"
+                        "J-Link USB 通信超时；请断开 J-Link、目标板供电及 "
+                        "3V3/VTref 10 秒后重插"
+                        if openocd_probe_communication_error else (
+                            "J-Link 探针在线，但 nRF52833 未响应；"
+                            "请检查板卡供电、SWD 排线和接口方向"
+                            if attempts else "没有可用的 SWD 核对工具"
+                        )
                     )
                 ),
                 "target_backend": "",
+                "target_failure": target_failure,
                 "target_diagnostics": diagnostics,
                 "driver_state": "missing" if openocd_driver_missing else "unknown",
                 "driver_action": (
