@@ -3195,6 +3195,7 @@ def test_windows_terminate_tree_forces_after_bridge_release_failure() -> None:
         ["taskkill", "/F", "/T", "/PID", "4321"],
         capture_output=True,
         timeout=10,
+        **gui_server.runtime.hidden_subprocess_kwargs(),
     )
 
 

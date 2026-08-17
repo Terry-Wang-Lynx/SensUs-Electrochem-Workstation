@@ -631,7 +631,7 @@ def test_measure_forwards_early_sigterm_waits_and_returns_stop_code(monkeypatch)
         active_handler[signum] = handler
         return previous
 
-    def start_child(command):
+    def start_child(command, **_kwargs):
         events.append(("spawn", command))
         # Exercise the race between OS process creation and assignment to ``child``.
         active_handler[signal.SIGTERM](signal.SIGTERM, None)
