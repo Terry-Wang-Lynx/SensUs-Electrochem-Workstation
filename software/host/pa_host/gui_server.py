@@ -68,6 +68,7 @@ from .collect import (
     probe_jlink_target,
     run_jlink_script,
     start_jlink_rtt,
+    stop_jlink_rtt,
 )
 from .cv import (
     export_cv_csv,
@@ -1030,18 +1031,7 @@ def _free_local_tcp_port() -> int:
 
 
 def _stop_runtime_probe_bridge(process: Any) -> None:
-    try:
-        process.terminate()
-    except (AttributeError, OSError):
-        return
-    try:
-        process.wait(timeout=3)
-    except (AttributeError, OSError, subprocess.TimeoutExpired):
-        try:
-            process.kill()
-            process.wait(timeout=2)
-        except (AttributeError, OSError, subprocess.TimeoutExpired):
-            pass
+    stop_jlink_rtt(process)
 
 
 def _probe_openocd_runtime_firmware(

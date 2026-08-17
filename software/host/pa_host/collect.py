@@ -255,6 +255,7 @@ DEVICE = "nRF52833_xxAA"
 SPEED_KHZ = 100
 JLINK_PROBE_ATTEMPTS = 2
 RTT_TELNET_PORT = 19021
+OPENOCD_TELNET_PORT = 4444
 RTT_RAM_START = 0x20000000
 RTT_RAM_END = 0x20020000
 RTT_MAX_CHANNELS = 16
@@ -994,14 +995,27 @@ def _openocd_rtt_available() -> bool:
     )
 
 
-def _stop_rtt_process(process: Any) -> None:
-    """Release a failed RTT backend before another driver opens the probe."""
+def stop_jlink_rtt(process: Any) -> None:
+    """Release an RTT backend without leaving older probes wedged on USB."""
     try:
         stream = getattr(process, "stdin", None)
         if stream:
             stream.close()
     except OSError:
         pass
+
+    control_port = getattr(process, "_sensus_openocd_control_port", None)
+    if isinstance(control_port, int) and process.poll() is None:
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", control_port), timeout=1
+            ) as control:
+                control.sendall(b"shutdown\n")
+            process.wait(timeout=5)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     try:
         if process.poll() is None:
             process.terminate()
@@ -1053,14 +1067,17 @@ def _start_openocd_rtt(
     )
     cmd = [
         str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+        "-c", f"telnet_port {OPENOCD_TELNET_PORT}",
         "-f", "interface/jlink.cfg", "-c", "transport select swd",
         "-f", "target/nrf52.cfg", "-c", server_commands,
     ]
-    return subprocess.Popen(
+    process = subprocess.Popen(
         cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace",
     )
+    setattr(process, "_sensus_openocd_control_port", OPENOCD_TELNET_PORT)
+    return process
 
 
 def _start_commander_memory_rtt(
@@ -1104,7 +1121,7 @@ def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
         if ready:
             print("[collect] OpenOCD RTT server 已就绪", file=sys.stderr)
             return process
-        _stop_rtt_process(process)
+        stop_jlink_rtt(process)
         print(
             f"[collect] OpenOCD RTT 不可用（{openocd_failure}），"
             "改用 Commander 内存桥",
@@ -2128,17 +2145,9 @@ def main(argv: list[str] | None = None) -> int:
             print("[collect] ⚠️ 未收到任何 CELL_V 行 —— 若固件 WP_CELLV_ENABLE=true,"
                   "首查 0x55 的 SYS_SELECT 位号假设", file=sys.stderr)
         if proc is not None:
-            # 🔴 用 terminate,别用 pkill —— pkill 会把这支克隆探头打掉线
-            try:
-                if proc.stdin:
-                    proc.stdin.close()
-            except OSError:
-                pass
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            # A clean OpenOCD shutdown matters on older ARM-OB probes: killing
+            # the process can leave their WinUSB endpoint timed out until replug.
+            stop_jlink_rtt(proc)
 
     # ---- 收尾完整性检查 ----
     print(f"\n[collect] 共 {len(samples)} 样本,忽略 {junk} 行非数据输出 → {args.out}",
