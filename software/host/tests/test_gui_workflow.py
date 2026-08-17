@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 
+from pa_host import gui_server
 from pa_host.diagnostics import DiagnosticStore
 from pa_host.gui_server import (
     AppState,
@@ -33,6 +34,18 @@ from pa_host.gui_server import (
     serve,
 )
 from pa_host.it import PlateauConfig
+
+
+def _hex_record(address: int, record_type: int, data: bytes = b"") -> str:
+    body = bytes((len(data), address >> 8, address & 0xFF, record_type)) + data
+    checksum = (-sum(body)) & 0xFF
+    return ":" + (body + bytes((checksum,))).hex().upper()
+
+
+def _write_hex(path: Path, *records: tuple[int, int, bytes]) -> None:
+    lines = [_hex_record(address, record_type, data)
+             for address, record_type, data in records]
+    path.write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
 def _point(point_id: str, concentration: float, current: float) -> dict[str, object]:
@@ -797,7 +810,7 @@ def test_apply_writes_configured_working_electrode_to_firmware_header() -> None:
         assert result["settings"]["working_electrode_v"] == 0.25
 
 
-def test_runtime_configurable_custom_apply_uses_verified_prebuilt_without_build() -> None:
+def test_runtime_configurable_custom_apply_reuses_verified_firmware_without_flash() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         config = root / "measurement_config.h"
@@ -813,14 +826,6 @@ def test_runtime_configurable_custom_apply_uses_verified_prebuilt_without_build(
             "runtime_protocol": {"name": "MEAS", "version": 1},
             "sha256": {"zephyr.hex": digest},
         }))
-        controller: SettingsController | None = None
-        observed_messages: list[str] = []
-
-        def flash(path: Path | None = None) -> None:
-            assert controller is not None
-            assert path == firmware
-            observed_messages.append(controller.snapshot()["message"])
-
         with (
             patch("pa_host.gui_server.FIRMWARE_CONFIG", config),
             patch("pa_host.gui_server.SETTINGS_PATH", settings_path),
@@ -828,14 +833,16 @@ def test_runtime_configurable_custom_apply_uses_verified_prebuilt_without_build(
             patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
             patch("pa_host.gui_server._refresh_usb_transport"),
             patch("pa_host.gui_server._release_stale_measurement_bridge"),
+            patch("pa_host.gui_server._probe_jlink_runtime_firmware",
+                  return_value=("ready", "verified")),
             patch.object(SettingsController, "_run_build") as build,
-            patch.object(SettingsController, "_flash_firmware", side_effect=flash),
+            patch.object(SettingsController, "_flash_firmware") as flash,
         ):
             controller = SettingsController()
             result = controller.apply({"potential_v": 0.1, "duration_s": 321})
 
         build.assert_not_called()
-        assert observed_messages == ["正在通过 J-Link 烧录并校验通用固件"]
+        flash.assert_not_called()
         saved = json.loads(settings_path.read_text())
         assert saved["firmware_source"] == "prebuilt"
         assert saved["firmware_sha256"] == digest
@@ -844,6 +851,120 @@ def test_runtime_configurable_custom_apply_uses_verified_prebuilt_without_build(
         assert result["firmware_source"] == "prebuilt"
         assert result["firmware_sha256"] == digest
         assert result["firmware_transport"] == "rtt"
+        assert result["message"].startswith("通用固件已确认")
+
+
+def test_usb_runtime_apply_reuses_data_firmware_without_smp_upgrade() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        v51 = root / "v51"
+        images = v51 / "images"
+        images.mkdir(parents=True)
+        image = images / "app.signed.bin"
+        image.write_bytes(b"runtime-v51")
+        digest = SettingsController._firmware_hash(image)
+        (v51 / "firmware.json").write_text(json.dumps({
+            "settings": SettingsController.validate({}),
+            "runtime_configurable": True,
+            "runtime_protocol": {"name": "MEAS", "version": 1},
+            "artifacts_sha256": {"app.signed.bin": digest},
+        }), encoding="utf-8")
+        settings_path = root / "settings.json"
+
+        with (
+            patch("pa_host.gui_server.SETTINGS_PATH", settings_path),
+            patch("pa_host.gui_server.V51_PREBUILT_IMAGE", image),
+            patch("pa_host.gui_server.HARDWARE_TRANSPORT", "serial"),
+            patch("pa_host.gui_server.SERIAL_DATA_PORT", "/dev/data"),
+            patch("pa_host.gui_server.SERIAL_SMP_PORT", ""),
+            patch("pa_host.gui_server._refresh_usb_transport"),
+            patch("pa_host.gui_server._probe_serial_runtime_firmware",
+                  return_value=("ready", "verified")),
+            patch.object(SettingsController, "_upgrade_v51_firmware") as upgrade,
+        ):
+            result = SettingsController().apply({"potential_v": -0.1})
+
+        upgrade.assert_not_called()
+        assert result["applied"] is True
+        assert result["firmware_transport"] == "serial"
+
+
+def test_runtime_apply_updates_once_then_requires_post_flash_handshake() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        prebuilt = root / "prebuilt"
+        prebuilt.mkdir()
+        firmware = prebuilt / "zephyr.hex"
+        firmware.write_bytes(b"runtime")
+        digest = SettingsController._firmware_hash(firmware)
+        (prebuilt / "firmware.json").write_text(json.dumps({
+            "settings": SettingsController.validate({}),
+            "rtt_address": "0x20001100",
+            "runtime_configurable": True,
+            "runtime_protocol": {"name": "MEAS", "version": 1},
+            "sha256": {"zephyr.hex": digest},
+        }), encoding="utf-8")
+        settings_path = root / "settings.json"
+
+        with (
+            patch("pa_host.gui_server.SETTINGS_PATH", settings_path),
+            patch("pa_host.gui_server.FIRMWARE_PREBUILT_DIR", prebuilt),
+            patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
+            patch("pa_host.gui_server._refresh_usb_transport"),
+            patch("pa_host.gui_server._release_stale_measurement_bridge"),
+            patch("pa_host.gui_server._probe_jlink_runtime_firmware",
+                  side_effect=[("missing", "old firmware"),
+                               ("missing", "old firmware"),
+                               ("ready", "verified")]),
+            patch.object(SettingsController, "_flash_firmware") as flash,
+        ):
+            result = SettingsController().apply({"potential_v": 0.05})
+
+        flash.assert_called_once_with(firmware)
+        assert result["applied"] is True
+        assert result["message"].startswith("通用固件已更新并确认")
+
+
+def test_post_flash_handshake_failure_does_not_overwrite_saved_settings() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        prebuilt = root / "prebuilt"
+        prebuilt.mkdir()
+        firmware = prebuilt / "zephyr.hex"
+        firmware.write_bytes(b"runtime")
+        digest = SettingsController._firmware_hash(firmware)
+        (prebuilt / "firmware.json").write_text(json.dumps({
+            "settings": SettingsController.validate({}),
+            "rtt_address": "0x20001100",
+            "runtime_configurable": True,
+            "runtime_protocol": {"name": "MEAS", "version": 1},
+            "sha256": {"zephyr.hex": digest},
+        }), encoding="utf-8")
+        settings_path = root / "settings.json"
+        previous = {"settings": SettingsController.validate({}), "keep": True}
+        settings_path.write_text(json.dumps(previous), encoding="utf-8")
+
+        with (
+            patch("pa_host.gui_server.SETTINGS_PATH", settings_path),
+            patch("pa_host.gui_server.FIRMWARE_PREBUILT_DIR", prebuilt),
+            patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
+            patch("pa_host.gui_server._refresh_usb_transport"),
+            patch("pa_host.gui_server._release_stale_measurement_bridge"),
+            patch("pa_host.gui_server._probe_jlink_runtime_firmware",
+                  side_effect=[("missing", "old"), ("missing", "old"),
+                               ("missing", "no reply"), ("missing", "no reply"),
+                               ("missing", "no reply")]),
+            patch.object(SettingsController, "_flash_firmware") as flash,
+            patch("pa_host.gui_server.time.sleep"),
+        ):
+            controller = SettingsController()
+            with pytest.raises(RuntimeError, match="更新后未通过"):
+                controller.apply({"potential_v": 0.05})
+
+        flash.assert_called_once_with(firmware)
+        assert settings_path.read_text(encoding="utf-8") == json.dumps(previous)
+        assert controller.snapshot()["state"] == "error"
+        assert controller.snapshot()["applied"] is False
 
 
 def test_corrupt_runtime_prebuilt_is_rejected_before_flash() -> None:
@@ -2067,107 +2188,468 @@ def test_native_workspace_picker_cancel_keeps_the_current_path(
     assert result == {"selected": False, "path": ""}
 
 
-def test_openocd_flash_recovers_nvmc_disconnect_with_page_reconnects() -> None:
+def test_jlink_flash_uses_one_backend_and_independent_readback() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        diagnostics = DiagnosticStore(Path(tmp) / "logs")
-        firmware = Path(tmp) / "firmware.hex"
-        firmware.write_text(
-            ":0100000000FF\n:0120000000DF\n:00000001FF\n",
-            encoding="ascii",
+        root = Path(tmp)
+        diagnostics = DiagnosticStore(root / "logs")
+        firmware = root / "firmware.hex"
+        _write_hex(firmware, (0, 0, b"\x00"), (0, 1, b""))
+        commander = root / "JLinkExe"
+        commander.write_text("commander", encoding="ascii")
+        commander.chmod(0o755)
+        completed = subprocess.CompletedProcess(
+            [str(commander)], 0,
+            stdout=("10000100 = 00052833\nDownloading file...O.K.\n"
+                    "Script processing completed.\n"),
+            stderr="",
         )
-        failed = subprocess.CalledProcessError(
-            1, ["openocd"], output="",
-            stderr="Error waiting NVMC_READY\nfailed erasing sectors 0 to 2",
-        )
-        erased_with_disconnect = subprocess.CompletedProcess(
-            ["openocd"], 1, stdout="", stderr="failed to read memory",
-        )
-        checked = subprocess.CompletedProcess(
-            ["openocd"], 0,
-            stdout=(
-                "successfully checked erase state\n"
-                "# 1: 0x00001000 (0x1000 4kB) not erased\n"
-            ), stderr="",
-        )
-        written = subprocess.CompletedProcess(
-            ["openocd"], 0,
-            stdout="wrote 2 bytes\nverified 2 bytes\n", stderr="",
-        )
+
         with (
-            patch("pa_host.gui_server.JLINK_EXE", Path(tmp) / "missing"),
-            patch("pa_host.gui_server.OPENOCD_EXE", Path(sys.executable)),
+            patch("pa_host.gui_server.JLINK_EXE", commander),
+            patch("pa_host.gui_server.JLINK_SERIAL", "29734569"),
             patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
-            patch("pa_host.gui_server.subprocess.run",
-                  side_effect=[
-                      failed, erased_with_disconnect, erased_with_disconnect,
-                      checked, written,
-                  ]) as run,
+            patch("pa_host.gui_server.probe_jlink_target",
+                  return_value=(True, "10000100 = 00052833")),
+            patch("pa_host.gui_server._openocd_target_probe",
+                  return_value=(False, "OpenOCD unavailable")),
+            patch.object(SettingsController, "_read_jlink_flash_image",
+                         side_effect=[b"\xFF", b"\x00"]) as readback,
+            patch.object(SettingsController, "_run_jlink_application") as run_app,
+            patch("pa_host.gui_server.run_jlink_script",
+                  return_value=completed) as commander_run,
+            patch("pa_host.gui_server.subprocess.run") as openocd_run,
         ):
             SettingsController._flash_firmware(firmware)
 
-        assert run.call_count == 5
-        first_command = run.call_args_list[0].args[0]
-        first_erase = run.call_args_list[1].args[0]
-        second_erase = run.call_args_list[2].args[0]
-        erase_check = run.call_args_list[3].args[0]
-        write_and_verify = run.call_args_list[4].args[0]
-        assert "adapter speed 4000" in first_command
-        assert any("program {" in item and "verify reset exit" in item
-                   for item in first_command)
-        assert "flash erase_sector 0 0 0" in first_erase
-        assert "flash erase_sector 0 2 2" in second_erase
-        assert "flash erase_check 0" in erase_check
-        assert any("flash write_image {" in item for item in write_and_verify)
-        assert any("verify_image {" in item for item in write_and_verify)
-        events = [event["event"] for event in diagnostics.snapshot()["events"]]
-        assert events == [
-            "firmware.flash.started",
-            "firmware.flash.tool_failed",
-            "firmware.flash.reconnect_fallback",
-            "firmware.flash.completed",
+        script = commander_run.call_args.args[0]
+        assert "si SWD\nspeed 100\ndevice nRF52833_xxAA\nconnect\n" in script
+        assert f"loadfile \"{firmware.resolve()}\", noreset" in script
+        assert "0x4001E" not in script
+        assert "recover" not in script.lower()
+        assert readback.call_count == 2
+        run_app.assert_called_once_with()
+        openocd_run.assert_not_called()
+        assert [event["event"] for event in diagnostics.snapshot()["events"]] == [
+            "firmware.flash.started", "firmware.flash.completed",
         ]
 
 
-def test_openocd_reconnect_flash_rejects_a_page_that_remains_dirty() -> None:
+def test_jlink_matching_image_skips_programming_but_restarts_target() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        diagnostics = DiagnosticStore(Path(tmp) / "logs")
-        firmware = Path(tmp) / "firmware.hex"
-        firmware.write_text(":0100000000FF\n:00000001FF\n", encoding="ascii")
-        failed = subprocess.CalledProcessError(
-            1, ["openocd"], output="", stderr="failed to erase reg",
-        )
-        erase_attempt = subprocess.CompletedProcess(
-            ["openocd"], 1, stdout="", stderr="failed to read memory",
-        )
-        still_dirty = subprocess.CompletedProcess(
-            ["openocd"], 0,
-            stdout=(
-                "successfully checked erase state\n"
-                "# 0: 0x00000000 (0x1000 4kB) not erased\n"
-            ), stderr="",
+        root = Path(tmp)
+        firmware = root / "firmware.hex"
+        _write_hex(firmware, (0, 0, b"\xA5"), (0, 1, b""))
+        commander = root / "JLinkExe"
+        commander.write_text("commander", encoding="ascii")
+        commander.chmod(0o755)
+        with (
+            patch("pa_host.gui_server.JLINK_EXE", commander),
+            patch("pa_host.gui_server.probe_jlink_target",
+                  return_value=(True, "reachable")),
+            patch("pa_host.gui_server._openocd_target_probe",
+                  return_value=(False, "OpenOCD unavailable")),
+            patch.object(SettingsController, "_read_jlink_flash_image",
+                         return_value=b"\xA5"),
+            patch.object(SettingsController, "_run_jlink_application") as run_app,
+            patch("pa_host.gui_server.run_jlink_script") as program,
+        ):
+            SettingsController._flash_firmware(firmware)
+
+        program.assert_not_called()
+        run_app.assert_called_once_with()
+
+
+def test_read_only_preflight_can_select_openocd_before_any_write() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        firmware = root / "firmware.hex"
+        _write_hex(firmware, (0, 0, b"\x00"), (0, 1, b""))
+        commander = root / "JLinkExe"
+        commander.touch()
+        openocd = root / "openocd"
+        openocd.touch()
+        scripts = root / "scripts"
+        (scripts / "interface").mkdir(parents=True)
+        (scripts / "target").mkdir()
+        (scripts / "interface/jlink.cfg").touch()
+        (scripts / "target/nrf52.cfg").touch()
+        with (
+            patch("pa_host.gui_server.JLINK_EXE", commander),
+            patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+            patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+            patch("pa_host.gui_server.probe_jlink_target",
+                  return_value=(False, "unsupported Commander")),
+            patch("pa_host.gui_server._openocd_target_probe",
+                  return_value=(True, "0x10000100: 00052833")),
+            patch.object(SettingsController, "_flash_with_jlink") as jlink_write,
+            patch.object(SettingsController, "_flash_with_openocd") as openocd_write,
+        ):
+            SettingsController._flash_firmware(firmware)
+
+        jlink_write.assert_not_called()
+        openocd_write.assert_called_once()
+
+
+def test_unreachable_swd_backends_never_begin_flash() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        firmware = root / "firmware.hex"
+        _write_hex(firmware, (0, 0, b"\x00"), (0, 1, b""))
+        commander = root / "JLinkExe"
+        commander.write_text("commander", encoding="ascii")
+        commander.chmod(0o755)
+        with (
+            patch("pa_host.gui_server.JLINK_EXE", commander),
+            patch("pa_host.gui_server.probe_jlink_target",
+                  return_value=(False, "cannot read IDR")),
+            patch("pa_host.gui_server._openocd_target_probe",
+                  return_value=(False, "cannot read IDR")) as openocd_probe,
+            patch.object(SettingsController, "_flash_with_openocd") as openocd_write,
+            pytest.raises(RuntimeError, match="目标无响应"),
+        ):
+            SettingsController._flash_firmware(firmware)
+
+        openocd_probe.assert_called_once()
+        openocd_write.assert_not_called()
+
+
+def test_jlink_operation_preflight_keeps_tool_output_in_diagnostics(
+    tmp_path: Path,
+) -> None:
+    diagnostics = DiagnosticStore(tmp_path / "logs")
+    status = {
+        "target_state": "unreachable",
+        "target_detail": "J-Link 探针在线，但 nRF52833 未响应",
+        "target_diagnostics": "SEGGER: cannot connect; OpenOCD: cannot read IDR",
+    }
+    with (
+        patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
+        patch("pa_host.gui_server._probe_jlink_target_status",
+              return_value=status) as probe,
+        pytest.raises(RuntimeError, match="nRF52833 未响应") as exc_info,
+    ):
+        gui_server._require_jlink_target("29734569")
+
+    probe.assert_called_once_with("29734569", force=True)
+    event = diagnostics.snapshot()["events"][-1]
+    assert event["event"] == "device.jlink.target_unreachable"
+    assert event["context"]["tool_output"].endswith("cannot read IDR")
+    assert exc_info.value.diagnostic_id == event["event_id"]
+
+
+def test_jlink_readback_mismatch_is_a_hard_failure() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        firmware = root / "firmware.hex"
+        _write_hex(firmware, (0, 0, b"\x12"), (0, 1, b""))
+        commander = root / "JLinkExe"
+        commander.write_text("commander", encoding="ascii")
+        commander.chmod(0o755)
+        completed = subprocess.CompletedProcess(
+            [str(commander)], 0,
+            stdout=("10000100 = 00052833\nDownloading file...O.K.\n"
+                    "Script processing completed.\n"), stderr="",
         )
         with (
-            patch("pa_host.gui_server.JLINK_EXE", Path(tmp) / "missing"),
-            patch("pa_host.gui_server.OPENOCD_EXE", Path(sys.executable)),
-            patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
-            patch("pa_host.gui_server.subprocess.run",
-                  side_effect=[failed, erase_attempt, still_dirty]) as run,
-            pytest.raises(RuntimeError, match="未擦净页:0"),
+            patch("pa_host.gui_server.JLINK_EXE", commander),
+            patch("pa_host.gui_server.probe_jlink_target",
+                  return_value=(True, "reachable")),
+            patch.object(SettingsController, "_read_jlink_flash_image",
+                         side_effect=[b"\xFF", b"\x34"]),
+            patch.object(SettingsController, "_run_jlink_application") as run_app,
+            patch("pa_host.gui_server.run_jlink_script", return_value=completed),
+            patch.object(SettingsController, "_flash_with_openocd") as openocd_write,
+            pytest.raises(RuntimeError, match="独立回读不一致"),
+        ):
+            SettingsController._flash_firmware(firmware)
+
+        run_app.assert_called_once_with()
+        openocd_write.assert_not_called()
+
+
+def test_runtime_response_requires_one_complete_matching_request() -> None:
+    request_id = "ready-current"
+    complete = "\n".join((
+        f"CFG_APPLIED req={request_id} src=get",
+        f"CFG_DERIVED req={request_id}",
+        f"CFG_CONFIRMED req={request_id} src=get verify_ok=1 "
+        "invalid_cfg=0 vdd_oor=0",
+    ))
+    assert gui_server._runtime_response_state(complete, request_id) == "ready"
+    assert gui_server._runtime_response_state(
+        f"CFG_APPLIED req={request_id} src=get", request_id
+    ) == "incomplete"
+    assert gui_server._runtime_response_state(
+        f"CFG_CONFIRMED req={request_id} src=get verify_ok=0",
+        request_id,
+    ) == "invalid"
+    mixed = complete.replace(request_id, "ready-old", 1)
+    assert gui_server._runtime_response_state(mixed, request_id) == "incomplete"
+
+
+def test_missing_jlink_rtt_layout_requires_readable_nrf52833() -> None:
+    metadata = {"rtt_address": "0x20001000"}
+    unavailable = gui_server.RTTControlBlockUnavailable("no control block")
+    with (
+        patch("pa_host.gui_server.JLinkMemoryRTT", side_effect=unavailable),
+        patch("pa_host.gui_server.JLINK_EXE") as commander,
+        patch("pa_host.gui_server.probe_jlink_target",
+              return_value=(True, "10000100 = 00052833")) as target,
+    ):
+        commander.is_file.return_value = True
+        state, detail = gui_server._probe_jlink_runtime_firmware(metadata)
+
+    assert state == "missing"
+    assert "control block" in detail
+    target.assert_called_once()
+
+
+def test_jlink_transport_failure_never_authorizes_firmware_update() -> None:
+    metadata = {"rtt_address": "0x20001000"}
+    with (
+        patch("pa_host.gui_server.JLinkMemoryRTT",
+              side_effect=RuntimeError("SWD timeout")),
+        patch("pa_host.gui_server.JLINK_EXE") as commander,
+        patch("pa_host.gui_server.probe_jlink_target",
+              return_value=(True, "10000100 = 00052833")) as target,
+    ):
+        commander.is_file.return_value = True
+        state, detail = gui_server._probe_jlink_runtime_firmware(metadata)
+
+    assert state == "transport_error"
+    assert detail == "SWD timeout"
+    target.assert_called_once()
+
+
+def test_runtime_probe_uses_openocd_after_read_only_jlink_preflight() -> None:
+    metadata = {"rtt_address": "0x20001000"}
+    with (
+        patch("pa_host.gui_server.JLINK_EXE") as commander,
+        patch("pa_host.gui_server.OPENOCD_EXE") as openocd,
+        patch("pa_host.gui_server.OPENOCD_SCRIPTS") as scripts,
+        patch("pa_host.gui_server.probe_jlink_target",
+              return_value=(False, "unsupported Commander")),
+        patch("pa_host.gui_server._openocd_rtt_layout_probe",
+              return_value=(True, True, "SEGGER RTT")),
+        patch("pa_host.gui_server._probe_openocd_runtime_firmware",
+              return_value=("ready", "verified")) as probe,
+    ):
+        commander.is_file.return_value = True
+        openocd.is_file.return_value = True
+        scripts.__truediv__.return_value.is_file.return_value = True
+        state, detail = gui_server._probe_jlink_runtime_firmware(metadata)
+
+    assert (state, detail) == ("ready", "verified")
+    probe.assert_called_once_with(0x20001000, gui_server.JLINK_SERIAL,
+                                  timeout_s=7.0)
+
+
+def test_openocd_missing_rtt_layout_is_recoverable_only_after_chip_identity() -> None:
+    metadata = {"rtt_address": "0x20001000"}
+    with (
+        patch("pa_host.gui_server.JLINK_EXE") as commander,
+        patch("pa_host.gui_server._openocd_rtt_layout_probe",
+              return_value=(True, False, "10000100 = 00052833")) as layout,
+        patch("pa_host.gui_server._probe_openocd_runtime_firmware") as runtime_probe,
+    ):
+        commander.is_file.return_value = False
+        state, detail = gui_server._probe_jlink_runtime_firmware(metadata)
+
+    assert state == "missing"
+    assert "00052833" in detail
+    layout.assert_called_once_with(0x20001000, gui_server.JLINK_SERIAL)
+    runtime_probe.assert_not_called()
+
+
+def test_schedule_start_requires_a_fresh_jlink_identity(tmp_path: Path) -> None:
+    app = AppState()
+    app.save_dir = tmp_path
+    app.workspace_root = tmp_path
+    app.workspace_available = True
+    settings = {"applied": True, "settings": SettingsController.validate({})}
+    with (
+        patch.object(app.settings, "snapshot", return_value=settings),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT_REQUESTED", "rtt"),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
+        patch("pa_host.gui_server._require_jlink_target",
+              side_effect=RuntimeError("目标板无响应")) as require_target,
+        pytest.raises(RuntimeError, match="目标板无响应"),
+    ):
+        app.start_schedule({"sample_role": "calibration"})
+
+    require_target.assert_called_once()
+    assert app.schedule.snapshot()["active"] is False
+
+
+def test_background_discovery_does_not_probe_while_operation_is_busy(
+    monkeypatch,
+) -> None:
+    class BusyLock:
+        def __init__(self) -> None:
+            self.released = False
+
+        def acquire(self, *, blocking: bool) -> bool:
+            assert blocking is False
+            return False
+
+        def release(self) -> None:
+            self.released = True
+
+    lock = BusyLock()
+    app = Mock(operation_lock=lock)
+    cached = [{"id": "jlink:1", "kind": "jlink", "probe_serial": "1"}]
+    discover = Mock(return_value=cached)
+    full_probe = Mock(side_effect=AssertionError("active hardware was probed"))
+    annotate = Mock(side_effect=AssertionError("active target was probed"))
+    remember = Mock()
+    monkeypatch.setattr(gui_server, "APP", app)
+    monkeypatch.setattr(gui_server, "_discover_devices", discover)
+    monkeypatch.setattr(gui_server, "_discover_devices_with_probe", full_probe)
+    monkeypatch.setattr(gui_server, "_annotate_target_states", annotate)
+    monkeypatch.setattr(gui_server, "_remember_device_discovery", remember)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_LOG_SIGNATURE", None)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_LOG_ERROR", "")
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_THREAD", Mock())
+
+    gui_server._run_device_discovery()
+
+    discover.assert_called_once_with(probe=False)
+    full_probe.assert_not_called()
+    annotate.assert_not_called()
+    remember.assert_called_once_with(cached, "")
+    assert lock.released is False
+    assert gui_server.DEVICE_DISCOVERY_THREAD is None
+
+
+def test_device_discovery_forgets_target_cache_after_probe_unplug(
+    monkeypatch,
+) -> None:
+    cache = {"29734569": {"target_state": "reachable"}}
+    monkeypatch.setattr(gui_server, "JLINK_TARGET_CACHE", cache)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", [])
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_AT", 0.0)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_ERROR", "")
+
+    gui_server._remember_device_discovery([])
+
+    assert cache == {}
+
+
+def test_jlink_readback_error_survives_failed_restart_cleanup() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        firmware = root / "firmware.hex"
+        _write_hex(firmware, (0, 0, b"\x12"), (0, 1, b""))
+        commander = root / "JLinkExe"
+        commander.touch()
+        with (
+            patch("pa_host.gui_server.JLINK_EXE", commander),
+            patch("pa_host.gui_server.probe_jlink_target",
+                  return_value=(True, "reachable")),
+            patch.object(SettingsController, "_read_jlink_flash_image",
+                         side_effect=RuntimeError("readback failed")),
+            patch.object(SettingsController, "_run_jlink_application",
+                         side_effect=RuntimeError("restart failed")),
+            pytest.raises(RuntimeError, match="readback failed"),
+        ):
+            SettingsController._flash_firmware(firmware)
+
+
+def test_openocd_fallback_uses_one_bounded_write_verify_run_session() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        firmware = root / "firmware.hex"
+        _write_hex(firmware, (0, 0, b"\x00"), (0, 1, b""))
+        openocd = root / "openocd"
+        scripts = root / "scripts"
+        (scripts / "interface").mkdir(parents=True)
+        (scripts / "target").mkdir()
+        (scripts / "interface/jlink.cfg").write_text("adapter driver jlink")
+        (scripts / "target/nrf52.cfg").write_text("target create")
+        openocd.write_text("openocd", encoding="ascii")
+        openocd.chmod(0o755)
+        output = (
+            "0x10000100: 00052833\n"
+            "wrote 1 bytes from file\nverified 1 bytes in 0.1s\n"
+        )
+        with (
+            patch("pa_host.gui_server.JLINK_EXE", root / "missing-jlink"),
+            patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+            patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+            patch("pa_host.gui_server._openocd_target_probe",
+                  return_value=(True, "0x10000100: 00052833")),
+            patch.object(SettingsController, "_run_openocd_once",
+                         return_value=(0, output)) as run,
+        ):
+            SettingsController._flash_firmware(firmware)
+
+        assert run.call_count == 1
+        commands = run.call_args.args[1:]
+        assert any(command.startswith("flash write_image erase {")
+                   for command in commands)
+        assert any(command.startswith("verify_image {") for command in commands)
+        assert commands[-2:] == ("reset run", "shutdown")
+        assert not any("erase_sector" in command or "0x4001E" in command
+                       for command in commands)
+
+
+def test_openocd_retry_is_bounded_and_never_switches_backend() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        firmware = root / "firmware.hex"
+        _write_hex(firmware, (0, 0, b"\x00"), (0, 1, b""))
+        openocd = root / "openocd"
+        scripts = root / "scripts"
+        (scripts / "interface").mkdir(parents=True)
+        (scripts / "target").mkdir()
+        (scripts / "interface/jlink.cfg").touch()
+        (scripts / "target/nrf52.cfg").touch()
+        openocd.touch()
+        with (
+            patch("pa_host.gui_server.JLINK_EXE", root / "missing-jlink"),
+            patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+            patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+            patch("pa_host.gui_server._openocd_target_probe",
+                  return_value=(True, "0x10000100: 00052833")),
+            patch.object(SettingsController, "_run_openocd_once",
+                         return_value=(1, "failed to read memory")) as run,
+            patch("pa_host.gui_server.time.sleep"),
+            pytest.raises(RuntimeError, match="写入/校验/复位失败"),
         ):
             SettingsController._flash_firmware(firmware)
 
         assert run.call_count == 3
-        events = [event["event"] for event in diagnostics.snapshot()["events"]]
-        assert events[-1] == "firmware.flash.reconnect_failed"
+        assert run.call_args.args[1:] == ("init", "reset run", "shutdown")
 
 
-def test_intel_hex_sector_parser_rejects_corrupt_checksum() -> None:
+def test_intel_hex_parser_rejects_corrupt_checksum() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         firmware = Path(tmp) / "firmware.hex"
         firmware.write_text(":0100000000FE\n", encoding="ascii")
-
         with pytest.raises(RuntimeError, match="Intel HEX 校验和错误"):
-            SettingsController._intel_hex_flash_sectors(firmware)
+            SettingsController._intel_hex_image(firmware)
+
+
+def test_intel_hex_parser_rejects_uicr_overlap_and_records_after_eof() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        uicr = root / "uicr.hex"
+        _write_hex(uicr, (0, 4, b"\x10\x00"), (0x1014, 0, b"\x05"),
+                   (0, 1, b""))
+        with pytest.raises(RuntimeError, match="应用 Flash 之外"):
+            SettingsController._intel_hex_image(uicr)
+
+        overlap = root / "overlap.hex"
+        _write_hex(overlap, (0, 0, b"\x01\x02"), (1, 0, b"\x02"),
+                   (0, 1, b""))
+        with pytest.raises(RuntimeError, match="重叠数据地址"):
+            SettingsController._intel_hex_image(overlap)
+
+        trailing = root / "trailing.hex"
+        _write_hex(trailing, (0, 0, b"\x01"), (0, 1, b""),
+                   (2, 0, b"\x03"))
+        with pytest.raises(RuntimeError, match="EOF 后仍有记录"):
+            SettingsController._intel_hex_image(trailing)
 
 
 def test_control_api_requires_json_and_rejects_cross_origin_posts() -> None:
@@ -2462,6 +2944,7 @@ def test_measurement_watcher_is_non_daemon(tmp_path: Path) -> None:
 
     with (
         patch("pa_host.gui_server.RUNS_DIR", tmp_path),
+        patch("pa_host.gui_server._require_jlink_target"),
         patch("pa_host.gui_server.subprocess.Popen", return_value=process),
         patch("pa_host.gui_server.threading.Thread", return_value=watcher) as thread_cls,
     ):
@@ -2499,6 +2982,7 @@ def test_watcher_start_failure_reclaims_collector_and_gets_diagnostic_id(
         patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
         patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
         patch("pa_host.gui_server.HARDWARE_TRANSPORT_REQUESTED", "rtt"),
+        patch("pa_host.gui_server._require_jlink_target"),
         patch("pa_host.gui_server.subprocess.Popen", return_value=process),
         patch("pa_host.gui_server.threading.Thread", return_value=watcher),
         patch.object(MeasurementController, "_terminate_tree") as terminate,
@@ -3359,6 +3843,7 @@ def test_initial_gate_get_write_failure_still_starts_cleanup_watcher(
     with (
         patch("pa_host.gui_server.RUNS_DIR", tmp_path),
         patch("pa_host.gui_server.DIAGNOSTICS", diagnostics),
+        patch("pa_host.gui_server._require_jlink_target"),
         patch("pa_host.gui_server.subprocess.Popen", return_value=process) as popen,
         patch("pa_host.gui_server.Path.open", autospec=True,
               side_effect=fail_command_append),

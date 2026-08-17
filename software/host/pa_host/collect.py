@@ -20,13 +20,14 @@
     python3 -m pa_host.synth /tmp/fake.csv --hours 1
     python3 -m pa_host.analyze /tmp/fake.csv --fsr-pa 50000
 
-🔴 两个必须知道的坑(2026-07-31 实测)
-    1. SEGGER 后端只能用已验证的 J-Link V8.80，不能用 V9.46。
-       V8.80 不存在时，本模块回退到已验证的 libjaylink OpenOCD。
-       见 docs/troubleshooting/jlink-v9克隆-swd-turnaround不松线.md
-    2. **`JLinkRTTLoggerExe` 的自动搜索找不到本固件的 RTT 控制块**(实测在 0x20001040,
-       魔术字与缓冲都正常),而它**不接受地址参数** ⇒ 只能走 `JLinkExe` 的
-       `exec SetRTTAddr <addr>` + `rtt start`,数据从 telnet 19021 出。本模块即按此实现。
+两个必须知道的坑
+    1. 部分探头不接受 JLinkExe 的命令行 ``-autoconnect`` 初始化，但可以用
+       Commander 脚本中的 ``si/speed/device/connect`` 顺序稳定连接。因此烧录、
+       目标核对和 RTT 都统一使用这条显式连接路径；SEGGER 工具不可用时回退到
+       随包的 libjaylink OpenOCD。
+    2. 部分兼容探头可执行 Commander 的短内存事务，但新版 SEGGER DLL 的异步
+       RTT 轮询持续报 memory read error。系统 J-Link 可用时，本模块直接按公开的
+       SEGGER RTT 环形缓冲布局做带回读校验的短事务；否则使用随包 OpenOCD。
        🔴 该地址**每次重新编译都可能变**,所以默认从 ELF 的 `_SEGGER_RTT` 符号自动提取,
        别硬编码。
 
@@ -34,7 +35,7 @@
    (会把它打掉线)。本模块用 Popen.terminate()。
 
 快照日期
-    2026-07-31
+    2026-08-17
 """
 
 from __future__ import annotations
@@ -48,6 +49,8 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -61,10 +64,11 @@ from .record import (
 )
 from . import runtime
 
-# 首选已验证的 V8.80;路径来自 STM32CubeIDE 自带的 J-Link 工具链。
-# 若 CubeIDE 被移除，回退到启用 libjaylink 的开源 OpenOCD：它仍通过同一个
-# RTT 端口向上层提供完全相同的行协议，不改测量和解析逻辑。
+# 优先使用用户系统中已安装的 SEGGER Commander；若不存在，回退到随包的
+# libjaylink OpenOCD。公开分发包不能重分发 SEGGER 工具，因此这里必须覆盖官方
+# 安装器与 STM32CubeIDE 的跨平台安装位置。
 _IS_WIN = sys.platform == "win32"
+BRIDGE_SHUTDOWN_COMMAND = b"SENSUS_BRIDGE_SHUTDOWN\n"
 
 JLINK_V880_DIR_MACOS = Path(
     "/Applications/STM32CubeIDE.app/Contents/Eclipse/plugins/"
@@ -77,56 +81,81 @@ JLINK_CUBEIDE_WIN = Path("C:/ST/STM32CubeIDE/STM32CubeIDE/plugins/"
     "com.st.stm32cube.ide.mcu.externaltools.jlink.win32_2.5.100.202509120932/tools/bin")
 
 def _resolve_jlink_exe() -> Path:
-    """选 JLinkExe (Windows: JLink.exe):显式 env > V8.80 > PATH。
+    """Find a compatible system-installed J-Link Commander.
 
-    🔴 这个顺序不能反。本机 `shutil.which("JLinkExe")` 解析到
-    /usr/local/bin/JLinkExe → /Applications/SEGGER/JLink_V946/JLinkExe = V9.46,
-    而 V9.x 的 DLL 丢了对克隆固件的 legacy 回退,连不上任何目标
-    (见 docs/troubleshooting/jlink-v9克隆-swd-turnaround不松线.md)。
-    原实现把 which() 排在 V8.80 前面 ⇒ 本文件顶部「只能用 V8.80」的注释
-    与实际行为相反,默认就挑中了坏的那支。2026-08-09 修。
+    The lab's V9-compatible probe implements the older J-Link USB protocol.
+    SEGGER V8.80 is the newest release verified to support its SWD turnaround
+    and Flash algorithm. Keep newer installations as a fallback, but prefer an
+    explicit V8.80 installation when both are present. The environment override
+    remains authoritative for genuine probes and future versions.
     """
     jlink_name = "JLink.exe" if _IS_WIN else "JLinkExe"
     override = os.environ.get("SENSUS_JLINK_EXE")
     if override:
-        return Path(override)
-    if _IS_WIN and runtime.is_frozen():
-        # The Windows portable package ships a pinned libjaylink OpenOCD.
-        # Do not accidentally select an arbitrary host JLink.exe (especially
-        # a V9 install that is incompatible with the validated clone probes).
-        return Path("/__sensus_portable_no_jlink_exe__/JLink.exe")
-    # 按优先级搜索各平台已知位置
+        return Path(override).expanduser()
     candidates: list[Path] = []
     if _IS_WIN:
-        candidates = [
-            JLINK_CUBEIDE_WIN / jlink_name,
-            JLINK_DIR_WIN / jlink_name,
+        program_roots = [
+            Path(os.environ.get("ProgramFiles", "C:/Program Files")),
+            Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")),
         ]
+        candidates.extend(
+            root / "SEGGER" / "JLink_V880" / jlink_name
+            for root in program_roots
+        )
+        candidates.append(JLINK_CUBEIDE_WIN / jlink_name)
+        for root in program_roots:
+            segger = root / "SEGGER"
+            if segger.exists():
+                candidates.extend(sorted(
+                    segger.glob(f"JLink*/{jlink_name}"), reverse=True
+                ))
+        candidates.append(JLINK_DIR_WIN / jlink_name)
+        for st_root in (Path("C:/ST"), program_roots[0] / "STMicroelectronics"):
+            if st_root.exists():
+                candidates.extend(sorted(
+                    st_root.glob(
+                        "**/com.st.stm32cube.ide.mcu.externaltools.jlink.*/"
+                        f"tools/bin/{jlink_name}"
+                    ),
+                    reverse=True,
+                ))
     else:
-        candidates = [JLINK_V880_DIR_MACOS / jlink_name]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+        candidates.extend((
+            Path.home() / "Applications/SEGGER/JLink_V880" / jlink_name,
+            Path("/Applications/SEGGER/JLink_V880") / jlink_name,
+            JLINK_V880_DIR_MACOS / jlink_name,
+        ))
+        for segger in (Path("/Applications/SEGGER"), Path.home() / "Applications/SEGGER"):
+            if segger.exists():
+                candidates.extend(sorted(
+                    segger.glob(f"JLink*/{jlink_name}"), reverse=True
+                ))
+        cubeide = Path("/Applications/STM32CubeIDE.app/Contents/Eclipse/plugins")
+        if cubeide.exists():
+            candidates.extend(sorted(
+                cubeide.glob(
+                    "com.st.stm32cube.ide.mcu.externaltools.jlink.*/"
+                    f"tools/bin/{jlink_name}"
+                ),
+                reverse=True,
+            ))
     found = shutil.which(jlink_name)
     if found:
+        candidates.append(Path(found))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
         try:
-            probe = subprocess.run(
-                [found, "-version"], capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=5,
-                check=False,
-            )
-            banner = f"{probe.stdout}\n{probe.stderr}"
-        except (OSError, subprocess.TimeoutExpired):
-            banner = ""
-        if "V8.80" in banner:
-            return Path(found)
-        print(
-            f"[collect] PATH 里的 {found} 不是已验证的 V8.80;"
-            "自动使用 OpenOCD 兼容通道",
-            file=sys.stderr,
-        )
-    # Return a deliberately absent path so callers select the OpenOCD branch.
-    return Path("/__sensus_no_compatible_jlink__/JLinkExe")
+            canonical = candidate.resolve()
+        except OSError:
+            canonical = candidate
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return Path(f"/__sensus_no_system_jlink__/{jlink_name}")
 
 
 JLINK_EXE = _resolve_jlink_exe()
@@ -219,8 +248,18 @@ ZEPHYR_SDK_NM = Path(
 )
 
 DEVICE = "nRF52833_xxAA"
-SPEED_KHZ = 4000
+# Some older and compatible probes need a slow first SWD handshake even though
+# they can run faster after the DAP is awake. The workstation traffic is small,
+# so keeping the complete session at 100 kHz costs little and removes a class of
+# intermittent first-connect failures seen at 1/4 MHz.
+SPEED_KHZ = 100
+JLINK_PROBE_ATTEMPTS = 2
 RTT_TELNET_PORT = 19021
+RTT_RAM_START = 0x20000000
+RTT_RAM_END = 0x20020000
+RTT_MAX_CHANNELS = 16
+RTT_MAX_BUFFER_SIZE = 64 * 1024
+RTT_BRIDGE_POLL_INTERVAL_S = 0.08
 # 触发命令未被固件确认前的重发间隔与最大次数。
 # 🔴 按**挂钟时间**重发,不依赖 socket 空闲 —— 固件仍在吐上一轮数据时永不空闲。
 TRIGGER_RESEND_INTERVAL_S = 1.0
@@ -229,6 +268,623 @@ SERIAL_TRIGGER_RESEND_INTERVAL_S = 3.0
 # 命令文件轮询间隔(方案 C:外部命令经采集器 socket 转发给固件)
 CMD_POLL_INTERVAL_S = 0.5
 DEFAULT_ELF = Path("/tmp/pabuild/firmware/zephyr/zephyr.elf")
+NRF52833_INFO_PART_ADDRESS = 0x10000100
+NRF52833_INFO_PART_VALUE = 0x00052833
+
+
+def jlink_connection_script(*commands: str, speed_khz: int = SPEED_KHZ) -> str:
+    """Build the explicit connection sequence accepted by all tested probes."""
+    lines = [
+        "si SWD",
+        f"speed {int(speed_khz)}",
+        f"device {DEVICE}",
+        "connect",
+        *commands,
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def run_jlink_script(
+    script: str,
+    probe_serial: str | None = None,
+    *,
+    executable: Path | None = None,
+    timeout_s: float = 15.0,
+    cancel_event: threading.Event | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run one Commander script and always remove its temporary file."""
+    executable = executable or JLINK_EXE
+    if not executable.is_file():
+        raise FileNotFoundError(f"J-Link Commander not found: {executable}")
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".jlink", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(script)
+        script_path = Path(handle.name)
+    command = [str(executable), "-NoGui", "1", "-ExitOnError", "1"]
+    if probe_serial:
+        command += ["-SelectEmuBySN", str(probe_serial)]
+    command += ["-CommanderScript", str(script_path)]
+    try:
+        if cancel_event is not None:
+            if cancel_event.is_set():
+                raise JLinkOperationCancelled("J-Link Commander operation cancelled")
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            deadline = time.monotonic() + max(1.0, timeout_s)
+            while True:
+                if cancel_event.is_set():
+                    process.terminate()
+                    try:
+                        process.communicate(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+                    raise JLinkOperationCancelled(
+                        "J-Link Commander operation cancelled"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.terminate()
+                    try:
+                        stdout, stderr = process.communicate(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                    raise subprocess.TimeoutExpired(
+                        command, timeout_s, output=stdout, stderr=stderr
+                    )
+                try:
+                    stdout, stderr = process.communicate(
+                        timeout=min(0.1, remaining)
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
+                return subprocess.CompletedProcess(
+                    command, process.returncode, stdout, stderr
+                )
+        return subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(1.0, timeout_s),
+        )
+    finally:
+        script_path.unlink(missing_ok=True)
+
+
+class JLinkOperationCancelled(RuntimeError):
+    """Raised when bridge shutdown interrupts an in-flight Commander call."""
+
+
+class RTTControlBlockUnavailable(RuntimeError):
+    """The expected RTT layout is absent from an otherwise readable target."""
+
+
+def probe_jlink_target(
+    probe_serial: str | None = None,
+    *,
+    executable: Path | None = None,
+    timeout_s: float = 10.0,
+) -> tuple[bool, str]:
+    """Read nRF52833 INFO.PART without resetting or writing the target.
+
+    Commander can return exit code zero after a failed ``connect``. Match the
+    FICR value and retry once so a transient first SWD handshake never becomes
+    either a false connected state or an unnecessary OpenOCD fallback.
+    """
+    script = jlink_connection_script(
+        f"mem32 0x{NRF52833_INFO_PART_ADDRESS:08X} 1",
+        "q",
+    )
+    expected = re.compile(
+        rf"\b{NRF52833_INFO_PART_ADDRESS:08X}\s*=\s*"
+        rf"{NRF52833_INFO_PART_VALUE:08X}\b",
+        flags=re.IGNORECASE,
+    )
+    outputs: list[str] = []
+    for attempt in range(JLINK_PROBE_ATTEMPTS):
+        try:
+            done = run_jlink_script(
+                script,
+                probe_serial,
+                executable=executable,
+                timeout_s=timeout_s,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            outputs.append(str(exc))
+        else:
+            output = f"{done.stdout}\n{done.stderr}"
+            outputs.append(output)
+            if done.returncode == 0 and expected.search(output):
+                return True, "\n".join(outputs)
+        if attempt + 1 < JLINK_PROBE_ATTEMPTS:
+            time.sleep(0.15)
+    return False, "\n".join(outputs)
+
+
+def _parse_jlink_mem32(output: str, address: int, count: int) -> list[int]:
+    """Parse an exact contiguous Commander ``mem32`` result."""
+    words: dict[int, int] = {}
+    for line in output.splitlines():
+        match = re.match(
+            r"^\s*([0-9A-Fa-f]{8})\s*=\s*"
+            r"((?:[0-9A-Fa-f]{8}(?:\s+|$))+)",
+            line,
+        )
+        if match is None:
+            continue
+        line_address = int(match.group(1), 16)
+        for index, raw_word in enumerate(match.group(2).split()):
+            words[line_address + index * 4] = int(raw_word, 16)
+    expected = [address + index * 4 for index in range(count)]
+    missing = [item for item in expected if item not in words]
+    if missing:
+        raise RuntimeError(
+            "JLinkExe 内存读取不完整，缺少地址:"
+            + ", ".join(f"0x{item:08X}" for item in missing[:4])
+        )
+    return [words[item] for item in expected]
+
+
+def _jlink_file_argument(path: Path) -> str:
+    text = str(path.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+    if "\n" in text or "\r" in text:
+        raise RuntimeError(f"JLinkExe 无法处理临时文件路径:{path}")
+    return f'"{text}"'
+
+
+class JLinkMemoryRTT:
+    """Minimal RTT channel-0 transport built from verified memory operations.
+
+    Some compatible probes can perform short Commander memory transactions but
+    fail the asynchronous RTT APIs in newer SEGGER DLLs. This transport follows
+    the public SEGGER RTT ring-buffer layout directly. Every pointer update and
+    every down-channel payload is read back before it becomes visible to the
+    target, so a transient SWD failure cannot silently become a command or a
+    duplicate measurement.
+    """
+
+    _TRANSIENT_MARKERS = (
+        "could not read memory",
+        "could not write memory",
+        "cannot connect to target",
+        "failed to connect",
+        "script execution aborted",
+        "error while programming",
+    )
+
+    def __init__(
+        self,
+        rtt_addr: int,
+        probe_serial: str | None,
+        *,
+        executable: Path | None = None,
+    ) -> None:
+        self.rtt_addr = int(rtt_addr)
+        self.probe_serial = probe_serial
+        self.executable = executable or JLINK_EXE
+        self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._operation_done = threading.Event()
+        self._operation_done.set()
+        self._closed = False
+        self._temporary = tempfile.TemporaryDirectory(prefix="sensus-rtt-")
+        self._sequence = 0
+        self.up_descriptor = 0
+        self.down_descriptor = 0
+        self.up_buffer = 0
+        self.down_buffer = 0
+        self.up_size = 0
+        self.down_size = 0
+        try:
+            self._load_layout()
+        except BaseException:
+            self._temporary.cleanup()
+            self._closed = True
+            raise
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def close(self) -> None:
+        self.cancel()
+        if not self._operation_done.wait(5.0):
+            return
+        with self._close_lock:
+            if self._closed:
+                return
+            self._temporary.cleanup()
+            self._closed = True
+
+    def _run(
+        self,
+        *commands: str,
+        timeout_s: float = 20.0,
+        attempts: int = 3,
+    ) -> str:
+        outputs: list[str] = []
+        self._operation_done.clear()
+        try:
+            if self._cancel.is_set():
+                raise JLinkOperationCancelled(
+                    "J-Link Commander operation cancelled"
+                )
+            for attempt in range(max(1, attempts)):
+                done = run_jlink_script(
+                    jlink_connection_script(*commands, "q"),
+                    self.probe_serial,
+                    executable=self.executable,
+                    timeout_s=timeout_s,
+                    cancel_event=self._cancel,
+                )
+                blob = f"{done.stdout}\n{done.stderr}"
+                outputs.append(blob)
+                lowered = blob.lower()
+                succeeded = (
+                    done.returncode == 0
+                    and "Script processing completed." in blob
+                    and not any(marker in lowered for marker in self._TRANSIENT_MARKERS)
+                )
+                if succeeded:
+                    return blob
+                if attempt + 1 < attempts:
+                    if self._cancel.wait(0.08 * (attempt + 1)):
+                        raise JLinkOperationCancelled(
+                            "J-Link Commander operation cancelled"
+                        )
+        finally:
+            self._operation_done.set()
+        tail = [
+            line.strip()
+            for line in "\n".join(outputs).splitlines()
+            if line.strip()
+        ][-8:]
+        raise RuntimeError("JLinkExe RTT 内存操作失败:" + " | ".join(tail))
+
+    @staticmethod
+    def _validate_buffer(name: str, address: int, size: int) -> None:
+        if (
+            size <= 1
+            or size > RTT_MAX_BUFFER_SIZE
+            or address < RTT_RAM_START
+            or address + size > RTT_RAM_END
+        ):
+            raise RuntimeError(
+                f"RTT {name} 缓冲区越界:addr=0x{address:08X}, size={size}"
+            )
+
+    def _load_layout(self) -> None:
+        if self.rtt_addr < RTT_RAM_START or self.rtt_addr + 24 > RTT_RAM_END:
+            raise RuntimeError(f"RTT 控制块地址越界:0x{self.rtt_addr:08X}")
+        header_blob = self._run(f"mem32 0x{self.rtt_addr:08X} 6")
+        header = _parse_jlink_mem32(header_blob, self.rtt_addr, 6)
+        magic = b"".join(word.to_bytes(4, "little") for word in header[:4])
+        if magic != b"SEGGER RTT\x00\x00\x00\x00\x00\x00":
+            raise RTTControlBlockUnavailable(
+                f"0x{self.rtt_addr:08X} 不是有效的 SEGGER RTT 控制块"
+            )
+        up_count, down_count = header[4:6]
+        if not 1 <= up_count <= RTT_MAX_CHANNELS:
+            raise RuntimeError(f"RTT 上行通道数量异常:{up_count}")
+        if not 1 <= down_count <= RTT_MAX_CHANNELS:
+            raise RuntimeError(f"RTT 下行通道数量异常:{down_count}")
+
+        self.up_descriptor = self.rtt_addr + 24
+        self.down_descriptor = self.up_descriptor + up_count * 24
+        if self.down_descriptor + down_count * 24 > RTT_RAM_END:
+            raise RuntimeError("RTT 通道描述符越过 nRF52833 RAM")
+        descriptors = self._run(
+            f"mem32 0x{self.up_descriptor:08X} 6",
+            f"mem32 0x{self.down_descriptor:08X} 6",
+        )
+        up = _parse_jlink_mem32(descriptors, self.up_descriptor, 6)
+        down = _parse_jlink_mem32(descriptors, self.down_descriptor, 6)
+        self.up_buffer, self.up_size = up[1], up[2]
+        self.down_buffer, self.down_size = down[1], down[2]
+        self._validate_buffer("上行", self.up_buffer, self.up_size)
+        self._validate_buffer("下行", self.down_buffer, self.down_size)
+        self._validate_descriptor("上行", up, self.up_buffer, self.up_size)
+        self._validate_descriptor("下行", down, self.down_buffer, self.down_size)
+
+    @staticmethod
+    def _validate_descriptor(
+        name: str,
+        descriptor: list[int],
+        expected_buffer: int,
+        expected_size: int,
+    ) -> None:
+        if descriptor[1] != expected_buffer or descriptor[2] != expected_size:
+            raise RuntimeError(f"RTT {name}缓冲区在读取期间发生变化")
+        if descriptor[3] >= expected_size or descriptor[4] >= expected_size:
+            raise RuntimeError(
+                f"RTT {name}指针越界:wr={descriptor[3]}, rd={descriptor[4]}, "
+                f"size={expected_size}"
+            )
+
+    def _descriptor(self, *, up: bool) -> list[int]:
+        address = self.up_descriptor if up else self.down_descriptor
+        expected_buffer = self.up_buffer if up else self.down_buffer
+        expected_size = self.up_size if up else self.down_size
+        blob = self._run(f"mem32 0x{address:08X} 6")
+        descriptor = _parse_jlink_mem32(blob, address, 6)
+        self._validate_descriptor(
+            "上行" if up else "下行",
+            descriptor,
+            expected_buffer,
+            expected_size,
+        )
+        return descriptor
+
+    def discard_pending_up(self) -> None:
+        """Atomically discard bytes predating this collector connection."""
+        with self._lock:
+            descriptor = self._descriptor(up=True)
+            write_offset = descriptor[3]
+            read_pointer = self.up_descriptor + 16
+            blob = self._run(
+                f"w4 0x{read_pointer:08X}, 0x{write_offset:08X}",
+                f"mem32 0x{read_pointer:08X} 1",
+            )
+            confirmed = _parse_jlink_mem32(blob, read_pointer, 1)[0]
+            if confirmed != write_offset:
+                raise RuntimeError("JLinkExe 未能确认清空 RTT 历史上行数据")
+
+    def _next_file(self, label: str) -> Path:
+        self._sequence += 1
+        return Path(self._temporary.name) / f"{self._sequence:08d}-{label}.bin"
+
+    def recv(self, _max_bytes: int = 65536) -> bytes:
+        with self._lock:
+            descriptor = self._descriptor(up=True)
+            write_offset, read_offset = descriptor[3], descriptor[4]
+            available = (write_offset - read_offset) % self.up_size
+            if available == 0:
+                return b""
+
+            first_length = min(available, self.up_size - read_offset)
+            second_length = available - first_length
+            first_path = self._next_file("up-a")
+            second_path = self._next_file("up-b") if second_length else None
+            commands = [
+                f"savebin {_jlink_file_argument(first_path)}, "
+                f"0x{self.up_buffer + read_offset:08X}, 0x{first_length:X}"
+            ]
+            if second_path is not None:
+                commands.append(
+                    f"savebin {_jlink_file_argument(second_path)}, "
+                    f"0x{self.up_buffer:08X}, 0x{second_length:X}"
+                )
+            read_pointer = self.up_descriptor + 16
+            commands.extend((
+                f"w4 0x{read_pointer:08X}, 0x{write_offset:08X}",
+                f"mem32 0x{read_pointer:08X} 1",
+            ))
+            try:
+                blob = self._run(*commands, timeout_s=30)
+                confirmed = _parse_jlink_mem32(blob, read_pointer, 1)[0]
+                if confirmed != write_offset:
+                    raise RuntimeError("JLinkExe 未能确认 RTT 上行读指针")
+                first = first_path.read_bytes()
+                second = second_path.read_bytes() if second_path is not None else b""
+                if len(first) != first_length or len(second) != second_length:
+                    raise RuntimeError("JLinkExe 保存的 RTT 上行长度不完整")
+                return first + second
+            finally:
+                first_path.unlink(missing_ok=True)
+                if second_path is not None:
+                    second_path.unlink(missing_ok=True)
+
+    def sendall(self, payload: bytes, timeout_s: float = 8.0) -> None:
+        if not payload:
+            return
+        deadline = time.monotonic() + timeout_s
+        sent = 0
+        with self._lock:
+            while sent < len(payload):
+                descriptor = self._descriptor(up=False)
+                write_offset, read_offset = descriptor[3], descriptor[4]
+                free = self.down_size - 1 - (
+                    (write_offset - read_offset) % self.down_size
+                )
+                if free <= 0:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("RTT 下行缓冲区持续占满，固件未消费命令")
+                    time.sleep(0.04)
+                    continue
+                chunk = payload[sent:sent + min(free, 64)]
+                commands: list[str] = []
+                for index, value in enumerate(chunk):
+                    address = self.down_buffer + (
+                        (write_offset + index) % self.down_size
+                    )
+                    commands.append(f"w1 0x{address:08X}, 0x{value:02X}")
+
+                first_length = min(len(chunk), self.down_size - write_offset)
+                second_length = len(chunk) - first_length
+                first_path = self._next_file("down-a")
+                second_path = self._next_file("down-b") if second_length else None
+                commands.append(
+                    f"savebin {_jlink_file_argument(first_path)}, "
+                    f"0x{self.down_buffer + write_offset:08X}, 0x{first_length:X}"
+                )
+                if second_path is not None:
+                    commands.append(
+                        f"savebin {_jlink_file_argument(second_path)}, "
+                        f"0x{self.down_buffer:08X}, 0x{second_length:X}"
+                    )
+                next_offset = (write_offset + len(chunk)) % self.down_size
+                write_pointer = self.down_descriptor + 12
+                commands.extend((
+                    f"w4 0x{write_pointer:08X}, 0x{next_offset:08X}",
+                    f"mem32 0x{write_pointer:08X} 1",
+                ))
+                try:
+                    blob = self._run(*commands, timeout_s=30)
+                    echoed = first_path.read_bytes()
+                    if second_path is not None:
+                        echoed += second_path.read_bytes()
+                    if echoed != chunk:
+                        raise RuntimeError("JLinkExe RTT 下行命令回读不一致")
+                    confirmed = _parse_jlink_mem32(
+                        blob, write_pointer, 1
+                    )[0]
+                    if confirmed != next_offset:
+                        raise RuntimeError("JLinkExe 未能确认 RTT 下行写指针")
+                finally:
+                    first_path.unlink(missing_ok=True)
+                    if second_path is not None:
+                        second_path.unlink(missing_ok=True)
+                sent += len(chunk)
+
+
+class JLinkMemoryRTTBridge:
+    """Expose :class:`JLinkMemoryRTT` as one local bidirectional socket."""
+
+    stdin = None
+
+    def __init__(
+        self,
+        transport: JLinkMemoryRTT,
+        port: int,
+        control_port: int | None = None,
+    ) -> None:
+        self.transport = transport
+        self.port = int(port)
+        self._stop = threading.Event()
+        self._done = threading.Event()
+        self._error: BaseException | None = None
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", self.port))
+        self._listener.listen(1)
+        self._listener.settimeout(0.2)
+        self._control_listener: socket.socket | None = None
+        self._control_thread: threading.Thread | None = None
+        if control_port is not None:
+            control_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            control_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                control_listener.bind(("127.0.0.1", int(control_port)))
+                control_listener.listen(1)
+                control_listener.settimeout(0.2)
+                self._control_listener = control_listener
+                self._control_thread = threading.Thread(
+                    target=self._serve_control,
+                    name=f"jlink-memory-rtt-control-{control_port}",
+                    daemon=True,
+                )
+                self._control_thread.start()
+            except OSError:
+                control_listener.close()
+        self._thread = threading.Thread(
+            target=self._serve,
+            name=f"jlink-memory-rtt-{self.port}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _serve_control(self) -> None:
+        listener = self._control_listener
+        if listener is None:
+            return
+        while not self._stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except (OSError, socket.timeout):
+                continue
+            try:
+                connection.settimeout(1)
+                payload = connection.recv(len(BRIDGE_SHUTDOWN_COMMAND) + 1)
+                if payload == BRIDGE_SHUTDOWN_COMMAND:
+                    self.terminate()
+                    return
+            except OSError:
+                pass
+            finally:
+                connection.close()
+
+    def _serve(self) -> None:
+        client: socket.socket | None = None
+        try:
+            while not self._stop.is_set() and client is None:
+                try:
+                    client, _ = self._listener.accept()
+                except socket.timeout:
+                    continue
+            if client is None:
+                return
+            client.settimeout(0.02)
+            while not self._stop.is_set():
+                try:
+                    incoming = client.recv(4096)
+                    if not incoming:
+                        break
+                    self.transport.sendall(incoming)
+                except socket.timeout:
+                    pass
+                outgoing = self.transport.recv()
+                if outgoing:
+                    client.sendall(outgoing)
+                else:
+                    self._stop.wait(RTT_BRIDGE_POLL_INTERVAL_S)
+        except BaseException as exc:
+            if not (self._stop.is_set() and isinstance(
+                exc, JLinkOperationCancelled
+            )):
+                self._error = exc
+                print(f"[collect] J-Link RTT 内存桥失败:{exc}", file=sys.stderr)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except OSError:
+                    pass
+            try:
+                self._listener.close()
+            except OSError:
+                pass
+            if self._control_listener is not None:
+                try:
+                    self._control_listener.close()
+                except OSError:
+                    pass
+            self.transport.close()
+            self._done.set()
+
+    def poll(self) -> int | None:
+        return 1 if self._error is not None else (0 if self._done.is_set() else None)
+
+    def terminate(self) -> None:
+        self._stop.set()
+        self.transport.cancel()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        if self._control_listener is not None:
+            try:
+                self._control_listener.close()
+            except OSError:
+                pass
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._done.wait(timeout):
+            raise subprocess.TimeoutExpired("JLinkMemoryRTTBridge", timeout)
+        return 1 if self._error is not None else 0
+
+    def kill(self) -> None:
+        self.terminate()
 
 
 class _AcquisitionDuration:
@@ -327,44 +983,62 @@ def find_rtt_address(elf: Path) -> int:
 # 取数来源
 # --------------------------------------------------------------------------
 def start_jlink_rtt(rtt_addr: int, probe_serial: str | None,
-                    port: int, reset_before_read: bool = False) -> subprocess.Popen:
+                    port: int, reset_before_read: bool = False) -> Any:
     """起 RTT 桥，数据出到 telnet ``port``。
 
-    优先保留已验证的 JLinkExe V8.80 通路。它不存在时，使用
-    libjaylink OpenOCD 建立等价的 RTT server。
+    系统 Commander 可到达目标时，使用带回读校验的内存桥。它不存在或无法
+    到达目标时，使用 libjaylink OpenOCD 建立等价的 RTT server。
     """
-    if JLINK_EXE.exists():
-        cmd = [str(JLINK_EXE), "-NoGui", "1", "-RTTTelnetPort", str(port)]
-        if probe_serial:
-            cmd += ["-SelectEmuBySN", probe_serial]
-
-        print(f"[collect] 启动 JLinkExe,RTT 控制块 @ 0x{rtt_addr:08X},telnet {port}",
-              file=sys.stderr)
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace",
+    jlink_ready = False
+    if JLINK_EXE.is_file():
+        jlink_ready, probe_output = probe_jlink_target(
+            probe_serial, executable=JLINK_EXE, timeout_s=10,
         )
-        assert proc.stdin is not None
-        reset_cmds = "r\nsleep 100\ng\nsleep 500\n" if reset_before_read else ""
-        proc.stdin.write(
-            f"si SWD\nspeed {SPEED_KHZ}\ndevice {DEVICE}\nconnect\n"
-            f"{reset_cmds}exec SetRTTAddr 0x{rtt_addr:08X}\nrtt start\n"
+        if not jlink_ready:
+            tail = [line.strip() for line in probe_output.splitlines()
+                    if line.strip()][-3:]
+            print(
+                "[collect] 系统 JLinkExe 未能连接目标，改用随包 OpenOCD: "
+                + " | ".join(tail),
+                file=sys.stderr,
+            )
+    if jlink_ready:
+        print(
+            f"[collect] 启动 J-Link RTT 内存桥,控制块 @ 0x{rtt_addr:08X},"
+            f"本地端口 {port}",
+            file=sys.stderr,
         )
-        proc.stdin.flush()   # 不关 stdin:JLinkExe 读到 EOF 会退出
-        return proc
+        try:
+            transport = JLinkMemoryRTT(
+                rtt_addr,
+                probe_serial,
+                executable=JLINK_EXE,
+            )
+            # Clearing the up-channel pointer is both more reliable and less
+            # intrusive than resetting the board: only bytes predating this
+            # collector are discarded, while AFE polarization remains intact.
+            if reset_before_read:
+                transport.discard_pending_up()
+            return JLinkMemoryRTTBridge(
+                transport, port, control_port=19022 if port == 19021 else None,
+            )
+        except Exception:
+            # A reachable Commander followed by an invalid or unverifiable RTT
+            # layout is a hard failure. Falling through to another backend would
+            # turn data corruption into an apparently successful measurement.
+            raise
 
-    if not OPENOCD_EXE.exists() or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").exists():
+    if not OPENOCD_EXE.is_file() or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").exists():
         sys.exit(
-            f"找不到 {JLINK_EXE}，也找不到可用的 libjaylink OpenOCD\n"
-            "→ 设 SENSUS_JLINK_EXE 指向 V8.80，或设 SENSUS_OPENOCD_EXE/"
+            f"{JLINK_EXE} 未能连接目标，也找不到可用的 libjaylink OpenOCD\n"
+            "→ 设 SENSUS_JLINK_EXE 指向系统 JLinkExe，或设 SENSUS_OPENOCD_EXE/"
             "SENSUS_OPENOCD_SCRIPTS。"
         )
 
     adapter_serial = f"adapter serial {probe_serial}; " if probe_serial else ""
     reset_cmds = "reset halt; reset run; sleep 500; " if reset_before_read else ""
     server_commands = (
-        f"{adapter_serial}adapter speed {SPEED_KHZ}; init; {reset_cmds}"
+        f"{adapter_serial}adapter speed {SPEED_KHZ}; init; poll off; {reset_cmds}"
         f"rtt setup 0x{rtt_addr:08X} 0x100 \"SEGGER RTT\"; "
         f"rtt start; rtt server start {port} 0"
     )
@@ -1343,7 +2017,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("   1) lsusb | grep J-Link   ← 探头还在 USB 上?",
                   file=sys.stderr)
-        print("   2) V8.80 的 JLinkExe 能 connect 吗(V9.46 一定不行)", file=sys.stderr)
+        print("   2) 系统 JLinkExe 能否用显式 connect 命令连接目标", file=sys.stderr)
         print("   3) RTT 地址对吗:nm zephyr.elf | grep _SEGGER_RTT", file=sys.stderr)
         print("   4) 固件真的在跑吗(halt 看 PC;空片是 0xFFFFFFFE)", file=sys.stderr)
         return 1

@@ -9,7 +9,18 @@ $Venv = Join-Path $Artifacts "build-env\windows-x64"
 $Release = Join-Path $Artifacts "releases\$Version\SensUs-Workstation-Windows-x64-$Version"
 $VenvPython = Join-Path $Venv "Scripts\python.exe"
 
+$SelectedVersion = & $Python -c "import json,sys; print(json.dumps(list(sys.version_info[:2])))"
+if ($LASTEXITCODE -ne 0 -or $SelectedVersion.Trim() -ne '[3, 12]') {
+  throw "Portable Windows builds require Python 3.12; selected: $SelectedVersion"
+}
+
 New-Item -ItemType Directory -Force -Path $Build, (Split-Path $Venv), (Split-Path $Release) | Out-Null
+if (Test-Path $VenvPython) {
+  $VenvVersion = & $VenvPython -c "import json,sys; print(json.dumps(list(sys.version_info[:2])))"
+  if ($VenvVersion.Trim() -ne '[3, 12]') {
+    Remove-Item -Recurse -Force $Venv
+  }
+}
 if (-not (Test-Path $VenvPython)) { & $Python -m venv $Venv }
 & $VenvPython -m pip install --disable-pip-version-check -e "${Root}[portable]"
 & $VenvPython -m PyInstaller --noconfirm --clean `

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SensUs 电化学工作站</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20260817-workspace-picker">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260817-jlink-target-gate">
 </head>
 <body>
   <div class="app-shell">
@@ -18,7 +18,7 @@
         <button class="nav-item" data-view="debug"><span>⚙</span>硬件 DEBUG</button>
       </nav>
       <div class="sidebar-footer">
-        <div class="device-row" id="deviceStatus"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small id="deviceTransport">连接方式检查中 · MAX30131</small></div></div>
+        <div class="device-row" id="deviceStatus"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small id="deviceTransport">连接方式检查中</small></div></div>
         <div class="firmware-note" id="firmwareNote">+0.2 V · 500 nA FSR</div>
       </div>
     </aside>
@@ -147,7 +147,7 @@
                 <label id="dcOffsetField">偏置电流<select id="offsetNA"><option value="9nA">9 nA</option><option value="19nA">19 nA</option><option value="40nA">40 nA</option><option value="80nA">80 nA</option><option value="10pct" data-pct="10" selected>10% FSR</option><option value="20pct" data-pct="20">20% FSR</option><option value="50pct" data-pct="50">50% FSR</option></select></label>
                 <div class="sampling-note"><strong id="outputPoints">1800 点</strong><span>MAX30131 原生约 8.06 Hz；更高输出频率由时间戳重采样生成</span></div>
                 <div class="notice warn" id="reflashWarn" hidden></div>
-                <button class="secondary full apply-settings" id="applySettings">应用条件并烧录硬件</button>
+                <button class="secondary full apply-settings" id="applySettings">应用条件</button>
               </section>
 
               <section class="measure-control-panel hardware-controls" data-control-panel="hardware" role="tabpanel">
@@ -430,6 +430,6 @@
     <div id="deviceList" class="device-list"></div>
   </dialog>
   <div class="toast" id="toast"></div>
-  <script src="/assets/app.js?v=20260817-workspace-picker"></script>
+  <script src="/assets/app.js?v=20260817-jlink-target-gate"></script>
 </body>
 </html>

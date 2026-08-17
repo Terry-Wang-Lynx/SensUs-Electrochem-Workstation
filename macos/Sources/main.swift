@@ -13,6 +13,7 @@ private final class BackendManager {
     private var consecutiveHealthFailures = 0
     private var recoveryInProgress = false
     private var intentionalShutdown = false
+    var onServerRecovered: ((URL) -> Void)?
     let projectRoot: URL
     let stateURL: URL
     let logURL: URL
@@ -59,23 +60,7 @@ private final class BackendManager {
     }
 
     private func launchServer() throws {
-        let bundledBackendCandidates: [URL] = {
-            guard let resources = Bundle.main.resourceURL else { return [] }
-            // PyInstaller's macOS onedir build stores the executable inside
-            // its distribution directory; keep the one-file layout working too.
-            return [
-                resources.appendingPathComponent("backend/SensUsBackend/SensUsBackend"),
-                resources.appendingPathComponent("backend/SensUsBackend"),
-            ]
-        }()
-        let bundledBackend = bundledBackendCandidates.first { candidate in
-            var isDirectory = ObjCBool(false)
-            return FileManager.default.fileExists(
-                atPath: candidate.path,
-                isDirectory: &isDirectory
-            ) && !isDirectory.boolValue
-                && FileManager.default.isExecutableFile(atPath: candidate.path)
-        }
+        let bundledBackend = Self.resolveBundledBackend()
         let usingBundledBackend = bundledBackend != nil
         let executable: URL
         let arguments: [String]
@@ -289,9 +274,13 @@ private final class BackendManager {
             do {
                 self.serverPort = try Self.findAvailablePort(preferred: self.serverPort)
                 try self.launchServer()
-                self.pollUntilReady(attempt: 0) { [weak self] _ in
-                    self?.consecutiveHealthFailures = 0
-                    self?.recoveryInProgress = false
+                self.pollUntilReady(attempt: 0) { [weak self] result in
+                    guard let self else { return }
+                    self.consecutiveHealthFailures = 0
+                    self.recoveryInProgress = false
+                    if case .success(let url) = result {
+                        self.onServerRecovered?(url)
+                    }
                 }
             } catch {
                 self.recoveryInProgress = false
@@ -305,7 +294,15 @@ private final class BackendManager {
         var candidates: [URL] = []
 
         if let resources = Bundle.main.resourceURL {
-            candidates.append(resources.appendingPathComponent("workstation", isDirectory: true))
+            let bundledResources = resources.appendingPathComponent(
+                "workstation", isDirectory: true
+            )
+            // A portable build must remain isolated from developer checkouts,
+            // persisted source paths, and host-side firmware/tooling.
+            if resolveBundledBackend() != nil {
+                return bundledResources.standardizedFileURL
+            }
+            candidates.append(bundledResources)
         }
 
         if let configured = environment["SENSUS_PROJECT_DIR"], !configured.isEmpty {
@@ -338,6 +335,24 @@ private final class BackendManager {
             return root.standardizedFileURL
         }
         return candidates.first ?? Bundle.main.bundleURL.deletingLastPathComponent()
+    }
+
+    private static func resolveBundledBackend() -> URL? {
+        guard let resources = Bundle.main.resourceURL else { return nil }
+        // PyInstaller's macOS onedir build stores the executable inside its
+        // distribution directory; keep the one-file layout working too.
+        let candidates = [
+            resources.appendingPathComponent("backend/SensUsBackend/SensUsBackend"),
+            resources.appendingPathComponent("backend/SensUsBackend"),
+        ]
+        return candidates.first { candidate in
+            var isDirectory = ObjCBool(false)
+            return FileManager.default.fileExists(
+                atPath: candidate.path,
+                isDirectory: &isDirectory
+            ) && !isDirectory.boolValue
+                && FileManager.default.isExecutableFile(atPath: candidate.path)
+        }
     }
 
     private enum BackendError: LocalizedError {
@@ -397,14 +412,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         configureMenus()
         configureMainWindow()
         configureOverlayPanel()
+        backend.onServerRecovered = { [weak self] url in
+            self?.loadRecoveredServer(url)
+        }
         showLoadingPage()
         backend.ensureServer { [weak self] result in
             guard let self else { return }
             switch result {
             case .success(let url):
-                self.mainWebView.load(
-                    URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
-                )
+                self.loadMainPage(url)
             case .failure(let error):
                 self.showStartupError(error.localizedDescription)
             }
@@ -703,6 +719,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
     }
 
+    private func loadMainPage(_ url: URL) {
+        mainWebView.load(
+            URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        )
+    }
+
+    private func loadRecoveredServer(_ url: URL) {
+        loadMainPage(url)
+        if overlayPanel.isVisible {
+            loadOverlayPage()
+        }
+    }
+
     @objc private func openInBrowser() {
         NSWorkspace.shared.open(backend.serverURL)
     }
@@ -731,17 +760,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func loadOverlayPage() {
-        let compactFile = backend.projectRoot
-            .appendingPathComponent("software/host/pa_host/gui/compact.html")
-        guard let html = try? String(contentsOf: compactFile, encoding: .utf8) else {
-            overlayWebView.loadHTMLString(Self.statusHTML(
-                title: "无法打开悬浮检测窗",
-                detail: "找不到迷你检测界面：\(compactFile.path)",
-                isError: true
-            ), baseURL: nil)
-            return
-        }
-        overlayWebView.loadHTMLString(html, baseURL: backend.serverURL)
+        let compactURL = URL(string: "compact", relativeTo: backend.serverURL)!
+        overlayWebView.load(
+            URLRequest(url: compactURL, cachePolicy: .reloadIgnoringLocalCacheData)
+        )
     }
 
     private func showLoadingPage() {

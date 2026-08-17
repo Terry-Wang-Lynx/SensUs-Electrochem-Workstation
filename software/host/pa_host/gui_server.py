@@ -51,12 +51,23 @@ from .it import (
     summarize_run,
 )
 from .collect import (
-    DEVICE as JLINK_DEVICE,
+    BRIDGE_SHUTDOWN_COMMAND,
     JLINK_EXE,
+    JLinkMemoryRTT,
+    RTTControlBlockUnavailable,
+    NRF52833_INFO_PART_ADDRESS,
+    NRF52833_INFO_PART_VALUE,
     OPENOCD_EXE,
     OPENOCD_SCRIPTS,
     SPEED_KHZ as JLINK_SPEED_KHZ,
+    _jlink_file_argument,
+    _parse_jlink_mem32,
     find_rtt_address,
+    jlink_connection_script,
+    parse_audit,
+    probe_jlink_target,
+    run_jlink_script,
+    start_jlink_rtt,
 )
 from .cv import (
     export_cv_csv,
@@ -134,6 +145,10 @@ DEVICE_DISCOVERY_LOG_SIGNATURE: tuple[Any, ...] | None = None
 DEVICE_DISCOVERY_LOG_ERROR = ""
 DEVICE_DISCOVERY_TTL_S = 1.0
 DEVICE_PROBE_LOCK = threading.Lock()
+JLINK_TARGET_PROBE_LOCK = threading.Lock()
+JLINK_TARGET_CACHE_LOCK = threading.RLock()
+JLINK_TARGET_CACHE: dict[str, dict[str, Any]] = {}
+JLINK_TARGET_CACHE_TTL_S = 5.0
 SMPMGR_EXE = Path(
     os.environ.get("SENSUS_SMPMGR")
     or shutil.which("smpmgr")
@@ -608,6 +623,472 @@ def _meaningful_process_tail(*outputs: object, limit: int = 6) -> list[str]:
     return lines[-limit:]
 
 
+def _unknown_jlink_target_status(probe_serial: str) -> dict[str, Any]:
+    return {
+        "target_state": "unknown",
+        "target_detail": "目标板连接尚未确认",
+        "target_backend": "",
+        "target_checked_at": 0.0,
+        "probe_serial": probe_serial,
+    }
+
+
+def _cached_jlink_target_status(probe_serial: str) -> dict[str, Any]:
+    if not probe_serial:
+        return _unknown_jlink_target_status("")
+    with JLINK_TARGET_CACHE_LOCK:
+        cached = JLINK_TARGET_CACHE.get(probe_serial)
+        return copy.deepcopy(
+            cached or _unknown_jlink_target_status(probe_serial)
+        )
+
+
+def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
+    if (
+        not OPENOCD_EXE.is_file()
+        or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
+    ):
+        return False, "随包 OpenOCD 不可用"
+    command = [
+        str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+        "-f", "interface/jlink.cfg", "-c", "transport select swd",
+        "-f", "target/nrf52.cfg",
+    ]
+    if probe_serial:
+        command += ["-c", f"adapter serial {probe_serial}"]
+    command += [
+        "-c", f"adapter speed {JLINK_SPEED_KHZ}",
+        "-c", (
+            f"init; mdw 0x{NRF52833_INFO_PART_ADDRESS:08X} 1; shutdown"
+        ),
+    ]
+    try:
+        done = subprocess.run(
+            command,
+            cwd=PROJECT_DIR,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    output = f"{done.stdout}\n{done.stderr}"
+    expected = re.compile(
+        rf"(?:0x)?{NRF52833_INFO_PART_ADDRESS:08X}\s*(?:=|:)\s*"
+        rf"(?:0x)?{NRF52833_INFO_PART_VALUE:08X}\b",
+        flags=re.IGNORECASE,
+    )
+    return done.returncode == 0 and bool(expected.search(output)), output
+
+
+def _openocd_rtt_layout_probe(
+    rtt_address: int, probe_serial: str,
+) -> tuple[bool, bool, str]:
+    """Read chip identity and the RTT signature without resetting or writing."""
+    if (
+        not OPENOCD_EXE.is_file()
+        or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
+    ):
+        return False, False, "随包 OpenOCD 不可用"
+    command = [
+        str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
+        "-f", "interface/jlink.cfg", "-c", "transport select swd",
+        "-f", "target/nrf52.cfg",
+    ]
+    if probe_serial:
+        command += ["-c", f"adapter serial {probe_serial}"]
+    command += [
+        "-c", f"adapter speed {JLINK_SPEED_KHZ}",
+        "-c", (
+            f"init; mdw 0x{NRF52833_INFO_PART_ADDRESS:08X} 1; "
+            f"mdw 0x{rtt_address:08X} 3; shutdown"
+        ),
+    ]
+    try:
+        done = subprocess.run(
+            command, cwd=PROJECT_DIR, check=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, False, str(exc)
+    output = f"{done.stdout}\n{done.stderr}"
+    part_pattern = re.compile(
+        rf"(?:0x)?{NRF52833_INFO_PART_ADDRESS:08X}\s*(?:=|:)\s*"
+        rf"(?:0x)?{NRF52833_INFO_PART_VALUE:08X}\b",
+        flags=re.IGNORECASE,
+    )
+    target_ready = done.returncode == 0 and bool(part_pattern.search(output))
+    rtt_pattern = re.compile(
+        rf"(?:0x)?{rtt_address:08X}\s*(?:=|:)\s*"
+        r"(?:0x)?47474553\s+(?:0x)?52205245\s+(?:0x)?00005454\b",
+        flags=re.IGNORECASE,
+    )
+    return target_ready, target_ready and bool(rtt_pattern.search(output)), output
+
+
+def _probe_jlink_target_status(
+    probe_serial: str,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Check the target without reset/write and cache the result briefly."""
+    now = time.monotonic()
+    with JLINK_TARGET_CACHE_LOCK:
+        cached = JLINK_TARGET_CACHE.get(probe_serial)
+        if (
+            cached
+            and not force
+            and now - float(cached.get("target_checked_at", 0.0))
+            < JLINK_TARGET_CACHE_TTL_S
+        ):
+            return copy.deepcopy(cached)
+
+    with JLINK_TARGET_PROBE_LOCK:
+        now = time.monotonic()
+        with JLINK_TARGET_CACHE_LOCK:
+            cached = JLINK_TARGET_CACHE.get(probe_serial)
+            if (
+                cached
+                and not force
+                and now - float(cached.get("target_checked_at", 0.0))
+                < JLINK_TARGET_CACHE_TTL_S
+            ):
+                return copy.deepcopy(cached)
+
+        attempts: list[str] = []
+        reachable = False
+        backend = ""
+        if JLINK_EXE.is_file():
+            reachable, output = probe_jlink_target(
+                probe_serial,
+                executable=JLINK_EXE,
+                timeout_s=10,
+            )
+            if reachable:
+                backend = "SEGGER J-Link Commander"
+            else:
+                tail = _meaningful_process_tail(output, limit=3)
+                attempts.append("SEGGER: " + (" | ".join(tail) or "目标无响应"))
+        if not reachable:
+            reachable, output = _openocd_target_probe(probe_serial)
+            if reachable:
+                backend = "OpenOCD / libjaylink"
+            else:
+                tail = _meaningful_process_tail(output, limit=3)
+                attempts.append("OpenOCD: " + (" | ".join(tail) or "目标无响应"))
+
+        if reachable:
+            result = {
+                "target_state": "reachable",
+                "target_detail": f"nRF52833 已响应（{backend}）",
+                "target_backend": backend,
+                "target_diagnostics": "",
+            }
+        else:
+            diagnostics = "；".join(attempts)
+            result = {
+                "target_state": "unreachable" if attempts else "unknown",
+                "target_detail": (
+                    "J-Link 探针在线，但 nRF52833 未响应；"
+                    "请检查板卡供电、SWD 排线和接口方向"
+                    if attempts else "没有可用的 SWD 核对工具"
+                ),
+                "target_backend": "",
+                "target_diagnostics": diagnostics,
+            }
+        result.update({
+            "target_checked_at": now,
+            "probe_serial": probe_serial,
+        })
+        with JLINK_TARGET_CACHE_LOCK:
+            JLINK_TARGET_CACHE[probe_serial] = copy.deepcopy(result)
+        return result
+
+
+def _require_jlink_target(probe_serial: str) -> dict[str, Any]:
+    """Require a fresh, read-only nRF52833 identity check before an operation."""
+    status = _probe_jlink_target_status(probe_serial, force=True)
+    if status.get("target_state") == "reachable":
+        return status
+    diagnostic_id = DIAGNOSTICS.record(
+        "error", "device.jlink.target_unreachable",
+        "J-Link probe is present but the nRF52833 target did not respond",
+        probe_serial=probe_serial,
+        target_detail=status.get("target_detail"),
+        tool_output=status.get("target_diagnostics"),
+    )
+    error = RuntimeError(str(status.get("target_detail") or "J-Link 目标板无响应"))
+    setattr(error, "diagnostic_id", diagnostic_id)
+    raise error
+
+
+def _annotate_target_states(
+    devices: list[dict[str, Any]],
+    *,
+    refresh_jlink: bool,
+) -> list[dict[str, Any]]:
+    for device in devices:
+        if device.get("kind") == "jlink":
+            probe_serial = str(device.get("probe_serial") or "")
+            status = (
+                _probe_jlink_target_status(probe_serial)
+                if refresh_jlink and probe_serial
+                else _cached_jlink_target_status(probe_serial)
+            )
+            device.update({
+                key: value for key, value in status.items()
+                if key.startswith("target_")
+            })
+        else:
+            ready = bool(device.get("selectable"))
+            device.update({
+                "target_state": "reachable" if ready else "unknown",
+                "target_detail": (
+                    "USB DATA 与 SMP 已响应"
+                    if ready else "USB 接口尚未核对完成"
+                ),
+                "target_backend": "USB CDC" if ready else "",
+            })
+    return devices
+
+
+def _runtime_probe_request_id() -> str:
+    """Return a firmware-safe request id that cannot match buffered output."""
+    return f"ready-{time.monotonic_ns():x}"[-32:]
+
+
+def _runtime_response_state(text: str, request_id: str) -> str:
+    """Classify one tagged GET response without trusting buffered RTT output."""
+    seen: set[str] = set()
+    tagged = False
+    confirmation_failed = False
+    for raw_line in text.splitlines():
+        event = parse_audit(raw_line)
+        if event is None or str(event.get("req") or "") != request_id:
+            continue
+        tagged = True
+        kind = str(event.get("kind") or "")
+        if kind == "CFG_APPLIED":
+            if event.get("src") == "get":
+                seen.add(kind)
+        elif kind == "CFG_DERIVED":
+            seen.add(kind)
+        elif kind == "CFG_CONFIRMED":
+            if (
+                event.get("src") == "get"
+                and event.get("verify_ok") == 1
+                and int(event.get("invalid_cfg") or 0) == 0
+                and int(event.get("vdd_oor") or 0) == 0
+            ):
+                seen.add(kind)
+            elif (
+                event.get("verify_ok") == 0
+                or int(event.get("invalid_cfg") or 0) != 0
+                or int(event.get("vdd_oor") or 0) != 0
+            ):
+                confirmation_failed = True
+    if {"CFG_APPLIED", "CFG_DERIVED", "CFG_CONFIRMED"}.issubset(seen):
+        return "ready"
+    if confirmation_failed:
+        return "invalid"
+    return "incomplete" if tagged else "missing"
+
+
+def _runtime_response_verified(text: str, request_id: str) -> bool:
+    """Return whether a complete tagged GET physically verified the AFE."""
+    return _runtime_response_state(text, request_id) == "ready"
+
+
+def _probe_serial_runtime_firmware(
+    candidate: str, *, timeout_s: float = 4.0,
+) -> tuple[str, str]:
+    """Verify the tagged runtime protocol over DATA CDC without changing it."""
+    try:
+        import serial
+    except ImportError:
+        return "transport_error", "pyserial 不可用"
+    request_id = _runtime_probe_request_id()
+    received = bytearray()
+    try:
+        with serial.Serial(candidate, 115200, timeout=0.1,
+                           write_timeout=0.5) as stream:
+            stream.dtr = True
+            try:
+                stream.reset_input_buffer()
+            except (AttributeError, OSError, ValueError):
+                pass
+            stream.write(f"GET req={request_id}\n".encode("ascii"))
+            stream.flush()
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                chunk = stream.read(512)
+                if chunk:
+                    received.extend(chunk)
+                    text = received.decode("utf-8", "replace")
+                    if _runtime_response_verified(text, request_id):
+                        return "ready", text
+    except (OSError, ValueError, serial.SerialException) as exc:
+        return "transport_error", str(exc)
+    text = received.decode("utf-8", "replace")
+    detail = " | ".join(_meaningful_process_tail(text, limit=4))
+    return _runtime_response_state(text, request_id), detail
+
+
+def _free_local_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _stop_runtime_probe_bridge(process: Any) -> None:
+    try:
+        process.terminate()
+    except (AttributeError, OSError):
+        return
+    try:
+        process.wait(timeout=3)
+    except (AttributeError, OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=2)
+        except (AttributeError, OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _probe_openocd_runtime_firmware(
+    rtt_address: int, probe_serial: str, *, timeout_s: float = 7.0,
+) -> tuple[str, str]:
+    """Verify runtime firmware through the bundled OpenOCD RTT server."""
+    port = _free_local_tcp_port()
+    process: Any | None = None
+    client: socket.socket | None = None
+    request_id = _runtime_probe_request_id()
+    received = bytearray()
+    try:
+        process = start_jlink_rtt(rtt_address, probe_serial or None, port)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and client is None:
+            if process.poll() is not None:
+                return "transport_error", "OpenOCD RTT 进程在建立连接前退出"
+            try:
+                client = socket.create_connection(("127.0.0.1", port), timeout=0.3)
+            except OSError:
+                time.sleep(0.08)
+        if client is None:
+            return "transport_error", "OpenOCD RTT 服务未就绪"
+        client.settimeout(0.2)
+        client.sendall(f"GET req={request_id}\n".encode("ascii"))
+        while time.monotonic() < deadline:
+            try:
+                chunk = client.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            received.extend(chunk)
+            text = received.decode("utf-8", "replace")
+            if _runtime_response_verified(text, request_id):
+                return "ready", text
+    except (OSError, RuntimeError, subprocess.SubprocessError, SystemExit) as exc:
+        return "transport_error", str(exc)
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except OSError:
+                pass
+        if process is not None:
+            _stop_runtime_probe_bridge(process)
+    text = received.decode("utf-8", "replace")
+    detail = " | ".join(_meaningful_process_tail(text, limit=4))
+    return _runtime_response_state(text, request_id), detail
+
+
+def _probe_jlink_runtime_firmware(
+    metadata: dict[str, Any], *, timeout_s: float = 7.0,
+) -> tuple[str, str]:
+    """Verify the V4 runtime protocol before considering a Flash operation."""
+    raw_address = metadata.get("rtt_address")
+    try:
+        rtt_address = (
+            int(raw_address, 0) if isinstance(raw_address, str) else int(raw_address)
+        )
+    except (TypeError, ValueError):
+        return "transport_error", "固件元数据缺少有效 RTT 地址"
+
+    if not JLINK_EXE.is_file():
+        reachable, layout_ready, output = _openocd_rtt_layout_probe(
+            rtt_address, JLINK_SERIAL,
+        )
+        detail = " | ".join(_meaningful_process_tail(output, limit=5))
+        if not reachable:
+            return "transport_error", detail or "OpenOCD 无法读取 nRF52833 身份"
+        if not layout_ready:
+            return "missing", detail or "未找到通用固件 RTT 控制块"
+        return _probe_openocd_runtime_firmware(
+            rtt_address, JLINK_SERIAL, timeout_s=timeout_s,
+        )
+
+    reachable, probe_output = probe_jlink_target(
+        JLINK_SERIAL or None, executable=JLINK_EXE, timeout_s=10,
+    )
+    if not reachable:
+        if (
+            OPENOCD_EXE.is_file()
+            and (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
+        ):
+            reachable, layout_ready, layout_output = _openocd_rtt_layout_probe(
+                rtt_address, JLINK_SERIAL,
+            )
+            detail = " | ".join(
+                _meaningful_process_tail(layout_output, limit=5)
+            )
+            if reachable and not layout_ready:
+                return "missing", detail or "未找到通用固件 RTT 控制块"
+            if not reachable:
+                return "transport_error", detail or "OpenOCD 无法读取 nRF52833 身份"
+            return _probe_openocd_runtime_firmware(
+                rtt_address, JLINK_SERIAL, timeout_s=timeout_s,
+            )
+        detail = " | ".join(_meaningful_process_tail(probe_output, limit=5))
+        return "transport_error", detail or "J-Link 无法读取 nRF52833 身份"
+
+    request_id = _runtime_probe_request_id()
+    transport: JLinkMemoryRTT | None = None
+    received = bytearray()
+    try:
+        transport = JLinkMemoryRTT(
+            rtt_address,
+            JLINK_SERIAL or None,
+            executable=JLINK_EXE,
+        )
+        transport.discard_pending_up()
+        transport.sendall(f"GET req={request_id}\n".encode("ascii"))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            chunk = transport.recv()
+            if chunk:
+                received.extend(chunk)
+                text = received.decode("utf-8", "replace")
+                if _runtime_response_verified(text, request_id):
+                    return "ready", text
+            else:
+                time.sleep(0.05)
+    except RTTControlBlockUnavailable as exc:
+        return "missing", str(exc)
+    except (OSError, RuntimeError, TimeoutError) as exc:
+        return "transport_error", str(exc)
+    finally:
+        if transport is not None:
+            transport.close()
+    text = received.decode("utf-8", "replace")
+    detail = " | ".join(_meaningful_process_tail(text, limit=4))
+    return _runtime_response_state(text, request_id), detail
+
+
 def _probe_serial_data_candidate(candidate: str) -> bool:
     """Read-only probe for one CDC candidate; never resets or writes firmware."""
     try:
@@ -823,7 +1304,9 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
             "selectable": bool(data_port and smp_port),
             "probe_required": not probe and not data_port,
         })
-    return sorted(devices, key=_device_sort_key)
+    return _annotate_target_states(
+        sorted(devices, key=_device_sort_key), refresh_jlink=False
+    )
 
 
 def _discover_devices_with_probe() -> list[dict[str, Any]]:
@@ -914,10 +1397,19 @@ def _devices_payload_from_devices(
     selected = _selected_device_copy()
     selected_id = selected.get("id") if selected else None
     if selected_id:
-        selected = next(
-            (device for device in devices if device.get("id") == selected_id),
-            selected,
+        present = next(
+            (device for device in devices if device.get("id") == selected_id), None,
         )
+        if present is not None:
+            selected = {**present, "present": True}
+        else:
+            selected = {
+                **(selected or {}),
+                "present": False,
+                "selectable": False,
+                "target_state": "unreachable",
+                "target_detail": "所选设备已断开",
+            }
     payload = {
         "devices": devices,
         "selected_device_id": selected_id,
@@ -940,6 +1432,15 @@ def _remember_device_discovery(
         DEVICE_DISCOVERY_CACHE = copy.deepcopy(devices)
         DEVICE_DISCOVERY_AT = time.monotonic()
         DEVICE_DISCOVERY_ERROR = error
+    if not error:
+        live_serials = {
+            str(device.get("probe_serial") or "")
+            for device in devices if device.get("kind") == "jlink"
+        }
+        with JLINK_TARGET_CACHE_LOCK:
+            for serial in list(JLINK_TARGET_CACHE):
+                if serial not in live_serials:
+                    JLINK_TARGET_CACHE.pop(serial, None)
 
 
 def _run_device_discovery() -> None:
@@ -947,8 +1448,19 @@ def _run_device_discovery() -> None:
     global DEVICE_DISCOVERY_LOG_SIGNATURE, DEVICE_DISCOVERY_LOG_ERROR
     error = ""
     devices: list[dict[str, Any]] = []
+    app = globals().get("APP")
+    operation_lock = getattr(app, "operation_lock", None)
+    operation_acquired = bool(
+        operation_lock is not None and operation_lock.acquire(blocking=False)
+    )
     try:
-        devices = _discover_devices_with_probe()
+        if operation_lock is not None and not operation_acquired:
+            devices = _discover_devices(probe=False)
+        elif app is not None and not app.hardware_idle():
+            devices = _discover_devices(probe=False)
+        else:
+            devices = _discover_devices_with_probe()
+            _annotate_target_states(devices, refresh_jlink=True)
     except (OSError, RuntimeError, ValueError) as exc:
         error = str(exc)
         # Preserve the last known list during a transient USB re-enumeration;
@@ -956,6 +1468,8 @@ def _run_device_discovery() -> None:
         with DEVICE_DISCOVERY_LOCK:
             devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
     finally:
+        if operation_acquired:
+            operation_lock.release()
         _remember_device_discovery(devices, error)
         signature = tuple(sorted(
             (
@@ -963,6 +1477,7 @@ def _run_device_discovery() -> None:
                 bool(device.get("selectable")),
                 str(device.get("data_port") or ""),
                 str(device.get("probe_serial") or ""),
+                str(device.get("target_state") or ""),
             )
             for device in devices
         ))
@@ -979,6 +1494,9 @@ def _run_device_discovery() -> None:
                     "name": device.get("name"),
                     "kind": device.get("kind"),
                     "selectable": device.get("selectable"),
+                    "target_state": device.get("target_state"),
+                    "target_detail": device.get("target_detail"),
+                    "target_diagnostics": device.get("target_diagnostics"),
                 } for device in devices],
             )
         DEVICE_DISCOVERY_LOG_SIGNATURE = signature
@@ -1036,6 +1554,7 @@ def _devices_payload(*, probe: bool = True) -> dict[str, Any]:
         else _discover_devices(probe=False)
     )
     if probe:
+        _annotate_target_states(devices, refresh_jlink=True)
         _remember_device_discovery(devices)
     return _devices_payload_from_devices(devices)
 
@@ -1198,9 +1717,19 @@ def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
 
 
 def _release_stale_measurement_bridge() -> None:
-    """Gracefully release an orphaned workstation OpenOCD RTT bridge."""
+    """Gracefully release an orphaned OpenOCD or memory RTT bridge."""
     if not _port_accepts_connections(19021):
         return
+    try:
+        with socket.create_connection(("127.0.0.1", 19022), timeout=1) as connection:
+            connection.sendall(BRIDGE_SHUTDOWN_COMMAND)
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            if not _port_accepts_connections(19021):
+                return
+            time.sleep(0.1)
+    except OSError:
+        pass
     try:
         with socket.create_connection(("127.0.0.1", 4444), timeout=1) as connection:
             connection.sendall(b"shutdown\n")
@@ -1445,6 +1974,37 @@ class SettingsController:
         with self.lock:
             self.message = message
 
+    @staticmethod
+    def _probe_runtime_firmware(
+        metadata: dict[str, Any], *, usb_transport: bool,
+    ) -> tuple[str, str]:
+        if usb_transport:
+            if not SERIAL_DATA_PORT:
+                return "transport_error", "未找到已选设备的 USB DATA CDC"
+            return _probe_serial_runtime_firmware(SERIAL_DATA_PORT)
+        return _probe_jlink_runtime_firmware(metadata)
+
+    @classmethod
+    def _wait_for_runtime_firmware(
+        cls, metadata: dict[str, Any], *, usb_transport: bool,
+        attempts: int = 3,
+    ) -> tuple[str, str]:
+        details: list[str] = []
+        last_state = "missing"
+        for attempt in range(1, max(1, attempts) + 1):
+            state, detail = cls._probe_runtime_firmware(
+                metadata, usb_transport=usb_transport,
+            )
+            last_state = state
+            if state == "ready":
+                return state, detail
+            details.append(f"{attempt}:{state}:{detail or '-'}")
+            if state == "invalid":
+                break
+            if attempt < attempts:
+                time.sleep(0.35 * attempt)
+        return last_state, " || ".join(details)
+
     def restore_for_transport(self, transport: str) -> None:
         if not self._loaded_saved:
             return
@@ -1606,18 +2166,23 @@ class SettingsController:
         )
 
     @staticmethod
-    def _intel_hex_flash_sectors(
-        firmware_hex: Path, page_size: int = 4096, flash_size: int = 512 * 1024
-    ) -> list[int]:
-        """Return nRF flash sectors touched by a validated Intel HEX image."""
+    def _intel_hex_image(
+        firmware_hex: Path, flash_size: int = 512 * 1024
+    ) -> dict[int, int]:
+        """Parse an Intel HEX image confined to nRF52833 application Flash."""
         base_address = 0
-        sectors: set[int] = set()
+        image: dict[int, int] = {}
+        saw_eof = False
         for line_number, raw_line in enumerate(
             firmware_hex.read_text(encoding="ascii").splitlines(), start=1
         ):
             line = raw_line.strip()
             if not line:
                 continue
+            if saw_eof:
+                raise RuntimeError(
+                    f"Intel HEX EOF 后仍有记录（第 {line_number} 行）"
+                )
             if not line.startswith(":"):
                 raise RuntimeError(
                     f"Intel HEX 格式错误（第 {line_number} 行）"
@@ -1639,32 +2204,78 @@ class SettingsController:
             address = (record[1] << 8) | record[2]
             record_type = record[3]
             data = record[4:-1]
-            if record_type == 0x00 and data:
+            if address + len(data) > 0x10000:
+                raise RuntimeError(
+                    f"Intel HEX 记录跨越 16 位地址边界（第 {line_number} 行）"
+                )
+            if record_type == 0x00:
+                if not data:
+                    continue
                 start = base_address + address
                 end = start + len(data) - 1
-                flash_start = max(0, start)
-                flash_end = min(flash_size - 1, end)
-                if flash_start <= flash_end:
-                    sectors.update(range(
-                        flash_start // page_size,
-                        flash_end // page_size + 1,
-                    ))
+                if start < 0 or end >= flash_size:
+                    raise RuntimeError(
+                        "Intel HEX 含应用 Flash 之外的数据，已拒绝烧录:"
+                        f"0x{start:08X}..0x{end:08X}（第 {line_number} 行）"
+                    )
+                for offset, value in enumerate(data):
+                    absolute = start + offset
+                    if absolute in image:
+                        raise RuntimeError(
+                            "Intel HEX 含重叠数据地址:"
+                            f"0x{absolute:08X}（第 {line_number} 行）"
+                        )
+                    image[absolute] = value
             elif record_type == 0x01:
-                break
-            elif record_type == 0x02 and len(data) == 2:
+                if address != 0 or data:
+                    raise RuntimeError(
+                        f"Intel HEX EOF 记录非法（第 {line_number} 行）"
+                    )
+                saw_eof = True
+            elif record_type == 0x02:
+                if address != 0 or len(data) != 2:
+                    raise RuntimeError(
+                        f"Intel HEX 段地址记录非法（第 {line_number} 行）"
+                    )
                 base_address = int.from_bytes(data, "big") << 4
-            elif record_type == 0x04 and len(data) == 2:
+            elif record_type == 0x04:
+                if address != 0 or len(data) != 2:
+                    raise RuntimeError(
+                        f"Intel HEX 线性地址记录非法（第 {line_number} 行）"
+                    )
                 base_address = int.from_bytes(data, "big") << 16
-        if not sectors:
+            elif record_type in (0x03, 0x05):
+                if address != 0 or len(data) != 4:
+                    raise RuntimeError(
+                        f"Intel HEX 启动地址记录非法（第 {line_number} 行）"
+                    )
+            else:
+                raise RuntimeError(
+                    f"Intel HEX 不支持的记录类型 0x{record_type:02X}"
+                    f"（第 {line_number} 行）"
+                )
+        if not saw_eof:
+            raise RuntimeError("Intel HEX 缺少唯一 EOF 记录")
+        if not image:
             raise RuntimeError("Intel HEX 中没有 nRF52833 Flash 数据")
-        return sorted(sectors)
+        return image
+
+    @classmethod
+    def _intel_hex_flash_sectors(
+        cls, firmware_hex: Path, page_size: int = 4096,
+        flash_size: int = 512 * 1024,
+    ) -> list[int]:
+        image = cls._intel_hex_image(firmware_hex, flash_size=flash_size)
+        return sorted({address // page_size for address in image})
 
     @staticmethod
     def _openocd_command(speed: int, *commands: str) -> list[str]:
         command = [
             str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
             "-f", "interface/jlink.cfg", "-c", "transport select swd",
-            "-f", "target/nrf52.cfg",
+            # Avoid a RAM flash algorithm on older compatible probes. OpenOCD
+            # still owns erase, write, verify and reset in one bounded session.
+            "-c", "set WORKAREASIZE 0", "-f", "target/nrf52.cfg",
         ]
         if JLINK_SERIAL:
             command += ["-c", f"adapter serial {JLINK_SERIAL}"]
@@ -1681,212 +2292,356 @@ class SettingsController:
         return "{" + text + "}"
 
     @classmethod
-    def _flash_openocd_reconnecting(cls, firmware_hex: Path) -> None:
-        """Recover clone probes that disconnect after every NVMC page erase."""
-        sectors = cls._intel_hex_flash_sectors(firmware_hex)
-        speed = 100
-        for sector in sectors:
-            try:
-                subprocess.run(
-                    cls._openocd_command(
-                        speed, "init", "reset halt",
-                        f"flash erase_sector 0 {sector} {sector}", "shutdown",
-                    ),
-                    cwd=PROJECT_DIR, check=False, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=15,
-                )
-            except subprocess.TimeoutExpired:
-                # The erase register write may have completed before the clone
-                # dropped SWD. The independent erase check below is authoritative.
-                pass
-
-        checked = subprocess.run(
-            cls._openocd_command(speed, "init", "flash erase_check 0", "shutdown"),
-            cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=30,
-        )
-        check_blob = f"{checked.stdout}\n{checked.stderr}"
-        if "successfully checked erase state" not in check_blob:
-            raise RuntimeError("OpenOCD 未能确认 Flash 擦除状态")
-        not_erased = {
-            int(match.group(1))
-            for match in re.finditer(r"#\s*(\d+):[^\n]*not erased", check_blob)
-        }
-        dirty = sorted(set(sectors) & not_erased)
-        if dirty:
-            raise RuntimeError(
-                "OpenOCD 重连擦除失败，未擦净页:"
-                + ", ".join(str(sector) for sector in dirty)
+    def _parse_openocd_words(
+        cls, output: str, address: int, count: int
+    ) -> list[int]:
+        words: dict[int, int] = {}
+        for line in output.splitlines():
+            match = re.match(
+                r"^\s*(?:0x)?([0-9A-Fa-f]{8}):\s*"
+                r"((?:[0-9A-Fa-f]{8}(?:\s+|$))+)",
+                line,
             )
+            if match is None:
+                continue
+            line_address = int(match.group(1), 16)
+            for index, raw_word in enumerate(match.group(2).split()):
+                words[line_address + index * 4] = int(raw_word, 16)
+        expected = [address + index * 4 for index in range(count)]
+        missing = [item for item in expected if item not in words]
+        if missing:
+            raise RuntimeError(
+                "OpenOCD 内存读取不完整，缺少地址:"
+                + ", ".join(f"0x{item:08X}" for item in missing[:4])
+            )
+        return [words[item] for item in expected]
 
-        firmware_path = cls._openocd_path(firmware_hex)
-        written = subprocess.run(
-            cls._openocd_command(
-                speed, "init", "reset halt",
-                f"flash write_image {firmware_path}",
-                f"verify_image {firmware_path}", "reset run", "shutdown",
-            ),
-            cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=180,
+    @staticmethod
+    def _openocd_transient(output: str) -> bool:
+        lowered = output.lower()
+        return any(marker in lowered for marker in (
+            "parity mismatch", "failed to read memory", "failed to write memory",
+            "error waiting nvmc_ready", "examination failed",
+            "failed to erase reg", "cannot read idr", "error connecting dp",
+            "libusb_error_timeout", "unable to connect", "target not examined",
+        ))
+
+    @classmethod
+    def _run_openocd_once(
+        cls, speed: int, *commands: str, timeout_s: float
+    ) -> tuple[int, str]:
+        command = cls._openocd_command(speed, *commands)
+        try:
+            done = subprocess.run(
+                command,
+                cwd=PROJECT_DIR,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_s,
+            )
+            return done.returncode, f"{done.stdout}\n{done.stderr}"
+        except subprocess.TimeoutExpired as exc:
+            return 124, f"{exc.stdout or ''}\n{exc.stderr or ''}\nTIMEOUT"
+        except OSError as exc:
+            return 127, str(exc)
+
+    @staticmethod
+    def _jlink_result_error(done: subprocess.CompletedProcess[str]) -> str:
+        blob = f"{done.stdout}\n{done.stderr}"
+        lowered = blob.lower()
+        failed = (
+            done.returncode != 0
+            or "script processing completed." not in lowered
+            or any(marker in lowered for marker in (
+                "error:", "failed to", "could not", "cannot connect",
+                "script execution aborted", "programming failed",
+            ))
         )
-        write_blob = f"{written.stdout}\n{written.stderr}".lower()
-        if "wrote " not in write_blob or "verified " not in write_blob:
-            raise RuntimeError("OpenOCD 重连烧录未确认写入和全镜像校验")
+        if not failed:
+            return ""
+        return " | ".join(_meaningful_process_tail(blob, limit=8))
+
+    @staticmethod
+    def _image_mismatch(
+        image: dict[int, int], readback: bytes,
+    ) -> tuple[int, int, int] | None:
+        start = min(image)
+        for address, expected in sorted(image.items()):
+            offset = address - start
+            actual = readback[offset] if offset < len(readback) else -1
+            if actual != expected:
+                return address, expected, actual
+        return None
+
+    @classmethod
+    def _read_jlink_flash_image(cls, image: dict[int, int]) -> bytes:
+        """Read one contiguous application range in a fresh Commander process."""
+        start = min(image)
+        length = max(image) - start + 1
+        failures: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="sensus-flash-read-") as temporary:
+            for attempt in range(1, 3):
+                output_path = Path(temporary) / f"readback-{attempt}.bin"
+                script = jlink_connection_script(
+                    f"mem32 0x{NRF52833_INFO_PART_ADDRESS:08X} 1",
+                    "h",
+                    f"savebin {_jlink_file_argument(output_path)}, "
+                    f"0x{start:08X}, 0x{length:X}",
+                    "q",
+                )
+                try:
+                    done = run_jlink_script(
+                        script, JLINK_SERIAL or None,
+                        executable=JLINK_EXE, timeout_s=90,
+                    )
+                    blob = f"{done.stdout}\n{done.stderr}"
+                    error = cls._jlink_result_error(done)
+                    part = _parse_jlink_mem32(
+                        blob, NRF52833_INFO_PART_ADDRESS, 1
+                    )[0]
+                    readback = output_path.read_bytes()
+                    if error:
+                        raise RuntimeError(error)
+                    if part != NRF52833_INFO_PART_VALUE:
+                        raise RuntimeError("J-Link 目标身份核对失败")
+                    if len(readback) != length:
+                        raise RuntimeError(
+                            f"J-Link 回读长度不完整:{len(readback)} != {length}"
+                        )
+                    return readback
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                    failures.append(str(exc))
+                    if attempt < 2:
+                        time.sleep(0.15)
+        raise RuntimeError("J-Link 独立回读失败:" + " || ".join(failures))
+
+    @classmethod
+    def _run_jlink_application(cls) -> None:
+        failures: list[str] = []
+        for attempt in range(1, 3):
+            try:
+                done = run_jlink_script(
+                    jlink_connection_script(
+                        f"mem32 0x{NRF52833_INFO_PART_ADDRESS:08X} 1",
+                        "r", "g", "sleep 200", "q",
+                    ),
+                    JLINK_SERIAL or None,
+                    executable=JLINK_EXE, timeout_s=20,
+                )
+                blob = f"{done.stdout}\n{done.stderr}"
+                error = cls._jlink_result_error(done)
+                part = _parse_jlink_mem32(
+                    blob, NRF52833_INFO_PART_ADDRESS, 1
+                )[0]
+                if error:
+                    raise RuntimeError(error)
+                if part != NRF52833_INFO_PART_VALUE:
+                    raise RuntimeError("J-Link 目标身份核对失败")
+                return
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                failures.append(str(exc))
+                if attempt < 2:
+                    time.sleep(0.15)
+        raise RuntimeError("J-Link 未能复位并运行目标:" + " || ".join(failures))
+
+    @classmethod
+    def _select_swd_flash_backend(cls) -> str:
+        """Select one backend using read-only chip identity checks."""
+        failures: list[str] = []
+        if (
+            OPENOCD_EXE.is_file()
+            and (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
+            and (OPENOCD_SCRIPTS / "target/nrf52.cfg").is_file()
+        ):
+            reachable, output = _openocd_target_probe(JLINK_SERIAL)
+            if reachable:
+                return "openocd"
+            detail = " | ".join(_meaningful_process_tail(output, limit=4))
+            failures.append("OpenOCD:" + (detail or "目标无响应"))
+        if JLINK_EXE.is_file():
+            reachable, output = probe_jlink_target(
+                JLINK_SERIAL or None, executable=JLINK_EXE, timeout_s=15,
+            )
+            if reachable:
+                return "jlink"
+            detail = " | ".join(_meaningful_process_tail(output, limit=4))
+            failures.append("J-Link:" + (detail or "目标无响应"))
+        if not failures:
+            failures.append("没有可用的 J-Link Commander 或随包 OpenOCD")
+        raise RuntimeError(
+            "J-Link 探头已连接，但 nRF52833 目标无响应:"
+            + " || ".join(failures)
+        )
+
+    @classmethod
+    def _flash_with_jlink(
+        cls,
+        firmware_hex: Path,
+        image: dict[int, int],
+        *,
+        target_verified: bool = False,
+    ) -> bool:
+        if not target_verified:
+            reachable, output = probe_jlink_target(
+                JLINK_SERIAL or None, executable=JLINK_EXE, timeout_s=15,
+            )
+            if not reachable:
+                raise RuntimeError(
+                    "J-Link 探头已连接，但 nRF52833 目标无响应:"
+                    + " | ".join(_meaningful_process_tail(output, limit=6))
+                )
+
+        try:
+            current = cls._read_jlink_flash_image(image)
+            changed = cls._image_mismatch(image, current) is not None
+            if changed:
+                script = jlink_connection_script(
+                    f"mem32 0x{NRF52833_INFO_PART_ADDRESS:08X} 1",
+                    "h",
+                    f"loadfile {_jlink_file_argument(firmware_hex)}, noreset",
+                    "q",
+                )
+                done = run_jlink_script(
+                    script, JLINK_SERIAL or None,
+                    executable=JLINK_EXE, timeout_s=180,
+                )
+                blob = f"{done.stdout}\n{done.stderr}"
+                error = cls._jlink_result_error(done)
+                part = _parse_jlink_mem32(
+                    blob, NRF52833_INFO_PART_ADDRESS, 1
+                )[0]
+                if (
+                    error
+                    or part != NRF52833_INFO_PART_VALUE
+                    or "o.k." not in blob.lower()
+                ):
+                    raise RuntimeError(
+                        "J-Link 写入未确认成功:"
+                        + (error or "缺少下载完成标记")
+                    )
+                verified = cls._read_jlink_flash_image(image)
+                mismatch = cls._image_mismatch(image, verified)
+                if mismatch is not None:
+                    address, expected, actual = mismatch
+                    actual_text = "EOF" if actual < 0 else f"0x{actual:02X}"
+                    raise RuntimeError(
+                        "J-Link 独立回读不一致:"
+                        f"0x{address:08X} 期望 0x{expected:02X}，实际 {actual_text}"
+                    )
+        except Exception:
+            try:
+                cls._run_jlink_application()
+            except Exception:
+                pass
+            raise
+        cls._run_jlink_application()
+        return changed
+
+    @classmethod
+    def _flash_with_openocd(
+        cls, firmware_hex: Path, image: dict[int, int],
+    ) -> None:
+        required_scripts = (
+            OPENOCD_SCRIPTS / "interface/jlink.cfg",
+            OPENOCD_SCRIPTS / "target/nrf52.cfg",
+        )
+        if not OPENOCD_EXE.is_file() or not all(path.is_file() for path in required_scripts):
+            raise RuntimeError("找不到完整的随包 OpenOCD 与 nRF52 脚本")
+        firmware_path = cls._openocd_path(firmware_hex)
+        failures: list[str] = []
+        for attempt in range(1, 3):
+            return_code, blob = cls._run_openocd_once(
+                100,
+                "init", "reset halt",
+                f"mdw 0x{NRF52833_INFO_PART_ADDRESS:08X} 1",
+                f"flash write_image erase {firmware_path}",
+                f"verify_image {firmware_path}",
+                "reset run", "shutdown",
+                timeout_s=300,
+            )
+            try:
+                part = cls._parse_openocd_words(
+                    blob, NRF52833_INFO_PART_ADDRESS, 1
+                )[0]
+            except RuntimeError as exc:
+                part = -1
+                failures.append(str(exc))
+            lowered = blob.lower()
+            success = (
+                return_code == 0
+                and part == NRF52833_INFO_PART_VALUE
+                and "wrote " in lowered
+                and "verified " in lowered
+                and not any(marker in lowered for marker in (
+                    "contents differ", "verification failed", "checksum mismatch",
+                ))
+            )
+            if success:
+                return
+            failures.append(" | ".join(_meaningful_process_tail(blob, limit=8)))
+            if attempt == 2 or not cls._openocd_transient(blob):
+                break
+            time.sleep(0.15)
+        # A failed command may have stopped after ``reset halt``. Use the same
+        # backend for a bounded best-effort restart, but never hide the original
+        # programming/verification error if this cleanup also fails.
+        try:
+            cls._run_openocd_once(
+                100, "init", "reset run", "shutdown", timeout_s=20,
+            )
+        except Exception:
+            pass
+        raise RuntimeError(
+            "OpenOCD 单会话写入/校验/复位失败:"
+            + " || ".join(item for item in failures if item)
+        )
 
     @classmethod
     def _flash_firmware(cls, firmware_hex: Path | None = None) -> None:
-        """用可用的 SWD 后端把 hex 烧进片子并校验。
-
-        Homebrew 的默认 openocd 没有编入 jlink 驱动；本机的用户级
-        OpenOCD 显式启用 libjaylink，并已通过连接、写入、verify 三项硬件
-        检查。旧的 JLinkExe V8.80 仍是第一优先级；它随 CubeIDE 缺失时
-        才走 OpenOCD 回退。
-
-        两种后端都必须检查各自的写入和校验成功标记，不只看进程退出码。
-        """
+        """Safely update one nRF52833 image without mixing flash backends."""
         firmware_hex = firmware_hex or _firmware_artifact("zephyr.hex")
         if not firmware_hex.exists():
             raise RuntimeError(f"找不到固件: {firmware_hex}")
-        backend = "jlink" if JLINK_EXE.exists() else "openocd"
+        image = cls._intel_hex_image(firmware_hex)
+        sectors = sorted({address // 4096 for address in image})
+        try:
+            backend = cls._select_swd_flash_backend()
+        except Exception as exc:
+            DIAGNOSTICS.record(
+                "error", "firmware.flash.preflight_failed",
+                "No SWD backend could verify the target identity",
+                firmware=firmware_hex, probe_serial=JLINK_SERIAL,
+                error=str(exc),
+            )
+            raise
         DIAGNOSTICS.record(
             "info", "firmware.flash.started", "Firmware flashing started",
             backend=backend, firmware=firmware_hex, probe_serial=JLINK_SERIAL,
+            pages=sectors,
         )
-        if not JLINK_EXE.exists():
-            if not OPENOCD_EXE.exists():
-                raise RuntimeError(
-                    f"既找不到 JLinkExe({JLINK_EXE})，也找不到 OpenOCD"
-                )
-            firmware_path = cls._openocd_path(firmware_hex)
-            command = cls._openocd_command(
-                JLINK_SPEED_KHZ,
-                f"program {firmware_path} verify reset exit",
-            )
-            try:
-                done = subprocess.run(
-                    command,
-                    cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=120,
-                )
-                blob = f"{done.stdout}\n{done.stderr}"
-            except subprocess.CalledProcessError as exc:
-                blob = f"{exc.stdout or ''}\n{exc.stderr or ''}"
-                DIAGNOSTICS.record(
-                    "error", "firmware.flash.tool_failed",
-                    "OpenOCD flash command failed",
-                    backend="openocd", firmware=firmware_hex,
-                    return_code=exc.returncode, output=blob,
-                )
-                transient = any(marker in blob.lower() for marker in (
-                    "parity mismatch", "failed to read memory",
-                    "error waiting nvmc_ready", "examination failed",
-                    "failed erasing sectors", "failed to erase reg",
-                ))
-                if transient:
-                    DIAGNOSTICS.record(
-                        "warning", "firmware.flash.reconnect_fallback",
-                        "OpenOCD failed transiently; reconnect fallback started",
-                        backend="openocd", firmware=firmware_hex, output=blob,
-                    )
-                    try:
-                        cls._flash_openocd_reconnecting(firmware_hex)
-                    except Exception as reconnect_exc:
-                        DIAGNOSTICS.exception(
-                            "firmware.flash.reconnect_failed",
-                            "OpenOCD reconnect flash failed",
-                            reconnect_exc,
-                            backend="openocd-reconnect", firmware=firmware_hex,
-                        )
-                        raise
-                    DIAGNOSTICS.record(
-                        "info", "firmware.flash.completed",
-                        "OpenOCD reconnect flash and verification completed",
-                        backend="openocd-reconnect", firmware=firmware_hex,
-                    )
-                    return
-                tail = [line for line in blob.strip().splitlines()
-                        if line.strip()][-5:]
-                raise RuntimeError(
-                    "OpenOCD 烧录失败:" + " | ".join(tail)
-                ) from exc
-            except (subprocess.TimeoutExpired, OSError) as exc:
-                DIAGNOSTICS.exception(
-                    "firmware.flash.tool_failed", "OpenOCD flash command failed",
-                    exc,
-                    backend="openocd", firmware=firmware_hex,
-                    stdout=getattr(exc, "stdout", ""),
-                    stderr=getattr(exc, "stderr", ""),
-                )
-                raise
-            if "Programming Finished" in blob and "Verified OK" in blob:
-                DIAGNOSTICS.record(
-                    "info", "firmware.flash.completed",
-                    "OpenOCD flash and verification completed",
-                    backend="openocd", firmware=firmware_hex,
-                )
-                return
-            DIAGNOSTICS.record(
-                "warning", "firmware.flash.reconnect_fallback",
-                "OpenOCD direct verification was incomplete; reconnect fallback started",
-                backend="openocd", firmware=firmware_hex, output=blob,
-            )
-            cls._flash_openocd_reconnecting(firmware_hex)
-            DIAGNOSTICS.record(
-                "info", "firmware.flash.completed",
-                "OpenOCD reconnect flash and verification completed",
-                backend="openocd-reconnect", firmware=firmware_hex,
-            )
-            return
-
-        jlink_path = str(firmware_hex.resolve()).replace("\\", "\\\\").replace('"', '\\"')
-        if "\n" in jlink_path or "\r" in jlink_path:
-            raise RuntimeError(f"JLinkExe 无法处理固件路径:{firmware_hex}")
-        script = f'loadfile "{jlink_path}"\nr\ng\nq\n'
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".jlink", delete=False, encoding="utf-8"
-        ) as handle:
-            handle.write(script)
-            script_path = Path(handle.name)
         try:
-            command = [
-                str(JLINK_EXE), "-device", JLINK_DEVICE, "-if", "SWD",
-                "-speed", str(JLINK_SPEED_KHZ), "-autoconnect", "1",
-                "-NoGui", "1", "-ExitOnError", "1",
-            ]
-            if JLINK_SERIAL:
-                command += ["-SelectEmuBySN", JLINK_SERIAL]
-            command += ["-CommanderScript", str(script_path)]
-            try:
-                done = subprocess.run(
-                    command,
-                    cwd=PROJECT_DIR, check=True, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=120,
+            if backend == "jlink":
+                changed = cls._flash_with_jlink(
+                    firmware_hex, image, target_verified=True,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-                    OSError) as exc:
-                DIAGNOSTICS.exception(
-                    "firmware.flash.tool_failed", "JLinkExe flash command failed",
-                    exc,
-                    backend="jlink", firmware=firmware_hex,
-                    stdout=getattr(exc, "stdout", ""),
-                    stderr=getattr(exc, "stderr", ""),
-                )
-                raise
-        finally:
-            script_path.unlink(missing_ok=True)
-        blob = f"{done.stdout}\n{done.stderr}"
-        if "O.K." not in blob or "Script processing completed." not in blob:
+            else:
+                cls._flash_with_openocd(firmware_hex, image)
+                changed = True
+        except Exception as exc:
             DIAGNOSTICS.record(
-                "error", "firmware.flash.verification_missing",
-                "JLinkExe did not confirm programming and verification",
-                backend="jlink", firmware=firmware_hex, output=blob,
+                "error", "firmware.flash.failed",
+                "Safe page-scoped firmware flash failed",
+                backend=backend, firmware=firmware_hex, error=str(exc),
             )
-            tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
-            raise RuntimeError("JLinkExe 烧录未确认成功:" + " | ".join(tail))
+            raise
         DIAGNOSTICS.record(
             "info", "firmware.flash.completed",
-            "JLinkExe flash and verification completed",
-            backend="jlink", firmware=firmware_hex,
+            "Single-backend image verification and run completed",
+            backend=backend, firmware=firmware_hex, pages=sectors,
+            changed=changed,
         )
 
     @staticmethod
@@ -2326,10 +3081,6 @@ class SettingsController:
             # never loses its DATA stream.
             _refresh_usb_transport()
             usb_transport = HARDWARE_TRANSPORT == "serial"
-            if usb_transport and not SERIAL_SMP_PORT:
-                raise RuntimeError(
-                    "已找到 V5.1 DATA CDC，但未找到同一设备的 SMP CDC"
-                )
             if not usb_transport:
                 _release_stale_measurement_bridge()
             firmware_source = "build"
@@ -2357,6 +3108,9 @@ class SettingsController:
                 or (settings == prebuilt_settings and not usb_transport)
             )
             if can_use_prebuilt:
+                runtime_supported = self._supports_runtime_settings(metadata)
+                if runtime.is_frozen() and not runtime_supported:
+                    raise RuntimeError("随包通用固件元数据缺失或版本不兼容")
                 firmware_source = "prebuilt"
                 if not runtime.is_frozen():
                     FIRMWARE_CONFIG.write_text(header, encoding="utf-8")
@@ -2368,12 +3122,70 @@ class SettingsController:
                 firmware_hash = self._verify_prebuilt_artifact(
                     firmware_hex, metadata
                 )
-                if usb_transport:
-                    self._set_apply_message("正在通过 USB 烧录并校验通用固件")
-                    self._upgrade_v51_firmware(firmware_hex)
+                updated = False
+                if runtime_supported:
+                    self._set_apply_message("正在核对目标板与通用固件")
+                    runtime_state, runtime_detail = self._wait_for_runtime_firmware(
+                        metadata, usb_transport=usb_transport, attempts=2,
+                    )
+                    if runtime_state == "invalid":
+                        raise RuntimeError(
+                            "通用固件已响应，但 MAX30131 物理配置核对失败:"
+                            + (runtime_detail or "确认信息不完整")
+                        )
+                    if runtime_state == "transport_error":
+                        raise RuntimeError(
+                            "无法核对当前硬件连接:"
+                            + (runtime_detail or "传输通道不可用")
+                        )
+                    if runtime_state == "incomplete":
+                        raise RuntimeError(
+                            "通用固件应答不完整，未执行烧录:"
+                            + (runtime_detail or "缺少带标识的配置确认行")
+                        )
+                    if runtime_state == "ready":
+                        DIAGNOSTICS.record(
+                            "info", "firmware.runtime.reused",
+                            "Existing runtime firmware passed tagged physical verification",
+                            transport="serial" if usb_transport else "rtt",
+                            firmware=firmware_hex,
+                        )
+                    else:
+                        updated = True
+                        DIAGNOSTICS.record(
+                            "info", "firmware.runtime.update_required",
+                            "Runtime protocol was not found; firmware update is required",
+                            transport="serial" if usb_transport else "rtt",
+                            detail=runtime_detail,
+                        )
+                        if usb_transport:
+                            if not SERIAL_SMP_PORT:
+                                raise RuntimeError(
+                                    "当前 USB 固件不支持通用协议，且未找到同一设备的 SMP CDC，无法安全升级"
+                                )
+                            self._set_apply_message(
+                                "固件不兼容，正在通过 USB 更新并校验"
+                            )
+                            self._upgrade_v51_firmware(firmware_hex)
+                        else:
+                            self._set_apply_message(
+                                "固件不兼容，正在通过 J-Link 更新并校验"
+                            )
+                            self._flash_firmware(firmware_hex)
+                        self._set_apply_message("正在确认更新后的运行时协议")
+                        verified_state, verification_detail = self._wait_for_runtime_firmware(
+                            metadata, usb_transport=usb_transport,
+                        )
+                        if verified_state != "ready":
+                            raise RuntimeError(
+                                "固件更新后未通过运行时核对:"
+                                + (verification_detail or "未收到完整应答")
+                            )
                 else:
-                    self._set_apply_message("正在通过 J-Link 烧录并校验通用固件")
+                    # Source-only compatibility for an old fixed-condition image.
+                    self._set_apply_message("正在更新并校验固定条件固件")
                     self._flash_firmware(firmware_hex)
+                    updated = True
                 SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
                 SETTINGS_PATH.write_text(json.dumps({
                     "settings": settings,
@@ -2389,8 +3201,16 @@ class SettingsController:
                     self.applied = True
                     self.state = "applied"
                     self.message = (
-                        "通用固件已就绪；测量前会自动下发并核验当前条件"
-                        if self._supports_runtime_settings(metadata)
+                        (
+                            "通用固件已更新并确认；当前条件已保存，"
+                            "测量前会自动下发并核验"
+                        )
+                        if runtime_supported and updated
+                        else (
+                            "通用固件已确认；当前条件已保存，"
+                            "测量前会自动下发并核验"
+                        )
+                        if runtime_supported
                         else "推荐条件已使用内置固件应用到硬件"
                     )
                     self.error = ""
@@ -3150,6 +3970,8 @@ class MeasurementController:
                 self.thread is not None and self.thread.is_alive()
             ):
                 raise RuntimeError("已有测量正在运行或正在保存结果")
+            if HARDWARE_TRANSPORT == "rtt":
+                _require_jlink_target(JLINK_SERIAL)
             self.settings = SettingsController.validate(settings or self.settings)
             self.filter_config = validate_filter_config(filter_config or self.filter_config)
             self.plateau_config = PlateauConfig.validate(
@@ -6798,6 +7620,10 @@ class AppState:
             save_dir = self._require_workspace()
             if not self.settings.snapshot()["applied"]:
                 raise RuntimeError("请先将当前检测条件应用到硬件")
+            if HARDWARE_TRANSPORT_REQUESTED != "rtt" or _selected_device_copy() is not None:
+                _refresh_usb_transport()
+            if HARDWARE_TRANSPORT == "rtt":
+                _require_jlink_target(JLINK_SERIAL)
             role = str(payload.get("sample_role") or "test")
             workflow = self.workflow_snapshot()
             is_it = self.settings.snapshot()["settings"].get("method") == "it"
@@ -8382,6 +9208,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                         result["message"] = "已恢复自动检测"
                     else:
                         devices = _discover_devices_with_probe()
+                        _annotate_target_states(devices, refresh_jlink=True)
+                        _remember_device_discovery(devices)
                         device = next(
                             (item for item in devices if item.get("id") == requested_id),
                             None,
@@ -8396,7 +9224,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             raise RuntimeError("该 J-Link 没有可用的探头序列号")
                         _set_device_selection(device)
                         APP.settings.restore_for_transport(HARDWARE_TRANSPORT)
-                        result = _devices_payload(probe=False)
+                        result = _devices_payload_from_devices(devices)
                         result["message"] = f"已选择 {device.get('name', '设备')}"
             elif self.path == "/api/measurement/start":
                 with APP.operation_lock:
@@ -8451,7 +9279,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/predict":
                 result = APP.predict(payload)
             elif self.path == "/api/schedule/start":
-                result = APP.start_schedule(payload)
+                with APP.operation_lock:
+                    result = APP.start_schedule(payload)
             elif self.path == "/api/schedule/stop":
                 result = APP.schedule.stop()
             elif self.path == "/api/settings/apply":

@@ -354,11 +354,37 @@ function measurementInputIssue(){
   return null;
 }
 function workspaceReady(){return Boolean(state.workflow?.workspace_available)}
+function hardwareOperationStatus(){
+  const payload=state.devices||{},devices=Array.isArray(payload.devices)?payload.devices:[];
+  const usable=devices.filter(device=>device.selectable);
+  const selected=payload.selected_device||devices.find(device=>device.id===payload.selected_device_id)||null;
+  if(selected?.present===false)return {ready:false,message:'所选设备已断开'};
+  const active=selected||(usable.length===1?usable[0]:null);
+  if(!active){
+    if(usable.length>1)return {ready:false,message:'请先选择本次使用的设备'};
+    return {ready:false,message:payload.probing?'正在核对硬件连接':'未发现可用硬件'};
+  }
+  if(active.kind==='jlink'){
+    if(active.target_state==='reachable')return {ready:true,message:''};
+    return {ready:false,message:active.target_state==='unreachable'?'目标板无响应，请检查板卡供电和 SWD 排线':'正在核对 J-Link 目标板'};
+  }
+  return active.selectable
+    ?{ready:true,message:''}
+    :{ready:false,message:'USB DATA 与 SMP 接口尚未就绪'};
+}
 function updateStartState(){
   const running=state.measurement?.busy??state.measurement?.state==='running', ready=state.workflow?.calibration_ready;
   const cv=state.method==='cv';
-  $('startMeasure').disabled=running||!state.settings?.applied||!workspaceReady()||(!cv&&state.sampleRole==='test'&&!ready);
-  $('startMeasure').textContent=cv?'开始 CV 扫描':state.sampleRole==='calibration'?'开始标定测量':'开始测试并预测';
+  const hardware=hardwareOperationStatus(),button=$('startMeasure');
+  button.disabled=running||!hardware.ready||!state.settings?.applied||!workspaceReady()||(!cv&&state.sampleRole==='test'&&!ready);
+  button.textContent=cv?'开始 CV 扫描':state.sampleRole==='calibration'?'开始标定测量':'开始测试并预测';
+  button.title=!running&&!hardware.ready?hardware.message:'';
+}
+function updateScheduleStartState(){
+  const button=$('startSchedule'),hardware=hardwareOperationStatus();
+  const busy=Boolean(state.measurement?.busy)||Boolean(state.schedule?.active)||Boolean(state.devices?.busy);
+  button.disabled=busy||!hardware.ready||!state.settings?.applied||!workspaceReady();
+  button.title=!busy&&!hardware.ready?hardware.message:'';
 }
 function setSampleRole(role, quiet=false){
   if(role==='test'&&!state.workflow?.calibration_ready){if(!quiet)toast('请先选择标定点并生成测试曲线');return}
@@ -787,9 +813,8 @@ function renderRange(data){
   $('applyRange').disabled=!running;
   renderReflashWarn(a);
 }
-// 🔴 运行时档位 ≠ 已烧录 settings 时告警。点「应用条件并烧录硬件」会重编译+烧录+
-//    **复位 MCU**,复位中断极化 ⇒ 档位回退到编译期默认,并重新引入初始瞬态
-//    (实测撞轨 7~91s,期间恒电位环开环)。这个后果在点之前必须可见。
+// 运行时档位与下次测量条件不同时，明确告知用户。
+// 应用按钮只确认通用固件并保存条件；真实配置仍由测量前门禁下发和回读。
 function renderReflashWarn(applied){
   const node=$('reflashWarn'), s=state.settings?.settings;
   if(!applied||!s){ node.hidden=true; return }
@@ -799,7 +824,7 @@ function renderReflashWarn(applied){
   if(!same) node.textContent=
     `⚠️ 硬件当前跑的是 ${liveFsr} nA / offset ${liveOff} nA(在线切档结果),`+
     `而上面这组条件是 ${s.fsr_nA} nA / offset ${s.offset_nA} nA。`+
-    `点「应用条件并烧录硬件」会复位 MCU ⇒ 丢掉在线切档结果、并重新引入初始瞬态。`;
+    `下次测量将使用上方条件。`;
 }
 // 两相测量。工作点 E=+200mV 驱动**氧化**,信号走器件原生方向、不受 offset 限制;
 // 但复位放生电极后的**起始瞬态是还原方向**(实测起点 ≥500nA),而还原侧上限就是
@@ -955,6 +980,19 @@ function renderHardwareConnection(data=state.measurement){
   let dotClass='',title='硬件未连接',detail='未发现 USB DATA 或 J-Link';
   if(data?.state==='running'){
     dotClass='busy';title='设备测量中';detail=String(data.device_name||activeDevice?.name||data.transport_label||'已连接硬件');
+  }else if(selected?.present===false){
+    dotClass='error';title='所选设备已断开';detail=String(selected.target_detail||'请重新插拔后刷新');
+  }else if(activeDevice?.kind==='jlink'){
+    const targetState=String((payload.probing&&activeDevice.target_state==='unknown')?'checking':(activeDevice.target_state||'unknown'));
+    if(targetState==='reachable'){
+      dotClass='ok';title='目标板已连接';detail=String(activeDevice.name||'J-Link');
+    }else if(targetState==='checking'){
+      dotClass='probing';title='正在核对目标板';detail=String(activeDevice.name||'J-Link 探头已连接');
+    }else if(targetState==='unreachable'){
+      dotClass='error';title='目标板无响应';detail='请检查板卡供电和 SWD 排线';
+    }else{
+      dotClass='warning';title='J-Link 探头已连接';detail=String(activeDevice.target_detail||'目标板连接尚未确认');
+    }
   }else if(activeDevice){
     dotClass='ok';title='硬件已连接';detail=String(activeDevice.name||activeDevice.transport_label||'已连接设备');
   }else if(usable.length>1){
@@ -964,10 +1002,12 @@ function renderHardwareConnection(data=state.measurement){
   }else if(devices.length){
     dotClass='warning';title='硬件尚未就绪';detail=devices.map(device=>device.name||device.transport_label).filter(Boolean).join(' · ')||'请重新插拔后刷新';
   }
+  const showModel=data?.state==='running'||activeDevice?.target_state==='reachable'||(activeDevice?.kind==='usb'&&activeDevice?.selectable);
   $('deviceDot').className=`status-dot ${dotClass}`.trim();
   $('deviceState').textContent=title;
-  $('deviceTransport').textContent=`${detail} · MAX30131`;
-  $('deviceStatus').title=`${title}：${detail}`;
+  $('deviceTransport').textContent=`${detail}${showModel?' · MAX30131':''}`;
+  const diagnostics=String(activeDevice?.target_diagnostics||'');
+  $('deviceStatus').title=diagnostics||`${title}：${detail}`;
 }
 function updateMeasurement(data){
   syncChartWindowRun(data.run_id);
@@ -986,9 +1026,9 @@ function updateMeasurement(data){
   $('liveCurrentTime').textContent=live?(cv?`${fmt(live.potential_v,3)} V · 第 ${live.cycle} 圈 · 点 ${Number(live.index)+1}`:`t = ${fmt(live.time_s,2)} s · 点 ${Number(live.index)+1}`):'尚无数据';
   $('liveCurrentBox').classList.toggle('invalid',Boolean(displayLive&&!displayLive.valid));
   renderHardwareConnection(data);
-  if(data.error){$('measureError').textContent=data.error;$('measureError').hidden=false}else if(!state.measureRequestError)$('measureError').hidden=true; updateStartState();drawAll();void handleWorkflowCompletion(data);
+  if(data.error){$('measureError').textContent=data.error;$('measureError').hidden=false}else if(!state.measureRequestError)$('measureError').hidden=true; updateStartState();updateScheduleStartState();if(state.settings)updateSettingsApplyState();drawAll();void handleWorkflowCompletion(data);
 }
-async function refreshMeasurement(){if(state.exiting)return;try{updateMeasurement(await api('/api/status',{timeoutMs:1500}))}catch(e){$('deviceState').textContent=e.message.includes('超时')?'设备正在重新连接':'服务未连接';$('deviceTransport').textContent='连接状态未知 · MAX30131';$('deviceDot').className='status-dot error'}}
+async function refreshMeasurement(){if(state.exiting)return;try{updateMeasurement(await api('/api/status',{timeoutMs:1500}))}catch(e){$('deviceState').textContent=e.message.includes('超时')?'设备正在重新连接':'服务未连接';$('deviceTransport').textContent='连接状态未知';$('deviceDot').className='status-dot error'}}
 async function measurementRefreshLoop(){
   if(state.exiting)return;
   await refreshMeasurement();
@@ -1019,7 +1059,10 @@ $('exitApp').addEventListener('click',async()=>{
   },350);
 });
 function deviceCardDetail(device){
-  if(device.kind==='jlink')return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探头 SN ${device.probe_serial}`:''}`;
+  if(device.kind==='jlink'){
+    const stateText=device.target_state==='reachable'?'目标板已响应':device.target_state==='unreachable'?'目标板无响应':state.devices.probing?'正在核对目标板':'目标板尚未核对';
+    return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探头 SN ${device.probe_serial}`:''} · ${stateText}`;
+  }
   const ports=[device.data_port&&`DATA ${device.data_port}`,device.smp_port&&`SMP ${device.smp_port}`].filter(Boolean);
   if(device.probe_required)return state.devices.probing?'正在后台识别 CDC 接口':'测量进行中，暂不打开 CDC 探测';
   return ports.length?ports.join(' · '):'未识别 DATA/SMP 接口';
@@ -1039,7 +1082,8 @@ function renderDeviceList(payload=state.devices){
     const action=document.createElement('button'); action.type='button'; action.className='secondary'; action.dataset.deviceId=device.id;
     action.textContent=device.id===selected?'当前使用':'选择'; action.disabled=Boolean(state.devices.busy)||device.id===selected||!device.selectable;
     card.append(title,action);
-    const note=document.createElement('small'); note.className='device-state'; note.textContent=device.id===selected?'当前测量将使用此设备':device.selectable?'空闲时可选择':'设备尚未准备好'; card.append(note);
+    const note=document.createElement('small'); note.className='device-state';
+    note.textContent=device.target_state==='unreachable'?(device.id===selected?'已选中，但目标板无响应':'探针在线，但目标板无响应'):device.id===selected?'当前测量将使用此设备':device.selectable?'空闲时可选择':'设备尚未准备好'; card.append(note);
     list.append(card);
   });
   if(!devices.length){const empty=document.createElement('div');empty.className='device-empty';empty.textContent='没有发现可识别的 USB DATA 或 J-Link。';list.append(empty)}
@@ -1048,7 +1092,7 @@ function renderDeviceList(payload=state.devices){
   const discoveryError=String(state.devices.error||'');
   $('deviceDialogBusy').hidden=!state.devices.busy&&!discoveryError;
   $('deviceDialogBusy').textContent=state.devices.busy?'测量或自动任务运行期间不能切换设备':discoveryError?`设备探测失败：${discoveryError}`:'';
-  renderHardwareConnection();
+  renderHardwareConnection();updateStartState();updateScheduleStartState();if(state.settings)updateSettingsApplyState();
 }
 async function refreshDevices(open=false){
   if(state.deviceRefreshPromise)return state.deviceRefreshPromise;
@@ -1163,7 +1207,7 @@ function renderSettings(data){
   pages.measure[1]=cv?`${signedPotential(s.cv_low_v)} 至 ${signedPotential(s.cv_high_v)} V · ${s.cv_scan_rate_v_s} V/s · ${s.cv_cycles} 圈`:adaptive?`I-T 智能平台检测与末 ${s.fit_window_s} 秒稳态分析`:`${s.duration_s} 秒 I-T 检测与末 ${s.fit_window_s} 秒稳态分析`; if($('view-measure').classList.contains('active'))$('pageSubtitle').textContent=pages.measure[1];
   const applying=data.state==='applying',settingsFailed=data.state==='error', failDetail=String(data.error||'').trim();
   $('settingsMessage').textContent=settingsFailed&&failDetail?failDetail:data.message; $('settingsMessage').title=settingsFailed&&failDetail?failDetail:''; $('settingsMessage').classList.toggle('error-text',settingsFailed&&!!failDetail);
-  $('settingsBadge').textContent=applying?'应用中':settingsFailed?'失败':data.applied?'已应用':'未应用'; $('settingsBadge').className=`live-badge ${settingsFailed?'error':data.applied?'running':''}`;
+  $('settingsBadge').textContent=applying?'应用中':settingsFailed?'失败':data.applied?'已准备':'未应用'; $('settingsBadge').className=`live-badge ${settingsFailed?'error':data.applied?'running':''}`;
   const itCommonMode=`V_WE ${fmt(s.working_electrode_v,3)} V · V_RE ${fmt(s.working_electrode_v-s.potential_v,3)} V`;
   $('firmwareNote').textContent=cv?`CV ${signedPotential(s.cv_low_v)}–${signedPotential(s.cv_high_v)} V · EIS ADC ${s.cv_eis_fsr_uA} µA`:wideIt?`${signedPotential(s.potential_v)} V 恒电位 · ${itCommonMode} · EIS ADC ${s.fsr_nA/1000} µA`:`${signedPotential(s.potential_v)} V 恒电位 · ${itCommonMode} · ${s.fsr_nA} nA FSR`; $('scheduleMethodLabel').textContent=cv?`CV · ${s.cv_cycles} 圈 · ${Math.round(s.duration_s/60)} 分钟`:adaptive?`恒电位 I-T · 智能停止 · ${signedPotential(s.potential_v)} V`:`恒电位 I-T · ${s.duration_s} 秒 · ${signedPotential(s.potential_v)} V`;
   $('chartWindow').querySelectorAll('button').forEach((button,index)=>{if(cv){const labels=['全程','5 圈','1 圈'];const values=['all','5','1'];button.textContent=labels[index];button.dataset.window=values[index]}else{const labels=['300 s','20 s','5 s'];const values=['300','20','5'];button.textContent=labels[index];button.dataset.window=values[index]}});
@@ -1175,10 +1219,16 @@ function renderSettings(data){
   const minInterval=adaptive?adaptiveMinimum/60:(s.prestep_s+s.duration_s+10)/60; $('intervalMinutes').min=minInterval.toFixed(2); if(Number($('intervalMinutes').value)<minInterval)$('intervalMinutes').value=Math.ceil(minInterval*4)/4;
   SETTINGS_INPUT_IDS.forEach(id=>{$(id).disabled=applying||(id==='durationS'&&adaptive)});
   $('methodMode').querySelectorAll('button').forEach(button=>button.disabled=applying);
-  $('applySettings').disabled=applying;$('applySettings').textContent=applying?'正在应用…':'应用条件并烧录硬件';
+  $('applySettings').textContent=applying?'正在应用…':'应用条件';updateSettingsApplyState();
   if(applying)ensureSettingsProgressPolling();
   renderWorkflow(state.workflow||{save_dir:'',stage:'collect',calibration_ready:false,points_count:0,selected_points_count:0,settings_match:true});renderScheduleMode();drawAll();
-  updateStartState(); $('startSchedule').disabled=state.schedule?.active||!data.applied||!workspaceReady();
+  updateStartState();updateScheduleStartState();
+}
+function updateSettingsApplyState(){
+  const button=$('applySettings'),applying=state.settings?.state==='applying',hardware=hardwareOperationStatus();
+  const measurementBusy=Boolean(state.measurement?.busy),scheduleBusy=Boolean(state.schedule?.active),deviceBusy=Boolean(state.devices?.busy);
+  button.disabled=applying||measurementBusy||scheduleBusy||deviceBusy||!hardware.ready;
+  button.title=measurementBusy?'测量进行中，不能修改硬件条件':scheduleBusy?'自动任务进行中，不能修改硬件条件':deviceBusy?'硬件操作进行中':!applying&&!hardware.ready?hardware.message:'';
 }
 function settingsChanged(){if(!state.settings)return;state.settingsDirty=true;state.settings.applied=false;state.settings.state='not_applied';state.settings.message='参数已修改，请重新应用';const s=readSettings();state.settings.settings=s;renderSettings(state.settings)}
 ['potentialV','workingElectrodeV','durationS','adaptiveStop','sensPeriodCode','sampleRateHz','fitWindowS','fsrNA','offsetNA','cvLowV','cvHighV','cvScanRate','cvCycles','cvQuietS','cvEisFsrUA'].forEach(id=>$(id).addEventListener('change',settingsChanged));
@@ -1298,7 +1348,7 @@ function updateSchedule(data){
   $('scheduleBadge').className=`live-badge ${data.active?'running':''}`;
   $('scheduleMessage').textContent=data.message;
   $('completedRuns').textContent=data.completed_runs;
-  $('startSchedule').disabled=data.active||Boolean(state.measurement?.busy)||!state.settings?.applied||!workspaceReady();
+  updateScheduleStartState();if(state.settings)updateSettingsApplyState();
   $('stopSchedule').disabled=!data.active;
   const next=data.next_run_at?new Date(data.next_run_at*1000):null;
   const stop=data.stop_at?new Date(data.stop_at*1000):null;

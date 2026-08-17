@@ -59,6 +59,10 @@ def test_gui_exposes_dynamic_transport_and_graceful_exit_controls() -> None:
     assert "nativeApp.postMessage('quit')" in app
     assert 'name: "sensusApp"' in swift
     assert 'action == "quit"' in swift
+    assert "var onServerRecovered: ((URL) -> Void)?" in swift
+    assert "self.onServerRecovered?(url)" in swift
+    assert "backend.onServerRecovered = { [weak self] url in" in swift
+    assert 'URL(string: "compact", relativeTo: backend.serverURL)' in swift
     assert ".exit-button" in styles
     assert "J-Link · MAX30131" not in html
 
@@ -81,37 +85,103 @@ const capture = () => ({
 });
 let state = {
   measurement: {state: 'idle'},
-  devices: {devices: [{id: 'j1', name: 'J-Link SN 1', selectable: true}], probing: false},
+  devices: {devices: [{id: 'j1', kind: 'jlink', name: 'J-Link SN 1', selectable: true, target_state: 'unknown'}], probing: false},
 };
+renderHardwareConnection(); const probeOnly = capture();
+state.devices.devices[0].target_state = 'reachable';
 renderHardwareConnection(); const connected = capture();
 state.devices = {devices: [], probing: false};
 renderHardwareConnection(); const disconnected = capture();
 state.devices = {devices: [
-  {id: 'j1', name: 'J-Link SN 1', selectable: true},
-  {id: 'u1', name: 'USB Board 1', selectable: true},
+  {id: 'j1', kind: 'jlink', name: 'J-Link SN 1', selectable: true, target_state: 'reachable'},
+  {id: 'u1', kind: 'usb', name: 'USB Board 1', selectable: true, target_state: 'reachable'},
 ], probing: false};
 renderHardwareConnection(); const multiple = capture();
+state.devices.selected_device_id = 'u1';
+renderHardwareConnection(); const selectedMultiple = capture();
+state.devices = {devices: [], selected_device:{id:'u1',kind:'usb',name:'USB Board 1',present:false,target_detail:'USB 已断开'}, selected_device_id:'u1', probing:false};
+renderHardwareConnection(); const staleSelected = capture();
+state.devices = {devices: [{id:'j1',kind:'jlink',name:'J-Link SN 1',selectable:true,target_state:'unknown'}], probing:true};
+renderHardwareConnection(); const checking = capture();
 """,
-        "{connected,disconnected,multiple}",
+        "{probeOnly,connected,disconnected,multiple,selectedMultiple,staleSelected,checking}",
     )
 
     assert states == {
+        "probeOnly": {
+            "dot": "status-dot warning",
+            "title": "J-Link 探头已连接",
+            "detail": "目标板连接尚未确认",
+        },
         "connected": {
             "dot": "status-dot ok",
-            "title": "硬件已连接",
+            "title": "目标板已连接",
             "detail": "J-Link SN 1 · MAX30131",
         },
         "disconnected": {
             "dot": "status-dot",
             "title": "硬件未连接",
-            "detail": "未发现 USB DATA 或 J-Link · MAX30131",
+            "detail": "未发现 USB DATA 或 J-Link",
         },
         "multiple": {
             "dot": "status-dot warning",
             "title": "已发现 2 个硬件",
-            "detail": "请在右上角选择本次使用的设备 · MAX30131",
+            "detail": "请在右上角选择本次使用的设备",
+        },
+        "selectedMultiple": {
+            "dot": "status-dot ok",
+            "title": "硬件已连接",
+            "detail": "USB Board 1 · MAX30131",
+        },
+        "staleSelected": {
+            "dot": "status-dot error",
+            "title": "所选设备已断开",
+            "detail": "USB 已断开",
+        },
+        "checking": {
+            "dot": "status-dot probing",
+            "title": "正在核对目标板",
+            "detail": "J-Link SN 1",
         },
     }
+
+
+def test_hardware_actions_require_a_verified_target() -> None:
+    states = _evaluate_chart_js(
+        ["hardwareOperationStatus"],
+        """
+let state = {devices: {devices: [], probing: true}};
+const probing = hardwareOperationStatus();
+state.devices = {devices: [{id:'j1',kind:'jlink',selectable:true,target_state:'unreachable'}], probing:false};
+const unreachable = hardwareOperationStatus();
+state.devices.devices[0].target_state = 'reachable';
+const jlink = hardwareOperationStatus();
+state.devices = {devices: [{id:'u1',kind:'usb',selectable:true,target_state:'reachable'}], probing:false};
+const usb = hardwareOperationStatus();
+state.devices = {devices: [
+  {id:'j1',kind:'jlink',selectable:true,target_state:'reachable'},
+  {id:'u1',kind:'usb',selectable:true,target_state:'reachable'},
+], probing:false};
+const multiple = hardwareOperationStatus();
+state.devices.selected_device_id = 'u1';
+const selected = hardwareOperationStatus();
+state.devices = {devices: [], selected_device:{id:'u1',kind:'usb',selectable:true,present:false}, selected_device_id:'u1', probing:false};
+const disconnected = hardwareOperationStatus();
+""",
+        "{probing,unreachable,jlink,usb,multiple,selected,disconnected}",
+    )
+
+    assert states["probing"] == {"ready": False, "message": "正在核对硬件连接"}
+    assert states["unreachable"]["ready"] is False
+    assert "目标板无响应" in states["unreachable"]["message"]
+    assert states["jlink"] == {"ready": True, "message": ""}
+    assert states["usb"] == {"ready": True, "message": ""}
+    assert states["multiple"] == {
+        "ready": False,
+        "message": "请先选择本次使用的设备",
+    }
+    assert states["selected"] == {"ready": True, "message": ""}
+    assert states["disconnected"] == {"ready": False, "message": "所选设备已断开"}
 
 
 def test_settings_apply_has_long_timeout_and_reload_safe_progress_polling() -> None:
@@ -122,8 +192,57 @@ def test_settings_apply_has_long_timeout_and_reload_safe_progress_polling() -> N
     assert "function ensureSettingsProgressPolling()" in app
     assert "state.settings?.state!=='applying'" in app
     assert "api('/api/settings',{timeoutMs:3000})" in app
-    assert "$('applySettings').disabled=applying" in app
+    assert "function updateSettingsApplyState()" in app
+    assert "button.disabled=applying||measurementBusy||scheduleBusy||deviceBusy||!hardware.ready" in app
     assert "if(applying)ensureSettingsProgressPolling()" in app
+
+
+def test_schedule_and_settings_buttons_share_the_hardware_gate() -> None:
+    states = _evaluate_chart_js(
+        [
+            "workspaceReady", "hardwareOperationStatus",
+            "updateSettingsApplyState", "updateScheduleStartState",
+        ],
+        """
+const nodes = {
+  applySettings: {disabled: false, title: ''},
+  startSchedule: {disabled: false, title: ''},
+};
+const $ = id => nodes[id];
+let state = {
+  workflow: {workspace_available: true},
+  settings: {state: 'ready', applied: true},
+  measurement: {busy: false},
+  schedule: {active: false},
+  devices: {busy: false, probing: false, devices: [
+    {id:'j1', kind:'jlink', selectable:true, target_state:'unreachable'},
+  ]},
+};
+const capture = () => ({
+  apply: {disabled:nodes.applySettings.disabled,title:nodes.applySettings.title},
+  schedule: {disabled:nodes.startSchedule.disabled,title:nodes.startSchedule.title},
+});
+updateSettingsApplyState(); updateScheduleStartState(); const unreachable = capture();
+state.devices.devices[0].target_state = 'reachable';
+updateSettingsApplyState(); updateScheduleStartState(); const ready = capture();
+state.measurement.busy = true;
+updateSettingsApplyState(); updateScheduleStartState(); const measuring = capture();
+""",
+        "{unreachable,ready,measuring}",
+    )
+
+    assert states["unreachable"]["apply"]["disabled"] is True
+    assert "目标板无响应" in states["unreachable"]["apply"]["title"]
+    assert states["unreachable"]["schedule"]["disabled"] is True
+    assert states["ready"] == {
+        "apply": {"disabled": False, "title": ""},
+        "schedule": {"disabled": False, "title": ""},
+    }
+    assert states["measuring"]["apply"] == {
+        "disabled": True,
+        "title": "测量进行中，不能修改硬件条件",
+    }
+    assert states["measuring"]["schedule"]["disabled"] is True
 
 
 def test_measurement_start_validates_inputs_keeps_errors_and_waits_for_gate() -> None:
@@ -818,7 +937,7 @@ def test_debug_overlay_controls_remain_clickable_in_empty_and_narrow_states() ->
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
 
-    assert html.count("20260817-workspace-picker") == 2
+    assert html.count("20260817-jlink-target-gate") == 2
     assert ".empty-chart{position:absolute;inset:0;display:grid;place-items:center;color:#8a969a;font-size:12px;pointer-events:none}" in css
     assert ".chart-legend{position:absolute;z-index:2;" in css
     assert "@media(max-width:900px)" in css

@@ -4,6 +4,7 @@ import os
 import plistlib
 import re
 import runpy
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,44 @@ def test_release_versions_stay_in_sync() -> None:
     assert pa_host.__version__ == project_version
     assert app_metadata["CFBundleShortVersionString"] == project_version
     assert app_metadata["CFBundleVersion"] == project_version
+    assert app_metadata["LSMinimumSystemVersion"] == "14.0"
+
+
+def test_portable_builds_pin_python_and_enforce_macos_compatibility() -> None:
+    root = Path(__file__).parents[3]
+    macos_build = (root / "packaging" / "build_macos_portable.sh").read_text(
+        encoding="utf-8"
+    )
+    windows_build = (root / "windows" / "build_portable.ps1").read_text(
+        encoding="utf-8"
+    )
+    verifier = (root / "packaging" / "verify_macos_bundle.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'SENSUS_PORTABLE_PYTHON_MINOR:-3.12' in macos_build
+    assert "Portable Windows builds require Python 3.12" in windows_build
+    assert "verify_macos_bundle.py" in macos_build
+    assert "OpenOCD is required for a self-contained J-Link package" in macos_build
+    for command_name in ('"lipo"', '"vtool"', '"otool"'):
+        assert command_name in verifier
+
+
+def test_macos_bundle_verifier_ignores_otool_header_path() -> None:
+    root = Path(__file__).parents[3]
+    verifier = runpy.run_path(str(root / "packaging" / "verify_macos_bundle.py"))
+
+    links = verifier["linked_libraries"](
+        "/Users/student/SensUs Workstation.app/Contents/MacOS/SensUsWorkstation:\n"
+        "\t@rpath/libusb-1.0.0.dylib (compatibility version 3.0.0)\n"
+        "\t/System/Library/Frameworks/AppKit.framework/AppKit "
+        "(compatibility version 1.0.0)\n"
+    )
+
+    assert links == [
+        "@rpath/libusb-1.0.0.dylib",
+        "/System/Library/Frameworks/AppKit.framework/AppKit",
+    ]
 
 
 def test_bundled_runtime_firmware_metadata_matches_artifacts() -> None:
@@ -128,14 +167,98 @@ def test_frozen_build_prefers_openocd_shipped_next_to_workstation(
     assert resolved_scripts == scripts
 
 
-def test_windows_frozen_build_does_not_use_host_jlink_install(monkeypatch) -> None:
+def test_frozen_build_uses_compatible_system_jlink_when_present(
+    tmp_path: Path, monkeypatch
+) -> None:
+    program_files = tmp_path / "Program Files"
+    commander = program_files / "SEGGER" / "JLink_V999" / "JLink.exe"
+    commander.parent.mkdir(parents=True)
+    commander.write_text("commander", encoding="ascii")
+    commander.chmod(0o755)
     monkeypatch.setattr(collect, "_IS_WIN", True)
     monkeypatch.setattr(collect.runtime, "is_frozen", lambda: True)
     monkeypatch.delenv("SENSUS_JLINK_EXE", raising=False)
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "Program Files (x86)"))
 
-    assert collect._resolve_jlink_exe() == Path(
-        "/__sensus_portable_no_jlink_exe__/JLink.exe"
+    assert collect._resolve_jlink_exe() == commander
+
+
+def test_frozen_build_allows_explicit_jlink_service_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    commander = tmp_path / "JLink.exe"
+    commander.write_text("commander", encoding="ascii")
+    monkeypatch.setattr(collect, "_IS_WIN", True)
+    monkeypatch.setattr(collect.runtime, "is_frozen", lambda: True)
+    monkeypatch.setenv("SENSUS_JLINK_EXE", str(commander))
+
+    assert collect._resolve_jlink_exe() == commander
+
+
+def test_jlink_target_probe_uses_explicit_connection_sequence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    commander = tmp_path / "JLinkExe"
+    commander.write_text("commander", encoding="ascii")
+    commander.chmod(0o755)
+    captured: dict[str, str] = {}
+
+    def fake_run(command, **kwargs):
+        script_path = Path(command[command.index("-CommanderScript") + 1])
+        captured["script"] = script_path.read_text(encoding="utf-8")
+        return subprocess.CompletedProcess(
+            command, 0,
+            stdout=(
+                "Found SW-DP with ID 0x2BA01477\n"
+                "Cortex-M4 identified.\n10000100 = 00052833\n"
+                "Script processing completed.\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(collect.subprocess, "run", fake_run)
+
+    reachable, _ = collect.probe_jlink_target(
+        "29734569", executable=commander
     )
+
+    assert reachable is True
+    assert captured["script"].splitlines() == [
+        "si SWD", "speed 100", "device nRF52833_xxAA", "connect",
+        "mem32 0x10000100 1", "q",
+    ]
+
+
+def test_jlink_target_probe_retries_a_transient_first_connect(
+    tmp_path: Path, monkeypatch
+) -> None:
+    commander = tmp_path / "JLinkExe"
+    commander.write_text("commander", encoding="ascii")
+    commander.chmod(0o755)
+    attempts = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        output = (
+            "Could not connect to the target device.\n"
+            if attempts == 1
+            else "10000100 = 00052833\nScript processing completed.\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(collect.subprocess, "run", fake_run)
+    monkeypatch.setattr(collect.time, "sleep", lambda _seconds: None)
+
+    reachable, output = collect.probe_jlink_target(
+        "29734569", executable=commander
+    )
+
+    assert reachable is True
+    assert attempts == 2
+    assert "Could not connect" in output
+    assert "10000100 = 00052833" in output
 
 
 def test_frozen_project_dir_resolves_app_resources_without_source_checkout(
@@ -154,6 +277,26 @@ def test_frozen_project_dir_resolves_app_resources_without_source_checkout(
     monkeypatch.delenv("SENSUS_PROJECT_DIR", raising=False)
 
     assert runtime.project_dir() == workstation.resolve()
+
+
+def test_macos_portable_launcher_never_falls_back_to_a_saved_source_tree() -> None:
+    root = Path(__file__).parents[3]
+    swift = (root / "macos" / "Sources" / "main.swift").read_text(
+        encoding="utf-8"
+    )
+    resolver_start = swift.index("private static func resolveProjectRoot()")
+    resolver_end = swift.index(
+        "private static func resolveBundledBackend()", resolver_start
+    )
+    resolver = swift[resolver_start:resolver_end]
+
+    assert "if resolveBundledBackend() != nil" in resolver
+    assert resolver.index("if resolveBundledBackend() != nil") < resolver.index(
+        'environment["SENSUS_PROJECT_DIR"]'
+    )
+    assert resolver.index("if resolveBundledBackend() != nil") < resolver.index(
+        'UserDefaults.standard.string(forKey: "projectRoot")'
+    )
 
 
 def test_command_stream_keeps_partial_lines() -> None:
@@ -212,14 +355,20 @@ def test_frozen_custom_conditions_never_invoke_toolchain(
     v40.mkdir()
     v51.mkdir(parents=True)
     (v40 / "zephyr.hex").write_bytes(b"runtime V4")
+    metadata = {
+        "settings": gui_server.SettingsController.DEFAULTS,
+        "runtime_configurable": True,
+        "runtime_protocol": {"name": "MEAS", "version": 1},
+        "rtt_address": "0x20001000",
+    }
     (tmp_path / "v51" / "firmware.json").write_text(
-        json.dumps({"settings": gui_server.SettingsController.DEFAULTS}),
+        json.dumps(metadata),
         encoding="utf-8",
     )
     image = v51 / "app.signed.bin"
     image.write_bytes(b"runtime V5.1")
     (v40 / "firmware.json").write_text(
-        json.dumps({"settings": gui_server.SettingsController.DEFAULTS}),
+        json.dumps(metadata),
         encoding="utf-8",
     )
     settings_path = tmp_path / "gui_settings.json"
@@ -234,6 +383,12 @@ def test_frozen_custom_conditions_never_invoke_toolchain(
     monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "COM9")
     monkeypatch.setattr(gui_server, "_refresh_usb_transport", lambda: None)
     monkeypatch.setattr(gui_server, "_release_stale_measurement_bridge", lambda: None)
+    probe_states = iter((("missing", "legacy"), ("missing", "legacy"),
+                         ("ready", "verified")))
+    monkeypatch.setattr(
+        gui_server.SettingsController, "_probe_runtime_firmware",
+        staticmethod(lambda *_args, **_kwargs: next(probe_states)),
+    )
     monkeypatch.setattr(
         gui_server.SettingsController, "_run_build",
         staticmethod(lambda *_args, **_kwargs: pytest.fail("toolchain was invoked")),

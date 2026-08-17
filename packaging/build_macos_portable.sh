@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT="${0:A:h:h}"
 VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "$ROOT/pyproject.toml")"
+PYTHON="${PYTHON:-python3}"
+REQUIRED_PYTHON_MINOR="${SENSUS_PORTABLE_PYTHON_MINOR:-3.12}"
+MINIMUM_MACOS_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$ROOT/macos/Info.plist")"
 ARTIFACTS="$ROOT/artifacts"
 BUILD="$ARTIFACTS/build/macos-arm64"
 RELEASES="$ARTIFACTS/releases/$VERSION"
@@ -22,9 +25,18 @@ if [[ -z "${SWIFT_MODULECACHE_PATH:-}" ]]; then
   export SWIFT_MODULECACHE_PATH
 fi
 
+if ! "$PYTHON" -c "import sys; raise SystemExit(sys.version_info[:2] != tuple(map(int, '$REQUIRED_PYTHON_MINOR'.split('.'))))"; then
+  echo "Portable macOS builds require Python $REQUIRED_PYTHON_MINOR; got $($PYTHON -V 2>&1)" >&2
+  exit 1
+fi
+
 mkdir -p "$BUILD" "$RELEASES" "${VENV:h}"
+if [[ -x "$VENV/bin/python" ]] && ! "$VENV/bin/python" -c \
+  "import sys; raise SystemExit(sys.version_info[:2] != tuple(map(int, '$REQUIRED_PYTHON_MINOR'.split('.'))))"; then
+  rm -rf "$VENV"
+fi
 if [[ ! -x "$VENV/bin/python" ]]; then
-  "${PYTHON:-python3}" -m venv "$VENV"
+  "$PYTHON" -m venv "$VENV"
 fi
 INSTALL_FLAGS=()
 if "$VENV/bin/python" -c 'import setuptools, wheel' >/dev/null 2>&1; then
@@ -41,7 +53,7 @@ fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/backend"
-xcrun swiftc -swift-version 5 -O -target arm64-apple-macos13.0 \
+xcrun swiftc -swift-version 5 -O -target "arm64-apple-macos${MINIMUM_MACOS_VERSION}" \
   -module-cache-path "$SWIFT_MODULECACHE_PATH" \
   -framework AppKit -framework WebKit "$ROOT/macos/Sources/main.swift" \
   -o "$APP/Contents/MacOS/SensUsWorkstation"
@@ -59,12 +71,25 @@ OPENOCD="${SENSUS_OPENOCD_EXE:-}"
 if [[ -z "$OPENOCD" ]]; then
   OPENOCD="$(command -v openocd || true)"
 fi
-if [[ -n "$OPENOCD" && -x "$OPENOCD" ]]; then
-  "$ROOT/packaging/bundle_macos_openocd.sh" "$OPENOCD" \
-    "$APP/Contents/Resources/tools/openocd"
-fi
+[[ -n "$OPENOCD" && -x "$OPENOCD" ]] || {
+  echo "OpenOCD is required for a self-contained J-Link package" >&2
+  exit 1
+}
+"$ROOT/packaging/bundle_macos_openocd.sh" "$OPENOCD" \
+  "$APP/Contents/Resources/tools/openocd"
+
+for required in \
+  "$APP/Contents/Resources/tools/openocd/bin/openocd" \
+  "$APP/Contents/Resources/tools/openocd/share/openocd/scripts/interface/jlink.cfg" \
+  "$APP/Contents/Resources/tools/openocd/share/openocd/scripts/target/nrf52.cfg"; do
+  [[ -e "$required" ]] || { echo "Missing portable resource: $required" >&2; exit 1; }
+done
 
 xattr -cr "$APP" 2>/dev/null || true
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
+if [[ "${SENSUS_SKIP_COMPATIBILITY_CHECK:-0}" != "1" ]]; then
+  "$VENV/bin/python" "$ROOT/packaging/verify_macos_bundle.py" \
+    "$APP" --minimum-version "$MINIMUM_MACOS_VERSION"
+fi
 echo "$APP"
