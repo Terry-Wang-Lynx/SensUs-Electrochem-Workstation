@@ -2590,6 +2590,7 @@ def test_openocd_missing_rtt_layout_is_recoverable_only_after_chip_identity() ->
     metadata = {"rtt_address": "0x20001000"}
     with (
         patch("pa_host.gui_server.JLINK_EXE") as commander,
+        patch("pa_host.gui_server._openocd_jlink_available", return_value=True),
         patch("pa_host.gui_server._openocd_rtt_layout_probe",
               return_value=(True, False, "10000100 = 00052833")) as layout,
         patch("pa_host.gui_server._probe_openocd_runtime_firmware") as runtime_probe,
