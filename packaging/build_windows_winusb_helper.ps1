@@ -74,10 +74,10 @@ Get-VerifiedDownload -Url $WdkUrl -Sha256 $WdkSha256 -Path $WdkMsi
 Get-VerifiedDownload -Url $Libusb0Url -Sha256 $Libusb0Sha256 -Path $Libusb0Archive
 Get-VerifiedDownload -Url $LibusbKUrl -Sha256 $LibusbKSha256 -Path $LibusbKArchive
 
-$WdkRoot = Join-Path $VendorRoot "wdk"
-$Libusb0Root = Join-Path $VendorRoot "libusb0"
-$LibusbKRoot = Join-Path $VendorRoot "libusbk"
-$ExtractRoot = Join-Path $VendorRoot "extract"
+$WdkRoot = Join-Path $Source "wdk"
+$Libusb0Root = Join-Path $Source "libusb0"
+$LibusbKRoot = Join-Path $Source "libusbk"
+$ExtractRoot = Join-Path $Source "extract"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $WdkRoot, $Libusb0Root, $LibusbKRoot, $ExtractRoot
 New-Item -ItemType Directory -Force -Path $WdkRoot, $ExtractRoot | Out-Null
 
@@ -112,12 +112,22 @@ if (-not $LibusbKSource) {
 Move-Item $LibusbKSource.FullName $LibusbKRoot
 Remove-Item -Recurse -Force $ExtractRoot
 
-$BuildMacros = 'WDK_DIR=\"../wdk/Windows Kits/8.0\";LIBUSB0_DIR=\"../libusb0\";LIBUSBK_DIR=\"../libusbk/bin\"'
-$SolutionDir = $Source.TrimEnd("\") + "\"
-$HelperProject = Join-Path $Source "examples\.msvc\wdi-simple.vcxproj"
-& msbuild.exe $HelperProject /m /t:Build "/p:Configuration=Release" "/p:Platform=Win32" "/p:SolutionDir=$SolutionDir" "/p:BuildMacros=$BuildMacros"
-if ($LASTEXITCODE -ne 0) {
-  throw "libwdi wdi-simple build failed with exit code $LASTEXITCODE"
+$BuildBatch = Join-Path ([IO.Path]::GetTempPath()) ("sensus-libwdi-" + [guid]::NewGuid().ToString("N") + ".cmd")
+$env:SENSUS_LIBWDI_SOURCE = $Source
+@'
+@echo off
+msbuild "%SENSUS_LIBWDI_SOURCE%\libwdi.sln" /m /p:Configuration=Release,Platform=Win32,BuildMacros="WDK_DIR=\"../wdk/Windows Kits/8.0\";LIBUSB0_DIR=\"../libusb0\";LIBUSBK_DIR=\"../libusbk/bin\""
+exit /b %ERRORLEVEL%
+'@ | Set-Content -Encoding ascii $BuildBatch
+try {
+  & cmd.exe /d /c $BuildBatch
+  $BuildExitCode = $LASTEXITCODE
+} finally {
+  Remove-Item -Force -ErrorAction SilentlyContinue $BuildBatch
+  Remove-Item Env:SENSUS_LIBWDI_SOURCE -ErrorAction SilentlyContinue
+}
+if ($BuildExitCode -ne 0) {
+  throw "libwdi wdi-simple build failed with exit code $BuildExitCode"
 }
 $Helper = Join-Path $Source "Win32\Release\examples\wdi-simple.exe"
 if (-not (Test-Path $Helper)) {
