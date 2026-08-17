@@ -3,7 +3,7 @@ const $ = (id) => {
   if (!node) throw new Error(`界面资源版本不一致（缺少 ${id}），请刷新页面后重试`);
   return node;
 };
-const state = { measurement: null, measurementDrawRevision: null, measurementDrawPending: false, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, historyCurveCatalog: [], historyCurves: [], historyCurveIds: [], historyPreview: null, devices: {devices: [], selected_device_id: null, busy: false, probing: true}, deviceRefreshPromise: null, workspaceSwitchPromise: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, measureRequestError: '', showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, settingsApplyActive: false, settingsApplyRequestPending: false, settingsApplySequence: 0, settingsPollSequence: 0, driftDirty: false, exiting: false };
+const state = { measurement: null, measurementDrawRevision: null, measurementDrawPending: false, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, historyCurveCatalog: [], historyCurves: [], historyCurveIds: [], historyPreview: null, devices: {devices: [], selected_device_id: null, busy: false, probing: true}, deviceRefreshPromise: null, workspaceSwitchPromise: null, appUpdate: null, appUpdateRequested: false, appUpdateApplying: false, appUpdatePollTimer: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, measureRequestError: '', showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, settingsApplyActive: false, settingsApplyRequestPending: false, settingsApplySequence: 0, settingsPollSequence: 0, driftDirty: false, exiting: false };
 state.diagnostics=null;state.diagnosticsRefreshPromise=null;state.clientIssueLast=new Map();
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
@@ -1171,6 +1171,43 @@ $('exitApp').addEventListener('click',async()=>{
     button.textContent=acknowledged?'后端已退出，请关闭标签页':'后端未响应，请检查运行进程';
   },350);
 });
+function renderAppUpdate(data){
+  state.appUpdate=data||null;const button=$('appUpdate'),active=['downloading','preparing','ready','applying'].includes(data?.state),visible=Boolean(data?.available&&(active||data.state==='available'||data.state==='error'));
+  button.hidden=!visible;if(!visible)return;
+  if(data.state==='downloading'||data.state==='preparing'){button.disabled=true;button.textContent=`↓ ${Math.round(Number(data.progress||0)*100)}%`;button.title='正在下载并校验新版本';return}
+  if(data.state==='ready'){button.disabled=state.appUpdateRequested;button.textContent=state.appUpdateRequested?'↻ 正在重启…':'↻ 安装更新';return}
+  if(data.state==='applying'){button.disabled=true;button.textContent='↻ 正在安装…';return}
+  button.disabled=false;button.textContent=data.state==='error'?'↻ 重试':'↻ 更新';button.title=data.error||`更新到 ${data.latest_version}`;
+}
+async function applyReadyAppUpdate(){
+  if(!state.appUpdateRequested||state.appUpdateApplying||state.appUpdate?.state!=='ready')return;
+  state.appUpdateApplying=true;
+  try{
+    renderAppUpdate(await post('/api/app-update/apply'));
+    state.exiting=true;
+    const nativeApp=window.webkit?.messageHandlers?.sensusApp;
+    if(nativeApp)nativeApp.postMessage('quit');
+  }catch(e){state.appUpdateApplying=false;state.appUpdateRequested=false;showGlobalError('软件更新失败',e);try{renderAppUpdate(await api('/api/app-update'))}catch{}}
+}
+async function refreshAppUpdate(){
+  if(state.exiting)return;
+  try{const data=await api('/api/app-update');renderAppUpdate(data);if(data.state==='error'&&state.appUpdateRequested){state.appUpdateRequested=false;showGlobalError('软件更新失败',new Error(data.error||'下载或校验新版本失败'))}else if(data.state==='ready')void applyReadyAppUpdate()}
+  catch(e){if(state.appUpdateRequested)showGlobalError('软件更新失败',e)}
+}
+function appUpdatePollLoop(){
+  if(state.exiting)return;
+  void refreshAppUpdate().finally(()=>{const active=['checking','downloading','preparing','ready','applying'].includes(state.appUpdate?.state);state.appUpdatePollTimer=setTimeout(appUpdatePollLoop,state.appUpdateRequested||active?600:60000)});
+}
+function wakeAppUpdatePoll(){
+  if(state.appUpdatePollTimer)clearTimeout(state.appUpdatePollTimer);state.appUpdatePollTimer=setTimeout(appUpdatePollLoop,250);
+}
+$('appUpdate').onclick=async()=>{
+  const update=state.appUpdate;if(!update?.available)return;
+  if(update.state==='ready'){state.appUpdateRequested=true;renderAppUpdate(update);void applyReadyAppUpdate();return}
+  if(!confirm(`更新到 ${update.latest_version}？\n下载和校验完成后，软件会自动重启。`))return;
+  try{const data=await post('/api/app-update/start');state.appUpdateRequested=true;renderAppUpdate(data);wakeAppUpdatePoll()}
+  catch(e){state.appUpdateRequested=false;showGlobalError('无法开始软件更新',e)}
+};
 function deviceCardDetail(device){
   if(device.kind==='jlink'){
     if(device.driver_state==='missing')return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探针 SN ${device.probe_serial}`:''} · Windows 驱动待准备`;
@@ -1530,14 +1567,17 @@ function updateValidationSummary(){
 }
 function renderValidation(points){
   const body=$('validationBody');body.replaceChildren();const rows=state.calibration?.model?(points||[]):[];$('validationEmpty').hidden=rows.length>0;
-  rows.forEach((point,index)=>{const tr=document.createElement('tr');tr.dataset.pointId=point.point_id||point.run_id||`validation-${index+1}`;const number=document.createElement('td');number.textContent=String(index+1);tr.appendChild(number);[['sample_name',point.sample_name||''],['concentration_um',point.concentration_um],['current_nA',point.current_nA]].forEach(([key,value])=>{const td=document.createElement('td'),input=document.createElement('input');input.dataset.validationKey=key;input.value=value??'';if(key!=='sample_name'){input.type='number';input.step='0.001';input.min=key==='concentration_um'?'0':''}input.addEventListener('input',()=>{state.validationDirty=true;$('validationEditBadge').textContent='未保存修改';$('validationEditBadge').className='live-badge warn';$('saveValidation').disabled=false;updateValidationSummary()});td.appendChild(input);tr.appendChild(td)});for(let i=0;i<7;i++){const td=document.createElement('td');td.dataset.validationDerived='true';tr.appendChild(td)}const action=document.createElement('td'),promote=document.createElement('button');promote.className='text-button';promote.type='button';promote.textContent='添加为标定点';promote.title='将该测试点复制到候选标定点列表';promote.onclick=async()=>{try{state.calibration=await post('/api/calibration/promote-validation',{point_id:tr.dataset.pointId});renderCalibration();toast('已添加为候选标定点，请选择后重新拟合')}catch(e){toast(diagnosticMessage(e))}};action.appendChild(promote);tr.appendChild(action);body.appendChild(tr);syncValidationRow(tr)});
+  rows.forEach((point,index)=>{const tr=document.createElement('tr');tr.dataset.pointId=point.point_id||point.run_id||`validation-${index+1}`;const number=document.createElement('td');number.textContent=String(index+1);tr.appendChild(number);[['sample_name',point.sample_name||''],['concentration_um',point.concentration_um],['current_nA',point.current_nA]].forEach(([key,value])=>{const td=document.createElement('td'),input=document.createElement('input');input.dataset.validationKey=key;input.value=value??'';if(key!=='sample_name'){input.type='number';input.step='0.001';input.min=key==='concentration_um'?'0':''}input.addEventListener('input',()=>{state.validationDirty=true;$('validationEditBadge').textContent='未保存修改';$('validationEditBadge').className='live-badge warn';$('saveValidation').disabled=false;updateValidationSummary()});td.appendChild(input);tr.appendChild(td)});for(let i=0;i<7;i++){const td=document.createElement('td');td.dataset.validationDerived='true';tr.appendChild(td)}const action=document.createElement('td'),actions=document.createElement('div'),promote=document.createElement('button'),remove=document.createElement('button');actions.className='validation-row-actions';promote.className='text-button';promote.type='button';promote.textContent='添加为标定点';promote.title='将该测试点复制到候选标定点列表';promote.onclick=async()=>{try{state.calibration=await post('/api/calibration/promote-validation',{point_id:tr.dataset.pointId});renderCalibration();toast('已添加为候选标定点，请选择后重新拟合')}catch(e){toast(diagnosticMessage(e))}};remove.className='delete-point';remove.type='button';remove.textContent='×';remove.title='删除该测试点（保留原始测量文件）';remove.setAttribute('aria-label',`删除测试点 ${point.sample_name||index+1}`);remove.onclick=async()=>{if(!confirm(`删除测试点“${point.sample_name||index+1}”？\n原始测量 CSV 会保留。`))return;try{remove.disabled=true;if(state.validationDirty)await persistValidationEdits();state.calibration=await post('/api/calibration/validation/delete',{point_id:tr.dataset.pointId});renderCalibration();toast('测试点已删除，原始测量文件仍保留')}catch(e){remove.disabled=false;toast(diagnosticMessage(e))}};actions.append(promote,remove);action.appendChild(actions);tr.appendChild(action);body.appendChild(tr);syncValidationRow(tr)});
   state.validationDirty=false;$('validationEditBadge').textContent='已保存';$('validationEditBadge').className='live-badge running';$('saveValidation').disabled=true;updateValidationSummary();
 }
 function renderCalibration(){
   const c=state.calibration||{}, {model,points,validation_points=[],model_path,model_created_at,drift_bias_nA,model_compatible}=c;
   if(points)renderPoints(points);$('modelR2').textContent=model?fmt(model.r2,4):'--';$('modelRmse').textContent=model?`${fmt(model.rmse_nA,2)} nA`:'--';$('modelSlope').textContent=model&&model.degree===1?`${fmt(model.coefficients[0],3)} nA/µM`:'--';const bias=Number(drift_bias_nA||0);$('calibrationStatus').textContent=model&&!model_compatible?'旧条件曲线 · 当前 IT 条件不匹配，测试已禁用':model?`已锁定 ${model.n_points} 个选中点 · ${model.concentration_min_um}–${model.concentration_max_um} µM${bias?` · bias ${bias>0?'+':''}${fmt(bias,3)} nA`:''}`:'选择至少两个不同浓度的候选点';$('modelPath').textContent=model_path?`${model_path}${model_created_at?` · ${new Date(model_created_at*1000).toLocaleString('zh-CN',{hour12:false})}`:''}`:'尚未生成测试曲线';renderValidation(validation_points);state.calibrationDirty=false;drawAll();
 }
-$('saveValidation').onclick=async()=>{try{$('saveValidation').disabled=true;const data=await post('/api/calibration/validation',{points:readValidationPoints().map(point=>({point_id:point.point_id,sample_name:point.sample_name,concentration_um:point.concentration_um,current_nA:point.current_nA}))});state.calibration=data;state.validationDirty=false;renderCalibration();toast('测试点修改已保存')}catch(e){$('saveValidation').disabled=false;toast(diagnosticMessage(e))}};
+async function persistValidationEdits(){
+  $('saveValidation').disabled=true;const data=await post('/api/calibration/validation',{points:readValidationPoints().map(point=>({point_id:point.point_id,sample_name:point.sample_name,concentration_um:point.concentration_um,current_nA:point.current_nA}))});state.calibration=data;state.validationDirty=false;return data;
+}
+$('saveValidation').onclick=async()=>{try{await persistValidationEdits();renderCalibration();toast('测试点修改已保存')}catch(e){$('saveValidation').disabled=false;toast(diagnosticMessage(e))}};
 
 function driftOption(record){const date=new Date(record.finished_at*1000).toLocaleString('zh-CN',{hour12:false});return `${date} · ${fmt(record.steady_current_nA,3)} nA · ${record.sample_name}`}
 function renderDrift(data){state.drift=data;const records=data.records||[],oldStart=$('driftStart').value,oldEnd=$('driftEnd').value;$('driftStart').innerHTML='';$('driftEnd').innerHTML='';records.forEach(record=>[$('driftStart'),$('driftEnd')].forEach(select=>{const option=document.createElement('option');option.value=record.run_id;option.textContent=driftOption(record);select.appendChild(option)}));const saved=data.record_ids||[];if(records.length){$('driftStart').value=oldStart&&records.some(r=>r.run_id===oldStart)?oldStart:(saved[0]||records[0].run_id);$('driftEnd').value=oldEnd&&records.some(r=>r.run_id===oldEnd)?oldEnd:(saved.at(-1)||records.at(-1).run_id)}$('driftSolution').value=data.solution_name||'';$('driftConcentration').value=data.known_concentration_um??'';$('applyDrift').checked=Boolean(data.enabled);$('applyDrift').disabled=data.calculated_at==null;$('calculateDrift').disabled=records.length<2;$('driftStart').disabled=$('driftEnd').disabled=records.length===0;$('driftStartCurrent').textContent=fmt(data.start_current_nA,3);$('driftEndCurrent').textContent=fmt(data.end_current_nA,3);$('driftBias').textContent=data.calculated_at?`${Number(data.bias_nA)>0?'+':''}${fmt(data.bias_nA,3)}`:'--';$('driftSlope').textContent=fmt(data.slope_nA_per_hour,3);$('driftStatus').textContent=records.length<2?`已有 ${records.length} 次稳定化 IT，至少需要 2 次`:data.calculated_at?`${(data.record_ids||[]).length} 次记录 · ${data.enabled?'校正已启用':'校正未启用'}`:`已有 ${records.length} 次稳定化 IT，可选择范围计算`;state.driftDirty=false;}
@@ -1595,6 +1635,7 @@ async function initializePart(step,operation,{visible=false}={}){
 }
 async function init(){
   setInterval(()=>$('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);
+  appUpdatePollLoop();
   await loadFilter();await loadPlateau();
   await initializePart('硬件参数',async()=>{state.settingsDirty=false;renderSettings(await api('/api/settings'))},{visible:true});
   await initializePart('工作区',async()=>renderWorkflow(await api('/api/workflow')),{visible:true});

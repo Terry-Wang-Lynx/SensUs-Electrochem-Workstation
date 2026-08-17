@@ -11,6 +11,7 @@ import sys
 import time
 import urllib.request
 import webbrowser
+from pathlib import Path
 
 
 WINDOWS_COLD_START_TIMEOUT_S = 180
@@ -58,9 +59,15 @@ def _windows_app() -> int:
         try:
             _wait_for_server(url, expected_project, timeout_s=0.8)
         except RuntimeError:
+            child_environment = {
+                **os.environ,
+                "SENSUS_PORTABLE_CHILD": "1",
+                "SENSUS_APP_ROOT": str(Path(sys.executable).resolve().parent),
+                "SENSUS_APP_PID": str(os.getpid()),
+            }
             child = subprocess.Popen(
                 [sys.executable, "gui", "--host", "127.0.0.1", "--port", "8765"],
-                env={**os.environ, "SENSUS_PORTABLE_CHILD": "1"},
+                env=child_environment,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
             # Windows Defender may inspect every native dependency on the

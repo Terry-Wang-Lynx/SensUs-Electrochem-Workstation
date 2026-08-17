@@ -1,9 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 ROOT = Path(SPECPATH).resolve().parent
+WINDOWS_ICON = ROOT / "artifacts" / "build" / "windows-x64" / "SensUs-Workstation.ico"
+if sys.platform == "win32" and not WINDOWS_ICON.is_file():
+    raise SystemExit(f"Missing generated Windows icon: {WINDOWS_ICON}")
 
 a = Analysis(
     [str(ROOT / "packaging" / "portable_entry.py")],
@@ -16,6 +20,7 @@ a = Analysis(
         "pa_host.it_tool",
         "pa_host.collect",
         "pa_host.analyze",
+        "pa_host.app_update",
         "pa_host.cv",
         "pa_host.diagnostics",
         "pa_host.filtering",
@@ -52,6 +57,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(WINDOWS_ICON) if sys.platform == "win32" else None,
 )
 coll = COLLECT(
     exe,

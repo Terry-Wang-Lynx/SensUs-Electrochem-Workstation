@@ -51,6 +51,26 @@ def test_portable_builds_pin_python_and_enforce_macos_compatibility() -> None:
         assert command_name in verifier
 
 
+def test_portable_packages_use_the_shared_brand_logo() -> None:
+    root = Path(__file__).parents[3]
+    source = root / "branding" / "sensus-logo-source.png"
+    macos_icon = (root / "macos" / "create_icon.py").read_text(encoding="utf-8")
+    windows_icon = (root / "windows" / "create_icon.py").read_text(encoding="utf-8")
+    windows_build = (root / "windows" / "build_portable.ps1").read_text(
+        encoding="utf-8"
+    )
+    spec = (root / "packaging" / "portable.spec").read_text(encoding="utf-8")
+    manifest = (root / "MANIFEST.in").read_text(encoding="utf-8")
+
+    assert source.is_file()
+    assert '"branding" / "sensus-logo-source.png"' in macos_icon
+    assert '"branding" / "sensus-logo-source.png"' in windows_icon
+    assert 'Join-Path $Root "windows\\create_icon.py"' in windows_build
+    assert 'icon=str(WINDOWS_ICON) if sys.platform == "win32" else None' in spec
+    assert "recursive-include branding *.png" in manifest
+    assert "recursive-include software/host/pa_host/gui *.html *.js *.css *.png" in manifest
+
+
 def test_windows_portable_builds_and_bundles_pinned_winusb_helper() -> None:
     root = Path(__file__).parents[3]
     helper_build = (
@@ -89,6 +109,19 @@ def test_windows_first_launch_allows_defender_cold_start() -> None:
     )
 
     assert entry["WINDOWS_COLD_START_TIMEOUT_S"] >= 120
+
+
+def test_portable_launchers_expose_their_installed_location_to_app_updates() -> None:
+    root = Path(__file__).parents[3]
+    swift = (root / "macos" / "Sources" / "main.swift").read_text(encoding="utf-8")
+    windows = (root / "packaging" / "portable_entry.py").read_text(encoding="utf-8")
+    spec = (root / "packaging" / "portable.spec").read_text(encoding="utf-8")
+
+    assert 'environment["SENSUS_APP_BUNDLE"] = Bundle.main.bundleURL.path' in swift
+    assert 'environment["SENSUS_APP_PID"]' in swift
+    assert '"SENSUS_APP_ROOT": str(Path(sys.executable).resolve().parent)' in windows
+    assert '"SENSUS_APP_PID": str(os.getpid())' in windows
+    assert '"pa_host.app_update"' in spec
 
 
 def test_macos_openocd_bundler_reuses_already_relocated_libraries() -> None:

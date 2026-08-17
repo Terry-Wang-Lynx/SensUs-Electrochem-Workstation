@@ -3,6 +3,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from PIL import Image
+
 
 GUI_DIR = Path(__file__).parents[1] / "pa_host" / "gui"
 
@@ -847,6 +849,8 @@ def test_gui_exposes_history_curve_overlay_batch_naming_and_cross_add_controls()
     assert "toggle.indeterminate=selected>0&&selected<inputs.length" in app
     assert "/api/calibration/promote-validation" in app
     assert "/api/calibration/add-validation" in app
+    assert "/api/calibration/validation/delete" in app
+    assert "validation-row-actions" in app
     assert "integerX:true" in app
     assert '>切换工作区</button>' not in html
     assert '>新建批次</button>' in html
@@ -886,6 +890,35 @@ syncHistoryCurveSelectAll(); const complete = capture();
         "empty": {"disabled": True, "checked": False, "indeterminate": False},
         "partial": {"disabled": False, "checked": False, "indeterminate": True},
         "complete": {"disabled": False, "checked": True, "indeterminate": False},
+    }
+
+
+def test_app_update_button_is_visible_only_for_an_available_portable_update() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'id="appUpdate"' in html
+    assert "/api/app-update/start" in app
+    assert "/api/app-update/apply" in app
+
+    result = _evaluate_chart_js(
+        ["renderAppUpdate"],
+        """
+const button={hidden:false,disabled:false,textContent:'',title:''};
+const $=id=>button;
+let state={appUpdateRequested:false,appUpdate:null};
+const capture=()=>({hidden:button.hidden,disabled:button.disabled,text:button.textContent});
+renderAppUpdate({available:false,state:'idle'});const none=capture();
+renderAppUpdate({available:true,state:'available',latest_version:'0.4.7'});const available=capture();
+renderAppUpdate({available:true,state:'downloading',latest_version:'0.4.7',progress:.42});const downloading=capture();
+renderAppUpdate({available:true,state:'ready',latest_version:'0.4.7'});const ready=capture();
+""",
+        "{none,available,downloading,ready}",
+    )
+    assert result == {
+        "none": {"hidden": True, "disabled": False, "text": ""},
+        "available": {"hidden": False, "disabled": False, "text": "↻ 更新"},
+        "downloading": {"hidden": False, "disabled": True, "text": "↓ 42%"},
+        "ready": {"hidden": False, "disabled": False, "text": "↻ 安装更新"},
     }
 
 
@@ -1273,11 +1306,49 @@ def test_debug_overlay_controls_remain_clickable_in_empty_and_narrow_states() ->
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
 
-    assert html.count("20260817-v045") == 2
+    assert html.count("20260817-v047") == 4
     assert ".empty-chart{position:absolute;inset:0;display:grid;place-items:center;color:#8a969a;font-size:12px;pointer-events:none}" in css
     assert ".chart-legend{position:absolute;z-index:2;" in css
     assert "@media(max-width:900px)" in css
     assert ".dbg-chart .panel-head{align-items:flex-start;flex-direction:column;gap:10px}" in css
+
+
+def test_method_conditions_share_the_measurement_page_scrollbar() -> None:
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert ".control-content{height:auto;min-height:0;overflow:visible}" in styles
+    assert (
+        ".control-panel{display:grid;grid-template-rows:auto auto auto;"
+        "align-self:stretch;overflow:visible}"
+    ) in styles
+    assert ".measure-control-panel{display:none;height:auto}" in styles
+    assert "#view-measure .workspace-grid>.control-panel{height:390px" not in styles
+    assert (
+        "#view-measure.active{display:block;height:calc(100vh - 60px);"
+        "min-height:0;overflow:auto;padding:10px 16px 82px}"
+    ) in styles
+    for nested_height in (
+        "height:172px;min-height:172px",
+        "height:300px;min-height:300px",
+        "height:390px;min-height:390px",
+    ):
+        assert nested_height not in styles
+
+
+def test_gui_uses_the_supplied_white_background_logo() -> None:
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    styles = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+    logo_path = GUI_DIR / "sensus-logo.png"
+
+    assert '<link rel="icon" type="image/png" href="/assets/sensus-logo.png' in html
+    assert '<img class="brand-mark" src="/assets/sensus-logo.png' in html
+    assert ".brand-mark{display:block;width:34px;height:34px;object-fit:contain;" in styles
+    with Image.open(logo_path) as logo:
+        assert logo.size == (1024, 1024)
+        rgba = logo.convert("RGBA")
+        assert rgba.getextrema()[3] == (255, 255)
+        for corner in ((0, 0), (1023, 0), (0, 1023), (1023, 1023)):
+            assert rgba.getpixel(corner) == (255, 255, 255, 255)
 
 
 def test_plateau_input_bounds_match_backend_validation() -> None:

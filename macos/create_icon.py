@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Create the source raster for the macOS workstation icon."""
+"""Create white-background workstation icons from the shared SensUs logo."""
 
 from __future__ import annotations
 
-import math
 import struct
 import sys
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
+
+
+ROOT = Path(__file__).resolve().parents[1]
+LOGO_SOURCE = ROOT / "branding" / "sensus-logo-source.png"
 
 
 _ICNS_PNG_TYPES = (
@@ -37,51 +40,25 @@ def _write_icns(image: Image.Image, output: Path) -> None:
     output.write_bytes(b"icns" + struct.pack(">I", len(body) + 8) + body)
 
 
+def render_logo(size: int) -> Image.Image:
+    """Preserve the supplied mark and center it on an opaque white canvas."""
+    with Image.open(LOGO_SOURCE) as source:
+        mark = source.convert("RGBA")
+    available = round(size * 0.90)
+    scale = min(available / mark.width, available / mark.height)
+    mark = mark.resize(
+        (round(mark.width * scale), round(mark.height * scale)),
+        Image.Resampling.LANCZOS,
+    )
+    image = Image.new("RGBA", (size, size), "#ffffff")
+    position = ((size - mark.width) // 2, (size - mark.height) // 2)
+    image.alpha_composite(mark, position)
+    return image
+
+
 def main() -> int:
     output = Path(sys.argv[1])
-    size = 1024
-    image = Image.new("RGBA", (size, size), "#eef2f3")
-    draw = ImageDraw.Draw(image)
-
-    draw.rounded_rectangle((70, 70, 954, 954), radius=205, fill="#ffffff")
-    draw.rounded_rectangle((132, 132, 892, 892), radius=148, fill="#f7faf9")
-
-    axis = "#26373d"
-    teal = "#147d78"
-    coral = "#d7654f"
-    grid = "#d9e3e3"
-
-    for fraction in (0.25, 0.5, 0.75):
-        x = 230 + int(570 * fraction)
-        y = 250 + int(500 * fraction)
-        draw.line((x, 250, x, 750), fill=grid, width=5)
-        draw.line((230, y, 800, y), fill=grid, width=5)
-
-    draw.line((230, 250, 230, 750, 800, 750), fill=axis, width=18, joint="curve")
-
-    forward: list[tuple[float, float]] = []
-    reverse: list[tuple[float, float]] = []
-    for index in range(241):
-        value = -1.0 + 2.0 * index / 240.0
-        x = 515 + value * 255
-        forward_current = 0.53 * math.tanh(3.4 * (value - 0.08)) + 0.20 * math.sin(
-            math.pi * (value + 0.18)
-        )
-        reverse_current = 0.49 * math.tanh(3.1 * (value + 0.11)) - 0.21 * math.sin(
-            math.pi * (value - 0.10)
-        )
-        forward.append((x, 510 - 260 * forward_current))
-        reverse.append((x, 510 - 260 * reverse_current))
-
-    draw.line(forward, fill=teal, width=22, joint="curve")
-    draw.line(list(reversed(reverse)), fill=coral, width=22, joint="curve")
-    point_x, point_y = forward[173]
-    draw.ellipse((point_x - 23, point_y - 23, point_x + 23, point_y + 23), fill=axis)
-    draw.ellipse((point_x - 13, point_y - 13, point_x + 13, point_y + 13), fill="#ffffff")
-
-    for x, color, height in ((310, teal, 82), (390, coral, 112), (470, axis, 66)):
-        draw.rounded_rectangle((x, 160, x + 38, 160 + height), radius=19, fill=color)
-
+    image = render_logo(1024)
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output)
     if len(sys.argv) > 2:

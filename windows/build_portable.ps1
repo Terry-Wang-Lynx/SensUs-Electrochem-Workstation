@@ -43,6 +43,11 @@ if (Test-Path $VenvPython) {
 }
 if (-not (Test-Path $VenvPython)) { & $Python -m venv $Venv }
 & $VenvPython -m pip install --disable-pip-version-check -e "${Root}[portable]"
+$Icon = Join-Path $Build "SensUs-Workstation.ico"
+& $VenvPython (Join-Path $Root "windows\create_icon.py") $Icon
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Icon)) {
+  throw "Failed to generate the Windows application icon: $Icon"
+}
 & $VenvPython -m PyInstaller --noconfirm --clean `
   --distpath (Join-Path $Build "pyinstaller-dist") `
   --workpath (Join-Path $Build "pyinstaller-work") `

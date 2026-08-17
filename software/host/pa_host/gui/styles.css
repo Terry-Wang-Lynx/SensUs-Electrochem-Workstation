@@ -104,7 +104,7 @@ input[aria-invalid="true"]:focus{border-color:var(--red);box-shadow:0 0 0 2px rg
   #view-measure .workspace-grid>.chart-panel .panel-head{display:block;min-height:0}
   #view-measure .workspace-grid>.chart-panel .chart-actions{margin-top:8px;justify-content:flex-start;gap:8px}
   #view-measure .workspace-grid>.chart-panel .live-current{min-width:130px}
-  #view-measure .workspace-grid>.control-panel{height:390px;margin-top:12px}
+  #view-measure .workspace-grid>.control-panel{height:auto;margin-top:12px}
   #view-measure .filter-panel{padding-left:12px;padding-right:12px}
 }
 
@@ -248,6 +248,7 @@ input[aria-invalid="true"]:focus{border-color:var(--red);box-shadow:0 0 0 2px rg
 #dbgLoopWarn{line-height:1.7}
 
 /* ── 工作站主布局：曲线优先，控制区横向展开 ─────────────────────────── */
+.brand-mark{display:block;width:34px;height:34px;object-fit:contain;background:#fff;border-radius:6px}
 html,body,.app-shell{height:100%;overflow:hidden}
 .app-shell{min-height:0}
 main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hidden}
@@ -278,13 +279,13 @@ main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hi
 .workspace-grid>.chart-panel .metric-strip>div{padding:6px 16px}
 .workspace-grid>.chart-panel .metric-strip strong{font-size:17px;line-height:1.45}
 
-.control-panel{display:grid;grid-template-rows:auto minmax(0,1fr) auto;align-self:stretch;overflow:hidden}
+.control-panel{display:grid;grid-template-rows:auto auto auto;align-self:stretch;overflow:visible}
 .control-head{min-height:50px;padding:8px 14px}
 .control-head-actions{display:flex;align-items:center;gap:10px}
 .control-tabs button{min-width:82px;padding:6px 10px}
-.control-content{height:172px;min-height:172px;overflow:auto}
+.control-content{height:auto;min-height:0;overflow:visible}
 .control-content input,.control-content select{padding:7px 9px}
-.measure-control-panel{display:none;height:100%}
+.measure-control-panel{display:none;height:auto}
 .measure-control-panel.active{display:grid}
 
 .sample-controls{grid-template-columns:180px minmax(170px,1fr) minmax(180px,1fr) minmax(235px,1.15fr);
@@ -352,10 +353,9 @@ main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hi
   html,body,.app-shell{overflow:auto}
   main{height:auto;min-height:100vh;overflow:visible}
   #view-measure.active{height:calc(100vh - 60px);min-height:0;overflow:auto}
-  .workspace-grid{grid-template-rows:minmax(320px,48vh) 352px}
+  .workspace-grid{grid-template-rows:minmax(320px,48vh) auto}
   .workflow-bar{grid-template-columns:1fr auto;padding:12px 14px}
   .workflow-bar .save-directory{grid-column:1/-1}
-  .control-content{height:300px;min-height:300px}
   .sample-controls{grid-template-columns:1fr 1fr}
   .sample-controls .action-row{grid-column:2;grid-row:auto}
   .sample-controls .auto-save-preview{grid-column:1}
@@ -370,10 +370,10 @@ main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hi
 }
 @media(max-width:720px){
   main{display:block}
+  #view-measure.active{display:block;height:calc(100vh - 60px);min-height:0;overflow:auto;padding:10px 16px 82px}
   .control-head{align-items:flex-start;gap:8px}
   .control-head-actions{align-items:flex-end;flex-direction:column-reverse}
   .control-tabs button{min-width:0}
-  .control-content{height:390px;min-height:390px}
   .sample-controls,.it-settings.measure-control-panel{grid-template-columns:1fr 1fr}
   .it-settings.measure-control-panel #itSettings,
   .it-settings.measure-control-panel #itSettings>.field-pair,
@@ -426,6 +426,7 @@ main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hi
 .validation-panel th:nth-child(3),.validation-panel td:nth-child(3),.validation-panel th:nth-child(4),.validation-panel td:nth-child(4){min-width:130px}
 .validation-panel th:nth-child(5),.validation-panel td:nth-child(5),.validation-panel th:nth-child(6),.validation-panel td:nth-child(6){min-width:120px}
 .validation-panel td input{min-width:0;width:100%;padding:6px 7px}
+.validation-row-actions{display:flex;align-items:center;gap:4px}.validation-row-actions .text-button{white-space:nowrap}.validation-row-actions .delete-point{flex:0 0 30px;width:30px;height:30px;padding:0;border-radius:4px;font-size:20px;line-height:1}
 .validation-derived{font-weight:650;color:#4f5b60}
 .validation-derived.zone-blue{color:#18735f;background:#eff8f3}
 .validation-derived.zone-green{color:#9a6710;background:#fff8e8}
@@ -512,3 +513,5 @@ main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hi
 @media(max-width:620px){
   .sidebar nav{grid-template-columns:repeat(5,minmax(0,1fr))}
 }
+.app-update-button{margin-left:auto;border:1px solid #70ad9b;border-radius:5px;background:#eaf7f2;color:#0c624f;padding:6px 8px;font:inherit;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap}.app-update-button:hover{background:#d9eee7}.app-update-button:disabled{cursor:wait}.app-update-button[hidden]{display:none}
+@media(min-width:621px) and (max-width:980px){.brand{flex-direction:column;gap:6px}.app-update-button{margin-left:0;width:34px;height:26px;padding:0;font-size:0}.app-update-button::before{content:'↻';font-size:15px}}

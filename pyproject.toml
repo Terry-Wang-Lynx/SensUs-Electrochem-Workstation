@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sensus-electrochem-workstation"
-version = "0.4.6"
+version = "0.4.7"
 description = "Local GUI and acquisition workflow for the SensUs MAX30131 electrochemistry workstation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -42,7 +42,7 @@ where = ["software/host"]
 include = ["pa_host*"]
 
 [tool.setuptools.package-data]
-pa_host = ["gui/*.html", "gui/*.js", "gui/*.css"]
+pa_host = ["gui/*.html", "gui/*.js", "gui/*.css", "gui/*.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["software/host/tests"]

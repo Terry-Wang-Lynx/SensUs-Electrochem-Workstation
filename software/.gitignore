@@ -17,3 +17,4 @@ firmware/bootloader/
 *.csv
 *.png
 !host/tests/**/*.csv
+!host/pa_host/gui/sensus-logo.png

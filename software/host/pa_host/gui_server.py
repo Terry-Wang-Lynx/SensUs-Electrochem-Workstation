@@ -89,7 +89,9 @@ from .live_metrics import (
 from .stability_eta import StabilityEtaEstimator
 from .workspace_history import BATCH_KIND, WORKSPACE_KIND, WorkspaceHistory
 from .frontend_update import FrontendUpdater
+from .app_update import AppUpdateError, AppUpdateManager
 from .diagnostics import DiagnosticStore
+from . import __version__
 from . import runtime
 from .windows_jlink import (
     JLINK_VENDOR_ID,
@@ -110,6 +112,18 @@ WINUSB_HELPER = resolve_winusb_helper(PROJECT_DIR)
 DIAGNOSTICS = DiagnosticStore(runtime.logs_dir())
 FRONTEND_UPDATER = FrontendUpdater(
     PACKAGE_DIR / "gui", STATE_DIR, PROJECT_DIR
+)
+
+
+def _app_update_event(event: str, message: str, context: dict[str, Any]) -> None:
+    DIAGNOSTICS.record(
+        "warning" if event.endswith("failed") else "info",
+        event, message, **context,
+    )
+
+
+APP_UPDATER = AppUpdateManager(
+    __version__, STATE_DIR, event_callback=_app_update_event
 )
 GUI_DIR = FRONTEND_UPDATER.prepare_startup()
 RUNS_DIR = STATE_DIR / "gui_runs"
@@ -6846,6 +6860,7 @@ class AppState:
         self.records: list[dict[str, Any]] = []
         self.validation_overrides: dict[str, dict[str, Any]] = {}
         self.manual_validation_points: list[dict[str, Any]] = []
+        self.deleted_validation_point_ids: set[str] = set()
         self.drift = self._empty_drift()
         self.workspace_runtime_settings: dict[str, Any] | None = None
         self.workspace_runtime_filter: dict[str, Any] | None = None
@@ -7119,6 +7134,7 @@ class AppState:
             self.records = []
             self.validation_overrides = {}
             self.manual_validation_points = []
+            self.deleted_validation_point_ids = set()
             self.drift = self._empty_drift()
             self.workspace_runtime_settings = None
             self.workspace_runtime_filter = None
@@ -7265,9 +7281,16 @@ class AppState:
                             dict(point) for point in raw_manual
                             if isinstance(point, dict)
                         ]
+                    raw_deleted = saved_validation.get("deleted_point_ids", [])
+                    if isinstance(raw_deleted, list):
+                        self.deleted_validation_point_ids = {
+                            str(point_id) for point_id in raw_deleted
+                            if str(point_id).strip()
+                        }
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     self.validation_overrides = {}
                     self.manual_validation_points = []
+                    self.deleted_validation_point_ids = set()
 
             if paths["runtime"].exists():
                 try:
@@ -7294,7 +7317,7 @@ class AppState:
         "calibration_filter", "calibration_settings", "calibration_plateau",
         "points", "point_records", "selected_point_ids", "model_created_at",
         "validation_started_at", "records", "validation_overrides",
-        "manual_validation_points", "drift",
+        "manual_validation_points", "deleted_validation_point_ids", "drift",
         "workspace_runtime_settings", "workspace_runtime_filter",
         "workspace_runtime_plateau", "latest_workflow_result",
     )
@@ -8245,7 +8268,10 @@ class AppState:
     def _save_validation_overrides(self) -> None:
         self._workspace_paths()["validation"].write_text(
             json.dumps({"points": self.validation_overrides,
-                        "manual_points": self.manual_validation_points}, indent=2,
+                        "manual_points": self.manual_validation_points,
+                        "deleted_point_ids": sorted(
+                            self.deleted_validation_point_ids
+                        )}, indent=2,
                        ensure_ascii=False),
             encoding="utf-8",
         )
@@ -8298,6 +8324,35 @@ class AppState:
             self.validation_overrides = overrides
             self.manual_validation_points = list(manual.values())
             self._save_validation_overrides()
+        return self.model_payload()
+
+    def delete_validation_point(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Hide one test point while preserving its underlying measurement files."""
+        point_id = str(payload.get("point_id") or "").strip()
+        if not point_id:
+            raise ValueError("请选择要删除的测试点")
+        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
+            raise RuntimeError("测量或自动任务运行期间不能删除测试点")
+        with self.operation_lock, self.lock:
+            manual_before = len(self.manual_validation_points)
+            self.manual_validation_points = [
+                point for point in self.manual_validation_points
+                if str(point.get("point_id") or "") != point_id
+            ]
+            removed_manual = len(self.manual_validation_points) != manual_before
+            record_exists = any(
+                str(row.get("run_id") or f"validation-{index:04d}") == point_id
+                and row.get("sample_role") == "test"
+                and row.get("state") == "completed"
+                for index, row in enumerate(self.records, 1)
+            )
+            if not removed_manual and not record_exists:
+                raise ValueError("测试点记录不存在")
+            if record_exists:
+                self.deleted_validation_point_ids.add(point_id)
+            self.validation_overrides.pop(point_id, None)
+            self._save_validation_overrides()
+        self._refresh_history_best_effort()
         return self.model_payload()
 
     def _stabilization_records(self) -> list[dict[str, Any]]:
@@ -8936,6 +8991,8 @@ class AppState:
             if row.get("sample_role") != "test" or row.get("state") != "completed":
                 continue
             point_id = str(row.get("run_id") or f"validation-{index:04d}")
+            if point_id in self.deleted_validation_point_ids:
+                continue
             override = self.validation_overrides.get(point_id, {})
             try:
                 measured_current = float(override.get("current_nA", row["steady_current_nA"]))
@@ -9467,6 +9524,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({
                 "ok": True,
                 "project": str(PROJECT_DIR),
+                "version": __version__,
                 "diagnostic_session": DIAGNOSTICS.session_id,
             })
             return
@@ -9494,6 +9552,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/frontend":
             self._send_json(FRONTEND_UPDATER.mark_ready())
             return
+        if parsed.path == "/api/app-update":
+            self._send_json(APP_UPDATER.status(trigger_check=True))
+            return
         if parsed.path.startswith("/assets/"):
             name = Path(parsed.path.removeprefix("/assets/")).name
             asset = GUI_DIR / name
@@ -9510,6 +9571,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         shutdown_requested = False
         try:
             payload = self._body()
+            update_blocked_paths = {
+                "/api/devices/select", "/api/devices/jlink-driver/install",
+                "/api/measurement/start", "/api/range",
+                "/api/range/measurement", "/api/range/auto",
+                "/api/debug/start", "/api/debug/begin", "/api/debug/cmd",
+                "/api/schedule/start", "/api/settings/apply",
+            }
+            if APP_UPDATER.busy and self.path in update_blocked_paths:
+                raise RuntimeError("软件更新正在准备，暂时不能启动测量、烧录或硬件操作")
             if self.path == "/api/frontend/ready":
                 result = FRONTEND_UPDATER.mark_ready()
             elif self.path == "/api/diagnostics/client":
@@ -9533,6 +9603,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # active acquisition,收回采集子进程/J-Link, then closes the HTTP server.
                 result = {"ok": True, "message": "后端正在退出"}
                 shutdown_requested = True
+            elif self.path == "/api/app-update/start":
+                with APP.operation_lock:
+                    if not APP.hardware_idle():
+                        raise RuntimeError("请先停止测量、自动任务或硬件参数更新")
+                    result = APP_UPDATER.start_download()
+            elif self.path == "/api/app-update/apply":
+                with APP.operation_lock:
+                    if not APP.hardware_idle():
+                        raise RuntimeError("请先停止测量、自动任务或硬件参数更新")
+                    result = APP_UPDATER.begin_install()
+                    shutdown_requested = True
             elif self.path == "/api/devices/select":
                 with APP.operation_lock:
                     if not APP.hardware_idle():
@@ -9613,6 +9694,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = APP.fit(payload)
             elif self.path == "/api/calibration/validation":
                 result = APP.update_validation_points(payload)
+            elif self.path == "/api/calibration/validation/delete":
+                result = APP.delete_validation_point(payload)
             elif self.path == "/api/calibration/promote-validation":
                 result = APP.add_validation_to_calibration(payload)
             elif self.path == "/api/calibration/add-validation":
@@ -9704,7 +9787,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
         ):
             raise
-        except (ValueError, KeyError, TypeError, OSError) as exc:
+        except (ValueError, KeyError, TypeError, OSError, AppUpdateError) as exc:
             payload = {"error": str(exc)}
             diagnostic_id = str(getattr(exc, "diagnostic_id", ""))
             if diagnostic_id:
@@ -9790,6 +9873,7 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
         raise
     finally:
         FRONTEND_UPDATER.stop()
+        APP_UPDATER.stop()
         APP.schedule.stop()
         # 🔴 同步收干净,不能只靠 stop() 里那个 1.5s 延迟线程 —— 进程一退它就没了。
         APP.measurement.stop()

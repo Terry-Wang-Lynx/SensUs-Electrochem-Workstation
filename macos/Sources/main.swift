@@ -110,6 +110,8 @@ private final class BackendManager {
         environment["SENSUS_STATE_DIR"] = stateURL.path
         environment["PYTHONUNBUFFERED"] = "1"
         if usingBundledBackend {
+            environment["SENSUS_APP_BUNDLE"] = Bundle.main.bundleURL.path
+            environment["SENSUS_APP_PID"] = String(ProcessInfo.processInfo.processIdentifier)
             if let resources = Bundle.main.resourceURL {
                 let openocd = resources.appendingPathComponent("tools/openocd/bin/openocd")
                 let scripts = resources.appendingPathComponent("tools/openocd/share/openocd/scripts")

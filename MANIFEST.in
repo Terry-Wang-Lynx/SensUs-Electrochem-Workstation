@@ -6,10 +6,11 @@ include Launch_Electrochem_Workstation.bat
 include Launch_Electrochem_Workstation.ps1
 recursive-include macos *.swift *.plist *.sh *.py
 recursive-include windows *.py *.bat *.md *.ico
+recursive-include branding *.png
 recursive-include protocols *.md *.json *.h
 recursive-include software/firmware *.c *.h *.conf *.yml *.yaml *.dts *.cmake *.txt CMakeLists.txt Makefile Kconfig Kconfig.* *_defconfig
 recursive-include software/firmware/prebuilt *.json *.hex *.elf
-recursive-include software/host/pa_host/gui *.html *.js *.css
+recursive-include software/host/pa_host/gui *.html *.js *.css *.png
 recursive-include software/host/tests *.py
 recursive-include docs *.md
 exclude software/firmware/src/measurement_config.h

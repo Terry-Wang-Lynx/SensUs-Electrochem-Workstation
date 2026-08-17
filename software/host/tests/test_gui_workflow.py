@@ -1472,6 +1472,48 @@ def test_calibration_and_test_points_can_be_copied_between_lists_and_persisted()
                    for point in reloaded.manual_validation_points)
 
 
+def test_validation_points_can_be_deleted_without_rewriting_raw_records() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "delete-validation"
+        app = AppState()
+        app.save_dir = workspace
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        app._append_record({
+            "finished_at": float(app.model_created_at or 0) + 10,
+            "run_id": "test-delete", "sample_name": "保留原始数据",
+            "sample_role": "test", "known_concentration_um": 5,
+            "steady_current_nA": 20, "state": "completed",
+            "data_path": "test.csv", "raw_path": "test-raw.csv",
+        })
+        app.add_calibration_to_validation({"point_id": "zero"})
+        index_path = workspace / "measurement-index.csv"
+        original_index = index_path.read_text(encoding="utf-8")
+
+        result = app.delete_validation_point({"point_id": "test-delete"})
+        assert {point["point_id"] for point in result["validation_points"]} == {
+            "manual-test-zero"
+        }
+        assert index_path.read_text(encoding="utf-8") == original_index
+        assert app.records[0]["data_path"] == "test.csv"
+
+        result = app.delete_validation_point({"point_id": "manual-test-zero"})
+        assert result["validation_points"] == []
+
+        reloaded = AppState()
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        assert reloaded.model_payload()["validation_points"] == []
+        saved = json.loads(
+            (workspace / "calibration-validation.json").read_text(encoding="utf-8")
+        )
+        assert saved["deleted_point_ids"] == ["test-delete"]
+        assert saved["manual_points"] == []
+
+
 def test_ap_scoring_keeps_the_complete_index_beyond_one_hundred_rows() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp) / "complete-index"
