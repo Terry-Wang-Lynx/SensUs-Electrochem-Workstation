@@ -403,8 +403,12 @@ class AppUpdateManager:
                 raise AppUpdateError("新版本尚未准备完成")
             if target is None or not target.exists():
                 raise AppUpdateError("找不到当前安装位置")
+            normalized_target = str(target).replace("\\", "/")
+            on_macos_volume = bool(
+                re.match(r"^(?:[A-Za-z]:)?/Volumes/", normalized_target)
+            )
             if self.package_kind == "macos-arm64" and (
-                target.suffix != ".app" or str(target).startswith("/Volumes/")
+                target.suffix != ".app" or on_macos_volume
             ):
                 raise AppUpdateError("请先将软件拖入“应用程序”文件夹后再更新")
             if not os.access(target.parent, os.W_OK):
