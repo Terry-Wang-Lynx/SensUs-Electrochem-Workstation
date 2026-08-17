@@ -25,6 +25,9 @@ _DRIVER_ERROR_MARKERS = (
 # Driver replacement must be interface-specific. Rebinding the composite
 # parent or CDC interface would make the probe disappear from device discovery.
 _SUPPORTED_WINUSB_INTERFACES = {
+    # Legacy J-Link ARM-OB: one vendor-specific USB function, no CDC child.
+    (0x0101, None),
+    # Newer composite J-Link: bind only the debug function, preserving CDC.
     (0x0105, 0x02),
 }
 _INSTANCE_ID_RE = re.compile(

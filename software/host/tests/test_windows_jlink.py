@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from pa_host import gui_server, windows_jlink
+from pa_host import gui_server, jlink_usb, windows_jlink
 
 
 def _port(
@@ -57,6 +57,7 @@ def test_repairable_interfaces_only_selects_verified_debug_interface(
         windows_jlink,
         "_problem_device_payload",
         lambda _vid, _pid: [
+            {"instance_id": r"USB\VID_1366&PID_0101\LEGACY"},
             {"instance_id": r"USB\VID_1366&PID_0105&MI_00\SERIAL"},
             {"instance_id": r"USB\VID_1366&PID_0105&MI_02\SERIAL"},
             {"instance_id": r"USB\VID_1366&PID_0105\SERIAL"},
@@ -67,6 +68,22 @@ def test_repairable_interfaces_only_selects_verified_debug_interface(
     interfaces = windows_jlink.repairable_interfaces(0x1366, 0x0105)
 
     assert [(item.pid, item.mi) for item in interfaces] == [(0x0105, 0x02)]
+
+
+def test_repairable_interfaces_accepts_legacy_single_interface(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_jlink,
+        "_problem_device_payload",
+        lambda _vid, _pid: [{
+            "instance_id": r"USB\VID_1366&PID_0101\000000123456",
+        }],
+    )
+
+    interfaces = windows_jlink.repairable_interfaces(0x1366, 0x0101)
+
+    assert [(item.pid, item.mi) for item in interfaces] == [(0x0101, None)]
 
 
 def test_problem_interfaces_rejects_non_segger_vendor() -> None:
@@ -114,6 +131,38 @@ def test_install_winusb_uses_only_supported_interface(
     assert arguments[arguments.index("--type") + 1] == "0"
     assert arguments[arguments.index("--log") + 1] == "1"
     assert "--silent" not in arguments
+
+
+def test_install_winusb_legacy_device_does_not_guess_an_interface_id(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    helper = tmp_path / "wdi-simple.exe"
+    helper.write_bytes(b"helper")
+    interface = windows_jlink.JLinkUsbInterface(
+        0x1366, 0x0101, None,
+        r"USB\VID_1366&PID_0101\000000123456",
+    )
+    monkeypatch.setattr(windows_jlink, "_IS_WIN", True)
+    monkeypatch.setattr(
+        windows_jlink, "repairable_interfaces", lambda _vid, _pid: [interface]
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(_executable, arguments, *, timeout_s):
+        assert timeout_s == 180.0
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "ok", "")
+
+    monkeypatch.setattr(windows_jlink, "_run_elevated", fake_run)
+
+    result = windows_jlink.install_winusb_driver(
+        helper, vid=0x1366, pid=0x0101,
+    )
+
+    assert result["installed"][0]["mi"] is None
+    assert len(calls) == 1
+    assert "--iid" not in calls[0]
+    assert calls[0][calls[0].index("--pid") + 1] == "0x0101"
 
 
 def test_install_winusb_never_guesses_an_interface(
@@ -187,11 +236,77 @@ def test_windows_serial_discovery_skips_non_usb_com_ports(monkeypatch) -> None:
         serial_number="000029734569", vid=0x1366, pid=0x0105,
     )
     monkeypatch.setattr(gui_server, "_IS_WIN", True)
+    monkeypatch.setattr(gui_server, "discover_jlink_usb_devices", lambda: [])
     monkeypatch.setattr(
         list_ports, "comports", lambda: [bluetooth, motherboard, board, jlink]
     )
 
     assert gui_server._all_serial_port_infos() == [board, jlink]
+
+
+def test_driverless_legacy_jlink_is_discovered_without_a_com_port(
+    monkeypatch,
+) -> None:
+    from serial.tools import list_ports
+
+    legacy = jlink_usb.JLinkUsbInfo(
+        device=r"USB\VID_1366&PID_0101\000000123456",
+        description="J-Link",
+        hwid="USB VID:PID=1366:0101 SER=000000123456",
+        manufacturer="SEGGER",
+        product="J-Link",
+        serial_number="000000123456",
+        vid=0x1366,
+        pid=0x0101,
+        location="Port_#0001.Hub_#0002",
+        interface="",
+        instance_id=r"USB\VID_1366&PID_0101\000000123456",
+        status="Error",
+        problem_code=28,
+    )
+    monkeypatch.setattr(list_ports, "comports", lambda: [])
+    monkeypatch.setattr(
+        gui_server, "discover_jlink_usb_devices", lambda: [legacy]
+    )
+    monkeypatch.setattr(
+        gui_server, "_probe_jlink_target_status",
+        lambda serial, force=False: gui_server._unknown_jlink_target_status(serial),
+    )
+
+    devices = gui_server._discover_devices(probe=False)
+
+    assert len(devices) == 1
+    assert devices[0]["id"] == "jlink:123456"
+    assert devices[0]["probe_serial"] == "123456"
+    assert devices[0]["pid"] == 0x0101
+    assert devices[0]["cdc_port"].startswith("USB\\VID_1366")
+
+
+def test_native_jlink_is_deduplicated_against_its_cdc_port(monkeypatch) -> None:
+    from serial.tools import list_ports
+
+    cdc = _port(
+        "COM11", description="J-Link", manufacturer="SEGGER",
+        serial_number="000029734569", vid=0x1366, pid=0x0105,
+    )
+    native = jlink_usb.JLinkUsbInfo(
+        device=r"USB\VID_1366&PID_0105\000029734569",
+        description="J-Link", hwid="USB VID:PID=1366:0105",
+        manufacturer="SEGGER", product="J-Link",
+        serial_number="000029734569", vid=0x1366, pid=0x0105,
+        location="Port 1", interface="",
+        instance_id=r"USB\VID_1366&PID_0105\000029734569",
+        status="OK", problem_code=0,
+    )
+    monkeypatch.setattr(list_ports, "comports", lambda: [cdc])
+    monkeypatch.setattr(gui_server, "_IS_WIN", True)
+    monkeypatch.setattr(
+        gui_server, "discover_jlink_usb_devices", lambda: [native]
+    )
+
+    infos = gui_server._all_serial_port_infos()
+
+    assert infos == [cdc]
 
 
 @pytest.mark.parametrize("pnp_problem,expected", [(True, "missing"), (False, "unknown")])

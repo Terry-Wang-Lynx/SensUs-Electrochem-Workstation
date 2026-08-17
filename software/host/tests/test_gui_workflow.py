@@ -2706,7 +2706,7 @@ def test_openocd_fallback_uses_one_bounded_write_verify_run_session() -> None:
             patch("pa_host.gui_server.OPENOCD_EXE", openocd),
             patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
             patch("pa_host.gui_server._openocd_target_probe",
-                  return_value=(True, "0x10000100: 00052833")),
+                  return_value=(True, "SENSUS_INFO_PART=0x00052833")),
             patch.object(SettingsController, "_run_openocd_once",
                          return_value=(0, output)) as run,
         ):

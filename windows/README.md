@@ -77,8 +77,10 @@ WinUSB 准备工具和 V4/V5.1 稳定固件资源。
 
 ### J-Link 调试探头
 - 便携包默认使用随包 OpenOCD/libjaylink，不需要安装 SEGGER J-Link 软件。
+- 即使老式 J-Link 没有 CDC/COM 口，软件也会通过 Windows PnP 直接发现它。
 - 若 Windows 尚未给受支持的 J-Link 调试接口绑定 WinUSB，界面只在确认设备管理器
-  对应接口异常后显示“准备 J-Link”；确认一次 UAC 后会自动重新检测目标板。
+  对应接口异常后显示“准备 J-Link”；确认一次 UAC 后会自动重新检测目标板。老式
+  `PID 0101` 只包含一个调试接口；新式复合 `PID 0105` 只会准备 `MI_02`，不会改动 CDC。
 - 多探头时可在界面中手动选择设备；也可以设置 `SENSUS_JLINK_SERIAL` 指定序列号。
 - 源码目录仍可优先使用 `SENSUS_JLINK_EXE` 指向的 JLink.exe。
 

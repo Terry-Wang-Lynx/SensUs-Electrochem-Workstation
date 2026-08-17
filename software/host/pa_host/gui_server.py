@@ -98,6 +98,7 @@ from .windows_jlink import (
     repairable_interfaces,
     resolve_helper as resolve_winusb_helper,
 )
+from .jlink_usb import discover_jlink_usb_devices
 
 _IS_WIN = sys.platform == "win32"
 
@@ -541,11 +542,11 @@ def _port_accepts_connections(port: int) -> bool:
 
 
 def _all_serial_port_infos() -> list[Any]:
-    """Return all USB serial candidates while keeping descriptor metadata."""
+    """Return USB serial candidates plus J-Links without a CDC interface."""
     try:
         from serial.tools import list_ports
     except ImportError:
-        return []
+        list_ports = None
 
     def is_candidate(info: Any) -> bool:
         device = str(getattr(info, "device", "") or "")
@@ -573,7 +574,28 @@ def _all_serial_port_infos() -> list[Any]:
             )
         )
 
-    return [info for info in list_ports.comports() if is_candidate(info)]
+    infos = (
+        [info for info in list_ports.comports() if is_candidate(info)]
+        if list_ports is not None else []
+    )
+    try:
+        native_jlinks = discover_jlink_usb_devices()
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        DIAGNOSTICS.record(
+            "warning", "device.jlink.usb_discovery_failed",
+            "Native J-Link USB discovery failed", error=str(exc),
+        )
+        native_jlinks = []
+    existing_serials = {
+        _normalise_probe_serial(getattr(info, "serial_number", ""))
+        for info in infos if _is_jlink_port(info)
+    }
+    infos.extend(
+        info for info in native_jlinks
+        if not _normalise_probe_serial(info.serial_number)
+        or _normalise_probe_serial(info.serial_number) not in existing_serials
+    )
+    return infos
 
 
 def _port_descriptor(info: Any) -> str:
@@ -1049,8 +1071,9 @@ def _probe_openocd_runtime_firmware(
         while time.monotonic() < deadline:
             now = time.monotonic()
             if now >= next_request_at:
-                # The TCP listener can appear before the RTT downlink is ready.
-                # Repeating this tagged GET is read-only and bounded by deadline.
+                # OpenOCD can expose its TCP listener before the RTT down
+                # channel is ready. Reusing the tagged, read-only GET also
+                # survives a full telemetry ring without changing hardware.
                 client.sendall(request)
                 next_request_at = now + 1.0
             try:
@@ -1090,9 +1113,11 @@ def _probe_jlink_runtime_firmware(
     except (TypeError, ValueError):
         return "transport_error", "固件元数据缺少有效 RTT 地址"
 
-    # The portable package owns this OpenOCD build and uses it for collection
-    # and flashing. Prefer it so an unrelated system Commander version cannot
-    # alter old-firmware detection.
+    # The portable package owns this OpenOCD build and uses the same backend
+    # for collection and flashing. Prefer it even when a system Commander is
+    # installed so an unrelated SEGGER upgrade cannot change old-firmware
+    # detection. A readable nRF52833 identity plus a missing RTT signature is
+    # the only state that authorizes recovery flashing.
     openocd_failure = ""
     if _openocd_jlink_available():
         reachable, layout_ready, output = _openocd_rtt_layout_probe(
@@ -1293,7 +1318,8 @@ def _device_sort_key(device: dict[str, Any]) -> tuple[int, str]:
 def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
     """Enumerate J-Link probes and V5.1 USB boards without flashing/resetting."""
     devices: list[dict[str, Any]] = []
-    for info in _all_serial_port_infos():
+    all_infos = _all_serial_port_infos()
+    for info in all_infos:
         if not _is_jlink_port(info):
             continue
         probe_serial = _jlink_probe_serial(info)
@@ -1312,7 +1338,7 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
             "selectable": bool(probe_serial),
         })
 
-    candidates = _serial_port_infos()
+    candidates = [info for info in all_infos if not _is_jlink_port(info)]
     groups: list[list[Any]] = []
     for info in candidates:
         group = next((items for items in groups if _same_usb_device(items[0], info)), None)
@@ -1350,10 +1376,11 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
             )
         data_port = str(getattr(data_info, "device", "") or "") if data_info else ""
         representative = data_info or group[0]
-        smp_port = (
-            _discover_serial_smp_port(data_port, force=True)
-            if data_port else ""
-        )
+        sibling_ports = [
+            str(getattr(info, "device", "") or "")
+            for info in group if info is not data_info
+        ]
+        smp_port = sibling_ports[0] if data_port and len(sibling_ports) == 1 else ""
         identity = _usb_identity(representative)
         devices.append({
             "id": identity,
