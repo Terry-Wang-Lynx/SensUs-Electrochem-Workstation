@@ -40,7 +40,7 @@ from .it import (
     resample_run_10hz,
     summarize_run,
 )
-from .runtime import module_command
+from .runtime import hidden_subprocess_kwargs, module_command
 
 
 def _plot_run(path: str | Path, output: str | Path, window_s: float) -> None:
@@ -150,7 +150,7 @@ def _cmd_measure(args: argparse.Namespace) -> int:
 
     previous_sigterm = signal.signal(signal.SIGTERM, _forward_sigterm)
     try:
-        child = subprocess.Popen(cmd)
+        child = subprocess.Popen(cmd, **hidden_subprocess_kwargs())
         # SIGTERM may arrive after Popen starts the process but before it returns
         # and assigns ``child``. Forward that pending request once assignment is safe.
         if pending_sigterm:

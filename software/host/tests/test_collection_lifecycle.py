@@ -478,6 +478,10 @@ def test_openocd_rtt_reset_commands_follow_explicit_option(
     monkeypatch.setattr(collect, "OPENOCD_SCRIPTS", scripts)
     popen = Mock(return_value=process)
     monkeypatch.setattr(collect.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        collect.runtime, "hidden_subprocess_kwargs",
+        lambda **_kwargs: {"creationflags": 0x08000000},
+    )
 
     collect._start_openocd_rtt(
         0x20001100, "29734569", 19021, reset_before_read=True,
@@ -485,6 +489,7 @@ def test_openocd_rtt_reset_commands_follow_explicit_option(
 
     command = popen.call_args.args[0]
     assert "reset halt; reset run; sleep 500" in command[-1]
+    assert popen.call_args.kwargs["creationflags"] == 0x08000000
 
 
 def test_openocd_readiness_log_does_not_open_disposable_rtt_client(

@@ -2422,6 +2422,10 @@ def test_openocd_target_probe_accepts_explicit_read_memory_identity(
     with (
         patch("pa_host.gui_server.OPENOCD_EXE", openocd),
         patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+        patch(
+            "pa_host.gui_server.runtime.hidden_subprocess_kwargs",
+            return_value={"creationflags": 0x08000000},
+        ),
         patch("pa_host.gui_server.subprocess.run", return_value=completed) as run,
     ):
         reachable, output = gui_server._openocd_target_probe("29734569")
@@ -2431,6 +2435,7 @@ def test_openocd_target_probe_accepts_explicit_read_memory_identity(
     command = run.call_args.args[0]
     assert any("read_memory 0x10000100 32 1" in arg for arg in command)
     assert not any("mdw " in arg for arg in command)
+    assert run.call_args.kwargs["creationflags"] == 0x08000000
 
 
 def test_openocd_target_probe_rejects_connection_log_without_identity(

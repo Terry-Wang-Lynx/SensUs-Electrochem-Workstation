@@ -322,6 +322,7 @@ def run_jlink_script(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **runtime.hidden_subprocess_kwargs(),
             )
             deadline = time.monotonic() + max(1.0, timeout_s)
             while True:
@@ -363,6 +364,7 @@ def run_jlink_script(
             encoding="utf-8",
             errors="replace",
             timeout=max(1.0, timeout_s),
+            **runtime.hidden_subprocess_kwargs(),
         )
     finally:
         script_path.unlink(missing_ok=True)
@@ -975,7 +977,8 @@ def find_rtt_address(elf: Path) -> int:
 
     out = subprocess.run(
         [str(ZEPHYR_SDK_NM), str(elf)], capture_output=True, text=True,
-        encoding="utf-8", errors="replace", check=False
+        encoding="utf-8", errors="replace", check=False,
+        **runtime.hidden_subprocess_kwargs(),
     ).stdout
     for line in out.splitlines():
         parts = line.split()
@@ -1115,6 +1118,7 @@ def _start_openocd_rtt(
         cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace",
+        **runtime.hidden_subprocess_kwargs(),
     )
     setattr(process, "_sensus_openocd_control_port", OPENOCD_TELNET_PORT)
     stream = getattr(process, "stdout", None)

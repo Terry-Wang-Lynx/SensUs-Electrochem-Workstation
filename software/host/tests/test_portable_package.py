@@ -91,6 +91,29 @@ def test_windows_first_launch_allows_defender_cold_start() -> None:
     assert entry["WINDOWS_COLD_START_TIMEOUT_S"] >= 120
 
 
+def test_windows_background_tools_never_create_console_windows(monkeypatch) -> None:
+    monkeypatch.setattr(runtime.sys, "platform", "win32")
+    monkeypatch.setattr(
+        runtime.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False,
+    )
+    monkeypatch.setattr(
+        runtime.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False,
+    )
+
+    assert runtime.hidden_subprocess_kwargs() == {
+        "creationflags": 0x08000000,
+    }
+    assert runtime.hidden_subprocess_kwargs(new_process_group=True) == {
+        "creationflags": 0x08000200,
+    }
+
+    root = Path(__file__).parents[3]
+    portable_entry = (root / "packaging" / "portable_entry.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'getattr(subprocess, "CREATE_NO_WINDOW", 0)' in portable_entry
+
+
 def test_macos_openocd_bundler_reuses_already_relocated_libraries() -> None:
     root = Path(__file__).parents[3]
     bundler = (root / "packaging" / "bundle_macos_openocd.sh").read_text(

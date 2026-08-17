@@ -278,6 +278,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             errors="replace",
             timeout=120,
             env=environment,
+            **runtime.hidden_subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("目录选择窗口等待超时，请重试") from exc
@@ -740,6 +741,7 @@ def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
             encoding="utf-8",
             errors="replace",
             timeout=10,
+            **runtime.hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
@@ -779,6 +781,7 @@ def _openocd_rtt_layout_probe(
         done = subprocess.run(
             command, cwd=PROJECT_DIR, check=False, capture_output=True,
             text=True, encoding="utf-8", errors="replace", timeout=10,
+            **runtime.hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, False, str(exc)
@@ -2284,7 +2287,7 @@ class SettingsController:
             command, cwd=PROJECT_DIR, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             **(
-                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                runtime.hidden_subprocess_kwargs(new_process_group=True)
                 if _IS_WIN else {"start_new_session": True}
             ),
         )
@@ -2313,6 +2316,7 @@ class SettingsController:
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=10,
+                    **runtime.hidden_subprocess_kwargs(),
                 )
                 killed = result.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
@@ -2583,6 +2587,7 @@ class SettingsController:
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_s,
+                **runtime.hidden_subprocess_kwargs(),
             )
             return done.returncode, f"{done.stdout}\n{done.stderr}"
         except subprocess.TimeoutExpired as exc:
@@ -2910,6 +2915,7 @@ class SettingsController:
                 [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "5", "os", "reset"],
                 check=True, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=15,
+                **runtime.hidden_subprocess_kwargs(),
             )
             reset_output = f"{reset.stdout}\n{reset.stderr}"
             if runtime.is_frozen() or _IS_WIN:
@@ -2918,6 +2924,7 @@ class SettingsController:
                      str(image)],
                     check=True, capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=150,
+                    **runtime.hidden_subprocess_kwargs(),
                 )
             else:
                 upload_environment = {
@@ -4421,7 +4428,7 @@ class MeasurementController:
                     #    (2026-08-09 实测:停止 60s 后两者仍在跑、19021 仍被占,
                     #    下一次烧录/测量就会撞上探头被占)。有了进程组才能整棵收掉。
                     # Windows: CREATE_NEW_PROCESS_GROUP 代替 start_new_session。
-                    **(dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                    **(runtime.hidden_subprocess_kwargs(new_process_group=True)
                        if _IS_WIN else dict(start_new_session=True)),
                 )
             except Exception as exc:
@@ -5896,6 +5903,7 @@ class MeasurementController:
                 result = subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True, timeout=10,
+                    **runtime.hidden_subprocess_kwargs(),
                 )
                 killed = result.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
@@ -5937,6 +5945,7 @@ class MeasurementController:
                 result = subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True, timeout=10,
+                    **runtime.hidden_subprocess_kwargs(),
                 )
                 killed = result.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
