@@ -160,6 +160,33 @@ def test_rtt_reader_duration_expires_without_receiving_another_line(
         next(lines)
 
 
+def test_collector_writes_non_gbk_firmware_text_as_utf8(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    source = tmp_path / "firmware.log"
+    source.write_text(
+        "IT_START run=1 target_mv=400\n"
+        "固件状态 ⇒ 已应用\n"
+        "S seq=1 ms=100 counts=1 fa=-1 tag=0 auto=1 ovf=0 sat=0 ep=1\n"
+        "IT_DONE native=1 expected=1 elapsed_ms=100 ep=1 tainted=0\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "raw.csv"
+    raw_log = tmp_path / "rtt.log"
+    monkeypatch.setattr(collect.signal, "signal", lambda *_args: None)
+
+    result = collect.main([
+        "--out", str(output), "--tail", str(source),
+        "--raw-log", str(raw_log), "--it-10hz", "--progress-every", "0",
+    ])
+
+    assert result == 0
+    assert "固件状态 ⇒ 已应用" in raw_log.read_text(encoding="utf-8")
+    assert output.read_text(encoding="utf-8").startswith(
+        "# pA-Converter V4.0 IT 实时采集"
+    )
+
+
 def test_trigger_argument_rejects_non_ascii_before_collection_starts() -> None:
     with pytest.raises(SystemExit) as exc_info:
         collect.main(["--out", "run.csv", "--socket", "127.0.0.1:19021",

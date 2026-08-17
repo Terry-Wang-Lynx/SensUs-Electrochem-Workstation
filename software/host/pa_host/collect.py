@@ -1457,7 +1457,7 @@ def tail_lines(path: Path, idle_timeout: float | None = None):
     """跟读文件新增行(类似 tail -f)。文件尚未出现时等待。"""
     while not path.exists():
         time.sleep(0.2)
-    with path.open("r", errors="replace") as fh:
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
         buf = ""
         last_data = time.monotonic()
         while True:
@@ -2105,11 +2105,18 @@ def main(argv: list[str] | None = None) -> int:
     else:
         signal.signal(signal.SIGTERM, _on_sigint)
 
-    raw_out = args.raw_log.open("w", buffering=1) if args.raw_log else None
+    raw_out = (
+        args.raw_log.open(
+            "w", buffering=1, encoding="utf-8", errors="replace",
+        )
+        if args.raw_log else None
+    )
     # 电极电压独立 CSV,默认放在电流 CSV 旁边(<stem>-cellv.csv)。
     cell_v_path = args.cell_v or args.out.with_name(args.out.stem + "-cellv.csv")
     cell_v_new = not cell_v_path.exists() or cell_v_path.stat().st_size == 0
-    cell_v_out = cell_v_path.open("a", buffering=1)
+    cell_v_out = cell_v_path.open(
+        "a", buffering=1, encoding="utf-8", errors="replace",
+    )
     cell_v_rows = 0
     if cell_v_new:
         cell_v_out.write("# pA-Converter V4.0 电极电压连采(System ADC,与电流并行)\n")
@@ -2121,14 +2128,20 @@ def main(argv: list[str] | None = None) -> int:
     audit_path = args.audit or args.out.with_name(args.out.stem + "-audit.jsonl")
     cfg_csv_path = audit_path.with_name(audit_path.stem + "-cfg.csv")
     audit_new = not cfg_csv_path.exists() or cfg_csv_path.stat().st_size == 0
-    audit_out = audit_path.open("a", buffering=1)
-    cfg_csv_out = cfg_csv_path.open("a", buffering=1)
+    audit_out = audit_path.open(
+        "a", buffering=1, encoding="utf-8", errors="replace",
+    )
+    cfg_csv_out = cfg_csv_path.open(
+        "a", buffering=1, encoding="utf-8", errors="replace",
+    )
     audit_acc = CfgEventAccumulator()
     audit_rows = 0
     if audit_new:
         cfg_csv_out.write(",".join(CFG_EVENT_COLUMNS) + "\n")
     try:
-        with args.out.open("a", buffering=1) as out:
+        with args.out.open(
+            "a", buffering=1, encoding="utf-8", errors="replace",
+        ) as out:
             out_ref["cur"] = out
             if new_file:
                 method = "CV" if args.cv else "IT"
