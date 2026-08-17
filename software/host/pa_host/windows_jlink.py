@@ -28,6 +28,7 @@ _PROBE_COMMUNICATION_ERROR_MARKERS = (
     "jaylink_get_firmware_version() failed",
     "transport_write() failed: timeout occurred",
 )
+_LIBUSB_COMPATIBLE_SERVICES = {"winusb", "libusbk", "libusb0"}
 # Driver replacement must be interface-specific. Rebinding the composite
 # parent or CDC interface would make the probe disappear from device discovery.
 _SUPPORTED_WINUSB_INTERFACES = {
@@ -82,15 +83,26 @@ def _problem_device_payload(vid: int, pid: int) -> list[dict[str, Any]]:
 $ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+function Read-DeviceProperty([string]$InstanceId, [string]$KeyName) {{
+  $property = Get-PnpDeviceProperty `
+    -InstanceId $InstanceId -KeyName $KeyName -ErrorAction SilentlyContinue
+  if ($null -ne $property) {{ return $property.Data }}
+  return $null
+}}
 $items = Get-PnpDevice -PresentOnly |
   Where-Object {{
-    $_.InstanceId -like '{prefix}*' -and $_.Status -ne 'OK'
+    $_.InstanceId -like '{prefix}*'
   }} |
   ForEach-Object {{
+    $instanceId = [string]$_.InstanceId
     [PSCustomObject]@{{
-      instance_id = [string]$_.InstanceId
+      instance_id = $instanceId
       status = [string]$_.Status
       class_name = [string]$_.Class
+      problem_code = [int](Read-DeviceProperty $instanceId 'DEVPKEY_Device_ProblemCode')
+      service = [string](Read-DeviceProperty $instanceId 'DEVPKEY_Device_Service')
+      driver_inf_path = [string](Read-DeviceProperty $instanceId 'DEVPKEY_Device_DriverInfPath')
+      driver_provider = [string](Read-DeviceProperty $instanceId 'DEVPKEY_Device_DriverProvider')
     }}
   }}
 @($items) | ConvertTo-Json -Compress
@@ -121,11 +133,27 @@ $items = Get-PnpDevice -PresentOnly |
     return [item for item in payload if isinstance(item, dict)]
 
 
+def _interface_requires_winusb(item: dict[str, Any]) -> bool:
+    status = str(item.get("status") or "").strip().lower()
+    try:
+        problem_code = int(item.get("problem_code") or 0)
+    except (TypeError, ValueError):
+        problem_code = 0
+    service = str(item.get("service") or "").strip().lower()
+    return (
+        (bool(status) and status != "ok")
+        or problem_code != 0
+        or service not in _LIBUSB_COMPATIBLE_SERVICES
+    )
+
+
 def problem_interfaces(vid: int, pid: int) -> list[JLinkUsbInterface]:
     if int(vid) != JLINK_VENDOR_ID:
         raise ValueError("Only SEGGER J-Link USB interfaces may be prepared")
     matches: dict[tuple[int, int, int | None], JLinkUsbInterface] = {}
     for item in _problem_device_payload(int(vid), int(pid)):
+        if not _interface_requires_winusb(item):
+            continue
         instance_id = str(item.get("instance_id") or "")
         match = _INSTANCE_ID_RE.match(instance_id)
         if match is None:

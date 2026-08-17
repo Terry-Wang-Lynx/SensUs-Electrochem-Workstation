@@ -104,6 +104,64 @@ def test_repairable_interfaces_accepts_legacy_single_interface(
     assert [(item.pid, item.mi) for item in interfaces] == [(0x0101, None)]
 
 
+def test_repairable_interfaces_detects_status_ok_without_driver_binding(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_jlink,
+        "_problem_device_payload",
+        lambda _vid, _pid: [{
+            "instance_id": r"USB\VID_1366&PID_0101\000000123456",
+            "status": "OK",
+            "problem_code": 0,
+            "service": "",
+            "driver_inf_path": "",
+            "driver_provider": "",
+        }],
+    )
+
+    interfaces = windows_jlink.repairable_interfaces(0x1366, 0x0101)
+
+    assert [(item.pid, item.mi) for item in interfaces] == [(0x0101, None)]
+
+
+@pytest.mark.parametrize("service", ["WinUSB", "libusbK", "libusb0"])
+def test_repairable_interfaces_accepts_working_libusb_binding(
+    monkeypatch, service: str,
+) -> None:
+    monkeypatch.setattr(
+        windows_jlink,
+        "_problem_device_payload",
+        lambda _vid, _pid: [{
+            "instance_id": r"USB\VID_1366&PID_0101\000000123456",
+            "status": "OK",
+            "problem_code": 0,
+            "service": service,
+            "driver_inf_path": "oem55.inf",
+            "driver_provider": "libwdi",
+        }],
+    )
+
+    assert windows_jlink.repairable_interfaces(0x1366, 0x0101) == []
+
+
+def test_repairable_interfaces_repairs_broken_winusb_binding(monkeypatch) -> None:
+    monkeypatch.setattr(
+        windows_jlink,
+        "_problem_device_payload",
+        lambda _vid, _pid: [{
+            "instance_id": r"USB\VID_1366&PID_0101\000000123456",
+            "status": "Error",
+            "problem_code": 28,
+            "service": "WinUSB",
+        }],
+    )
+
+    interfaces = windows_jlink.repairable_interfaces(0x1366, 0x0101)
+
+    assert [(item.pid, item.mi) for item in interfaces] == [(0x0101, None)]
+
+
 def test_problem_interfaces_rejects_non_segger_vendor() -> None:
     with pytest.raises(ValueError, match="SEGGER"):
         windows_jlink.problem_interfaces(0x1234, 0x0105)
