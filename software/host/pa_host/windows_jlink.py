@@ -186,7 +186,12 @@ def _is_administrator() -> bool:
 
 
 def _run_elevated(
-    executable: Path, arguments: list[str], *, timeout_s: float,
+    executable: Path,
+    arguments: list[str],
+    *,
+    timeout_s: float,
+    restart_instance_id: str = "",
+    cleanup_paths: tuple[Path, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     command = [str(executable), *arguments]
     common = {
@@ -199,26 +204,78 @@ def _run_elevated(
         "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
     }
     if _is_administrator():
-        return subprocess.run(command, **common)
+        completed = subprocess.run(command, **common)
+        if completed.returncode == 0 and restart_instance_id:
+            restart_common = {
+                "check": False,
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": 30,
+                "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            }
+            subprocess.run(
+                ["pnputil.exe", "/restart-device", restart_instance_id],
+                **restart_common,
+            )
+            subprocess.run(["pnputil.exe", "/scan-devices"], **restart_common)
+        return completed
 
-    with tempfile.TemporaryDirectory(prefix="sensus-jlink-elevation-") as output_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="sensus-jlink-elevation-", ignore_cleanup_errors=True,
+    ) as output_dir:
         stdout_path = Path(output_dir) / "stdout.txt"
         stderr_path = Path(output_dir) / "stderr.txt"
+        # Keep ownership on the unelevated caller. If the elevated process
+        # creates these files itself, Windows may give the caller no read ACL.
+        stdout_path.touch()
+        stderr_path.touch()
 
         def ps_literal(value: object) -> str:
             return "'" + str(value).replace("'", "''") + "'"
 
-        wrapper = "\n".join((
+        wrapper_lines = [
             "$ErrorActionPreference = 'Stop'",
             f"$argumentLine = {ps_literal(subprocess.list2cmdline(arguments))}",
+            "$exitCode = 1",
+            "try {",
             (
                 f"$process = Start-Process -FilePath {ps_literal(executable)} "
                 f"-ArgumentList $argumentLine -WindowStyle Hidden -Wait -PassThru "
                 f"-RedirectStandardOutput {ps_literal(stdout_path)} "
                 f"-RedirectStandardError {ps_literal(stderr_path)}"
             ),
-            "exit $process.ExitCode",
-        ))
+            "  $exitCode = $process.ExitCode",
+        ]
+        if restart_instance_id:
+            restart_arguments = subprocess.list2cmdline(
+                ["/restart-device", restart_instance_id]
+            )
+            wrapper_lines.extend((
+                "  if ($exitCode -eq 0) {",
+                f"    $restartArguments = {ps_literal(restart_arguments)}",
+                (
+                    "    $null = Start-Process -FilePath 'pnputil.exe' "
+                    "-ArgumentList $restartArguments -WindowStyle Hidden "
+                    "-Wait -PassThru"
+                ),
+                (
+                    "    $null = Start-Process -FilePath 'pnputil.exe' "
+                    "-ArgumentList '/scan-devices' -WindowStyle Hidden "
+                    "-Wait -PassThru"
+                ),
+                "  }",
+            ))
+        wrapper_lines.extend(("} finally {",))
+        for cleanup_path in cleanup_paths:
+            wrapper_lines.append(
+                "  Remove-Item -LiteralPath "
+                f"{ps_literal(Path(cleanup_path))} -Recurse -Force "
+                "-ErrorAction SilentlyContinue"
+            )
+        wrapper_lines.extend(("}", "exit $exitCode"))
+        wrapper = "\n".join(wrapper_lines)
         encoded_wrapper = base64.b64encode(
             wrapper.encode("utf-16-le")
         ).decode("ascii")
@@ -243,12 +300,16 @@ exit $process.ExitCode
             env=environment,
             **common,
         )
-        stdout = stdout_path.read_text(
-            encoding="utf-8", errors="replace",
-        ) if stdout_path.is_file() else ""
-        stderr = stderr_path.read_text(
-            encoding="utf-8", errors="replace",
-        ) if stderr_path.is_file() else ""
+        def readable_output(path: Path) -> str:
+            try:
+                return path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                # The exit code remains authoritative. Driver installation must
+                # not be reported as failed only because UAC changed a log ACL.
+                return ""
+
+        stdout = readable_output(stdout_path)
+        stderr = readable_output(stderr_path)
         launcher_error = str(launcher.stderr or "").strip()
         if launcher_error:
             stderr = f"{launcher_error}\n{stderr}".strip()
@@ -263,6 +324,7 @@ def install_winusb_driver(
     vid: int,
     pid: int,
     timeout_s: float = 180.0,
+    interfaces: list[JLinkUsbInterface] | None = None,
 ) -> dict[str, Any]:
     helper = Path(helper).resolve()
     if not _IS_WIN:
@@ -272,7 +334,10 @@ def install_winusb_driver(
     if int(vid) != JLINK_VENDOR_ID:
         raise ValueError("Only SEGGER J-Link USB interfaces may be prepared")
 
-    interfaces = repairable_interfaces(int(vid), int(pid))
+    interfaces = (
+        repairable_interfaces(int(vid), int(pid))
+        if interfaces is None else list(interfaces)
+    )
     if not interfaces:
         raise RuntimeError(
             "No supported J-Link debug interface requiring WinUSB was found"
@@ -280,7 +345,14 @@ def install_winusb_driver(
 
     installed: list[dict[str, Any]] = []
     for interface in interfaces:
-        with tempfile.TemporaryDirectory(prefix="sensus-jlink-winusb-") as temporary:
+        if (
+            (interface.vid, interface.pid) != (int(vid), int(pid))
+            or (interface.pid, interface.mi) not in _SUPPORTED_WINUSB_INTERFACES
+        ):
+            raise RuntimeError("Unsupported J-Link debug interface")
+        with tempfile.TemporaryDirectory(
+            prefix="sensus-jlink-winusb-", ignore_cleanup_errors=True,
+        ) as temporary:
             suffix = f"mi{interface.mi:02x}" if interface.mi is not None else "device"
             arguments = [
                 "--name", "SensUs-J-Link-WinUSB",
@@ -296,7 +368,11 @@ def install_winusb_driver(
             if interface.mi is not None:
                 arguments.extend(("--iid", f"0x{interface.mi:02x}"))
             completed = _run_elevated(
-                helper, arguments, timeout_s=timeout_s,
+                helper,
+                arguments,
+                timeout_s=timeout_s,
+                restart_instance_id=interface.instance_id,
+                cleanup_paths=(Path(temporary),),
             )
             if completed.returncode != 0:
                 detail = " | ".join(

@@ -3,9 +3,12 @@ const state = {
   measurement: null,
   settings: null,
   workflow: null,
+  devices: {devices: [], selected_device_id: null, busy: false, probing: true},
   role: localStorage.getItem('compact-role') || 'calibration',
-  refreshing: false
+  refreshing: false,
+  measurementAction: null
 };
+const MEASUREMENT_START_TIMEOUT_MS = 45000;
 
 async function api(path, options = {}) {
   const {timeoutMs = 5000, ...fetchOptions} = options;
@@ -29,8 +32,8 @@ async function api(path, options = {}) {
   }
 }
 
-function post(path, body = {}) {
-  return api(path, {method: 'POST', body: JSON.stringify(body)});
+function post(path, body = {}, timeoutMs = 5000) {
+  return api(path, {method: 'POST', body: JSON.stringify(body), timeoutMs});
 }
 
 function fmt(value, digits = 3) {
@@ -84,13 +87,49 @@ function renderWorkflow(payload) {
   updateButton();
 }
 
+function renderDevices(payload) {
+  state.devices = payload || {devices: [], selected_device_id: null, busy: false, probing: false};
+  updateButton();
+}
+
+function hardwareOperationStatus() {
+  const payload = state.devices || {};
+  const devices = Array.isArray(payload.devices) ? payload.devices : [];
+  const usable = devices.filter(device => device.selectable);
+  const selected = payload.selected_device
+    || devices.find(device => device.id === payload.selected_device_id)
+    || null;
+  if (selected?.present === false) return {ready: false, message: '所选设备已断开'};
+  const active = selected || (usable.length === 1 ? usable[0] : null);
+  if (!active) {
+    if (usable.length > 1) return {ready: false, message: '请在完整工作站中选择本次使用的设备'};
+    return {ready: false, message: payload.probing ? '正在核对硬件连接' : '未发现可用硬件'};
+  }
+  if (active.kind === 'jlink') {
+    if (active.target_state === 'reachable') return {ready: true, message: ''};
+    if (active.driver_state === 'missing') return {ready: false, message: '请在完整工作站中准备 J-Link Windows 驱动'};
+    return {
+      ready: false,
+      message: active.target_state === 'unreachable'
+        ? String(active.target_detail || '目标板无响应，请检查板卡供电和 SWD 排线')
+        : '正在核对 J-Link 目标板'
+    };
+  }
+  return active.selectable
+    ? {ready: true, message: ''}
+    : {ready: false, message: 'USB DATA 与 SMP 接口尚未就绪'};
+}
+
 function renderMeasurement(payload) {
   state.measurement = payload;
   const running = payload.state === 'running';
+  const starting = state.measurementAction === 'starting'
+    || payload.operation_phase === 'configuring'
+    || payload.config_gate?.state === 'checking';
   const errored = payload.state === 'error';
   const complete = payload.state === 'completed';
-  $('statusText').textContent = running ? '正在测量' : errored ? '采集异常' : complete ? '测量完成' : '硬件待测';
-  $('statusDot').className = 'status-dot ' + (running ? 'running' : errored ? 'error' : '');
+  $('statusText').textContent = starting ? '正在核对硬件配置' : running ? '正在测量' : errored ? '采集异常' : complete ? '测量完成' : '硬件待测';
+  $('statusDot').className = 'status-dot ' + (running&&!starting ? 'running' : errored ? 'error' : '');
 
   const settings = payload.settings || state.settings?.settings || {};
   const cv = settings.method === 'cv';
@@ -220,24 +259,37 @@ function drawChart(payload) {
 
 function updateButton() {
   const running = state.measurement?.state === 'running';
+  const starting = state.measurementAction === 'starting'
+    || state.measurement?.operation_phase === 'configuring'
+    || state.measurement?.config_gate?.state === 'checking';
+  const stopping = state.measurementAction === 'stopping';
   const settingsApplied = state.settings?.applied;
+  const workspaceAvailable = state.workflow?.workspace_available ?? Boolean(state.workflow?.save_dir);
+  const hardware = hardwareOperationStatus();
   const cv = state.settings?.settings?.method === 'cv';
   const concentrationMissing = state.role === 'calibration' && $('concentration').value === '';
   const testUnavailable = state.role === 'test' && !state.workflow?.calibration_ready;
   const nameMissing = $('sampleName').value.trim() === '';
   const button = $('measureButton');
-  button.classList.toggle('stop', running);
-  button.textContent = running
+  button.classList.toggle('stop', running&&!starting);
+  button.textContent = starting
+    ? '正在核对硬件配置…'
+    : stopping ? '正在停止…' : running
     ? '停止测量'
     : cv ? '开始 CV 扫描' : state.role === 'calibration' ? '开始标定测量' : '开始测试并预测';
-  button.disabled = running
+  button.disabled = starting || stopping || Boolean(state.devices?.busy) ? true : running
     ? false
-    : !settingsApplied || !state.workflow?.save_dir || nameMissing || (!cv && (concentrationMissing || testUnavailable));
+    : !hardware.ready || !settingsApplied || !workspaceAvailable || nameMissing || (!cv && (concentrationMissing || testUnavailable));
+  button.title = !starting&&!stopping&&!running&&!hardware.ready ? hardware.message : '';
 }
 
 async function toggleMeasurement() {
+  if (state.measurementAction) return;
+  const stopping = state.measurement?.state === 'running';
+  state.measurementAction = stopping ? 'stopping' : 'starting';
+  updateButton();
   try {
-    if (state.measurement?.state === 'running') {
+    if (stopping) {
       renderMeasurement(await post('/api/measurement/stop'));
       return;
     }
@@ -248,9 +300,12 @@ async function toggleMeasurement() {
       sample_role: state.role,
       save_dir: state.workflow?.save_dir || '',
       source: 'compact_overlay'
-    }));
+    }, MEASUREMENT_START_TIMEOUT_MS));
   } catch (error) {
     setMessage(error.message, true);
+  } finally {
+    state.measurementAction = null;
+    updateButton();
   }
 }
 
@@ -261,8 +316,12 @@ async function refresh() {
     const measurement = await api('/api/status', {timeoutMs: 1500});
     renderMeasurement(measurement);
     if (measurement.state !== 'running') {
-      renderWorkflow(await api('/api/workflow'));
-      renderSettings(await api('/api/settings'));
+      const [workflow, settings, devices] = await Promise.all([
+        api('/api/workflow'), api('/api/settings'), api('/api/devices', {timeoutMs: 3000})
+      ]);
+      renderWorkflow(workflow);
+      renderSettings(settings);
+      renderDevices(devices);
     }
   } catch (error) {
     $('statusText').textContent = '服务未连接';
@@ -317,10 +376,11 @@ document.addEventListener('visibilitychange', () => {
 });
 
 setRole(state.role);
-Promise.all([api('/api/settings'), api('/api/workflow'), api('/api/status')])
-  .then(([settings, workflow, measurement]) => {
+Promise.all([api('/api/settings'), api('/api/workflow'), api('/api/status'), api('/api/devices', {timeoutMs: 3000})])
+  .then(([settings, workflow, measurement, devices]) => {
     renderSettings(settings);
     renderWorkflow(workflow);
+    renderDevices(devices);
     renderMeasurement(measurement);
     refresh();
   })

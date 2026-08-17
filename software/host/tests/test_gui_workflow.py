@@ -2680,6 +2680,7 @@ def test_background_discovery_does_not_probe_while_operation_is_busy(
     annotate = Mock(side_effect=AssertionError("active target was probed"))
     remember = Mock()
     monkeypatch.setattr(gui_server, "APP", app)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", cached)
     monkeypatch.setattr(gui_server, "_discover_devices", discover)
     monkeypatch.setattr(gui_server, "_discover_devices_with_probe", full_probe)
     monkeypatch.setattr(gui_server, "_annotate_target_states", annotate)
@@ -2690,11 +2691,50 @@ def test_background_discovery_does_not_probe_while_operation_is_busy(
 
     gui_server._run_device_discovery()
 
-    discover.assert_called_once_with(probe=False)
+    discover.assert_not_called()
     full_probe.assert_not_called()
     annotate.assert_not_called()
     remember.assert_called_once_with(cached, "")
     assert lock.released is False
+    assert gui_server.DEVICE_DISCOVERY_THREAD is None
+
+
+def test_background_discovery_yields_to_jlink_driver_preparation(
+    monkeypatch,
+) -> None:
+    class AvailableOperationLock:
+        def acquire(self, *, blocking: bool) -> bool:
+            raise AssertionError("driver preparation must take priority")
+
+        def release(self) -> None:
+            raise AssertionError("unacquired operation lock was released")
+
+    class PreparingLock:
+        @staticmethod
+        def locked() -> bool:
+            return True
+
+    cached = [{"id": "jlink:1", "kind": "jlink", "probe_serial": "1"}]
+    full_probe = Mock(side_effect=AssertionError("driver preparation was delayed"))
+    annotate = Mock(side_effect=AssertionError("target probe delayed UAC"))
+    remember = Mock()
+    monkeypatch.setattr(
+        gui_server, "APP", Mock(operation_lock=AvailableOperationLock())
+    )
+    monkeypatch.setattr(gui_server, "JLINK_DRIVER_INSTALL_LOCK", PreparingLock())
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", cached)
+    monkeypatch.setattr(gui_server, "_discover_devices_with_probe", full_probe)
+    monkeypatch.setattr(gui_server, "_annotate_target_states", annotate)
+    monkeypatch.setattr(gui_server, "_remember_device_discovery", remember)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_LOG_SIGNATURE", None)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_LOG_ERROR", "")
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_THREAD", Mock())
+
+    gui_server._run_device_discovery()
+
+    full_probe.assert_not_called()
+    annotate.assert_not_called()
+    remember.assert_called_once_with(cached, "")
     assert gui_server.DEVICE_DISCOVERY_THREAD is None
 
 

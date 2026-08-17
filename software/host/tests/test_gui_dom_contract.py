@@ -26,7 +26,13 @@ def _extract_js_function(source: str, name: str) -> str:
 
 
 def _evaluate_chart_js(names: list[str], setup: str, result: str) -> object:
-    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    return _evaluate_gui_js("app.js", names, setup, result)
+
+
+def _evaluate_gui_js(
+    file_name: str, names: list[str], setup: str, result: str,
+) -> object:
+    source = (GUI_DIR / file_name).read_text(encoding="utf-8")
     functions = "\n".join(_extract_js_function(source, name) for name in names)
     script = f"{functions}\n{setup}\nconsole.log(JSON.stringify({result}));"
     completed = subprocess.run(
@@ -484,6 +490,91 @@ def test_measurement_start_validates_inputs_keeps_errors_and_waits_for_gate() ->
     assert "function clearMeasurementInputState()" in app
     assert "else if(!state.measureRequestError)$('measureError').hidden=true" in app
     assert 'input[aria-invalid="true"]' in (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+
+def test_measurement_start_pending_survives_stale_status_refresh() -> None:
+    states = _evaluate_chart_js(
+        ["workspaceReady", "hardwareOperationStatus", "updateStartState"],
+        """
+const button = {disabled:false,textContent:'',title:''};
+const $ = id => { if(id==='startMeasure')return button; throw new Error(id); };
+let state = {
+  measurement:{state:'idle',busy:false}, measurementStartPending:true,
+  workflow:{workspace_available:true,calibration_ready:true},
+  settings:{applied:true}, method:'it', sampleRole:'calibration',
+  devices:{devices:[{id:'j1',kind:'jlink',selectable:true,target_state:'reachable'}],probing:false},
+};
+const capture=()=>({disabled:button.disabled,text:button.textContent,title:button.title});
+updateStartState(); const clicked=capture();
+state.measurement={state:'idle',busy:false}; updateStartState(); const staleIdle=capture();
+state.measurementStartPending=false; updateStartState(); const ready=capture();
+state.measurement={state:'running',busy:true,operation_phase:'configuring',config_gate:{state:'checking'}};
+updateStartState(); const configuring=capture();
+""",
+        "{clicked,staleIdle,ready,configuring}",
+    )
+
+    assert states["clicked"]["disabled"] is True
+    assert states["clicked"]["text"] == "正在核对硬件配置…"
+    assert states["staleIdle"] == states["clicked"]
+    assert states["ready"] == {"disabled": False, "text": "开始标定测量", "title": ""}
+    assert states["configuring"]["disabled"] is True
+    assert states["configuring"]["text"] == "正在核对硬件配置…"
+
+
+def test_compact_measurement_start_has_pending_guard_and_full_gate_timeout() -> None:
+    compact = (GUI_DIR / "compact.js").read_text(encoding="utf-8")
+    states = _evaluate_gui_js(
+        "compact.js",
+        ["hardwareOperationStatus", "updateButton"],
+        """
+const nodes={
+  concentration:{value:'1'},sampleName:{value:'standard'},
+  measureButton:{disabled:false,textContent:'',title:'',classList:{toggle(){}}},
+};
+const $=id=>nodes[id];
+let state={
+  measurement:{state:'idle'},measurementAction:null,
+  settings:{applied:true,settings:{method:'it'}},
+  workflow:{workspace_available:true,save_dir:'/data',calibration_ready:false},
+  role:'calibration',devices:{probing:false,busy:false,devices:[]},
+};
+const capture=()=>({disabled:nodes.measureButton.disabled,text:nodes.measureButton.textContent,title:nodes.measureButton.title});
+updateButton();const disconnected=capture();
+state.devices.devices=[{id:'j1',kind:'jlink',selectable:true,target_state:'unreachable',target_detail:'目标板无响应'}];
+updateButton();const unreachable=capture();
+state.devices.devices[0].target_state='reachable';
+updateButton();const ready=capture();
+state.measurementAction='starting';
+updateButton();const starting=capture();
+state.measurementAction=null;state.measurement={state:'running',operation_phase:'running',config_gate:{state:'matched'}};
+updateButton();const running=capture();
+state.measurementAction='stopping';
+updateButton();const stopping=capture();
+""",
+        "{disconnected,unreachable,ready,starting,running,stopping}",
+    )
+
+    assert "MEASUREMENT_START_TIMEOUT_MS = 45000" in compact
+    assert "if (state.measurementAction) return" in compact
+    assert "state.measurementAction = stopping ? 'stopping' : 'starting'" in compact
+    assert "}, MEASUREMENT_START_TIMEOUT_MS)" in compact
+    assert "payload.operation_phase === 'configuring'" in compact
+    assert "api('/api/devices', {timeoutMs: 3000})" in compact
+    assert states == {
+        "disconnected": {
+            "disabled": True, "text": "开始标定测量", "title": "未发现可用硬件",
+        },
+        "unreachable": {
+            "disabled": True, "text": "开始标定测量", "title": "目标板无响应",
+        },
+        "ready": {"disabled": False, "text": "开始标定测量", "title": ""},
+        "starting": {
+            "disabled": True, "text": "正在核对硬件配置…", "title": "",
+        },
+        "running": {"disabled": False, "text": "停止测量", "title": ""},
+        "stopping": {"disabled": True, "text": "正在停止…", "title": ""},
+    }
 
 
 def test_gui_exposes_diagnostics_and_frontend_error_boundaries() -> None:

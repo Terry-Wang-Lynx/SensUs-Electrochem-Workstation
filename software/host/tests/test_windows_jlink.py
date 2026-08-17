@@ -176,14 +176,18 @@ def test_install_winusb_uses_only_supported_interface(
         0x1366, 0x0105, 0x02,
         r"USB\VID_1366&PID_0105&MI_02\SERIAL",
     )
-    commands: list[tuple[Path, list[str], float]] = []
+    commands: list[tuple[Path, list[str], float, str, tuple[Path, ...]]] = []
     monkeypatch.setattr(windows_jlink, "_IS_WIN", True)
     monkeypatch.setattr(
         windows_jlink, "repairable_interfaces", lambda _vid, _pid: [interface]
     )
 
-    def fake_run(executable, arguments, *, timeout_s):
-        commands.append((executable, arguments, timeout_s))
+    def fake_run(
+        executable, arguments, *, timeout_s, restart_instance_id, cleanup_paths,
+    ):
+        commands.append(
+            (executable, arguments, timeout_s, restart_instance_id, cleanup_paths)
+        )
         return subprocess.CompletedProcess([str(executable), *arguments], 0, "ok", "")
 
     monkeypatch.setattr(windows_jlink, "_run_elevated", fake_run)
@@ -200,9 +204,11 @@ def test_install_winusb_uses_only_supported_interface(
             "instance_id": interface.instance_id,
         }
     ]
-    executable, arguments, timeout = commands[0]
+    executable, arguments, timeout, restart_instance_id, cleanup_paths = commands[0]
     assert executable == helper.resolve()
     assert timeout == 91
+    assert restart_instance_id == interface.instance_id
+    assert len(cleanup_paths) == 1
     assert arguments[arguments.index("--iid") + 1] == "0x02"
     assert arguments[arguments.index("--type") + 1] == "0"
     assert arguments[arguments.index("--log") + 1] == "1"
@@ -224,8 +230,12 @@ def test_install_winusb_legacy_device_does_not_guess_an_interface_id(
     )
     calls: list[list[str]] = []
 
-    def fake_run(_executable, arguments, *, timeout_s):
+    def fake_run(
+        _executable, arguments, *, timeout_s, restart_instance_id, cleanup_paths,
+    ):
         assert timeout_s == 180.0
+        assert restart_instance_id == interface.instance_id
+        assert len(cleanup_paths) == 1
         calls.append(arguments)
         return subprocess.CompletedProcess(arguments, 0, "ok", "")
 
@@ -272,7 +282,11 @@ def test_non_admin_helper_uses_elevated_wrapper_for_output_capture(
     monkeypatch.setattr(windows_jlink.subprocess, "run", fake_run)
 
     result = windows_jlink._run_elevated(
-        helper, ["--dest", str(tmp_path / "output with spaces")], timeout_s=30,
+        helper,
+        ["--dest", str(tmp_path / "output with spaces")],
+        timeout_s=30,
+        restart_instance_id=r"USB\VID_1366&PID_0101\000000123456",
+        cleanup_paths=(tmp_path / "output with spaces",),
     )
 
     outer = str(captured["command"][-1])
@@ -284,8 +298,38 @@ def test_non_admin_helper_uses_elevated_wrapper_for_output_capture(
     ).decode("utf-16-le")
     assert "-RedirectStandardOutput" in wrapper
     assert "-RedirectStandardError" in wrapper
+    assert "pnputil.exe" in wrapper
+    assert "/restart-device" in wrapper
+    assert "Remove-Item -LiteralPath" in wrapper
     assert '"' + str(tmp_path / "output with spaces") + '"' in wrapper
     assert result.returncode == 0
+
+
+def test_elevated_helper_log_acl_cannot_turn_success_into_failure(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    helper = tmp_path / "wdi-simple.exe"
+    helper.write_bytes(b"helper")
+    monkeypatch.setattr(windows_jlink, "_is_administrator", lambda: False)
+    monkeypatch.setattr(
+        windows_jlink.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    original_read_text = Path.read_text
+
+    def deny_elevated_logs(path: Path, *args, **kwargs):
+        if path.name in {"stdout.txt", "stderr.txt"}:
+            raise PermissionError(5, "access denied", str(path))
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_elevated_logs)
+
+    result = windows_jlink._run_elevated(helper, [], timeout_s=30)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
 
 
 def test_resolve_helper_finds_portable_sibling(tmp_path: Path, monkeypatch) -> None:
@@ -461,10 +505,6 @@ def test_driver_preparation_refuses_multiple_connected_jlinks(
         "COM11", description="J-Link", manufacturer="SEGGER",
         serial_number="000029734569", vid=0x1366, pid=0x0105,
     )
-    other = _port(
-        "COM12", description="J-Link", manufacturer="SEGGER",
-        serial_number="000012345678", vid=0x1366, pid=0x0105,
-    )
     helper = tmp_path / "wdi-simple.exe"
     helper.write_bytes(b"helper")
     monkeypatch.setattr(gui_server, "_IS_WIN", True)
@@ -472,12 +512,84 @@ def test_driver_preparation_refuses_multiple_connected_jlinks(
     monkeypatch.setattr(gui_server, "_find_jlink_for_id", lambda _id: selected)
     monkeypatch.setattr(
         gui_server,
-        "_probe_jlink_target_status",
-        lambda _serial, force: {"target_state": "unreachable", "driver_state": "missing"},
+        "repairable_interfaces",
+        lambda _vid, _pid: [
+            windows_jlink.JLinkUsbInterface(
+                0x1366, 0x0105, 0x02,
+                r"USB\VID_1366&PID_0105&MI_02\000029734569",
+            ),
+            windows_jlink.JLinkUsbInterface(
+                0x1366, 0x0105, 0x02,
+                r"USB\VID_1366&PID_0105&MI_02\000012345678",
+            ),
+        ],
     )
-    monkeypatch.setattr(
-        gui_server, "_all_serial_port_infos", lambda: [selected, other]
-    )
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", [])
 
     with pytest.raises(RuntimeError, match="只保留这一只 J-Link"):
         gui_server._prepare_jlink_winusb("jlink:29734569")
+
+
+def test_driver_preparation_reaches_uac_without_reprobing_openocd(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    helper = tmp_path / "wdi-simple.exe"
+    helper.write_bytes(b"helper")
+    device = {
+        "id": "jlink:123456", "kind": "jlink", "probe_serial": "123456",
+        "serial_number": "000000123456", "vid": 0x1366, "pid": 0x0101,
+        "name": "J-Link · SN 123456", "selectable": True,
+    }
+    interface = windows_jlink.JLinkUsbInterface(
+        0x1366, 0x0101, None,
+        r"USB\VID_1366&PID_0101\000000123456",
+    )
+    order: list[str] = []
+    pnp_results = iter(([interface], []))
+    monkeypatch.setattr(gui_server, "_IS_WIN", True)
+    monkeypatch.setattr(gui_server, "WINUSB_HELPER", helper)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", [device])
+    monkeypatch.setattr(
+        gui_server, "repairable_interfaces",
+        lambda _vid, _pid: order.append("pnp") or next(pnp_results),
+    )
+    monkeypatch.setattr(
+        gui_server, "install_winusb_driver",
+        lambda *_args, **_kwargs: order.append("install") or {"installed": [{}]},
+    )
+    monkeypatch.setattr(
+        gui_server, "_probe_jlink_target_status",
+        lambda *_args, **_kwargs: order.append("probe") or {
+            "target_state": "reachable", "target_failure": "",
+            "driver_state": "ready",
+        },
+    )
+    monkeypatch.setattr(gui_server, "_start_device_discovery", lambda: True)
+
+    result = gui_server._prepare_jlink_winusb("jlink:123456")
+
+    assert order == ["pnp", "install", "pnp", "probe"]
+    assert result["message"] == "J-Link 已准备并连上 nRF52833"
+
+
+def test_empty_device_cache_returns_immediately_and_starts_one_probe(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", [])
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_AT", 0.0)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_THREAD", None)
+    started: list[bool] = []
+    monkeypatch.setattr(
+        gui_server, "_start_device_discovery",
+        lambda: started.append(True) or True,
+    )
+    monkeypatch.setattr(
+        gui_server, "_discover_devices",
+        lambda **_kwargs: pytest.fail("HTTP cache path must not enumerate devices"),
+    )
+
+    payload = gui_server._cached_devices_payload()
+
+    assert payload["devices"] == []
+    assert payload["probing"] is True
+    assert started == [True]

@@ -3,7 +3,7 @@ const $ = (id) => {
   if (!node) throw new Error(`界面资源版本不一致（缺少 ${id}），请刷新页面后重试`);
   return node;
 };
-const state = { measurement: null, measurementDrawRevision: null, measurementDrawPending: false, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, historyCurveCatalog: [], historyCurves: [], historyCurveIds: [], historyPreview: null, devices: {devices: [], selected_device_id: null, busy: false, probing: true}, deviceRefreshPromise: null, workspaceSwitchPromise: null, appUpdate: null, appUpdateRequested: false, appUpdateApplying: false, appUpdatePollTimer: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, measureRequestError: '', showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, settingsApplyActive: false, settingsApplyRequestPending: false, settingsApplySequence: 0, settingsPollSequence: 0, driftDirty: false, exiting: false };
+const state = { measurement: null, measurementStartPending: false, measurementDrawRevision: null, measurementDrawPending: false, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, historyCurveCatalog: [], historyCurves: [], historyCurveIds: [], historyPreview: null, devices: {devices: [], selected_device_id: null, busy: false, probing: true}, deviceRefreshPromise: null, jlinkDriverPreparePending: false, workspaceSwitchPromise: null, appUpdate: null, appUpdateRequested: false, appUpdateApplying: false, appUpdatePollTimer: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, measureRequestError: '', showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, settingsApplyActive: false, settingsApplyRequestPending: false, settingsApplySequence: 0, settingsPollSequence: 0, driftDirty: false, exiting: false };
 state.diagnostics=null;state.diagnosticsRefreshPromise=null;state.clientIssueLast=new Map();
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
@@ -459,15 +459,16 @@ function hardwareOperationStatus(){
 }
 function updateStartState(){
   const running=state.measurement?.busy??state.measurement?.state==='running', ready=state.workflow?.calibration_ready;
+  const starting=Boolean(state.measurementStartPending)||state.measurement?.operation_phase==='configuring'||state.measurement?.config_gate?.state==='checking';
   const cv=state.method==='cv';
   const hardware=hardwareOperationStatus(),button=$('startMeasure');
-  button.disabled=running||!hardware.ready||!state.settings?.applied||!workspaceReady()||(!cv&&state.sampleRole==='test'&&!ready);
-  button.textContent=cv?'开始 CV 扫描':state.sampleRole==='calibration'?'开始标定测量':'开始测试并预测';
-  button.title=!running&&!hardware.ready?hardware.message:'';
+  button.disabled=starting||running||!hardware.ready||!state.settings?.applied||!workspaceReady()||(!cv&&state.sampleRole==='test'&&!ready);
+  button.textContent=starting?'正在核对硬件配置…':cv?'开始 CV 扫描':state.sampleRole==='calibration'?'开始标定测量':'开始测试并预测';
+  button.title=starting?'正在建立采集连接并核对硬件配置':!running&&!hardware.ready?hardware.message:'';
 }
 function updateScheduleStartState(){
   const button=$('startSchedule'),hardware=hardwareOperationStatus();
-  const busy=Boolean(state.measurement?.busy)||Boolean(state.schedule?.active)||Boolean(state.devices?.busy);
+  const busy=Boolean(state.measurementStartPending)||Boolean(state.measurement?.busy)||Boolean(state.schedule?.active)||Boolean(state.devices?.busy);
   button.disabled=busy||!hardware.ready||!state.settings?.applied||!workspaceReady();
   button.title=!busy&&!hardware.ready?hardware.message:'';
 }
@@ -1124,10 +1125,10 @@ function scheduleMeasurementDraw(data){
 }
 function updateMeasurement(data){
   syncChartWindowRun(data.run_id);
-  state.measurement=data; const running=data.state==='running', complete=data.state==='completed';
+  state.measurement=data; const running=data.state==='running', complete=data.state==='completed', starting=Boolean(state.measurementStartPending)||data.operation_phase==='configuring'||data.config_gate?.state==='checking';
   setPlateauFormalRunLock(running&&!Boolean(data.metadata?.debug));
   renderRange(data); renderTransient(data); renderCellV(data);
-  $('measureMessage').textContent=data.message||''; $('liveBadge').textContent=running?'采集中':complete?'已完成':data.state==='error'?'错误':'待机'; $('liveBadge').className=`live-badge ${running?'running':data.state==='error'?'error':''}`;
+  $('measureMessage').textContent=data.message||''; $('liveBadge').textContent=starting?'准备中':running?'采集中':complete?'已完成':data.state==='error'?'错误':'待机'; $('liveBadge').className=`live-badge ${running&&!starting?'running':data.state==='error'?'error':''}`;
   $('stopMeasure').disabled=!running; $('useForCalibration').disabled=!complete||data.summary?.steady_current_nA==null; $('predictConcentration').disabled=!complete||data.summary?.steady_current_nA==null;
   const cv=(data.settings?.method||state.method)==='cv';
   if(cv)renderCvMetricStrip(data);else renderItMetricStrip(data,running);
@@ -1221,20 +1222,21 @@ function deviceCardDetail(device){
 function renderDeviceList(payload=state.devices){
   state.devices=payload||{devices:[],selected_device_id:null,busy:false,probing:false};
   const devices=Array.isArray(state.devices.devices)?state.devices.devices:[];
+  const driverPreparing=Boolean(state.jlinkDriverPreparePending||state.devices.driver_preparing);
   const selected=state.devices.selected_device_id;
   const list=$('deviceList'); list.replaceChildren();
   const auto=document.createElement('article'); auto.className=`device-card ${selected?'':'selected'}`;
   auto.innerHTML='<div><strong>自动检测</strong><small>只有一个设备时自动使用；多个设备时保留当前选择</small></div><button class="secondary" type="button" data-device-id="auto">使用自动检测</button>';
-  const autoButton=auto.querySelector('button'); autoButton.disabled=Boolean(state.devices.busy)||!selected;
+  const autoButton=auto.querySelector('button'); autoButton.disabled=driverPreparing||Boolean(state.devices.busy)||!selected;
   list.append(auto);
   devices.forEach(device=>{
     const card=document.createElement('article'); card.className=`device-card ${device.id===selected?'selected':''}${device.selectable?'':' unavailable'}`;
     const title=document.createElement('div'); title.innerHTML=`<strong>${escapeHtml(device.name||'未命名设备')}</strong><small>${escapeHtml(deviceCardDetail(device))}</small>`;
     const action=document.createElement('button'); action.type='button'; action.className='secondary'; action.dataset.deviceId=device.id;
     if(device.driver_action==='install_winusb'){
-      delete action.dataset.deviceId;action.dataset.driverDeviceId=device.id;action.textContent='准备 J-Link';action.title='安装 OpenOCD 需要的 WinUSB 驱动；Windows 会请求一次管理员确认';action.disabled=Boolean(state.devices.busy);
+      delete action.dataset.deviceId;action.dataset.driverDeviceId=device.id;action.textContent=driverPreparing?'正在准备…':'准备 J-Link';action.title='安装 OpenOCD 需要的 WinUSB 驱动；Windows 会请求一次管理员确认';action.disabled=driverPreparing||Boolean(state.devices.busy);
     }else{
-      action.textContent=device.id===selected?'当前使用':'选择'; action.disabled=Boolean(state.devices.busy)||device.id===selected||!device.selectable;
+      action.textContent=device.id===selected?'当前使用':'选择'; action.disabled=driverPreparing||Boolean(state.devices.busy)||device.id===selected||!device.selectable;
     }
     card.append(title,action);
     const note=document.createElement('small'); note.className='device-state';
@@ -1243,12 +1245,12 @@ function renderDeviceList(payload=state.devices){
   });
   if(!devices.length){const empty=document.createElement('div');empty.className='device-empty';empty.textContent='没有发现可识别的 USB DATA 或 J-Link。';list.append(empty)}
   const count=devices.length?`${devices.length} 个设备`:'未发现设备';
-  $('deviceDialogSummary').textContent=state.devices.busy?`${count} · 测量进行中，暂不能切换`:`${count} · 选择后会锁定该设备`;
+  $('deviceDialogSummary').textContent=driverPreparing?`${count} · 正在准备 J-Link Windows 驱动`:state.devices.busy?`${count} · 硬件操作进行中，暂不能切换`:`${count} · 选择后会锁定该设备`;
   const discoveryError=String(state.devices.error||'');
-  $('deviceDialogBusy').classList.toggle('error',Boolean(state.devices.busy)||Boolean(discoveryError));
-  $('deviceDialogBusy').classList.remove('progress');
-  $('deviceDialogBusy').hidden=!state.devices.busy&&!discoveryError;
-  $('deviceDialogBusy').textContent=state.devices.busy?'测量或自动任务运行期间不能切换设备':discoveryError?`设备探测失败：${discoveryError}`:'';
+  $('deviceDialogBusy').classList.toggle('error',!driverPreparing&&(Boolean(state.devices.busy)||Boolean(discoveryError)));
+  $('deviceDialogBusy').classList.toggle('progress',driverPreparing);
+  $('deviceDialogBusy').hidden=!driverPreparing&&!state.devices.busy&&!discoveryError;
+  $('deviceDialogBusy').textContent=driverPreparing?'请确认 Windows 管理员权限提示；驱动安装及设备恢复会自动完成':state.devices.busy?'硬件操作期间不能切换设备':discoveryError?`设备探测失败：${discoveryError}`:'';
   renderHardwareConnection();updateStartState();updateScheduleStartState();if(state.settings)updateSettingsApplyState();
 }
 async function refreshDevices(open=false){
@@ -1281,12 +1283,15 @@ async function chooseDevice(deviceId){
   }catch(e){buttons.forEach(button=>{button.disabled=false});$('deviceDialogBusy').textContent=diagnosticMessage(e);$('deviceDialogBusy').hidden=false}
 }
 async function prepareJlinkDriver(deviceId){
+  if(state.jlinkDriverPreparePending)return;
+  state.jlinkDriverPreparePending=true;
   const buttons=$('deviceList').querySelectorAll('button');buttons.forEach(button=>{button.disabled=true});
   $('deviceDialogBusy').hidden=false;$('deviceDialogBusy').classList.remove('error');$('deviceDialogBusy').classList.add('progress');$('deviceDialogBusy').textContent='请确认 Windows 弹出的管理员权限提示，完成后会自动重新检测';
   try{
     const data=await api('/api/devices/jlink-driver/install',{method:'POST',body:JSON.stringify({device_id:deviceId}),timeoutMs:210000});
     renderDeviceList(data);toast(data.message||'J-Link Windows 驱动已准备');await refreshMeasurement();
-  }catch(e){buttons.forEach(button=>{button.disabled=false});$('deviceDialogBusy').classList.remove('progress');$('deviceDialogBusy').classList.add('error');$('deviceDialogBusy').textContent=diagnosticMessage(e)}
+  }catch(e){$('deviceDialogBusy').classList.remove('progress');$('deviceDialogBusy').classList.add('error');$('deviceDialogBusy').textContent=diagnosticMessage(e)}
+  finally{state.jlinkDriverPreparePending=false;void refreshDevices(false)}
 }
 $('selectDevice').addEventListener('click',()=>void refreshDevices(true));
 $('refreshDevices').addEventListener('click',()=>void refreshDevices(false));
@@ -1300,15 +1305,15 @@ $('chartWindow').addEventListener('click', event => {
   drawAll();
 });
 $('startMeasure').addEventListener('click',async()=>{
-  const button=$('startMeasure'),label=button.textContent;
+  if(state.measurementStartPending)return;
   clearMeasurementInputState();
   const issue=measurementInputIssue();
   if(issue){const input=$(issue.field);input.setAttribute('aria-invalid','true');input.focus();errorBox('measureError',issue.message);return}
+  state.measurementStartPending=true;updateStartState();
   try{
-    button.disabled=true;button.textContent='正在核对硬件配置…';
     const payload={sample_name:$('sampleName').value,known_concentration_um:concentrationValue(),sample_role:state.sampleRole,source:'manual_gui'};
     updateMeasurement(await api('/api/measurement/start',{method:'POST',body:JSON.stringify(payload),timeoutMs:MEASUREMENT_START_TIMEOUT_MS}));
-  }catch(e){errorBox('measureError',e)}finally{button.textContent=label;updateStartState()}
+  }catch(e){errorBox('measureError',e)}finally{state.measurementStartPending=false;updateStartState()}
 });
 $('stopMeasure').addEventListener('click',async()=>{clearMeasureError();try{updateMeasurement(await post('/api/measurement/stop'))}catch(e){errorBox('measureError',e)}});
 $('sampleRole').addEventListener('click',event=>{const button=event.target.closest('button[data-role]');if(button)setSampleRole(button.dataset.role)});
