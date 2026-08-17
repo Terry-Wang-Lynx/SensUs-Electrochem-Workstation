@@ -8,7 +8,9 @@
 再双击解压目录中的 `SensUsBackend.exe`。便携包已经包含 Python、工作站依赖、
 V4/V5.1 随包固件、`smpmgr` 和带 `libjaylink` 的 OpenOCD，不需要安装 Python、
 OpenOCD 或 nRF Connect SDK。Windows 10/11 x64 的 USB CDC 和 J-Link 硬件通道均可
-直接使用。若本机没有 WebView2 Runtime，启动器会自动改用系统默认浏览器打开界面。
+直接使用。某些首次接入的 J-Link 若缺少调试接口驱动，设备列表会显示“准备 J-Link”；
+点击后确认一次 Windows 管理员提示即可，所需工具已经在包内，不会联网安装其他软件。
+若本机没有 WebView2 Runtime，启动器会自动改用系统默认浏览器打开界面。
 
 ### 源码目录启动
 
@@ -57,9 +59,10 @@ set SENSUS_PROJECT_DIR=%CD%
 windows\build_win.bat
 ```
 
-需要预先安装 Python 3.10+。打包脚本会在 `artifacts/build-env/` 创建隔离环境，
-用 PyInstaller 生成 onedir 后端，并打包 WebView2 原生窗口、OpenOCD/libjaylink 和
-V4/V5.1 稳定固件资源。
+构建机需要 Python 3.12、Git 和 Visual Studio 2022 C++ Build Tools。打包脚本会在
+`artifacts/build-env/` 创建隔离环境，从固定提交和校验过的依赖构建 libwdi helper，
+再用 PyInstaller 生成 onedir 后端，并打包 WebView2 原生窗口、OpenOCD/libjaylink、
+WinUSB 准备工具和 V4/V5.1 稳定固件资源。
 
 输出：`artifacts\releases\<version>\SensUs-Workstation-Windows-x64-<version>.zip`
 
@@ -74,6 +77,8 @@ V4/V5.1 稳定固件资源。
 
 ### J-Link 调试探头
 - 便携包默认使用随包 OpenOCD/libjaylink，不需要安装 SEGGER J-Link 软件。
+- 若 Windows 尚未给受支持的 J-Link 调试接口绑定 WinUSB，界面只在确认设备管理器
+  对应接口异常后显示“准备 J-Link”；确认一次 UAC 后会自动重新检测目标板。
 - 多探头时可在界面中手动选择设备；也可以设置 `SENSUS_JLINK_SERIAL` 指定序列号。
 - 源码目录仍可优先使用 `SENSUS_JLINK_EXE` 指向的 JLink.exe。
 
@@ -98,7 +103,7 @@ V4/V5.1 稳定固件资源。
 | Python 命令行 | ✅ | ✅ |
 | 通用固件烧录与自定义条件 | ✅ | ✅ (便携版零工具链) |
 | 新增固件协议的现场编译 | ✅ (需 NCS) | ✅ (需 NCS) |
-| 硬件采集 | ✅ | ✅ (需 J-Link) |
+| 硬件采集 | ✅ (USB/J-Link) | ✅ (USB/J-Link) |
 | CV 分析 | ✅ | ✅ |
 | I-T 分析 | ✅ | ✅ |
 | 标定/预测 | ✅ | ✅ |
@@ -114,7 +119,8 @@ V4/V5.1 稳定固件资源。
 → 安装 Python 3.10+ 并勾选"Add Python to PATH"。
 
 ### "无法启动采集进程"
-→ 检查探头是否连接，并确认设备管理器已识别 J-Link；便携包不需要安装 J-Link 软件。
+→ 检查探头和目标板供电。若设备列表显示“准备 J-Link”，点击并确认一次 Windows
+管理员提示；便携包不需要另外下载 J-Link 软件。
 
 ### "找不到 JLinkExe / JLink.exe"
 → 便携包会自动回退到随包 OpenOCD；只有源码目录需要设置

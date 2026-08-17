@@ -13,6 +13,9 @@ import urllib.request
 import webbrowser
 
 
+WINDOWS_COLD_START_TIMEOUT_S = 180
+
+
 def _wait_for_server(url: str, expected_project: str, timeout_s: float = 25) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -60,7 +63,12 @@ def _windows_app() -> int:
                 env={**os.environ, "SENSUS_PORTABLE_CHILD": "1"},
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
-            _wait_for_server(url, expected_project)
+            # Windows Defender may inspect every native dependency on the
+            # first launch of an unsigned portable ZIP. The verified clean
+            # Windows machine needed about 55 seconds before /api/health.
+            _wait_for_server(
+                url, expected_project, timeout_s=WINDOWS_COLD_START_TIMEOUT_S,
+            )
         try:
             import webview
 

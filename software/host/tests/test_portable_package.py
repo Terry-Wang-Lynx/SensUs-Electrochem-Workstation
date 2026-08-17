@@ -51,6 +51,46 @@ def test_portable_builds_pin_python_and_enforce_macos_compatibility() -> None:
         assert command_name in verifier
 
 
+def test_windows_portable_builds_and_bundles_pinned_winusb_helper() -> None:
+    root = Path(__file__).parents[3]
+    helper_build = (
+        root / "packaging" / "build_windows_winusb_helper.ps1"
+    ).read_text(encoding="utf-8")
+    windows_build = (root / "windows" / "build_portable.ps1").read_text(
+        encoding="utf-8"
+    )
+    workflow = (root / ".github" / "workflows" / "portable-release.yml").read_text(
+        encoding="utf-8"
+    )
+    spec = (root / "packaging" / "portable.spec").read_text(encoding="utf-8")
+
+    commit = "9b23b82a2dd1cbffc16d46c212f92c6bf8c0c602"
+    for value in (
+        commit,
+        "29314207814ce9d5d73695f7e9239539cf37c79e750b9d5ea5a5ef5487a583d6",
+        "9950b7a226e3ea387365c046d13b68bd0b0b18c015c034363601ff601c5b5585",
+        "38605d8d5a86f408a4b7bec60f6d4a096050eee72f89a63a8d5be125252d3fe7",
+    ):
+        assert value in helper_build
+    assert commit in workflow
+    assert "microsoft/setup-msbuild@v2" in workflow
+    assert "build_windows_winusb_helper.ps1" in workflow
+    for name in (
+        "wdi-simple.exe", "COPYING-LGPL", "libwdi-1.5.1-source.zip", "SOURCE.txt"
+    ):
+        assert name in windows_build
+    assert '"pa_host.windows_jlink"' in spec
+
+
+def test_windows_first_launch_allows_defender_cold_start() -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+
+    assert entry["WINDOWS_COLD_START_TIMEOUT_S"] >= 120
+
+
 def test_macos_openocd_bundler_reuses_already_relocated_libraries() -> None:
     root = Path(__file__).parents[3]
     bundler = (root / "packaging" / "bundle_macos_openocd.sh").read_text(

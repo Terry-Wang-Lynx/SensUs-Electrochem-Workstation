@@ -39,6 +39,13 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout pinned libwdi source
+        uses: actions/checkout@v4
+        with:
+          repository: pbatard/libwdi
+          ref: 9b23b82a2dd1cbffc16d46c212f92c6bf8c0c602
+          path: artifacts/vendor/libwdi
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -46,6 +53,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: microsoft/setup-msbuild@v2
       - name: Install test dependencies
         run: python -m pip install -e ".[dev,analysis]"
       - name: Run host tests
@@ -54,6 +62,9 @@ jobs:
           PYTHONIOENCODING: utf-8
           SENSUS_TRANSPORT: rtt
         run: python -m pytest -q software/host/tests
+      - name: Build pinned WinUSB helper
+        shell: pwsh
+        run: ./packaging/build_windows_winusb_helper.ps1
       - name: Build portable ZIP
         shell: pwsh
         env:

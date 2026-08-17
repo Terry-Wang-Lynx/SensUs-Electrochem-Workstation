@@ -552,6 +552,8 @@ def test_gui_exposes_manual_multi_device_picker() -> None:
         assert f'id="{element_id}"' in html
     assert "/api/devices" in app
     assert "/api/devices/select" in app
+    assert "/api/devices/jlink-driver/install" in app
+    assert "准备 J-Link" in app
     assert "device-card" in styles
 
 

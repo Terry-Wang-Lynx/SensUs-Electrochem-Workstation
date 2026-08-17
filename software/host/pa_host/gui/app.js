@@ -450,6 +450,7 @@ function hardwareOperationStatus(){
   }
   if(active.kind==='jlink'){
     if(active.target_state==='reachable')return {ready:true,message:''};
+    if(active.driver_state==='missing')return {ready:false,message:'请先在“选择设备”中准备 J-Link Windows 驱动'};
     return {ready:false,message:active.target_state==='unreachable'?'目标板无响应，请检查板卡供电和 SWD 排线':'正在核对 J-Link 目标板'};
   }
   return active.selectable
@@ -1074,7 +1075,9 @@ function renderHardwareConnection(data=state.measurement){
     dotClass='error';title='所选设备已断开';detail=String(selected.target_detail||'请重新插拔后刷新');
   }else if(activeDevice?.kind==='jlink'){
     const targetState=String((payload.probing&&activeDevice.target_state==='unknown')?'checking':(activeDevice.target_state||'unknown'));
-    if(targetState==='reachable'){
+    if(activeDevice.driver_state==='missing'){
+      dotClass='error';title='J-Link 驱动待准备';detail=String(activeDevice.driver_message||'请打开“选择设备”准备 Windows 驱动');
+    }else if(targetState==='reachable'){
       dotClass='ok';title='目标板已连接';detail=String(activeDevice.name||'J-Link');
     }else if(targetState==='checking'){
       dotClass='probing';title='正在核对目标板';detail=String(activeDevice.name||'J-Link 探头已连接');
@@ -1170,6 +1173,7 @@ $('exitApp').addEventListener('click',async()=>{
 });
 function deviceCardDetail(device){
   if(device.kind==='jlink'){
+    if(device.driver_state==='missing')return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探针 SN ${device.probe_serial}`:''} · Windows 驱动待准备`;
     const stateText=device.target_state==='reachable'?'目标板已响应':device.target_state==='unreachable'?'目标板无响应':state.devices.probing?'正在核对目标板':'目标板尚未核对';
     return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探头 SN ${device.probe_serial}`:''} · ${stateText}`;
   }
@@ -1190,16 +1194,22 @@ function renderDeviceList(payload=state.devices){
     const card=document.createElement('article'); card.className=`device-card ${device.id===selected?'selected':''}${device.selectable?'':' unavailable'}`;
     const title=document.createElement('div'); title.innerHTML=`<strong>${escapeHtml(device.name||'未命名设备')}</strong><small>${escapeHtml(deviceCardDetail(device))}</small>`;
     const action=document.createElement('button'); action.type='button'; action.className='secondary'; action.dataset.deviceId=device.id;
-    action.textContent=device.id===selected?'当前使用':'选择'; action.disabled=Boolean(state.devices.busy)||device.id===selected||!device.selectable;
+    if(device.driver_action==='install_winusb'){
+      delete action.dataset.deviceId;action.dataset.driverDeviceId=device.id;action.textContent='准备 J-Link';action.title='安装 OpenOCD 需要的 WinUSB 驱动；Windows 会请求一次管理员确认';action.disabled=Boolean(state.devices.busy);
+    }else{
+      action.textContent=device.id===selected?'当前使用':'选择'; action.disabled=Boolean(state.devices.busy)||device.id===selected||!device.selectable;
+    }
     card.append(title,action);
     const note=document.createElement('small'); note.className='device-state';
-    note.textContent=device.target_state==='unreachable'?(device.id===selected?'已选中，但目标板无响应':'探针在线，但目标板无响应'):device.id===selected?'当前测量将使用此设备':device.selectable?'空闲时可选择':'设备尚未准备好'; card.append(note);
+    note.textContent=device.driver_state==='missing'?(device.driver_message||'需要准备 Windows WinUSB 驱动'):device.target_state==='unreachable'?(device.id===selected?'已选中，但目标板无响应':'探针在线，但目标板无响应'):device.id===selected?'当前测量将使用此设备':device.selectable?'空闲时可选择':'设备尚未准备好'; card.append(note);
     list.append(card);
   });
   if(!devices.length){const empty=document.createElement('div');empty.className='device-empty';empty.textContent='没有发现可识别的 USB DATA 或 J-Link。';list.append(empty)}
   const count=devices.length?`${devices.length} 个设备`:'未发现设备';
   $('deviceDialogSummary').textContent=state.devices.busy?`${count} · 测量进行中，暂不能切换`:`${count} · 选择后会锁定该设备`;
   const discoveryError=String(state.devices.error||'');
+  $('deviceDialogBusy').classList.toggle('error',Boolean(state.devices.busy)||Boolean(discoveryError));
+  $('deviceDialogBusy').classList.remove('progress');
   $('deviceDialogBusy').hidden=!state.devices.busy&&!discoveryError;
   $('deviceDialogBusy').textContent=state.devices.busy?'测量或自动任务运行期间不能切换设备':discoveryError?`设备探测失败：${discoveryError}`:'';
   renderHardwareConnection();updateStartState();updateScheduleStartState();if(state.settings)updateSettingsApplyState();
@@ -1233,9 +1243,17 @@ async function chooseDevice(deviceId){
     toast(data.message||'设备选择已更新');
   }catch(e){buttons.forEach(button=>{button.disabled=false});$('deviceDialogBusy').textContent=diagnosticMessage(e);$('deviceDialogBusy').hidden=false}
 }
+async function prepareJlinkDriver(deviceId){
+  const buttons=$('deviceList').querySelectorAll('button');buttons.forEach(button=>{button.disabled=true});
+  $('deviceDialogBusy').hidden=false;$('deviceDialogBusy').classList.remove('error');$('deviceDialogBusy').classList.add('progress');$('deviceDialogBusy').textContent='请确认 Windows 弹出的管理员权限提示，完成后会自动重新检测';
+  try{
+    const data=await api('/api/devices/jlink-driver/install',{method:'POST',body:JSON.stringify({device_id:deviceId}),timeoutMs:210000});
+    renderDeviceList(data);toast(data.message||'J-Link Windows 驱动已准备');await refreshMeasurement();
+  }catch(e){buttons.forEach(button=>{button.disabled=false});$('deviceDialogBusy').classList.remove('progress');$('deviceDialogBusy').classList.add('error');$('deviceDialogBusy').textContent=diagnosticMessage(e)}
+}
 $('selectDevice').addEventListener('click',()=>void refreshDevices(true));
 $('refreshDevices').addEventListener('click',()=>void refreshDevices(false));
-$('deviceList').addEventListener('click',event=>{const button=event.target.closest('button[data-device-id]');if(button&&!button.disabled)void chooseDevice(button.dataset.deviceId)});
+$('deviceList').addEventListener('click',event=>{const button=event.target.closest('button[data-driver-device-id],button[data-device-id]');if(!button||button.disabled)return;if(button.dataset.driverDeviceId)void prepareJlinkDriver(button.dataset.driverDeviceId);else void chooseDevice(button.dataset.deviceId)});
 $('chartWindow').addEventListener('click', event => {
   const button = event.target.closest('button[data-window]');
   if (!button) return;

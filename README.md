@@ -167,10 +167,11 @@ make dmg
 分发包。完整 Zephyr 固件仍需本机的 NCS/Zephyr 工具链与自定义板定义。
 
 给其他同学使用时，优先分发 `artifacts/releases/<version>/` 下的便携包。macOS
-便携包面向 Apple Silicon/macOS 13+，Windows 包面向 Windows 10/11 x64；两者不要求
+便携包面向 Apple Silicon/macOS 14+，Windows 包面向 Windows 10/11 x64；两者不要求
 安装项目 Python 环境。Windows 便携包还自带 OpenOCD/libjaylink、`smpmgr` 和随包固件，
-因此 USB/J-Link 硬件通道不需要额外安装主机工具；若 WebView2 Runtime 不存在则自动
-退回系统浏览器。Windows 包由 `windows/build_portable.ps1` 或
+因此 USB/J-Link 硬件通道不需要额外下载主机工具；首次接入且调试接口驱动缺失的
+J-Link 会在界面中提供一次“准备 J-Link”操作。macOS 不需要该 WinUSB 步骤。若
+WebView2 Runtime 不存在则自动退回系统浏览器。Windows 包由 `windows/build_portable.ps1` 或
 `portable-release` GitHub Actions 在 Windows 上原生生成。稳定前端的签名更新、
 缓存、重启激活和回退机制见
 [docs/PORTABLE_DISTRIBUTION.md](docs/PORTABLE_DISTRIBUTION.md)。

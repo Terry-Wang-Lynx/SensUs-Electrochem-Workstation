@@ -8,3 +8,10 @@ https://github.com/openocd-org/openocd
 The bundled OpenOCD build includes libjaylink support for SEGGER J-Link
 compatible probes. SEGGER trademarks and proprietary J-Link software are not
 included in this package.
+
+The Windows package also includes the unmodified wdi-simple utility from
+libwdi 1.5.1, used to prepare the supported J-Link WinUSB interface after the
+user explicitly confirms the action. libwdi is distributed under the GNU
+Lesser General Public License, version 3 or later. The package includes
+COPYING, COPYING-LGPL, build provenance, and the complete pinned source archive
+under tools/winusb. Upstream: https://github.com/pbatard/libwdi

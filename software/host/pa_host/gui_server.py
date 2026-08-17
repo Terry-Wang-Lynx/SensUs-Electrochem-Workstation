@@ -91,6 +91,13 @@ from .workspace_history import BATCH_KIND, WORKSPACE_KIND, WorkspaceHistory
 from .frontend_update import FrontendUpdater
 from .diagnostics import DiagnosticStore
 from . import runtime
+from .windows_jlink import (
+    JLINK_VENDOR_ID,
+    install_winusb_driver,
+    openocd_reports_missing_driver,
+    repairable_interfaces,
+    resolve_helper as resolve_winusb_helper,
+)
 
 _IS_WIN = sys.platform == "win32"
 
@@ -98,6 +105,7 @@ _IS_WIN = sys.platform == "win32"
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = runtime.project_dir()
 STATE_DIR = runtime.state_dir()
+WINUSB_HELPER = resolve_winusb_helper(PROJECT_DIR)
 DIAGNOSTICS = DiagnosticStore(runtime.logs_dir())
 FRONTEND_UPDATER = FrontendUpdater(
     PACKAGE_DIR / "gui", STATE_DIR, PROJECT_DIR
@@ -544,10 +552,25 @@ def _all_serial_port_infos() -> list[Any]:
         if not device:
             return False
         lowered = device.lower()
-        return (
-            "usbmodem" in lowered
-            or "usbserial" in lowered
-            or device.upper().startswith("COM")
+        if "usbmodem" in lowered or "usbserial" in lowered:
+            return True
+        if not (_IS_WIN and device.upper().startswith("COM")):
+            return False
+        # Windows may expose Bluetooth and motherboard UARTs as COM ports.
+        # Opening every one adds several seconds per port and can write GET to
+        # unrelated hardware. Keep only descriptors that are actually USB.
+        descriptor = _port_descriptor(info).lower()
+        return bool(
+            getattr(info, "vid", None) is not None
+            or "usb" in descriptor
+            or "segger" in descriptor
+            or "j-link" in descriptor
+            or "jlink" in descriptor
+            or (
+                JLINK_CDC_SERIAL
+                and re.sub(r"\D", "", str(JLINK_CDC_SERIAL))
+                in re.sub(r"\D", "", descriptor)
+            )
         )
 
     return [info for info in list_ports.comports() if is_candidate(info)]
@@ -761,6 +784,7 @@ def _probe_jlink_target_status(
         attempts: list[str] = []
         reachable = False
         backend = ""
+        openocd_driver_missing = False
         if JLINK_EXE.is_file():
             reachable, output = probe_jlink_target(
                 probe_serial,
@@ -774,6 +798,11 @@ def _probe_jlink_target_status(
                 attempts.append("SEGGER: " + (" | ".join(tail) or "目标无响应"))
         if not reachable:
             reachable, output = _openocd_target_probe(probe_serial)
+            openocd_driver_missing = bool(
+                _IS_WIN
+                and openocd_reports_missing_driver(output)
+                and _jlink_requires_winusb(probe_serial)
+            )
             if reachable:
                 backend = "OpenOCD / libjaylink"
             else:
@@ -786,18 +815,37 @@ def _probe_jlink_target_status(
                 "target_detail": f"nRF52833 已响应（{backend}）",
                 "target_backend": backend,
                 "target_diagnostics": "",
+                "driver_state": "ready",
+                "driver_action": "",
+                "driver_message": "Windows J-Link 接口已就绪",
             }
         else:
             diagnostics = "；".join(attempts)
+            helper_available = WINUSB_HELPER.is_file()
             result = {
                 "target_state": "unreachable" if attempts else "unknown",
                 "target_detail": (
-                    "J-Link 探针在线，但 nRF52833 未响应；"
-                    "请检查板卡供电、SWD 排线和接口方向"
-                    if attempts else "没有可用的 SWD 核对工具"
+                    "J-Link 已识别，但 Windows 调试接口驱动尚未准备"
+                    if openocd_driver_missing else (
+                        "J-Link 探针在线，但 nRF52833 未响应；"
+                        "请检查板卡供电、SWD 排线和接口方向"
+                        if attempts else "没有可用的 SWD 核对工具"
+                    )
                 ),
                 "target_backend": "",
                 "target_diagnostics": diagnostics,
+                "driver_state": "missing" if openocd_driver_missing else "unknown",
+                "driver_action": (
+                    "install_winusb"
+                    if openocd_driver_missing and helper_available else ""
+                ),
+                "driver_message": (
+                    "点击‘准备 J-Link’并确认 Windows 权限提示"
+                    if openocd_driver_missing and helper_available else (
+                        "当前便携包缺少 WinUSB 准备工具，请更新软件"
+                        if openocd_driver_missing else ""
+                    )
+                ),
             }
         result.update({
             "target_checked_at": now,
@@ -840,7 +888,7 @@ def _annotate_target_states(
             )
             device.update({
                 key: value for key, value in status.items()
-                if key.startswith("target_")
+                if key.startswith("target_") or key.startswith("driver_")
             })
         else:
             ready = bool(device.get("selectable"))
@@ -1241,6 +1289,8 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
             "probe_serial": probe_serial,
             "cdc_port": str(getattr(info, "device", "") or ""),
             "serial_number": str(getattr(info, "serial_number", "") or ""),
+            "vid": getattr(info, "vid", None),
+            "pid": getattr(info, "pid", None),
             "location": str(getattr(info, "location", "") or ""),
             "selectable": bool(probe_serial),
         })
@@ -1347,6 +1397,144 @@ def _find_jlink_for_id(device_id: str) -> Any | None:
          if _is_jlink_port(info) and _jlink_device_id(info) == device_id),
         None,
     )
+
+
+def _jlink_usb_ids(info: Any) -> tuple[int, int]:
+    vid = getattr(info, "vid", None)
+    pid = getattr(info, "pid", None)
+    if vid is None or pid is None:
+        descriptor = _port_descriptor(info)
+        match = re.search(
+            r"VID(?:_|:PID=)([0-9A-F]{4})(?:&PID_|:)([0-9A-F]{4})",
+            descriptor,
+            flags=re.IGNORECASE,
+        )
+        if match is not None:
+            vid, pid = int(match.group(1), 16), int(match.group(2), 16)
+    if vid is None or pid is None:
+        raise RuntimeError("无法读取该 J-Link 的 USB VID/PID")
+    if int(vid) != JLINK_VENDOR_ID:
+        raise RuntimeError("只能准备 SEGGER J-Link 的 Windows 驱动")
+    return int(vid), int(pid)
+
+
+def _jlink_requires_winusb(probe_serial: str) -> bool:
+    """Confirm the missing driver against the exact PnP debug interface."""
+    info = next(
+        (
+            candidate for candidate in _all_serial_port_infos()
+            if _is_jlink_port(candidate)
+            and _jlink_probe_serial(candidate) == probe_serial
+        ),
+        None,
+    )
+    if info is None:
+        return False
+    try:
+        vid, pid = _jlink_usb_ids(info)
+        return bool(repairable_interfaces(vid, pid))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _prepare_jlink_winusb(device_id: str) -> dict[str, Any]:
+    if not _IS_WIN:
+        raise RuntimeError("WinUSB 准备仅适用于 Windows")
+    if not WINUSB_HELPER.is_file():
+        raise RuntimeError("当前便携包缺少 WinUSB 准备工具，请更新软件")
+    info = _find_jlink_for_id(device_id)
+    if info is None:
+        raise ValueError("J-Link 已断开，请重新插入后刷新")
+    probe_serial = _jlink_probe_serial(info)
+    if not probe_serial:
+        raise RuntimeError("该 J-Link 没有可用的探针序列号")
+    status = _probe_jlink_target_status(probe_serial, force=True)
+    if status.get("target_state") == "reachable":
+        devices = _discover_devices(probe=False)
+        return {
+            **_devices_payload_from_devices(devices),
+            "message": "J-Link 调试接口已经就绪",
+        }
+    if status.get("driver_state") != "missing":
+        raise RuntimeError(
+            str(status.get("target_detail") or "J-Link 的 Windows 驱动无需更改")
+        )
+
+    connected_probes = {
+        _jlink_probe_serial(candidate)
+        for candidate in _all_serial_port_infos()
+        if _is_jlink_port(candidate) and _jlink_probe_serial(candidate)
+    }
+    if len(connected_probes) > 1:
+        raise RuntimeError(
+            "准备 Windows 驱动时请只保留这一只 J-Link，完成后可重新插回其他探头"
+        )
+
+    vid, pid = _jlink_usb_ids(info)
+    DIAGNOSTICS.record(
+        "info", "device.jlink.driver_install.started",
+        "J-Link WinUSB preparation started",
+        device_id=device_id, probe_serial=probe_serial,
+        vid=f"{vid:04x}", pid=f"{pid:04x}", helper=WINUSB_HELPER,
+    )
+    started_at = time.monotonic()
+    try:
+        installation = install_winusb_driver(
+            WINUSB_HELPER, vid=vid, pid=pid,
+        )
+    except Exception as exc:
+        diagnostic_id = DIAGNOSTICS.exception(
+            "device.jlink.driver_install.failed",
+            "J-Link WinUSB preparation failed",
+            exc, device_id=device_id, probe_serial=probe_serial,
+            vid=f"{vid:04x}", pid=f"{pid:04x}",
+            duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+        )
+        try:
+            setattr(exc, "diagnostic_id", diagnostic_id)
+        except (AttributeError, TypeError):
+            pass
+        raise
+
+    with JLINK_TARGET_CACHE_LOCK:
+        JLINK_TARGET_CACHE.pop(probe_serial, None)
+    # Driver rebinding can briefly remove both composite interfaces. Wait for
+    # the CDC descriptor before running OpenOCD against the new WinUSB device.
+    for _ in range(30):
+        if _find_jlink_for_id(device_id) is not None:
+            break
+        time.sleep(0.5)
+    devices = _discover_devices_with_probe()
+    _annotate_target_states(devices, refresh_jlink=True)
+    _remember_device_discovery(devices)
+    prepared = next(
+        (device for device in devices if device.get("probe_serial") == probe_serial),
+        None,
+    )
+    if prepared is None:
+        raise RuntimeError(
+            "WinUSB 已安装，但 J-Link 正在重新枚举；请重插探针后刷新"
+        )
+    if prepared.get("driver_state") == "missing":
+        raise RuntimeError(
+            "Windows 未启用新的 WinUSB 驱动；请重插 J-Link 后再刷新"
+        )
+    DIAGNOSTICS.record(
+        "info", "device.jlink.driver_install.completed",
+        "J-Link WinUSB preparation completed",
+        device_id=device_id, probe_serial=probe_serial,
+        installation=installation,
+        target_state=prepared.get("target_state"),
+        target_detail=prepared.get("target_detail"),
+        duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+    )
+    result = _devices_payload_from_devices(devices)
+    result["message"] = (
+        "J-Link 已准备并连上 nRF52833"
+        if prepared.get("target_state") == "reachable"
+        else "WinUSB 已准备；请检查目标板供电和 SWD 连线"
+    )
+    return result
 
 
 def _set_device_selection(device: dict[str, Any] | None) -> None:
@@ -9226,6 +9414,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                         APP.settings.restore_for_transport(HARDWARE_TRANSPORT)
                         result = _devices_payload_from_devices(devices)
                         result["message"] = f"已选择 {device.get('name', '设备')}"
+            elif self.path == "/api/devices/jlink-driver/install":
+                with APP.operation_lock:
+                    if not APP.hardware_idle():
+                        raise RuntimeError("测量或自动任务运行期间不能准备 J-Link 驱动")
+                    requested_id = str(payload.get("device_id") or "").strip()
+                    if not requested_id.startswith("jlink:"):
+                        raise ValueError("请选择需要准备的 J-Link")
+                    result = _prepare_jlink_winusb(requested_id)
             elif self.path == "/api/measurement/start":
                 with APP.operation_lock:
                     if APP.schedule.snapshot()["active"]:

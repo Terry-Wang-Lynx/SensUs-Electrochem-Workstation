@@ -26,6 +26,7 @@ a = Analysis(
         "pa_host.runtime",
         "pa_host.stability_eta",
         "pa_host.workspace_history",
+        "pa_host.windows_jlink",
         "serial",
         "serial.tools.list_ports",
         "serial.tools.list_ports_common",
