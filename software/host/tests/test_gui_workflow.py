@@ -2396,6 +2396,139 @@ def test_runtime_response_requires_one_complete_matching_request() -> None:
     assert gui_server._runtime_response_state(mixed, request_id) == "incomplete"
 
 
+def test_openocd_target_probe_accepts_batch_read_memory_output(
+    tmp_path: Path,
+) -> None:
+    openocd = tmp_path / "openocd"
+    scripts = tmp_path / "scripts"
+    (scripts / "interface").mkdir(parents=True)
+    (scripts / "target").mkdir()
+    (scripts / "interface/jlink.cfg").touch()
+    (scripts / "target/nrf52.cfg").touch()
+    openocd.touch()
+    completed = subprocess.CompletedProcess(
+        [str(openocd)], 0,
+        stdout=(
+            "Info : [nrf52.cpu] Cortex-M4 r0p1 processor detected\n"
+            "SENSUS_INFO_PART=0x52833\n"
+        ),
+        stderr="shutdown command invoked\n",
+    )
+    with (
+        patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+        patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+        patch("pa_host.gui_server.subprocess.run", return_value=completed) as run,
+    ):
+        reachable, output = gui_server._openocd_target_probe("29734569")
+
+    assert reachable is True
+    assert "SENSUS_INFO_PART=0x52833" in output
+    command = run.call_args.args[0]
+    assert any("read_memory 0x10000100 32 1" in arg for arg in command)
+    assert not any("mdw " in arg for arg in command)
+
+
+def test_openocd_target_probe_rejects_connection_log_without_identity(
+    tmp_path: Path,
+) -> None:
+    openocd = tmp_path / "openocd"
+    scripts = tmp_path / "scripts"
+    (scripts / "interface").mkdir(parents=True)
+    (scripts / "target").mkdir()
+    (scripts / "interface/jlink.cfg").touch()
+    (scripts / "target/nrf52.cfg").touch()
+    openocd.touch()
+    completed = subprocess.CompletedProcess(
+        [str(openocd)], 0,
+        stdout=(
+            "Info : [nrf52.cpu] Cortex-M4 r0p1 processor detected\n"
+            "Info : [nrf52.cpu] target has 6 breakpoints, 4 watchpoints\n"
+        ),
+        stderr="shutdown command invoked\n",
+    )
+    with (
+        patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+        patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+        patch("pa_host.gui_server.subprocess.run", return_value=completed),
+    ):
+        reachable, _output = gui_server._openocd_target_probe("29734569")
+
+    assert reachable is False
+
+
+def test_openocd_rtt_layout_probe_accepts_unpadded_read_memory_words(
+    tmp_path: Path,
+) -> None:
+    openocd = tmp_path / "openocd"
+    scripts = tmp_path / "scripts"
+    (scripts / "interface").mkdir(parents=True)
+    (scripts / "target").mkdir()
+    (scripts / "interface/jlink.cfg").touch()
+    (scripts / "target/nrf52.cfg").touch()
+    openocd.touch()
+    completed = subprocess.CompletedProcess(
+        [str(openocd)], 0,
+        stdout=(
+            "SENSUS_INFO_PART=0x52833\n"
+            "SENSUS_RTT_SIGNATURE=0x47474553 0x52205245 0x5454\n"
+        ),
+        stderr="shutdown command invoked\n",
+    )
+    with (
+        patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+        patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
+        patch("pa_host.gui_server.subprocess.run", return_value=completed) as run,
+    ):
+        reachable, layout_ready, output = gui_server._openocd_rtt_layout_probe(
+            0x20001100, "29734569",
+        )
+
+    assert (reachable, layout_ready) == (True, True)
+    assert "SENSUS_RTT_SIGNATURE" in output
+    command = run.call_args.args[0]
+    assert any("read_memory 0x20001100 32 3" in arg for arg in command)
+
+
+def test_openocd_runtime_probe_retries_tagged_get_until_verified() -> None:
+    process = Mock()
+    process.poll.return_value = None
+    client = Mock()
+    sent: list[bytes] = []
+    client.sendall.side_effect = sent.append
+    response = "\n".join((
+        "CFG_APPLIED req=probe-1 src=get",
+        "CFG_DERIVED req=probe-1",
+        "CFG_CONFIRMED req=probe-1 src=get verify_ok=1 "
+        "invalid_cfg=0 vdd_oor=0",
+    )).encode("ascii")
+
+    def receive(_size: int) -> bytes:
+        if len(sent) < 2:
+            raise gui_server.socket.timeout
+        return response
+
+    client.recv.side_effect = receive
+    clock = iter(value * 0.4 for value in range(20))
+    with (
+        patch("pa_host.gui_server._runtime_probe_request_id",
+              return_value="probe-1"),
+        patch("pa_host.gui_server.start_jlink_rtt", return_value=process),
+        patch("pa_host.gui_server.socket.create_connection",
+              return_value=client),
+        patch("pa_host.gui_server.time.monotonic",
+              side_effect=lambda: next(clock)),
+    ):
+        state, detail = gui_server._probe_openocd_runtime_firmware(
+            0x20001100, "29734569", timeout_s=5.0,
+        )
+
+    assert state == "ready"
+    assert "CFG_CONFIRMED" in detail
+    assert sent == [b"GET req=probe-1\n", b"GET req=probe-1\n"]
+    client.close.assert_called_once_with()
+    process.terminate.assert_called_once_with()
+
+
 def test_missing_jlink_rtt_layout_requires_readable_nrf52833() -> None:
     metadata = {"rtt_address": "0x20001000"}
     unavailable = gui_server.RTTControlBlockUnavailable("no control block")
@@ -2578,7 +2711,7 @@ def test_openocd_fallback_uses_one_bounded_write_verify_run_session() -> None:
         openocd.write_text("openocd", encoding="ascii")
         openocd.chmod(0o755)
         output = (
-            "0x10000100: 00052833\n"
+            "SENSUS_INFO_PART=0x00052833\n"
             "wrote 1 bytes from file\nverified 1 bytes in 0.1s\n"
         )
         with (
@@ -2586,7 +2719,7 @@ def test_openocd_fallback_uses_one_bounded_write_verify_run_session() -> None:
             patch("pa_host.gui_server.OPENOCD_EXE", openocd),
             patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
             patch("pa_host.gui_server._openocd_target_probe",
-                  return_value=(True, "0x10000100: 00052833")),
+                  return_value=(True, "SENSUS_INFO_PART=0x00052833")),
             patch.object(SettingsController, "_run_openocd_once",
                          return_value=(0, output)) as run,
         ):

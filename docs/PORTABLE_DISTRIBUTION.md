@@ -32,8 +32,10 @@ Windows 原生构建：
 并将 `openocd.exe`、运行库和 `interface/jlink.cfg` 等 scripts 放入 ZIP。运行时不
 需要目标电脑安装 Python、OpenOCD、nRF Connect SDK 或 SEGGER J-Link 软件。它还会
 从固定的 libwdi 1.5.1 提交构建 `wdi-simple.exe`，并把完整对应源码和许可证随包分发。
+J-Link 发现同时读取 CDC 和系统 USB 设备树，所以没有 COM 口的老式 ARM-OB 也会显示。
 只有 OpenOCD 报告不可访问、且 Windows 设备管理器确认受支持的 J-Link 调试接口异常
-时，界面才允许用户点击“准备 J-Link”并确认一次 UAC；不会改动 CDC 接口。
+时，界面才允许用户点击“准备 J-Link”并确认一次 UAC。老式 `PID 0101` 是单接口设备；
+新式复合 `PID 0105` 只处理 `MI_02`，不会改动 CDC 接口。
 如果电脑已安装兼容的 SEGGER Commander，会在包内 OpenOCD 无法识别目标时
 作为备用通道；没安装时仍使用包内 OpenOCD。
 

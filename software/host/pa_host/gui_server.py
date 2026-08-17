@@ -98,6 +98,7 @@ from .windows_jlink import (
     repairable_interfaces,
     resolve_helper as resolve_winusb_helper,
 )
+from .jlink_usb import discover_jlink_usb_devices
 
 _IS_WIN = sys.platform == "win32"
 
@@ -541,11 +542,11 @@ def _port_accepts_connections(port: int) -> bool:
 
 
 def _all_serial_port_infos() -> list[Any]:
-    """Return all USB serial candidates while keeping descriptor metadata."""
+    """Return USB serial candidates plus J-Links without a CDC interface."""
     try:
         from serial.tools import list_ports
     except ImportError:
-        return []
+        list_ports = None
 
     def is_candidate(info: Any) -> bool:
         device = str(getattr(info, "device", "") or "")
@@ -573,7 +574,28 @@ def _all_serial_port_infos() -> list[Any]:
             )
         )
 
-    return [info for info in list_ports.comports() if is_candidate(info)]
+    infos = (
+        [info for info in list_ports.comports() if is_candidate(info)]
+        if list_ports is not None else []
+    )
+    try:
+        native_jlinks = discover_jlink_usb_devices()
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        DIAGNOSTICS.record(
+            "warning", "device.jlink.usb_discovery_failed",
+            "Native J-Link USB discovery failed", error=str(exc),
+        )
+        native_jlinks = []
+    existing_serials = {
+        _normalise_probe_serial(getattr(info, "serial_number", ""))
+        for info in infos if _is_jlink_port(info)
+    }
+    infos.extend(
+        info for info in native_jlinks
+        if not _normalise_probe_serial(info.serial_number)
+        or _normalise_probe_serial(info.serial_number) not in existing_serials
+    )
+    return infos
 
 
 def _port_descriptor(info: Any) -> str:
@@ -666,11 +688,34 @@ def _cached_jlink_target_status(probe_serial: str) -> dict[str, Any]:
         )
 
 
+def _openocd_jlink_available() -> bool:
+    return bool(
+        OPENOCD_EXE.is_file()
+        and (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
+        and (OPENOCD_SCRIPTS / "target/nrf52.cfg").is_file()
+    )
+
+
+def _openocd_identity_command() -> str:
+    return (
+        "set sensus_info [read_memory "
+        f"0x{NRF52833_INFO_PART_ADDRESS:08X} 32 1]; "
+        "echo \"SENSUS_INFO_PART=[format 0x%08X "
+        "[lindex $sensus_info 0]]\""
+    )
+
+
+def _openocd_identity_verified(output: str) -> bool:
+    return bool(re.search(
+        rf"\bSENSUS_INFO_PART\s*=\s*(?:0x)?0*"
+        rf"{NRF52833_INFO_PART_VALUE:X}\b",
+        output,
+        flags=re.IGNORECASE,
+    ))
+
+
 def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
-    if (
-        not OPENOCD_EXE.is_file()
-        or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
-    ):
+    if not _openocd_jlink_available():
         return False, "随包 OpenOCD 不可用"
     command = [
         str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
@@ -681,9 +726,7 @@ def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
         command += ["-c", f"adapter serial {probe_serial}"]
     command += [
         "-c", f"adapter speed {JLINK_SPEED_KHZ}",
-        "-c", (
-            f"init; mdw 0x{NRF52833_INFO_PART_ADDRESS:08X} 1; shutdown"
-        ),
+        "-c", f"init; {_openocd_identity_command()}; shutdown",
     ]
     try:
         done = subprocess.run(
@@ -699,22 +742,14 @@ def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     output = f"{done.stdout}\n{done.stderr}"
-    expected = re.compile(
-        rf"(?:0x)?{NRF52833_INFO_PART_ADDRESS:08X}\s*(?:=|:)\s*"
-        rf"(?:0x)?{NRF52833_INFO_PART_VALUE:08X}\b",
-        flags=re.IGNORECASE,
-    )
-    return done.returncode == 0 and bool(expected.search(output)), output
+    return done.returncode == 0 and _openocd_identity_verified(output), output
 
 
 def _openocd_rtt_layout_probe(
     rtt_address: int, probe_serial: str,
 ) -> tuple[bool, bool, str]:
     """Read chip identity and the RTT signature without resetting or writing."""
-    if (
-        not OPENOCD_EXE.is_file()
-        or not (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
-    ):
+    if not _openocd_jlink_available():
         return False, False, "随包 OpenOCD 不可用"
     command = [
         str(OPENOCD_EXE), "-s", str(OPENOCD_SCRIPTS),
@@ -726,8 +761,16 @@ def _openocd_rtt_layout_probe(
     command += [
         "-c", f"adapter speed {JLINK_SPEED_KHZ}",
         "-c", (
-            f"init; mdw 0x{NRF52833_INFO_PART_ADDRESS:08X} 1; "
-            f"mdw 0x{rtt_address:08X} 3; shutdown"
+            "init; set sensus_info [read_memory "
+            f"0x{NRF52833_INFO_PART_ADDRESS:08X} 32 1]; "
+            "set sensus_rtt [read_memory "
+            f"0x{rtt_address:08X} 32 3]; "
+            "echo \"SENSUS_INFO_PART=[format 0x%08X "
+            "[lindex $sensus_info 0]]\"; "
+            "echo \"SENSUS_RTT_SIGNATURE=[format 0x%08X "
+            "[lindex $sensus_rtt 0]] [format 0x%08X "
+            "[lindex $sensus_rtt 1]] [format 0x%08X "
+            "[lindex $sensus_rtt 2]]\"; shutdown"
         ),
     ]
     try:
@@ -739,14 +782,14 @@ def _openocd_rtt_layout_probe(
         return False, False, str(exc)
     output = f"{done.stdout}\n{done.stderr}"
     part_pattern = re.compile(
-        rf"(?:0x)?{NRF52833_INFO_PART_ADDRESS:08X}\s*(?:=|:)\s*"
-        rf"(?:0x)?{NRF52833_INFO_PART_VALUE:08X}\b",
+        rf"\bSENSUS_INFO_PART\s*=\s*(?:0x)?0*"
+        rf"{NRF52833_INFO_PART_VALUE:X}\b",
         flags=re.IGNORECASE,
     )
     target_ready = done.returncode == 0 and bool(part_pattern.search(output))
     rtt_pattern = re.compile(
-        rf"(?:0x)?{rtt_address:08X}\s*(?:=|:)\s*"
-        r"(?:0x)?47474553\s+(?:0x)?52205245\s+(?:0x)?00005454\b",
+        r"\bSENSUS_RTT_SIGNATURE\s*=\s*"
+        r"(?:0x)?0*47474553\s+(?:0x)?0*52205245\s+(?:0x)?0*5454\b",
         flags=re.IGNORECASE,
     )
     return target_ready, target_ready and bool(rtt_pattern.search(output)), output
@@ -1028,8 +1071,16 @@ def _probe_openocd_runtime_firmware(
         if client is None:
             return "transport_error", "OpenOCD RTT 服务未就绪"
         client.settimeout(0.2)
-        client.sendall(f"GET req={request_id}\n".encode("ascii"))
+        request = f"GET req={request_id}\n".encode("ascii")
+        next_request_at = 0.0
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_request_at:
+                # OpenOCD can expose its TCP listener before the RTT down
+                # channel is ready. Reusing the tagged, read-only GET also
+                # survives a full telemetry ring without changing hardware.
+                client.sendall(request)
+                next_request_at = now + 1.0
             try:
                 chunk = client.recv(4096)
             except socket.timeout:
@@ -1067,42 +1118,38 @@ def _probe_jlink_runtime_firmware(
     except (TypeError, ValueError):
         return "transport_error", "固件元数据缺少有效 RTT 地址"
 
-    if not JLINK_EXE.is_file():
+    # The portable package owns this OpenOCD build and uses the same backend
+    # for collection and flashing. Prefer it even when a system Commander is
+    # installed so an unrelated SEGGER upgrade cannot change old-firmware
+    # detection. A readable nRF52833 identity plus a missing RTT signature is
+    # the only state that authorizes recovery flashing.
+    openocd_failure = ""
+    if _openocd_jlink_available():
         reachable, layout_ready, output = _openocd_rtt_layout_probe(
             rtt_address, JLINK_SERIAL,
         )
         detail = " | ".join(_meaningful_process_tail(output, limit=5))
-        if not reachable:
-            return "transport_error", detail or "OpenOCD 无法读取 nRF52833 身份"
-        if not layout_ready:
-            return "missing", detail or "未找到通用固件 RTT 控制块"
-        return _probe_openocd_runtime_firmware(
-            rtt_address, JLINK_SERIAL, timeout_s=timeout_s,
-        )
+        if reachable:
+            if not layout_ready:
+                return "missing", detail or "未找到通用固件 RTT 控制块"
+            return _probe_openocd_runtime_firmware(
+                rtt_address, JLINK_SERIAL, timeout_s=timeout_s,
+            )
+        openocd_failure = detail or "OpenOCD 无法读取 nRF52833 身份"
+
+    if not JLINK_EXE.is_file():
+        return "transport_error", openocd_failure or "没有可用的 J-Link 读取后端"
 
     reachable, probe_output = probe_jlink_target(
         JLINK_SERIAL or None, executable=JLINK_EXE, timeout_s=10,
     )
     if not reachable:
-        if (
-            OPENOCD_EXE.is_file()
-            and (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
-        ):
-            reachable, layout_ready, layout_output = _openocd_rtt_layout_probe(
-                rtt_address, JLINK_SERIAL,
-            )
-            detail = " | ".join(
-                _meaningful_process_tail(layout_output, limit=5)
-            )
-            if reachable and not layout_ready:
-                return "missing", detail or "未找到通用固件 RTT 控制块"
-            if not reachable:
-                return "transport_error", detail or "OpenOCD 无法读取 nRF52833 身份"
-            return _probe_openocd_runtime_firmware(
-                rtt_address, JLINK_SERIAL, timeout_s=timeout_s,
-            )
         detail = " | ".join(_meaningful_process_tail(probe_output, limit=5))
-        return "transport_error", detail or "J-Link 无法读取 nRF52833 身份"
+        failures = [item for item in (
+            openocd_failure,
+            detail or "J-Link 无法读取 nRF52833 身份",
+        ) if item]
+        return "transport_error", " || ".join(failures)
 
     request_id = _runtime_probe_request_id()
     transport: JLinkMemoryRTT | None = None
@@ -1276,7 +1323,8 @@ def _device_sort_key(device: dict[str, Any]) -> tuple[int, str]:
 def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
     """Enumerate J-Link probes and V5.1 USB boards without flashing/resetting."""
     devices: list[dict[str, Any]] = []
-    for info in _all_serial_port_infos():
+    all_infos = _all_serial_port_infos()
+    for info in all_infos:
         if not _is_jlink_port(info):
             continue
         probe_serial = _jlink_probe_serial(info)
@@ -1295,7 +1343,7 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
             "selectable": bool(probe_serial),
         })
 
-    candidates = _serial_port_infos()
+    candidates = [info for info in all_infos if not _is_jlink_port(info)]
     groups: list[list[Any]] = []
     for info in candidates:
         group = next((items for items in groups if _same_usb_device(items[0], info)), None)
@@ -1333,10 +1381,11 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
             )
         data_port = str(getattr(data_info, "device", "") or "") if data_info else ""
         representative = data_info or group[0]
-        smp_port = (
-            _discover_serial_smp_port(data_port, force=True)
-            if data_port else ""
-        )
+        sibling_ports = [
+            str(getattr(info, "device", "") or "")
+            for info in group if info is not data_info
+        ]
+        smp_port = sibling_ports[0] if data_port and len(sibling_ports) == 1 else ""
         identity = _usb_identity(representative)
         devices.append({
             "id": identity,
@@ -2639,11 +2688,7 @@ class SettingsController:
     def _select_swd_flash_backend(cls) -> str:
         """Select one backend using read-only chip identity checks."""
         failures: list[str] = []
-        if (
-            OPENOCD_EXE.is_file()
-            and (OPENOCD_SCRIPTS / "interface/jlink.cfg").is_file()
-            and (OPENOCD_SCRIPTS / "target/nrf52.cfg").is_file()
-        ):
+        if _openocd_jlink_available():
             reachable, output = _openocd_target_probe(JLINK_SERIAL)
             if reachable:
                 return "openocd"
@@ -2744,23 +2789,19 @@ class SettingsController:
             return_code, blob = cls._run_openocd_once(
                 100,
                 "init", "reset halt",
-                f"mdw 0x{NRF52833_INFO_PART_ADDRESS:08X} 1",
+                _openocd_identity_command(),
                 f"flash write_image erase {firmware_path}",
                 f"verify_image {firmware_path}",
                 "reset run", "shutdown",
                 timeout_s=300,
             )
-            try:
-                part = cls._parse_openocd_words(
-                    blob, NRF52833_INFO_PART_ADDRESS, 1
-                )[0]
-            except RuntimeError as exc:
-                part = -1
-                failures.append(str(exc))
+            identity_verified = _openocd_identity_verified(blob)
+            if not identity_verified:
+                failures.append("OpenOCD 未返回 nRF52833 身份标记")
             lowered = blob.lower()
             success = (
                 return_code == 0
-                and part == NRF52833_INFO_PART_VALUE
+                and identity_verified
                 and "wrote " in lowered
                 and "verified " in lowered
                 and not any(marker in lowered for marker in (
