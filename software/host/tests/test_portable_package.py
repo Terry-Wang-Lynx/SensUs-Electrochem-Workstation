@@ -5,6 +5,7 @@ import plistlib
 import re
 import runpy
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -51,7 +52,7 @@ def test_portable_builds_pin_python_and_enforce_macos_compatibility() -> None:
         assert command_name in verifier
 
 
-def test_portable_packages_use_the_shared_brand_logo() -> None:
+def test_portable_packages_use_the_shared_brand_logo(tmp_path: Path) -> None:
     root = Path(__file__).parents[3]
     source = root / "branding" / "sensus-logo-source.png"
     macos_icon = (root / "macos" / "create_icon.py").read_text(encoding="utf-8")
@@ -69,6 +70,16 @@ def test_portable_packages_use_the_shared_brand_logo() -> None:
     assert 'icon=str(WINDOWS_ICON) if sys.platform == "win32" else None' in spec
     assert "recursive-include branding *.png" in manifest
     assert "recursive-include software/host/pa_host/gui *.html *.js *.css *.png" in manifest
+
+    generated_icon = tmp_path / "SensUs-Workstation.ico"
+    result = subprocess.run(
+        [sys.executable, str(root / "windows" / "create_icon.py"), str(generated_icon)],
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+    assert result.returncode == 0, result.stderr.decode("ascii", errors="replace")
+    assert generated_icon.is_file()
 
 
 def test_windows_portable_builds_and_bundles_pinned_winusb_helper() -> None:

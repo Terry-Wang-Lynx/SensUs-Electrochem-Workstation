@@ -41,7 +41,7 @@ def main() -> int:
         output, format="ICO", sizes=[(s, s) for s in sizes],
         append_images=images[1:],
     )
-    print(f"图标已生成: {output} ({len(sizes)} 种尺寸)")
+    print(f"Icon generated: {output} ({len(sizes)} sizes)")
     return 0
 
 
