@@ -113,7 +113,9 @@ Move-Item $LibusbKSource.FullName $LibusbKRoot
 Remove-Item -Recurse -Force $ExtractRoot
 
 $BuildMacros = 'WDK_DIR=\"../wdk/Windows Kits/8.0\";LIBUSB0_DIR=\"../libusb0\";LIBUSBK_DIR=\"../libusbk/bin\"'
-& msbuild.exe (Join-Path $Source "libwdi.sln") /m /t:wdi-simple "/p:Configuration=Release" "/p:Platform=Win32" "/p:BuildMacros=$BuildMacros"
+$SolutionDir = $Source.TrimEnd("\") + "\"
+$HelperProject = Join-Path $Source "examples\.msvc\wdi-simple.vcxproj"
+& msbuild.exe $HelperProject /m /t:Build "/p:Configuration=Release" "/p:Platform=Win32" "/p:SolutionDir=$SolutionDir" "/p:BuildMacros=$BuildMacros"
 if ($LASTEXITCODE -ne 0) {
   throw "libwdi wdi-simple build failed with exit code $LASTEXITCODE"
 }
