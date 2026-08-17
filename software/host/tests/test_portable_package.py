@@ -113,6 +113,20 @@ def test_windows_portable_builds_and_bundles_pinned_winusb_helper() -> None:
     assert '"pa_host.windows_jlink"' in spec
 
 
+def test_portable_release_builds_only_windows_by_default() -> None:
+    root = Path(__file__).parents[3]
+    workflow = (root / ".github" / "workflows" / "portable-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "build_macos:" in workflow
+    assert "default: false" in workflow
+    assert (
+        "if: github.event_name == 'workflow_dispatch' "
+        "&& inputs.build_macos == true"
+    ) in workflow
+
+
 def test_windows_first_launch_allows_defender_cold_start() -> None:
     entry = runpy.run_path(
         str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),

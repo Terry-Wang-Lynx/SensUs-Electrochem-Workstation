@@ -2,12 +2,19 @@ name: portable-release
 
 on:
   workflow_dispatch:
+    inputs:
+      build_macos:
+        description: "Also build the macOS package"
+        required: false
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
 
 jobs:
   macos-arm64:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_macos == true
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
