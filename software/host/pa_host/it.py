@@ -700,6 +700,15 @@ def evaluate_platform(
     )
 
 
+def _read_csv_lines(path: Path) -> list[str]:
+    """Read current UTF-8 CSVs while retaining legacy Windows GBK files."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="gb18030")
+    return text.splitlines()
+
+
 def _load_run_csv_with_quality(
         path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load ``time_s``, signed current in nA, and validity from a run CSV.
@@ -710,8 +719,9 @@ def _load_run_csv_with_quality(
     """
 
     path = Path(path)
-    with path.open(newline="") as handle:
-        rows = list(csv.DictReader(line for line in handle if not line.startswith("#")))
+    rows = list(csv.DictReader(
+        line for line in _read_csv_lines(path) if not line.startswith("#")
+    ))
     if not rows:
         raise ValueError(f"run CSV has no data rows: {path}")
 
@@ -831,7 +841,7 @@ def resample_run_10hz(path: str | Path, output: str | Path,
         valid_domain = np.zeros(n, dtype=bool)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="") as handle:
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
         handle.write("# Fixed-rate host resampling; native hardware timestamps retained in source run\n")
         handle.write(f"# source_rate_hz: {source_rate:.9f}\n")
         handle.write(f"# target_rate_hz: {target_rate_hz:.9f}\n")
@@ -891,20 +901,21 @@ def summarize_run(path: str | Path, window_s: float = DEFAULT_WINDOW_S,
 
 def load_calibration_points(path: str | Path) -> list[CalibrationPoint]:
     path = Path(path)
-    with path.open(newline="") as handle:
-        reader = csv.DictReader(line for line in handle if not line.startswith("#"))
-        if reader.fieldnames is None:
-            raise ValueError("calibration CSV has no header")
-        points: list[CalibrationPoint] = []
-        for row in reader:
-            concentration = _finite(_pick(row, (
-                "concentration_um", "concentration_uM", "concentration", "ldopa_concentration_um")))
-            current = _finite(_pick(row, (
-                "current_nA", "current_na", "endpoint_current_nA", "endpoint_current_na",
-                "steady_current_nA")))
-            if concentration is None or current is None:
-                raise ValueError("each calibration row needs concentration and current")
-            points.append(CalibrationPoint(concentration, current, row.get("label", "")))
+    reader = csv.DictReader(
+        line for line in _read_csv_lines(path) if not line.startswith("#")
+    )
+    if reader.fieldnames is None:
+        raise ValueError("calibration CSV has no header")
+    points: list[CalibrationPoint] = []
+    for row in reader:
+        concentration = _finite(_pick(row, (
+            "concentration_um", "concentration_uM", "concentration", "ldopa_concentration_um")))
+        current = _finite(_pick(row, (
+            "current_nA", "current_na", "endpoint_current_nA", "endpoint_current_na",
+            "steady_current_nA")))
+        if concentration is None or current is None:
+            raise ValueError("each calibration row needs concentration and current")
+        points.append(CalibrationPoint(concentration, current, row.get("label", "")))
     if not points:
         raise ValueError("calibration CSV has no points")
     return points
