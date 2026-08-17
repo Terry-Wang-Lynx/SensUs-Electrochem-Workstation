@@ -3625,6 +3625,7 @@ class MeasurementController:
         self.bridge_log_handle: Any = None
         self.user_stop_requested = False
         self.auto_stop_requested = False
+        self._bridge_stop_forced = False
         self._auto_stop_evidence: dict[str, Any] | None = None
         self._plateau_last_segment = 0
         self._plateau_consecutive_passes = 0
@@ -4269,6 +4270,7 @@ class MeasurementController:
             self.error = ""
             self.user_stop_requested = False
             self.auto_stop_requested = False
+            self._bridge_stop_forced = False
             self._auto_stop_evidence = None
             self._reset_plateau_monitor_locked()
             self._plateau_context_start_s = 0.0
@@ -5865,28 +5867,40 @@ class MeasurementController:
                     return
                 except (RuntimeError, subprocess.TimeoutExpired, OSError):
                     pass
+            killed = False
             try:
-                subprocess.run(
+                result = subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True, timeout=10,
                 )
+                killed = result.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
-                process.kill()
+                pass
+            if not killed:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
         else:
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError, OSError):
                 process.terminate()
 
-    @classmethod
-    def _terminate_if_running(cls, process: subprocess.Popen[str], delay_s: float) -> None:
+    def _terminate_if_running(
+        self, process: subprocess.Popen[str], delay_s: float
+    ) -> None:
         time.sleep(delay_s)
         if process.poll() is None:
-            cls._terminate_tree(process)
+            with self.lock:
+                self._bridge_stop_forced = bool(
+                    self.user_stop_requested or self.auto_stop_requested
+                )
+            self._terminate_tree(process)
             try:
                 process.wait(timeout=6)
             except subprocess.TimeoutExpired:
-                cls._kill_tree(process)
+                self._kill_tree(process)
 
     @staticmethod
     def _kill_tree(process: subprocess.Popen[str]) -> None:
@@ -5894,13 +5908,20 @@ class MeasurementController:
         if process.poll() is not None:
             return
         if _IS_WIN:
+            killed = False
             try:
-                subprocess.run(
+                result = subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True, timeout=10,
                 )
+                killed = result.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
-                process.kill()
+                pass
+            if not killed:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
         else:
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
@@ -5949,7 +5970,9 @@ class MeasurementController:
                 self.error = "" if gate_state == "aborted" else self.message
                 return
             terminal_data = self._data(update_monitor=False)
-            requested_stop_exit = return_code in (3, -15)
+            requested_stop_exit = return_code in (3, -15) or (
+                self._bridge_stop_forced and return_code in (0, 1)
+            )
             if self.user_stop_requested and requested_stop_exit:
                 self._freeze_live_analysis_locked(
                     terminal_data, completed=False,

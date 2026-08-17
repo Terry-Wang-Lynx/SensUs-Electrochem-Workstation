@@ -381,8 +381,29 @@ def test_jlink_rtt_prefers_ready_openocd_without_probing_commander(
     assert command[0] == str(openocd)
     assert "adapter serial 29734569" in command[-1]
     assert "rtt server start 19021 0" in command[-1]
+    assert "reset halt" not in command[-1]
+    assert "reset run" not in command[-1]
     assert "telnet_port 4444" in command
     assert process._sensus_openocd_control_port == 4444
+
+
+def test_openocd_rtt_reset_commands_follow_explicit_option(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    openocd = tmp_path / "openocd"
+    scripts = tmp_path / "scripts"
+    process = Mock()
+    monkeypatch.setattr(collect, "OPENOCD_EXE", openocd)
+    monkeypatch.setattr(collect, "OPENOCD_SCRIPTS", scripts)
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(collect.subprocess, "Popen", popen)
+
+    collect._start_openocd_rtt(
+        0x20001100, "29734569", 19021, reset_before_read=True,
+    )
+
+    command = popen.call_args.args[0]
+    assert "reset halt; reset run; sleep 500" in command[-1]
 
 
 def test_stop_jlink_rtt_requests_clean_openocd_shutdown(monkeypatch) -> None:
