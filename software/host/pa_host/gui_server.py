@@ -4355,6 +4355,10 @@ class MeasurementController:
             self.on_complete = on_complete
 
             env = os.environ.copy()
+            # Frozen Windows child processes otherwise buffer stderr when it
+            # is redirected to collector.log, hiding the only actionable RTT
+            # backend details until after a forced stop.
+            env["PYTHONUNBUFFERED"] = "1"
             if not runtime.is_frozen():
                 host_dir = str(PROJECT_DIR / "software" / "host")
                 env["PYTHONPATH"] = host_dir + os.pathsep + env.get("PYTHONPATH", "")
@@ -9240,9 +9244,16 @@ def _diagnostic_runtime_context() -> dict[str, Any]:
 def _diagnostic_current_run_files() -> list[tuple[str, Path]]:
     with APP.measurement.lock:
         run_dir = APP.measurement.run_dir
+        backend_log = (
+            APP.measurement.raw_log.with_name(
+                APP.measurement.raw_log.stem + "-backend.log"
+            )
+            if APP.measurement.raw_log is not None else None
+        )
         candidates = [
             ("collector.log", run_dir / "collector.log" if run_dir else None),
             ("firmware-rtt.log", APP.measurement.raw_log),
+            ("rtt-backend.log", backend_log),
             ("hardware-audit.jsonl", APP.measurement.audit_path),
             ("summary.json", APP.measurement.summary_path),
             ("commands.txt", APP.measurement.cmd_path),

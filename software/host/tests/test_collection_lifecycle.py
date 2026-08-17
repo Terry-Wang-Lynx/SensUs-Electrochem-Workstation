@@ -106,6 +106,60 @@ def test_armed_rtt_recovers_start_marker_glued_to_config_line(
     assert sock.sent == [b"START\n"]
 
 
+def test_rtt_reader_reports_backend_exit_with_openocd_tail(monkeypatch) -> None:
+    sock = _CommandSocket()
+    monkeypatch.setattr(
+        collect.socket, "create_connection", lambda *_args, **_kwargs: sock,
+    )
+
+    class Backend:
+        _sensus_openocd_output_tail = [
+            "Info : Listening on port 19021 for rtt connections",
+            "Error: libusb_bulk_transfer failed with LIBUSB_ERROR_TIMEOUT",
+        ]
+
+        def __init__(self) -> None:
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 17
+
+    lines = collect.read_socket_lines(
+        "127.0.0.1", 19021, backend_process=Backend(),
+    )
+
+    with pytest.raises(RuntimeError, match="LIBUSB_ERROR_TIMEOUT"):
+        next(lines)
+
+
+def test_rtt_reader_duration_expires_without_receiving_another_line(
+    monkeypatch,
+) -> None:
+    class TimeoutSocket(_CommandSocket):
+        def recv(self, _size: int) -> bytes:
+            raise socket.timeout
+
+    sock = TimeoutSocket()
+    monkeypatch.setattr(
+        collect.socket, "create_connection", lambda *_args, **_kwargs: sock,
+    )
+    now = 0.0
+
+    def advancing_clock() -> float:
+        nonlocal now
+        now += 1.0
+        return now
+
+    monkeypatch.setattr(collect.time, "monotonic", advancing_clock)
+    lines = collect.read_socket_lines(
+        "127.0.0.1", 19021, trigger=None, duration_s=2.0,
+    )
+
+    with pytest.raises(StopIteration):
+        next(lines)
+
+
 def test_trigger_argument_rejects_non_ascii_before_collection_starts() -> None:
     with pytest.raises(SystemExit) as exc_info:
         collect.main(["--out", "run.csv", "--socket", "127.0.0.1:19021",
@@ -404,6 +458,30 @@ def test_openocd_rtt_reset_commands_follow_explicit_option(
 
     command = popen.call_args.args[0]
     assert "reset halt; reset run; sleep 500" in command[-1]
+
+
+def test_openocd_readiness_log_does_not_open_disposable_rtt_client(
+    monkeypatch,
+) -> None:
+    ready = threading.Event()
+    ready.set()
+
+    class Process:
+        _sensus_rtt_ready_event = ready
+
+        @staticmethod
+        def poll():
+            return None
+
+    monkeypatch.setattr(
+        collect.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "OpenOCD readiness must not consume an RTT client connection"
+        ),
+    )
+
+    assert collect._wait_for_rtt_server(Process(), 19021) == (True, "")
 
 
 def test_stop_jlink_rtt_requests_clean_openocd_shutdown(monkeypatch) -> None:
