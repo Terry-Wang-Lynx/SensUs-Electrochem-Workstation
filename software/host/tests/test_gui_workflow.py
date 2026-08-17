@@ -4281,6 +4281,60 @@ def test_formal_gate_never_sends_meas_before_physical_afe_confirmation(
     assert ctrl._config_gate["state"] == "checking"
 
 
+def test_formal_gate_ignores_inflight_probe_reply_after_afe_command(
+    tmp_path: Path,
+) -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.cmd_path = tmp_path / "cmd.txt"
+    ctrl.audit_path = tmp_path / "audit.jsonl"
+    ctrl.audit_path.write_text("", encoding="utf-8")
+    expected = SettingsController.runtime_afe_contract({"fsr_nA": 2000})
+    stale = {**expected, "fsr": 0, "off": 4, "e_mv": 400}
+    ctrl._config_gate = {
+        "state": "checking", "expected": expected, "request_id": "race1",
+        "afe_command": "SET fsr=5 off=1 e=200", "afe_command_sent": False,
+        "link_ready": False, "measurement_expected": {},
+        "measurement_sent": False, "measurement_confirmed": False,
+        "measurement_actual": {}, "legacy_fallback_sent": False,
+        "last_tagged_get_at": 0.0, "tagged_get_attempts": 1,
+        "mismatches": [],
+    }
+
+    with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(
+            json.dumps(event) + "\n"
+            for event in _cfg_gate_events(stale, request_id="race1", epoch=2)
+        ))
+    ctrl._audit_events()
+
+    assert ctrl._config_gate["link_probe_epoch"] == 2
+    assert ctrl._config_gate["require_post_set_epoch"] is True
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == "SET fsr=5 off=1 e=200\n"
+
+    with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(
+            json.dumps(event) + "\n"
+            for event in _cfg_gate_events(stale, request_id="race1", epoch=2)
+        ))
+    ctrl._audit_events()
+
+    assert ctrl._config_gate["state"] == "checking"
+    assert ctrl._config_gate["mismatches"] == []
+
+    with ctrl.audit_path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(
+            json.dumps(event) + "\n"
+            for event in _cfg_gate_events(expected, request_id="race1", epoch=3)
+        ))
+    ctrl._audit_events()
+
+    assert ctrl._config_gate["state"] == "matched"
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+        "SET fsr=5 off=1 e=200\nSTART\n"
+    )
+
+
 def test_formal_gate_retries_transient_afe_status_before_sending_meas(
     tmp_path: Path,
 ) -> None:

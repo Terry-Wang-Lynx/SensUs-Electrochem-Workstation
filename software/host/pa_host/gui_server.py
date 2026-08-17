@@ -4345,6 +4345,8 @@ class MeasurementController:
                     "afe_command_sent": False,
                     "afe_confirmed": False,
                     "link_ready": False,
+                    "link_probe_epoch": None,
+                    "require_post_set_epoch": False,
                     "exact_response_seen": False,
                     "phase": "probing_link",
                     "actual": {},
@@ -4991,6 +4993,16 @@ class MeasurementController:
             # builds also do this; keeping it mandatory rejects boot fragments.
             if record.get("confirmed_src") not in (None, "get"):
                 continue
+            if (
+                self._config_gate.get("afe_command_sent")
+                and self._config_gate.get("require_post_set_epoch")
+                and epoch == self._config_gate.get("link_probe_epoch")
+            ):
+                # More than one tagged GET may already be in flight when the
+                # first reply proves the downlink. Those replies describe the
+                # pre-SET epoch and can arrive after SET was queued. They must
+                # not be judged as the requested post-SET configuration.
+                continue
             if request_id == wanted_req:
                 exact_candidates.append((epoch, record))
             elif (self._config_gate.get("legacy_fallback_sent")
@@ -5042,6 +5054,14 @@ class MeasurementController:
                     probe_mismatches,
                 )
                 return
+            expected = self._config_gate.get("expected") or {}
+            self._config_gate.update({
+                "link_probe_epoch": epoch,
+                "require_post_set_epoch": any(
+                    actual.get(field) != wanted
+                    for field, wanted in expected.items()
+                ),
+            })
             self._apply_afe_after_link_probe_locked()
             return
         mismatches = self._config_mismatches(
