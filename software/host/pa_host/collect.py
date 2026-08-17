@@ -437,8 +437,10 @@ def _parse_jlink_mem32(output: str, address: int, count: int) -> list[int]:
 
 
 def _jlink_file_argument(path: Path) -> str:
-    text = str(path.resolve()).replace("\\", "\\\\").replace('"', '\\"')
-    if "\n" in text or "\r" in text:
+    # Commander scripts consume native Windows paths directly; doubling each
+    # backslash turns ``C:\\path`` into a different path on the target host.
+    text = str(path.resolve())
+    if any(character in text for character in ('"', "\n", "\r")):
         raise RuntimeError(f"JLinkExe 无法处理临时文件路径:{path}")
     return f'"{text}"'
 

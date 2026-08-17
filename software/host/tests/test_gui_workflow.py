@@ -2298,8 +2298,17 @@ def test_unreachable_swd_backends_never_begin_flash() -> None:
         commander = root / "JLinkExe"
         commander.write_text("commander", encoding="ascii")
         commander.chmod(0o755)
+        openocd = root / "openocd"
+        openocd.touch()
+        scripts = root / "scripts"
+        (scripts / "interface").mkdir(parents=True)
+        (scripts / "target").mkdir()
+        (scripts / "interface/jlink.cfg").touch()
+        (scripts / "target/nrf52.cfg").touch()
         with (
             patch("pa_host.gui_server.JLINK_EXE", commander),
+            patch("pa_host.gui_server.OPENOCD_EXE", openocd),
+            patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
             patch("pa_host.gui_server.probe_jlink_target",
                   return_value=(False, "cannot read IDR")),
             patch("pa_host.gui_server._openocd_target_probe",
