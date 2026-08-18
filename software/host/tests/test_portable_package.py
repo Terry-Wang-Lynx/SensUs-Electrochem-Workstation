@@ -471,16 +471,27 @@ def test_windows_portable_falls_back_to_system_browser(monkeypatch) -> None:
         str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
         run_name="portable_entry",
     )
+    fallback = entry["_fallback_to_system_browser"]
+    globals_ = fallback.__globals__
     opened: list[str] = []
-    monkeypatch.setattr(entry["webbrowser"], "open", opened.append)
+    messages: list[str] = []
+    monkeypatch.setattr(globals_["webbrowser"], "open", opened.append)
+    monkeypatch.setitem(
+        globals_, "_windows_message",
+        lambda _title, body: messages.append(body),
+    )
 
     class Child:
         def wait(self) -> int:
             return 17
 
-    fallback = entry["_fallback_to_system_browser"]
     assert fallback("http://127.0.0.1:8765/", Child(), RuntimeError("WebView2")) == 17
     assert opened == ["http://127.0.0.1:8765/"]
+    if sys.platform == "win32":
+        assert len(messages) == 1
+        assert "右上角" in messages[0]
+    else:
+        assert messages == []
 
 
 def test_windows_browser_fallback_waits_for_web_exit_after_message(
