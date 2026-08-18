@@ -8,6 +8,7 @@ class FakeSerial:
     def __init__(self, *, port, baudrate, timeout, write_timeout):
         self.port = port
         self.baudrate = baudrate
+        self.initial_timeout = timeout
         self.timeout = timeout
         self.write_timeout = write_timeout
         self.writes: list[bytes] = []
@@ -86,6 +87,7 @@ def test_serial_armed_mode_waits_for_command_file_start() -> None:
     lines.close()
 
     assert instances[0].writes == [b"GET\nSTATUS\n"]
+    assert instances[0].initial_timeout == collect.CONFIG_GATE_CMD_POLL_INTERVAL_S
 
 
 def test_serial_armed_start_is_sent_once_while_marker_is_delayed(
@@ -121,6 +123,8 @@ def test_serial_armed_start_is_sent_once_while_marker_is_delayed(
     lines.close()
 
     assert instances[0].writes == [b"GET\nSTATUS\n", b"START\n"]
+    assert instances[0].initial_timeout == collect.CONFIG_GATE_CMD_POLL_INTERVAL_S
+    assert instances[0].timeout == collect.SERIAL_READ_TIMEOUT_S
 
 
 def test_serial_armed_recovers_start_marker_glued_to_config_line(

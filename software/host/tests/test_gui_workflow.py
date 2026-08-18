@@ -2658,6 +2658,106 @@ def test_schedule_start_requires_a_fresh_jlink_identity(tmp_path: Path) -> None:
     assert app.schedule.snapshot()["active"] is False
 
 
+def test_formal_jlink_start_reuses_selected_probe_without_native_discovery() -> None:
+    selected = {
+        "id": "jlink:29734569",
+        "kind": "jlink",
+        "name": "J-Link SN 29734569",
+        "probe_serial": "29734569",
+    }
+
+    with (
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT_REQUESTED", "auto"),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
+        patch("pa_host.gui_server.JLINK_SERIAL", ""),
+        patch("pa_host.gui_server._selected_device_copy", return_value=selected),
+        patch("pa_host.gui_server._find_jlink_for_id") as discover,
+    ):
+        gui_server._refresh_usb_transport(reuse_verified_transport=True)
+        assert gui_server.JLINK_SERIAL == "29734569"
+        assert gui_server.HARDWARE_TRANSPORT == "rtt"
+
+    discover.assert_not_called()
+
+
+def test_formal_usb_start_reuses_present_selected_data_path() -> None:
+    selected = {
+        "id": "usb:board-1",
+        "kind": "usb",
+        "name": "USB 0001",
+        "data_port": "/dev/cu.sensus-data",
+    }
+    data_info = Mock(device="/dev/cu.sensus-data")
+    smp_info = Mock(device="/dev/cu.sensus-smp")
+
+    with (
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT_REQUESTED", "auto"),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT", "serial"),
+        patch("pa_host.gui_server.SERIAL_DATA_PORT", "/dev/cu.sensus-data"),
+        patch("pa_host.gui_server.SERIAL_SMP_PORT", "/dev/cu.sensus-smp"),
+        patch("pa_host.gui_server._selected_device_copy", return_value=selected),
+        patch("pa_host.gui_server._ports_for_identity",
+              return_value=[data_info, smp_info]),
+        patch("pa_host.gui_server._discover_serial_smp_port",
+              return_value="/dev/cu.sensus-smp"),
+        patch("pa_host.gui_server._probe_serial_data_candidate") as probe,
+    ):
+        gui_server._refresh_usb_transport(reuse_verified_transport=True)
+
+    probe.assert_not_called()
+
+
+def test_formal_usb_start_reuses_single_auto_data_path_without_probe() -> None:
+    current = {
+        "id": "usb:board-1",
+        "kind": "usb",
+        "name": "USB 0001",
+        "data_port": "/dev/cu.sensus-data",
+        "smp_port": "/dev/cu.sensus-smp",
+        "selectable": True,
+    }
+
+    with (
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT_REQUESTED", "auto"),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT", "serial"),
+        patch("pa_host.gui_server.SERIAL_DATA_PORT", "/dev/cu.sensus-data"),
+        patch("pa_host.gui_server.SERIAL_SMP_PORT", "/dev/cu.sensus-smp"),
+        patch("pa_host.gui_server._selected_device_copy", return_value=None),
+        patch("pa_host.gui_server._discover_devices", return_value=[current]) as quick,
+        patch("pa_host.gui_server._discover_devices_with_probe") as full_probe,
+    ):
+        gui_server._refresh_usb_transport(reuse_verified_transport=True)
+
+    quick.assert_called_once_with(probe=False)
+    full_probe.assert_not_called()
+
+
+def test_formal_usb_start_probes_when_auto_mode_sees_multiple_devices() -> None:
+    current = {
+        "id": "usb:board-1", "kind": "usb", "selectable": True,
+        "data_port": "/dev/cu.sensus-data", "smp_port": "/dev/cu.sensus-smp",
+    }
+    jlink = {
+        "id": "jlink:1", "kind": "jlink", "selectable": True,
+        "probe_serial": "1",
+    }
+
+    with (
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT_REQUESTED", "auto"),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT", "serial"),
+        patch("pa_host.gui_server.SERIAL_DATA_PORT", "/dev/cu.sensus-data"),
+        patch("pa_host.gui_server._selected_device_copy", return_value=None),
+        patch("pa_host.gui_server._discover_devices",
+              return_value=[current, jlink]),
+        patch("pa_host.gui_server._discover_devices_with_probe",
+              return_value=[current, jlink]) as full_probe,
+        pytest.raises(RuntimeError, match="多个可用设备"),
+    ):
+        gui_server._refresh_usb_transport(reuse_verified_transport=True)
+
+    full_probe.assert_called_once_with()
+
+
 def test_background_discovery_does_not_probe_while_operation_is_busy(
     monkeypatch,
 ) -> None:
@@ -3195,6 +3295,65 @@ def test_measurement_watcher_is_non_daemon(tmp_path: Path) -> None:
     assert thread_cls.call_args.kwargs["daemon"] is False
     watcher.start.assert_called_once_with()
     thread_cls.call_args.kwargs["args"][0].close()
+
+
+def test_verified_measurement_uses_collector_gate_instead_of_duplicate_jlink_probe(
+    tmp_path: Path,
+) -> None:
+    ctrl = MeasurementController()
+    process = Mock(pid=4321)
+    watcher = Mock()
+    watcher.is_alive.return_value = False
+
+    with (
+        patch("pa_host.gui_server.RUNS_DIR", tmp_path),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT", "rtt"),
+        patch("pa_host.gui_server.HARDWARE_TRANSPORT_REQUESTED", "rtt"),
+        patch("pa_host.gui_server._selected_device_copy", return_value=None),
+        patch("pa_host.gui_server._require_jlink_target") as require_target,
+        patch("pa_host.gui_server.subprocess.Popen", return_value=process) as popen,
+        patch("pa_host.gui_server.threading.Thread", return_value=watcher) as thread_cls,
+    ):
+        snapshot = ctrl.start(verify_runtime_config=True)
+
+    require_target.assert_not_called()
+    collector_command = popen.call_args.args[0]
+    assert "pa_host.collect" in collector_command
+    assert "pa_host.it_tool" not in collector_command
+    assert "--no-reset-before-read" in collector_command
+    assert "--it-10hz" in collector_command
+    assert snapshot["operation_phase"] == "configuring"
+    assert ctrl.cmd_path is not None
+    assert ctrl.cmd_path.read_text(encoding="utf-8").startswith("GET req=")
+    watcher.start.assert_called_once_with()
+    thread_cls.call_args.kwargs["args"][0].close()
+
+
+def test_config_gate_watcher_uses_fast_poll_interval() -> None:
+    ctrl = MeasurementController()
+    ctrl.state = "running"
+    ctrl.process = Mock()
+    ctrl.process.poll.side_effect = [None, 1, 1]
+    ctrl.process.wait.return_value = 1
+    ctrl._config_gate = {"state": "checking", "mismatches": []}
+    log_handle = Mock()
+
+    with (
+        patch.object(ctrl, "_audit_events"),
+        patch.object(ctrl, "_scan_range_events") as scan_range,
+        patch.object(ctrl, "_maybe_auto_switch") as auto_switch,
+        patch.object(ctrl, "_refresh_live_analysis_locked") as refresh_analysis,
+        patch.object(ctrl, "_maybe_auto_stop") as auto_stop,
+        patch("pa_host.gui_server.time.sleep") as sleep,
+    ):
+        ctrl._watch(log_handle)
+
+    sleep.assert_called_once_with(gui_server.CONFIG_GATE_WATCH_POLL_INTERVAL_S)
+    # The only range scan is the final drain after the child has exited.
+    scan_range.assert_called_once_with()
+    auto_switch.assert_not_called()
+    refresh_analysis.assert_not_called()
+    auto_stop.assert_not_called()
 
 
 def test_wait_for_completion_joins_watcher_without_a_deadline() -> None:
@@ -4325,9 +4484,12 @@ def test_stop_during_config_gate_wakes_waiter_without_completion_callback() -> N
     log_handle.close.assert_called_once_with()
 
 
-def test_process_exit_during_config_gate_wakes_waiter_without_callback() -> None:
+def test_process_exit_during_config_gate_surfaces_collector_detail(
+    tmp_path: Path,
+) -> None:
     ctrl = MeasurementController()
     ctrl.state = "running"
+    ctrl.run_dir = tmp_path
     ctrl.process = Mock()
     ctrl.process.poll.return_value = 1
     ctrl.process.wait.return_value = 1
@@ -4335,14 +4497,20 @@ def test_process_exit_during_config_gate_wakes_waiter_without_callback() -> None
     completed: list[dict[str, object]] = []
     ctrl.on_complete = completed.append
 
-    log_handle = Mock()
+    collector_log = tmp_path / "collector.log"
+    collector_log.write_text(
+        "[collect] startup\n目标板未响应，请检查供电和 SWD 排线\n",
+        encoding="utf-8",
+    )
+    log_handle = collector_log.open("a", encoding="utf-8")
     ctrl._watch(log_handle)
 
     assert ctrl._config_gate_event.wait(0)
     assert ctrl._config_gate["state"] == "process_exit"
+    assert "目标板未响应，请检查供电和 SWD 排线" in ctrl.error
     assert ctrl.state == "error"
     assert completed == []
-    log_handle.close.assert_called_once_with()
+    assert log_handle.closed
 
 
 def test_initial_gate_get_write_failure_still_starts_cleanup_watcher(
@@ -4462,7 +4630,7 @@ def test_formal_gate_never_sends_meas_before_physical_afe_confirmation(
     ctrl._audit_events()
 
     assert ctrl.cmd_path.read_text(encoding="utf-8") == (
-        "GET req=staged1\nSET fsr=1 e=400\n"
+        "GET req=staged1\nSET fsr=1 e=400\nGET req=staged1\n"
     )
     assert ctrl._config_gate["link_ready"] is True
     assert ctrl._config_gate["measurement_sent"] is False
@@ -4471,7 +4639,8 @@ def test_formal_gate_never_sends_meas_before_physical_afe_confirmation(
     with patch("pa_host.gui_server.time.time", return_value=last_get + 0.8):
         ctrl._maybe_retry_tagged_gate_get_locked()
     assert ctrl.cmd_path.read_text(encoding="utf-8") == (
-        "GET req=staged1\nSET fsr=1 e=400\nGET req=staged1\n"
+        "GET req=staged1\nSET fsr=1 e=400\n"
+        "GET req=staged1\nGET req=staged1\n"
     )
 
     with ctrl.audit_path.open("a", encoding="utf-8") as handle:
@@ -4483,7 +4652,7 @@ def test_formal_gate_never_sends_meas_before_physical_afe_confirmation(
 
     assert ctrl.cmd_path.read_text(encoding="utf-8") == (
         "GET req=staged1\nSET fsr=1 e=400\n"
-        "GET req=staged1\nMEAS staged staged1\n"
+        "GET req=staged1\nGET req=staged1\nMEAS staged staged1\n"
     )
     assert ctrl._config_gate["measurement_sent"] is True
     assert ctrl._config_gate["state"] == "checking"
@@ -4518,7 +4687,9 @@ def test_formal_gate_ignores_inflight_probe_reply_after_afe_command(
 
     assert ctrl._config_gate["link_probe_epoch"] == 2
     assert ctrl._config_gate["require_post_set_epoch"] is True
-    assert ctrl.cmd_path.read_text(encoding="utf-8") == "SET fsr=5 off=1 e=200\n"
+    assert ctrl.cmd_path.read_text(encoding="utf-8") == (
+        "SET fsr=5 off=1 e=200\nGET req=race1\n"
+    )
 
     with ctrl.audit_path.open("a", encoding="utf-8") as handle:
         handle.write("".join(
@@ -4538,8 +4709,9 @@ def test_formal_gate_ignores_inflight_probe_reply_after_afe_command(
     ctrl._audit_events()
 
     assert ctrl._config_gate["state"] == "matched"
+    assert ctrl._config_gate["startup_duration_ms"] is None
     assert ctrl.cmd_path.read_text(encoding="utf-8") == (
-        "SET fsr=5 off=1 e=200\nSTART\n"
+        "SET fsr=5 off=1 e=200\nGET req=race1\nSTART\n"
     )
 
 

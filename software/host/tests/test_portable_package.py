@@ -813,6 +813,9 @@ def test_source_subprocess_command_keeps_module_invocation() -> None:
 def test_frozen_subprocess_command_reuses_backend(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "is_frozen", lambda: True)
     monkeypatch.setattr(runtime.sys, "executable", "/portable/SensUsBackend")
+    assert runtime.module_command("pa_host.collect", "--help") == [
+        "/portable/SensUsBackend", "collect", "--help"
+    ]
     assert runtime.module_command("pa_host.it_tool", "measure") == [
         "/portable/SensUsBackend", "it-tool", "measure"
     ]

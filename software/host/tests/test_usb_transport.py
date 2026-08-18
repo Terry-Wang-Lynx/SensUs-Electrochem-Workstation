@@ -49,10 +49,24 @@ def test_transport_auto_prefers_discovered_data_cdc(monkeypatch) -> None:
 def test_jlink_cdc_is_excluded_from_v51_data_candidates(monkeypatch) -> None:
     jlink = _jlink_port()
     usb = _PortInfo("/dev/cu.usbmodem1103")
-    monkeypatch.setattr(gui_server, "_all_serial_port_infos", lambda: [jlink, usb])
+    monkeypatch.setattr(gui_server, "_listed_serial_port_infos", lambda: [jlink, usb])
 
     assert gui_server._serial_port_infos() == [usb]
     assert gui_server._jlink_probe_serial(jlink) == "29734569"
+
+
+def test_v51_data_candidates_do_not_run_native_jlink_discovery(monkeypatch) -> None:
+    from serial.tools import list_ports
+
+    jlink = _jlink_port()
+    usb = _PortInfo("/dev/cu.usbmodem1103")
+    monkeypatch.setattr(list_ports, "comports", lambda: [jlink, usb])
+    monkeypatch.setattr(
+        gui_server, "discover_jlink_usb_devices",
+        Mock(side_effect=AssertionError("native J-Link discovery must stay out")),
+    )
+
+    assert gui_server._serial_port_infos() == [usb]
 
 
 def test_device_discovery_groups_usb_interfaces_and_lists_jlink(monkeypatch) -> None:
@@ -108,7 +122,7 @@ def test_manual_usb_refresh_prefers_selected_data_over_first_interface(
     monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", data.device)
     monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", smp.device)
     monkeypatch.setattr(gui_server, "DIAGNOSTICS", diagnostics)
-    monkeypatch.setattr(gui_server, "_all_serial_port_infos", lambda: [smp, data])
+    monkeypatch.setattr(gui_server, "_listed_serial_port_infos", lambda: [smp, data])
     monkeypatch.setattr(
         gui_server, "_probe_serial_data_candidate",
         lambda port: attempts.append(port) is None and port == data.device,
@@ -145,7 +159,7 @@ def test_manual_usb_refresh_rediscovers_data_after_reenumeration(monkeypatch) ->
     monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "/dev/cu.usbmodem1103")
     monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "/dev/cu.usbmodem1101")
     monkeypatch.setattr(gui_server, "DIAGNOSTICS", Mock())
-    monkeypatch.setattr(gui_server, "_all_serial_port_infos", lambda: [smp, data])
+    monkeypatch.setattr(gui_server, "_listed_serial_port_infos", lambda: [smp, data])
     monkeypatch.setattr(
         gui_server, "_probe_serial_data_candidate",
         lambda port: attempts.append(port) is None and port == data.device,

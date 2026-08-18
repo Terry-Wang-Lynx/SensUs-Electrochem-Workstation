@@ -273,6 +273,11 @@ TRIGGER_MAX_RESENDS = 20
 SERIAL_TRIGGER_RESEND_INTERVAL_S = 3.0
 # 命令文件轮询间隔(方案 C:外部命令经采集器 socket 转发给固件)
 CMD_POLL_INTERVAL_S = 0.5
+# ARMED 阶段只持续到正式 START。此时快速轮询能让 GET/SET/MEAS 的确认
+# 往返跟随硬件速度；进入采集后恢复低频，避免长时间测量无意义地唤醒 CPU。
+CONFIG_GATE_CMD_POLL_INTERVAL_S = 0.05
+SERIAL_READ_TIMEOUT_S = 0.1
+SERIAL_LINE_SYNC_TIMEOUT_S = 0.5
 DEFAULT_ELF = Path("/tmp/pabuild/firmware/zephyr/zephyr.elf")
 NRF52833_INFO_PART_ADDRESS = 0x10000100
 NRF52833_INFO_PART_VALUE = 0x00052833
@@ -1103,8 +1108,16 @@ def _start_openocd_rtt(
 ) -> subprocess.Popen:
     adapter_serial = f"adapter serial {probe_serial}; " if probe_serial else ""
     reset_cmds = "reset halt; reset run; sleep 500; " if reset_before_read else ""
+    identity_check = (
+        "set sensus_info [read_memory "
+        f"0x{NRF52833_INFO_PART_ADDRESS:08X} 32 1]; "
+        "if {[lindex $sensus_info 0] != "
+        f"0x{NRF52833_INFO_PART_VALUE:08X}"
+        "} {error \"SENSUS_TARGET_MISMATCH: expected nRF52833\"}; "
+    )
     server_commands = (
-        f"{adapter_serial}adapter speed {SPEED_KHZ}; init; poll off; {reset_cmds}"
+        f"{adapter_serial}adapter speed {SPEED_KHZ}; init; {identity_check}"
+        f"poll off; {reset_cmds}"
         f"rtt setup 0x{rtt_addr:08X} 0x100 \"SEGGER RTT\"; "
         f"rtt start; rtt server start {port} 0"
     )
@@ -1297,7 +1310,10 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
         sock.sendall(trigger_bytes)
         print(f"[collect] 已发送硬件命令:{trigger_command}(未确认前每秒重发)",
               file=sys.stderr)
-    sock.settimeout(1.0)
+    command_poll_interval = (
+        CONFIG_GATE_CMD_POLL_INTERVAL_S if armed_only else CMD_POLL_INTERVAL_S
+    )
+    sock.settimeout(command_poll_interval)
     buf = b""
     last_data = time.monotonic()
     last_complete_line = last_data
@@ -1318,6 +1334,14 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
     with sock:
         while True:
             now = time.monotonic()
+            wanted_command_poll_interval = (
+                CONFIG_GATE_CMD_POLL_INTERVAL_S
+                if armed_only and not armed_start_sent
+                else CMD_POLL_INTERVAL_S
+            )
+            if wanted_command_poll_interval != command_poll_interval:
+                command_poll_interval = wanted_command_poll_interval
+                sock.settimeout(command_poll_interval)
             if backend_process is not None:
                 returncode = backend_process.poll()
                 if returncode is not None:
@@ -1346,7 +1370,7 @@ def read_socket_lines(host: str, port: int, connect_timeout: float = 20.0,
             # 与重发同理:必须在循环顶部按**挂钟时间**判。数据以 8 样本/秒连续流入时
             # recv 永不超时,挂在超时分支上的轮询一次都不会执行。
             if cmd_file is not None and \
-                    time.monotonic() - last_cmd_poll >= CMD_POLL_INTERVAL_S:
+                    time.monotonic() - last_cmd_poll >= command_poll_interval:
                 last_cmd_poll = time.monotonic()
                 try:
                     if cmd_file.exists():
@@ -1524,7 +1548,12 @@ def read_serial_lines(port: str, baudrate: int = 115200,
 
     try:
         stream_context = serial_factory(
-            port=port, baudrate=baudrate, timeout=0.1, write_timeout=1.0
+            port=port, baudrate=baudrate,
+            timeout=(
+                CONFIG_GATE_CMD_POLL_INTERVAL_S
+                if armed_only else SERIAL_READ_TIMEOUT_S
+            ),
+            write_timeout=1.0,
         )
     except Exception as exc:
         raise SystemExit(f"打不开 V5.1 DATA CDC {port}: {exc}") from exc
@@ -1533,7 +1562,7 @@ def read_serial_lines(port: str, baudrate: int = 115200,
     with stream_context as stream:
         # A persistent app may hand us the tail of an already-started line.
         # Discard exactly that first physical line before sending commands.
-        sync_deadline = time.monotonic() + 2.0
+        sync_deadline = time.monotonic() + SERIAL_LINE_SYNC_TIMEOUT_S
         while b"\n" not in buf and time.monotonic() < sync_deadline:
             try:
                 chunk = stream.read(4096)
@@ -1547,7 +1576,10 @@ def read_serial_lines(port: str, baudrate: int = 115200,
             print("[collect] DATA CDC 已对齐到完整行边界", file=sys.stderr)
         else:
             buf = b""
-            print("[collect] ⚠️ DATA CDC 2s 内无可对齐行", file=sys.stderr)
+            print(
+                "[collect] ⚠️ DATA CDC 0.5s 内无可对齐行，继续由带标识命令核验",
+                file=sys.stderr,
+            )
 
         # GET/STATUS are read-only and make every USB run self-describing.
         preamble = b"GET\nSTATUS\n" + (trigger_bytes or b"")
@@ -1559,7 +1591,22 @@ def read_serial_lines(port: str, baudrate: int = 115200,
 
         while True:
             now = time.monotonic()
-            if cmd_file is not None and now - last_cmd_poll >= CMD_POLL_INTERVAL_S:
+            command_poll_interval = (
+                CONFIG_GATE_CMD_POLL_INTERVAL_S
+                if armed_only and not armed_start_sent
+                else CMD_POLL_INTERVAL_S
+            )
+            wanted_read_timeout = (
+                CONFIG_GATE_CMD_POLL_INTERVAL_S
+                if armed_only and not armed_start_sent
+                else SERIAL_READ_TIMEOUT_S
+            )
+            if getattr(stream, "timeout", None) != wanted_read_timeout:
+                try:
+                    stream.timeout = wanted_read_timeout
+                except (AttributeError, OSError, ValueError):
+                    pass
+            if cmd_file is not None and now - last_cmd_poll >= command_poll_interval:
                 last_cmd_poll = now
                 try:
                     if cmd_file.exists():

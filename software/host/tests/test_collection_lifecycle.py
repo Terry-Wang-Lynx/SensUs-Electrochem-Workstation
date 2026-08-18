@@ -18,6 +18,7 @@ class _CommandSocket:
     def __init__(self) -> None:
         self.sent: list[bytes] = []
         self.chunks: list[bytes] = []
+        self.timeouts: list[float] = []
 
     def __enter__(self):
         return self
@@ -25,8 +26,8 @@ class _CommandSocket:
     def __exit__(self, *_args) -> None:
         return None
 
-    def settimeout(self, _timeout: float) -> None:
-        pass
+    def settimeout(self, timeout: float) -> None:
+        self.timeouts.append(timeout)
 
     def sendall(self, payload: bytes) -> None:
         self.sent.append(payload)
@@ -78,6 +79,10 @@ def test_armed_rtt_start_is_sent_once_while_waiting_for_delayed_marker(
     lines.close()
 
     assert sock.sent == [b"START\n"]
+    assert sock.timeouts[:2] == [
+        collect.CONFIG_GATE_CMD_POLL_INTERVAL_S,
+        collect.CMD_POLL_INTERVAL_S,
+    ]
 
 
 def test_armed_rtt_recovers_start_marker_glued_to_config_line(
@@ -488,6 +493,8 @@ def test_openocd_rtt_reset_commands_follow_explicit_option(
     )
 
     command = popen.call_args.args[0]
+    assert "read_memory 0x10000100 32 1" in command[-1]
+    assert "SENSUS_TARGET_MISMATCH: expected nRF52833" in command[-1]
     assert "reset halt; reset run; sleep 500" in command[-1]
     assert popen.call_args.kwargs["creationflags"] == 0x08000000
 

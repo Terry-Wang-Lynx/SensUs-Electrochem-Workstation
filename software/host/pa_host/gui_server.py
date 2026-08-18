@@ -3,7 +3,7 @@
 The GUI deliberately uses only Python's standard library on the server side;
 the browser renders the plots with a small canvas-based frontend.  This keeps
 the one-click tool usable on the lab Mac without installing a desktop GUI
-toolkit. Hardware acquisition is delegated to ``pa_host.it_tool``. V4.0 uses
+toolkit. Hardware acquisition is delegated to ``pa_host.collect``. V4.0 uses
 RTT/J-Link; V5.1 uses its DATA USB CDC while retaining the same line protocol,
 parser and analysis pipeline.
 """
@@ -141,6 +141,8 @@ LIVE_ANALYSIS_REFRESH_S = 0.9
 CLIENT_DIAGNOSTIC_MAX_LENGTH = 8_000
 CONFIG_GATE_GET_RETRY_S = 0.75
 CONFIG_GATE_LEGACY_PROBE_DELAY_S = 6.0
+CONFIG_GATE_WATCH_POLL_INTERVAL_S = 0.05
+MEASUREMENT_WATCH_POLL_INTERVAL_S = 0.5
 FIRMWARE_BUILD_DIR = PROJECT_DIR / "software" / "firmware" / "build" / "firmware" / "zephyr"
 FIRMWARE_PREBUILT_DIR = PROJECT_DIR / "software" / "firmware" / "prebuilt"
 FIRMWARE_CONFIG = PROJECT_DIR / "software" / "firmware" / "src" / "measurement_config.h"
@@ -579,12 +581,12 @@ def _port_accepts_connections(port: int) -> bool:
         return False
 
 
-def _all_serial_port_infos() -> list[Any]:
-    """Return USB serial candidates plus J-Links without a CDC interface."""
+def _listed_serial_port_infos() -> list[Any]:
+    """Return relevant OS serial ports without any native USB subprocess."""
     try:
         from serial.tools import list_ports
     except ImportError:
-        list_ports = None
+        return []
 
     def is_candidate(info: Any) -> bool:
         device = str(getattr(info, "device", "") or "")
@@ -605,10 +607,12 @@ def _all_serial_port_infos() -> list[Any]:
             or "jlink" in descriptor
         )
 
-    infos = (
-        [info for info in list_ports.comports() if is_candidate(info)]
-        if list_ports is not None else []
-    )
+    return [info for info in list_ports.comports() if is_candidate(info)]
+
+
+def _all_serial_port_infos() -> list[Any]:
+    """Return USB serial candidates plus J-Links without a CDC interface."""
+    infos = _listed_serial_port_infos()
     try:
         native_jlinks = discover_jlink_usb_devices()
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
@@ -666,7 +670,9 @@ def _is_jlink_port(info: Any) -> bool:
 
 def _serial_port_infos() -> list[Any]:
     """Return non-J-Link USB CDC candidates for V5.1 DATA/SMP discovery."""
-    return [info for info in _all_serial_port_infos() if not _is_jlink_port(info)]
+    # Native J-Link discovery invokes PowerShell/ioreg and yields no CDC path.
+    # USB DATA/SMP operations must not pay for that unrelated subprocess.
+    return [info for info in _listed_serial_port_infos() if not _is_jlink_port(info)]
 
 
 def _normalise_probe_serial(value: object) -> str:
@@ -2247,7 +2253,7 @@ def _devices_payload(*, probe: bool = True) -> dict[str, Any]:
     return _devices_payload_from_devices(devices)
 
 
-def _refresh_usb_transport() -> None:
+def _refresh_usb_transport(*, reuse_verified_transport: bool = False) -> None:
     """Refresh USB CDC paths immediately before an idle hardware operation."""
     global HARDWARE_TRANSPORT, SERIAL_DATA_PORT, SERIAL_SMP_PORT, JLINK_SERIAL
     selected = _selected_device_copy()
@@ -2255,6 +2261,12 @@ def _refresh_usb_transport() -> None:
         return
     if selected is not None:
         if selected.get("kind") == "jlink":
+            if reuse_verified_transport:
+                JLINK_SERIAL = str(selected.get("probe_serial") or "")
+                if not JLINK_SERIAL:
+                    raise RuntimeError("手动选择的 J-Link 没有可用序列号")
+                HARDWARE_TRANSPORT = "rtt"
+                return
             info = _find_jlink_for_id(str(selected.get("id") or ""))
             if info is None:
                 raise RuntimeError(f"手动选择的 {selected.get('name', 'J-Link')} 已断开")
@@ -2277,14 +2289,29 @@ def _refresh_usb_transport() -> None:
                 raise RuntimeError(
                     f"手动选择的 {selected.get('name', 'USB 设备')} 已断开"
                 )
-            for info in _ordered_usb_interfaces(infos, preferred_data_port):
-                candidate = str(getattr(info, "device", "") or "")
-                if not candidate:
-                    continue
-                attempted_ports.append(candidate)
-                if _probe_serial_data_candidate(candidate):
-                    data_port = candidate
-                    break
+            preferred_info = next(
+                (
+                    info for info in infos
+                    if str(getattr(info, "device", "") or "")
+                    == preferred_data_port
+                ),
+                None,
+            )
+            if reuse_verified_transport and preferred_info is not None:
+                # Formal measurement immediately proves this same DATA channel
+                # with a tagged GET before any SET/START. Reopening it here for
+                # another multi-second probe only duplicates that stronger gate.
+                data_port = preferred_data_port
+                attempted_ports.append(preferred_data_port)
+            else:
+                for info in _ordered_usb_interfaces(infos, preferred_data_port):
+                    candidate = str(getattr(info, "device", "") or "")
+                    if not candidate:
+                        continue
+                    attempted_ports.append(candidate)
+                    if _probe_serial_data_candidate(candidate):
+                        data_port = candidate
+                        break
             if data_port:
                 smp_port = _discover_serial_smp_port(data_port, force=True) or ""
         if not data_port:
@@ -2312,6 +2339,18 @@ def _refresh_usb_transport() -> None:
         )
         return
     if HARDWARE_TRANSPORT_REQUESTED == "auto":
+        if reuse_verified_transport and HARDWARE_TRANSPORT == "serial":
+            quick_devices = _discover_devices(probe=False)
+            if len(quick_devices) == 1:
+                quick_device = quick_devices[0]
+                if (
+                    quick_device.get("kind") == "usb"
+                    and quick_device.get("selectable")
+                    and str(quick_device.get("data_port") or "")
+                    == SERIAL_DATA_PORT
+                ):
+                    SERIAL_SMP_PORT = str(quick_device.get("smp_port") or "")
+                    return
         candidates = [
             device for device in _discover_devices_with_probe()
             if device.get("selectable")
@@ -4238,6 +4277,7 @@ class MeasurementController:
         self._config_gate: dict[str, Any] = {"state": "idle"}
         self._config_gate_event = threading.Event()
         self._prestart_gate_failed = False
+        self._startup_started_monotonic = 0.0
         # 只能拿本次 RTT 会话里收到的 CFG_CONFIRMED 作为下发依据。
         # OpenOCD 重建连接时可能会让 MCU 重启；上一轮的 cfg 缓存在那之后
         # 已不再代表硬件现状。
@@ -4771,11 +4811,15 @@ class MeasurementController:
               filter_config: dict[str, Any] | None = None,
               plateau_config: PlateauConfig | dict[str, Any] | None = None,
               verify_runtime_config: bool = False) -> dict[str, Any]:
+        startup_started_monotonic = time.monotonic()
         # V5.1 re-enumerates both CDC interfaces after firmware upload. Probe
         # immediately before opening the collector so a stale DATA path from
         # the pre-flash device cannot become a misleading exit-code-1 failure.
         if HARDWARE_TRANSPORT_REQUESTED != "rtt" or _selected_device_copy() is not None:
-            _refresh_usb_transport()
+            if verify_runtime_config:
+                _refresh_usb_transport(reuse_verified_transport=True)
+            else:
+                _refresh_usb_transport()
         with self.lock:
             if self.state == "running" or (
                 self.thread is not None and self.thread.is_alive()
@@ -4784,7 +4828,7 @@ class MeasurementController:
         # External tools may take several seconds on a cold Windows machine.
         # Keep the live status lock free so the UI remains responsive while the
         # start request is in its explicit configuring phase.
-        if HARDWARE_TRANSPORT == "rtt":
+        if HARDWARE_TRANSPORT == "rtt" and not verify_runtime_config:
             _require_jlink_target(JLINK_SERIAL)
         with self.lock:
             if self.state == "running" or (
@@ -4886,6 +4930,7 @@ class MeasurementController:
             self._debug_pending_cfg = None
             self._prestart_gate_failed = False
             self._config_gate_event = threading.Event()
+            self._startup_started_monotonic = startup_started_monotonic
             gate_request_id = hashlib.sha256(
                 f"{self.run_id}:{time.time_ns()}".encode("ascii")
             ).hexdigest()[:12]
@@ -4921,6 +4966,12 @@ class MeasurementController:
                     "last_tagged_get_at": 0.0,
                     "tagged_get_attempts": 0,
                     "legacy_fallback_sent": False,
+                    "timings_ms": {
+                        "transport_ready": round(
+                            (time.monotonic() - startup_started_monotonic) * 1000,
+                            1,
+                        ),
+                    },
                 }
                 if verify_runtime_config else {"state": "idle"}
             )
@@ -4948,9 +4999,11 @@ class MeasurementController:
             if not runtime.is_frozen():
                 host_dir = str(PROJECT_DIR / "software" / "host")
                 env["PYTHONPATH"] = host_dir + os.pathsep + env.get("PYTHONPATH", "")
+            # The GUI already owns run analysis and lifecycle handling. Launch
+            # the collector directly so frozen builds do not pay for an extra
+            # backend process whose only job was to forward these arguments.
             command = runtime.module_command(
-                "pa_host.it_tool",
-                "measure",
+                "pa_host.collect",
                 # 方案 C:命令文件。外部另开 telnet 连接写下行**无效**
                 # (JLinkExe 只转发采集器持有的那个连接)⇒ 必须走这个文件。
                 "--cell-v",
@@ -4973,6 +5026,8 @@ class MeasurementController:
                 ),
                 "--idle-timeout",
                 "25",
+                "--progress-every",
+                "100",
             )
             if HARDWARE_TRANSPORT == "serial":
                 if not SERIAL_DATA_PORT:
@@ -4984,11 +5039,13 @@ class MeasurementController:
                 # collector 持有唯一 RTT 桥并负责完整回收。
                 command += [
                     "--start-jlink", "--elf", str(_firmware_artifact("zephyr.elf")),
+                    # A unique tagged GET separates this run from stale RTT
+                    # bytes without resetting the cell's polarization state.
+                    "--no-reset-before-read",
                 ]
                 if JLINK_SERIAL:
                     command += ["--probe-serial", JLINK_SERIAL]
-            if method == "cv":
-                command.append("--cv")
+            command.append("--cv" if method == "cv" else "--it-10hz")
             log_handle = (self.run_dir / "collector.log").open(
                 "w", buffering=1, encoding="utf-8", errors="replace"
             )
@@ -5001,9 +5058,9 @@ class MeasurementController:
                     stderr=subprocess.STDOUT,
                     text=True, encoding="utf-8", errors="replace",
                     # 🔴 自成进程组:进程树是
-                    #      gui_server → it_tool → pa_host.collect → JLinkExe
-                    #    只 terminate 第一层(it_tool)的话,孙进程 collect 与曾孙
-                    #    JLinkExe 都活下来,**并且不会因 idle-timeout 自愈**
+                    #      gui_server → pa_host.collect → JLinkExe/OpenOCD
+                    #    只 terminate 第一层而不管理进程组的话,硬件后端仍可能
+                    #    活下来,**并且不会因 idle-timeout 自愈**
                     #    (2026-08-09 实测:停止 60s 后两者仍在跑、19021 仍被占,
                     #    下一次烧录/测量就会撞上探头被占)。有了进程组才能整棵收掉。
                     # Windows: CREATE_NEW_PROCESS_GROUP 代替 start_new_session。
@@ -5036,6 +5093,7 @@ class MeasurementController:
                 transport=HARDWARE_TRANSPORT,
                 config_gate=self._config_gate,
             )
+            self._mark_config_gate_timing_locked("collector_spawned")
             if verify_runtime_config:
                 # ARMED keeps the firmware idle. The full AFE and measurement
                 # snapshots are committed before a tagged physical GET; START
@@ -5409,6 +5467,19 @@ class MeasurementController:
             return False
         return True
 
+    def _mark_config_gate_timing_locked(self, milestone: str) -> None:
+        """Record relative startup timing without exposing a monotonic timestamp."""
+        if self._startup_started_monotonic <= 0:
+            return
+        timings = self._config_gate.setdefault("timings_ms", {})
+        timings.setdefault(
+            milestone,
+            round(
+                (time.monotonic() - self._startup_started_monotonic) * 1000,
+                1,
+            ),
+        )
+
     def _send_tagged_gate_get_locked(self) -> bool:
         """Send one replay request and remember it for bounded RTT-start retries."""
         request_id = self._config_gate.get("request_id")
@@ -5461,6 +5532,7 @@ class MeasurementController:
             "actual": {},
             "mismatches": [],
         })
+        self._mark_config_gate_timing_locked("afe_queued")
         self.message = "硬件通道已就绪，正在应用 AFE 配置"
         return True
 
@@ -5499,6 +5571,7 @@ class MeasurementController:
             "measurement_sent_at": time.time(),
             "phase": "checking_measurement",
         })
+        self._mark_config_gate_timing_locked("measurement_queued")
         self.message = "AFE 配置已确认，正在核对测量时序"
         return True
 
@@ -5625,7 +5698,12 @@ class MeasurementController:
                     for field, wanted in expected.items()
                 ),
             })
-            self._apply_afe_after_link_probe_locked()
+            self._mark_config_gate_timing_locked("link_verified")
+            if self._apply_afe_after_link_probe_locked():
+                # SET and tagged GET share one ordered command stream. Queueing
+                # the readback immediately preserves the physical verification
+                # boundary without paying a 0.75 s retry delay.
+                self._send_tagged_gate_get_locked()
             return
         mismatches = self._config_mismatches(
             self._config_gate["expected"], actual,
@@ -5657,6 +5735,7 @@ class MeasurementController:
             return
         self._config_gate["afe_confirmed"] = True
         self._config_gate["phase"] = "afe_matched"
+        self._mark_config_gate_timing_locked("afe_verified")
         measurement_expected = self._config_gate.get("measurement_expected") or {}
         if measurement_expected and not self._config_gate.get("measurement_sent"):
             self._send_measurement_gate_command_locked()
@@ -5693,6 +5772,16 @@ class MeasurementController:
             "verified_at": time.time(),
             "message": "硬件配置已完整确认",
         })
+        self._mark_config_gate_timing_locked("start_queued")
+        startup_duration_ms = (
+            round(
+                (time.monotonic() - self._startup_started_monotonic) * 1000,
+                1,
+            )
+            if self._startup_started_monotonic > 0
+            else None
+        )
+        self._config_gate["startup_duration_ms"] = startup_duration_ms
         self.metadata["hardware_config"] = {
             "expected": dict(self._config_gate["expected"]),
             "actual": actual,
@@ -5704,6 +5793,15 @@ class MeasurementController:
             "verification_level": self._config_gate["verification_level"],
             "verified_at": self._config_gate["verified_at"],
         }
+        DIAGNOSTICS.record(
+            "info", "measurement.start_ready",
+            "Measurement start gate completed",
+            run_id=self.run_id,
+            transport=HARDWARE_TRANSPORT,
+            device=_selected_device_copy(),
+            startup_duration_ms=startup_duration_ms,
+            timings_ms=dict(self._config_gate.get("timings_ms") or {}),
+        )
         self.message = "硬件配置已确认，正在启动测量"
         self._config_gate_event.set()
 
@@ -5770,6 +5868,7 @@ class MeasurementController:
                         key: event.get(key) for key in expected_measurement
                     }
                     self._config_gate["measurement_confirmed"] = True
+                    self._mark_config_gate_timing_locked("measurement_verified")
                 elif (kind == "MEAS_REJECT"
                       and self._config_gate.get("state") == "checking"
                       and self._config_gate.get("measurement_sent")
@@ -6470,8 +6569,8 @@ class MeasurementController:
         """整棵进程组收掉,而不是只收第一层。
 
         🔴 只 `process.terminate()` 收不干净:树是
-        it_tool → pa_host.collect → JLinkExe,`terminate` 只打到 it_tool,
-        collect 与 JLinkExe 会一直活着占住探头和 telnet 19021(实测 60s 不自愈)。
+        pa_host.collect → JLinkExe/OpenOCD，只终止 collector 仍可能留下
+        硬件后端占住探头和 telnet 19021(实测 60s 不自愈)。
 
         Windows: 先让 RTT 后端释放探头,超时后才用 taskkill /T 整棵收掉。
         macOS/Linux: 配合 Popen(start_new_session=True) 才能用 killpg 一次收完。
@@ -6566,26 +6665,47 @@ class MeasurementController:
             with self.lock:
                 self._maybe_retry_tagged_gate_get_locked()
                 self._maybe_send_legacy_gate_get_locked()
-            self._scan_range_events()
-            self._maybe_auto_switch()
+                gate_checking = self._config_gate.get("state") == "checking"
+            if not gate_checking:
+                self._scan_range_events()
+                self._maybe_auto_switch()
+                with self.lock:
+                    self._refresh_live_analysis_locked()
+                self._maybe_auto_stop()
             with self.lock:
-                self._refresh_live_analysis_locked()
-            self._maybe_auto_stop()
-            with self.lock:
-                if self._config_gate.get("state") != "checking":
+                gate_checking = self._config_gate.get("state") == "checking"
+                if not gate_checking:
                     self.message = self._progress_message()
-            time.sleep(0.5)
+            time.sleep(
+                CONFIG_GATE_WATCH_POLL_INTERVAL_S
+                if gate_checking else MEASUREMENT_WATCH_POLL_INTERVAL_S
+            )
         return_code = process.wait()
+        # The child has exited, so no writer remains. Close before reading the
+        # line-buffered file or its final backend diagnostic may still be hidden.
+        log_handle.close()
         with self.lock:
             gate_checking = self._config_gate.get("state") == "checking"
         if gate_checking:
+            collector_detail = ""
+            if self.run_dir is not None:
+                try:
+                    log_text = (self.run_dir / "collector.log").read_text(
+                        encoding="utf-8", errors="replace",
+                    )
+                except OSError:
+                    log_text = ""
+                collector_detail = " | ".join(
+                    _meaningful_process_tail(log_text)
+                )
+            detail_suffix = f"：{collector_detail}" if collector_detail else ""
             self._fail_config_gate(
                 "process_exit",
-                f"采集进程在配置核对完成前退出（退出码 {return_code}）",
+                f"采集进程在配置核对完成前退出（退出码 {return_code}）"
+                f"{detail_suffix}",
             )
         self._audit_events()
         self._scan_range_events()
-        log_handle.close()
         self._stop_bridge()
         with self.lock:
             self.finished_at = time.time()
