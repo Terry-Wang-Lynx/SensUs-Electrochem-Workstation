@@ -75,6 +75,12 @@ def test_portable_packages_use_the_shared_brand_logo(tmp_path: Path) -> None:
     assert 'icon=str(WINDOWS_ICON) if sys.platform == "win32" else None' in spec
     assert "recursive-include branding *.png" in manifest
     assert "recursive-include software/host/pa_host/gui *.html *.js *.css *.png" in manifest
+    assert "recursive-include .github/workflows *.yml" in manifest
+    assert "recursive-include packaging" in manifest
+    assert "*.overlay" in manifest
+    assert "*.pyw" in manifest
+    assert "*.md CMakeLists.txt" in manifest
+    assert "include software/README.md" in manifest
 
     generated_icon = tmp_path / "SensUs-Workstation.ico"
     result = subprocess.run(
@@ -159,6 +165,8 @@ def test_tag_release_builds_both_platforms_and_only_final_assets() -> None:
     assert "artifacts/releases/**/*.zip" not in workflow
     assert "Smoke test frozen macOS backend" in workflow
     assert "Smoke test frozen Windows backend" in workflow
+    assert '"$BACKEND" collect --help' in workflow
+    assert "$Backend collect --help" in workflow
     assert "echo [adapter list]" in workflow
     assert "Expand-Archive" in workflow
     assert "hdiutil verify" in workflow

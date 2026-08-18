@@ -1,18 +1,26 @@
 include README.md
+include software/README.md
+include macOS-开箱使用说明.md
 include Makefile
 include Makefile.win
 include Launch_Electrochem_Workstation.command
 include Launch_Electrochem_Workstation.bat
 include Launch_Electrochem_Workstation.ps1
+include 01-首次安装.command
+include 02-启动工作站.command
+include 03-安装固件工具链.command
+include 04-环境自检.command
+recursive-include .github/workflows *.yml
 recursive-include macos *.swift *.plist *.sh *.py
-recursive-include windows *.py *.bat *.md *.ico
+recursive-include windows *.py *.pyw *.bat *.ps1 *.md *.ico
 recursive-include branding *.png
 recursive-include protocols *.md *.json *.h
-recursive-include software/firmware *.c *.h *.conf *.yml *.yaml *.dts *.cmake *.txt CMakeLists.txt Makefile Kconfig Kconfig.* *_defconfig
+recursive-include software/firmware *.c *.h *.conf *.overlay *.yml *.yaml *.dts *.cmake *.txt *.md CMakeLists.txt Makefile Kconfig Kconfig.* *_defconfig
 recursive-include software/firmware/prebuilt *.json *.hex *.elf
 recursive-include software/host/pa_host/gui *.html *.js *.css *.png
 recursive-include software/host/tests *.py
 recursive-include docs *.md
+recursive-include packaging *.py *.sh *.ps1 *.txt *.lock *.spec *.json *.bin *.hex *.zip
 exclude software/firmware/src/measurement_config.h
 prune software/firmware/build
 prune software/firmware/tests/build

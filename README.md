@@ -1,6 +1,16 @@
 # SensUs Electrochemistry Workstation
 
-SensUs 是一套基于 MAX30131 与 nRF52833 的三电极电化学工作站软件。本仓库独立包含 Zephyr 固件、RTT 采集链路，以及面向实验人员的本地交互界面。
+SensUs 是一套基于 MAX30131 与 nRF52833 的三电极电化学工作站软件。本仓库独立包含 Zephyr 固件、RTT/USB 采集链路，以及面向实验人员的本地交互界面。
+
+## 当前交接基线
+
+- 当前发布版：`v0.4.12`，下载入口：[GitHub Releases](https://github.com/Terry-Wang-Lynx/SensUs-Electrochem-Workstation/releases/latest)
+- 完整维护说明：[docs/HANDOFF.md](docs/HANDOFF.md)
+- 固件与数据链路入口：[software/README.md](software/README.md)
+- 日常连接：板 1/V4 使用 J-Link + RTT；板 2/V5.1 使用 USB DATA + SMP
+- 源码范围：本仓库包含上位机、V4/V5.1 固件、板定义、测试、打包脚本和随包固件；PCB、仿真和硬件设计真值位于独立的 [pA-Converter 仓库](https://github.com/clateral912/pA-Converter)（私有，需另行授予接手人访问权限）
+
+给实验人员使用时，直接下载 Release 中的自包含分发包：Windows 10/11 x64 使用 ZIP，Apple Silicon + macOS 14 及以上使用 DMG。正常测量、修改 I-T/CV 条件和升级已经初始化的 V5.1 板卡不需要安装 Python、NCS、Zephyr、OpenOCD 或 SEGGER 工具。
 
 界面已经打通以下流程：
 
@@ -21,8 +31,9 @@ SensUs 是一套基于 MAX30131 与 nRF52833 的三电极电化学工作站软�
 macOS 上推荐使用原生悬浮窗口。首次构建一次：
 
 ```bash
+make install
 make app
-open “dist/SensUs Workstation.app”
+open "dist/SensUs Workstation.app"
 ```
 
 App 同时提供完整工作站和迷你悬浮检测窗。点击主窗口标题栏的”画中画”按钮，或按
@@ -56,7 +67,7 @@ make run
 
 ```bash
 make app
-open “dist/SensUs Workstation.app”
+open "dist/SensUs Workstation.app"
 ```
 
 ### Windows
@@ -97,10 +108,10 @@ V4/V5.1 通用运行时固件，应用任意合法 I-T/CV 条件时由上位机�
 4. 如需稳定化，运行定时 I-T，并选择是否把起止漂移作为 bias 引入模型。
 5. 将样品标记为“测试”，测量完成后自动套用锁定曲线预测浓度。
 
-“新建标定批次”会在当前工作区下创建独立的 `batch-YYYYMMDD_HHMMSS` 子目录，
-旧批次目录和测量文件保持不变。进入“历史记录”后先选择工作区，再从该工作区的
-批次列表打开并恢复当时的标定点、模型、设置和测量索引；旧版直接保存在工作区根目录
-的数据也会继续作为可恢复的工作区入口。
+“新建批次”会要求输入批次名称，并在地址栏所选工作区下创建使用该名称的安全子目录；
+旧批次目录和测量文件保持不变。“历史记录”只列出当前工作区内的批次，点击即可恢复
+当时的标定点、模型、设置、测量索引和历史曲线。旧版直接保存在工作区根目录的数据
+仍可作为兼容入口恢复。
 
 CV 不进入 I-T 标定/浓度预测链。扫描结束后会生成原始 CSV、标准化 CV CSV、
 质量汇总 JSON 和曲线 PNG。默认条件为 `-0.6 至 +0.6 V`、`0.05 V/s`、
@@ -112,7 +123,7 @@ CV 不进入 I-T 标定/浓度预测链。扫描结束后会生成原始 CSV、�
 
 ## 软件滤波
 
-“实时测量”和“硬件 DEBUG”页共用同一套主机侧滤波设置，点击“保存滤波设置”后
+“实时测量”和“硬件 DEBUG”页共用同一套主机侧滤波设置；修改后会自动保存并
 立即用于图表和实时电流显示。实时预览与结束后的分析使用相同的重复一阶前后向
 算法和边界填充，因此同一组输入会得到一致结果。它不改写固件、MAX30131 的量程
 或恒电位环，也不会修改原始采集文件。
@@ -161,7 +172,8 @@ make portable-macos
 make dmg
 ```
 
-`make app` 生成经过临时签名的通用 macOS 应用（Apple Silicon 与 Intel），
+`make app` 生成依赖本地 `.venv` 的通用 macOS 开发应用（Apple Silicon 与 Intel）；
+它不是零依赖分发包。`make dmg` 生成 Apple Silicon、macOS 14+ 的自包含 DMG。
 `make package` 生成 `dist/*.whl` 和包含固件源码、App 构建脚本与方法档案的
 `dist/*.tar.gz`。GitHub Actions 会执行主机端测试、固件纯逻辑层测试，并构建
 分发包。完整 Zephyr 固件仍需本机的 NCS/Zephyr 工具链与自定义板定义。
@@ -192,4 +204,4 @@ packaging/                   便携运行时、签名更新与跨平台发布脚
 
 ## 发布说明
 
-仓库当前未声明覆盖全项目的开源许可证。上传公开 GitHub 仓库前，项目所有者需要选择并加入适用的许可证；在此之前可作为私有仓库或内部发布包使用。
+仓库当前公开，但尚未声明覆盖全项目的开源许可证。源码可见不等于已授予第三方修改或再分发权；项目所有者需要选择并提交适用的许可证，或在内部移交时另行明确授权范围。

@@ -1,6 +1,6 @@
-# 烧录器配置。
-# 🔴 本机 nrfjprog 未安装,且这支克隆 J-Link 只能配 SEGGER V8.80 —— `west flash`
-#    大概率不可用。请改用 07 文档 §0 的 JLinkExe 手工烧录(见 ../../README.md §烧录)。
-#    留这行是为了将来装了 nrf-command-line-tools / 换正品探头后能直接用。
+# Zephyr developer flash runners. The workstation's normal V4 path instead
+# uses its bundled OpenOCD with target-identity checks and page-scoped writes.
+# A specific legacy lab probe may still need the V8.80 Commander fallback;
+# that compatibility case is not a global toolchain requirement.
 include(${ZEPHYR_BASE}/boards/common/nrfjprog.board.cmake)
 include(${ZEPHYR_BASE}/boards/common/jlink.board.cmake)

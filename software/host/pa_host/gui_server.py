@@ -205,7 +205,6 @@ V51_RESOURCE_DIR = next(
     (path for path in _V51_RESOURCE_CANDIDATES if path.exists()),
     _V51_RESOURCE_CANDIDATES[0],
 )
-V51_UPLOAD_SCRIPT = V51_RESOURCE_DIR / "scripts" / "03-usb-upload.sh"
 V51_PREBUILT_IMAGE = V51_RESOURCE_DIR / "images" / "app.signed.bin"
 
 
@@ -3491,9 +3490,6 @@ class SettingsController:
             raise RuntimeError(
                 "USB 固件更新需要 SENSUS_SMP_PORT 指向 SMP CDC"
             )
-        if not runtime.is_frozen() and not _IS_WIN and not V51_UPLOAD_SCRIPT.exists():
-            raise RuntimeError(f"找不到 USB 上传脚本:{V51_UPLOAD_SCRIPT}")
-
         smpmgr = (
             runtime.module_command("smpmgr")
             if runtime.is_frozen() else [str(SMPMGR_EXE)]
@@ -3516,26 +3512,13 @@ class SettingsController:
             SERIAL_SMP_PORT = _wait_for_bootloader_smp_port(
                 previous_smp_port, physical_usb,
             )
-            if runtime.is_frozen() or _IS_WIN:
-                done = subprocess.run(
-                    [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "10", "upgrade",
-                     str(image)],
-                    check=True, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=150,
-                    **runtime.hidden_subprocess_kwargs(),
-                )
-            else:
-                upload_environment = {
-                    **os.environ,
-                    "SENSUS_SMP_PORT": SERIAL_SMP_PORT,
-                }
-                done = subprocess.run(
-                    ["/bin/bash", str(V51_UPLOAD_SCRIPT), str(image)],
-                    cwd=PROJECT_DIR,
-                    check=True, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=150,
-                    env=upload_environment,
-                )
+            done = subprocess.run(
+                [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "10", "upgrade",
+                 str(image)],
+                check=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=150,
+                **runtime.hidden_subprocess_kwargs(),
+            )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
                 OSError, RuntimeError) as exc:
             DIAGNOSTICS.exception(

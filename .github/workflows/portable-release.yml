@@ -84,6 +84,7 @@ jobs:
           test -f "$APP/Contents/Resources/THIRD_PARTY_LICENSES/SBOM.spdx.json"
           ADAPTERS="$("$OPENOCD" -c 'echo [adapter list]; shutdown' 2>&1)"
           grep -qi 'jlink' <<<"$ADAPTERS"
+          "$BACKEND" collect --help >/dev/null
           PORT="$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
           export SENSUS_PROJECT_DIR="$WORKSTATION"
           export SENSUS_RESOURCE_DIR="$WORKSTATION"
@@ -233,6 +234,10 @@ jobs:
           if ($Adapters -notmatch "(?i)jlink") {
             throw "Final Windows OpenOCD does not contain the jlink adapter"
           }
+          & $Backend collect --help | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Frozen Windows collector entry point failed its smoke test"
+          }
           $env:SENSUS_PROJECT_DIR = Join-Path $Extracted "workstation"
           $env:SENSUS_RESOURCE_DIR = $env:SENSUS_PROJECT_DIR
           $env:SENSUS_STATE_DIR = Join-Path $env:RUNNER_TEMP "sensus-smoke-windows"
@@ -302,12 +307,14 @@ jobs:
           draft: true
           generate_release_notes: false
           body: |
-            本版本同时提供 Windows 和 macOS 分发包，内置上位机后端、稳定固件、OpenOCD、USB 更新工具及所需 Python 运行环境。
+            本版本同时提供 Windows 和 macOS 分发包，内置上位机后端、稳定固件、OpenOCD、USB 更新工具及所需 Python 运行环境。完整上位机、V4/V5.1 固件、板定义、测试和打包源码随 `v${{ needs.release-metadata.outputs.version }}` 标签公开，版本与移交说明见 `docs/HANDOFF.md`。
 
             - Windows 10/11 x64：请完整解压 ZIP 后运行 `SensUsBackend.exe`。首次启动可能出现 SmartScreen“未知发布者”提示；首次使用未安装兼容驱动的 J-Link 时，在右上角“选择设备”中点击“准备 J-Link”，并确认 Windows 管理员权限提示。
             - macOS 14 及以上、Apple Silicon：打开 DMG 后拖入“应用程序”。当前构建尚无 Apple Developer ID 公证，首次启动请在 Finder 中右键应用并选择“打开”。
-            - 支持 V4 板卡通过 J-Link 连接，以及 V5.1 板卡通过 USB DATA/SMP 或 J-Link 连接；检测到多个设备时可手动选择。
-            - 修复其他版本 SEGGER 工具兼容、J-Link 驱动准备、USB 重枚举、测量启动状态、退出清理及旧后台端口冲突问题。
+            - 日常连接映射：V4 板卡使用 J-Link/RTT；V5.1 板卡使用 USB DATA/SMP。V5.1 空片首次引导或恢复仍需 J-Link/SWD；检测到多个设备时可手动选择。
+            - 优化正式测量启动路径，去除重复探测并缩短配置门禁轮询；仍保留带请求 ID 的条件回读、物理寄存器核验和 `MEAS_CONFIRMED` 门禁，核验失败不会发送 `START`。
+            - 延续其他版本 SEGGER 工具兼容、J-Link 驱动准备、USB 重枚举、退出清理及旧后台端口冲突修复。
+            - CI 已验证主机测试、冻结入口、包完整性和随包工具；本次无实体板卡连接，真实首点时延及真机烧录/测量仍需接手人按交接清单复测。
 
             SHA-256 校验值见 `SHA256SUMS.txt`。
           files: |

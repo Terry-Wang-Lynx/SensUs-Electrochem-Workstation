@@ -186,14 +186,11 @@ def test_source_usb_upgrade_pins_upload_to_selected_smp(
     image.write_bytes(b"signed")
     smpmgr = tmp_path / "smpmgr"
     smpmgr.write_text("tool", encoding="utf-8")
-    upload = tmp_path / "03-usb-upload.sh"
-    upload.write_text("script", encoding="utf-8")
     reset = Mock(stdout="reset", stderr="")
     upgraded = Mock(stdout="Upgrade complete.", stderr="")
     monkeypatch.setattr(gui_server.runtime, "is_frozen", lambda: False)
     monkeypatch.setattr(gui_server, "_IS_WIN", False)
     monkeypatch.setattr(gui_server, "SMPMGR_EXE", smpmgr)
-    monkeypatch.setattr(gui_server, "V51_UPLOAD_SCRIPT", upload)
     monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "/dev/cu.usbmodem1101")
     monkeypatch.setattr(gui_server, "PROJECT_DIR", tmp_path)
     monkeypatch.setattr(gui_server, "DIAGNOSTICS", Mock())
@@ -211,10 +208,10 @@ def test_source_usb_upgrade_pins_upload_to_selected_smp(
         str(smpmgr), "--port", "/dev/cu.usbmodem1101", "--timeout", "5",
         "os", "reset",
     ]
-    assert calls[1].args[0] == ["/bin/bash", str(upload), str(image)]
-    assert calls[1].kwargs["env"]["SENSUS_SMP_PORT"] == (
-        "/dev/cu.usbmodem1101"
-    )
+    assert calls[1].args[0] == [
+        str(smpmgr), "--port", "/dev/cu.usbmodem1101", "--timeout", "10",
+        "upgrade", str(image),
+    ]
     ready.assert_called_once_with()
 
 
