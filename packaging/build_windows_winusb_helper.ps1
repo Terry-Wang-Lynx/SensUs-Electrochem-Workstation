@@ -134,6 +134,28 @@ if (-not $LibusbKSource) {
   throw "libusbK archive did not contain the expected directory"
 }
 Move-Item $LibusbKSource.FullName $LibusbKRoot
+
+# The binary redistributable intentionally contains only driver payloads. Keep
+# the license texts from the separately verified corresponding-source archive
+# beside that payload so the final portable bundle is self-contained.
+$LibusbKSourceExtract = Join-Path $ExtractRoot "libusbk-source"
+New-Item -ItemType Directory -Force -Path $LibusbKSourceExtract | Out-Null
+& $SevenZip.Source x $LibusbKSourceArchive "-o$LibusbKSourceExtract" -y | Out-Null
+if ($LASTEXITCODE -ne 0) {
+  throw "libusbK source extraction failed with exit code $LASTEXITCODE"
+}
+$LibusbKSourceTree = Get-ChildItem -Directory $LibusbKSourceExtract |
+  Where-Object Name -Like "libusbK*" |
+  Select-Object -First 1
+$LibusbKSourceLicenses = if ($LibusbKSourceTree) {
+  Join-Path $LibusbKSourceTree.FullName "license"
+} else {
+  ""
+}
+if (-not $LibusbKSourceLicenses -or -not (Test-Path $LibusbKSourceLicenses)) {
+  throw "libusbK source archive did not contain its license directory"
+}
+Copy-Item -Recurse $LibusbKSourceLicenses (Join-Path $LibusbKRoot "license")
 Remove-Item -Recurse -Force $ExtractRoot
 
 $BuildBatch = Join-Path ([IO.Path]::GetTempPath()) ("sensus-libwdi-" + [guid]::NewGuid().ToString("N") + ".cmd")

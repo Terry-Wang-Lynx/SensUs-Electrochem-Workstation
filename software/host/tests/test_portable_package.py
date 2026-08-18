@@ -114,6 +114,8 @@ def test_windows_portable_builds_and_bundles_pinned_winusb_helper() -> None:
     assert "Start-Process -FilePath msiexec.exe" in helper_build
     assert ") -Wait -PassThru" in helper_build
     assert "$WdkExtraction.ExitCode" in helper_build
+    assert "& $SevenZip.Source x $LibusbKSourceArchive" in helper_build
+    assert "Copy-Item -Recurse $LibusbKSourceLicenses" in helper_build
     for name in (
         "wdi-simple.exe",
         "COPYING-LGPL",
@@ -214,6 +216,18 @@ def test_windows_first_launch_allows_defender_cold_start() -> None:
     assert entry["WINDOWS_COLD_START_TIMEOUT_S"] >= 120
     assert entry["WINDOWS_SHUTDOWN_TIMEOUT_S"] >= 330
     assert entry["WINDOWS_MUTEX_NAME"].startswith("Local\\")
+
+
+def test_windows_child_keeps_single_instance_mutex_until_backend_exits() -> None:
+    source = (
+        Path(__file__).parents[3] / "packaging" / "portable_entry.py"
+    ).read_text(encoding="utf-8")
+
+    assert "def _hold_windows_single_instance()" in source
+    assert 'command == "gui"' in source
+    assert 'os.environ.get("SENSUS_PORTABLE_CHILD")' in source
+    assert "child_mutex = _hold_windows_single_instance()" in source
+    assert "_release_windows_single_instance(child_mutex)" in source
 
 
 def test_windows_launcher_safely_replaces_confirmed_legacy_backend(
@@ -739,6 +753,8 @@ def test_macos_launcher_recovers_a_persisted_dynamic_backend_before_8765() -> No
         "resolveStartPort(preferred: preferred"
     )
     assert "persisted.matches(health: health)" in resolver
+    assert "launcherProcessIsAlive(persisted.launcherPID)" in resolver
+    assert "persistedBackendStopping" in resolver
     assert "persistedBackendUnavailable" in resolver
     assert "clearPersistedBackendIfExited()" in swift
 

@@ -3357,6 +3357,60 @@ def test_server_shutdown_waits_for_measurement_finalization() -> None:
     server.server_close.assert_called_once_with()
 
 
+def test_launcher_process_alive_reports_current_process() -> None:
+    assert gui_server._launcher_process_alive(os.getpid()) is True
+
+
+def test_launcher_watchdog_releases_hardware_and_stops_orphan(
+    monkeypatch,
+) -> None:
+    server = Mock()
+    alive = iter((True, False))
+    shutdown_intent = threading.Event()
+    release = Mock(return_value={"ok": True})
+    diagnostics = Mock()
+    monkeypatch.setattr(
+        gui_server, "_launcher_process_alive", lambda _pid: next(alive),
+    )
+    monkeypatch.setattr(gui_server, "_release_hardware_for_shutdown", release)
+    monkeypatch.setattr(gui_server, "SHUTDOWN_INTENT", shutdown_intent)
+    monkeypatch.setattr(gui_server, "DIAGNOSTICS", diagnostics)
+
+    gui_server._watch_launcher_process(
+        server, 4321, poll_interval_s=0,
+    )
+
+    release.assert_called_once_with(timeout_s=330.0)
+    server.shutdown.assert_called_once_with()
+    assert shutdown_intent.is_set()
+    diagnostics.record.assert_called_once()
+
+
+def test_launcher_watchdog_stops_server_after_cleanup_failure(
+    monkeypatch,
+) -> None:
+    server = Mock()
+    shutdown_intent = threading.Event()
+    diagnostics = Mock()
+    monkeypatch.setattr(
+        gui_server, "_launcher_process_alive", lambda _pid: False,
+    )
+    monkeypatch.setattr(
+        gui_server, "_release_hardware_for_shutdown",
+        Mock(side_effect=RuntimeError("stuck hardware task")),
+    )
+    monkeypatch.setattr(gui_server, "SHUTDOWN_INTENT", shutdown_intent)
+    monkeypatch.setattr(gui_server, "DIAGNOSTICS", diagnostics)
+
+    gui_server._watch_launcher_process(
+        server, 4321, poll_interval_s=0,
+    )
+
+    server.shutdown.assert_called_once_with()
+    assert shutdown_intent.is_set()
+    diagnostics.exception.assert_called_once()
+
+
 def test_safe_shutdown_stops_measurement_and_waits_until_idle(monkeypatch) -> None:
     schedule = Mock()
     schedule.snapshot.return_value = {"active": True}

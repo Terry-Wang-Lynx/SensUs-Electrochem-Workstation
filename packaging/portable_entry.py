@@ -271,8 +271,8 @@ def _windows_confirm(title: str, message: str) -> bool:
         return False
 
 
-def _acquire_windows_single_instance() -> int | None:
-    """Prevent two portable launchers from probing or preparing one J-Link."""
+def _open_windows_single_instance(*, reject_existing: bool) -> int | None:
+    """Keep the launcher mutex alive in both the window and backend processes."""
     import ctypes
 
     kernel32 = ctypes.windll.kernel32
@@ -285,9 +285,22 @@ def _acquire_windows_single_instance() -> int | None:
     handle = int(kernel32.CreateMutexW(None, False, WINDOWS_MUTEX_NAME) or 0)
     if not handle:
         raise OSError("Unable to create the SensUs single-instance mutex")
-    if int(kernel32.GetLastError()) == WINDOWS_ALREADY_EXISTS:
+    if reject_existing and int(kernel32.GetLastError()) == WINDOWS_ALREADY_EXISTS:
         kernel32.CloseHandle(handle)
         return None
+    return handle
+
+
+def _acquire_windows_single_instance() -> int | None:
+    """Prevent two portable launchers from probing or preparing one J-Link."""
+    return _open_windows_single_instance(reject_existing=True)
+
+
+def _hold_windows_single_instance() -> int:
+    """Keep the mutex valid if a crashed native window leaves its backend alive."""
+    handle = _open_windows_single_instance(reject_existing=False)
+    if handle is None:  # pragma: no cover - reject_existing=False always returns a handle
+        raise OSError("Unable to retain the SensUs single-instance mutex")
     return handle
 
 
@@ -424,6 +437,16 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         finally:
             _release_windows_single_instance(mutex)
+    child_mutex: int | None = None
+    if (
+        command == "gui"
+        and sys.platform == "win32"
+        and os.environ.get("SENSUS_PORTABLE_CHILD")
+    ):
+        # The parent owns the same named object first. Holding a second handle
+        # here keeps a newly launched copy from racing an orphan backend that is
+        # still releasing hardware after the native window was force-closed.
+        child_mutex = _hold_windows_single_instance()
     if command in {"", "gui"}:
         from pa_host.gui_server import main as target
     elif command == "it-tool":
@@ -435,7 +458,11 @@ def main(argv: list[str] | None = None) -> int:
 
         app(args=argv, prog_name="smpmgr")
         return 0
-    return int(target(argv) or 0)
+    try:
+        return int(target(argv) or 0)
+    finally:
+        if child_mutex is not None:
+            _release_windows_single_instance(child_mutex)
 
 
 if __name__ == "__main__":

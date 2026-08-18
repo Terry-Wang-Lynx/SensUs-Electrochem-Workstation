@@ -9939,6 +9939,93 @@ def _request_server_shutdown() -> None:
         ).start()
 
 
+def _launcher_process_alive(process_id: int) -> bool:
+    """Check the native portable launcher without spawning another process."""
+    if process_id <= 0:
+        return False
+    if _IS_WIN:
+        import ctypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [
+            ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong,
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        handle = kernel32.OpenProcess(synchronize, False, process_id)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _watch_launcher_process(
+    server: ThreadingHTTPServer,
+    launcher_pid: int,
+    *,
+    poll_interval_s: float = 0.5,
+) -> None:
+    """Release hardware if the native shell crashes or is force-quit."""
+    while not SHUTDOWN_INTENT.wait(max(0.0, poll_interval_s)):
+        if _launcher_process_alive(launcher_pid):
+            continue
+        DIAGNOSTICS.record(
+            "warning", "application.launcher_exited",
+            "Native launcher exited before its backend",
+            launcher_pid=launcher_pid,
+        )
+        try:
+            _release_hardware_for_shutdown(timeout_s=330.0)
+        except Exception as exc:
+            DIAGNOSTICS.exception(
+                "application.launcher_release_failed",
+                "Hardware cleanup failed after the native launcher exited",
+                exc,
+                launcher_pid=launcher_pid,
+            )
+        finally:
+            # Refuse new hardware work even if a stuck driver task exhausted
+            # the graceful timeout. The serving loop's existing finalizer still
+            # reaps acquisition and J-Link child processes.
+            SHUTDOWN_INTENT.set()
+            server.shutdown()
+        return
+
+
+def _start_launcher_watchdog(
+    server: ThreadingHTTPServer,
+) -> threading.Thread | None:
+    raw_pid = str(os.environ.get("SENSUS_APP_PID", "")).strip()
+    try:
+        launcher_pid = int(raw_pid)
+    except ValueError:
+        return None
+    if launcher_pid <= 0 or launcher_pid == os.getpid():
+        return None
+    worker = threading.Thread(
+        target=_watch_launcher_process,
+        args=(server, launcher_pid),
+        name="native-launcher-watchdog",
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
 def _release_hardware_for_shutdown(timeout_s: float = 330.0) -> dict[str, Any]:
     """Wait out non-interruptible operations, then stop acquisition normally."""
     SHUTDOWN_INTENT.set()
@@ -10620,6 +10707,8 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
             signal.signal(sig, _graceful)
         except (ValueError, AttributeError):
             pass   # 非主线程时不给注册,或平台不支持时忽略
+
+    _start_launcher_watchdog(server)
 
     try:
         server.serve_forever()

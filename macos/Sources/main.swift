@@ -353,6 +353,23 @@ private final class BackendManager {
         if !strict, let persisted = loadPersistedBackend(from: persistedBackendURL) {
             if let health = fetchJSON(port: persisted.port, path: "/api/health"),
                persisted.matches(health: health) {
+                guard launcherProcessIsAlive(persisted.launcherPID) else {
+                    let deadline = Date().addingTimeInterval(8)
+                    while Date() < deadline && !canBind(port: persisted.port) {
+                        Thread.sleep(forTimeInterval: 0.2)
+                    }
+                    guard canBind(port: persisted.port) else {
+                        throw BackendError.persistedBackendStopping(
+                            persisted.port
+                        )
+                    }
+                    removePersistedBackend(
+                        persisted, from: persistedBackendURL
+                    )
+                    return try resolveStartPort(
+                        preferred: preferred, strict: strict
+                    )
+                }
                 return resolutionForExistingSensUs(
                     port: persisted.port, health: health
                 )
@@ -410,6 +427,12 @@ private final class BackendManager {
               !persisted.project.isEmpty,
               !persisted.launchToken.isEmpty else { return nil }
         return persisted
+    }
+
+    private static func launcherProcessIsAlive(_ processID: Int32) -> Bool {
+        guard processID > 0 else { return false }
+        if Darwin.kill(processID, 0) == 0 { return true }
+        return errno == EPERM
     }
 
     private static func removePersistedBackend(
@@ -785,6 +808,7 @@ private final class BackendManager {
         case existingBackendCancelled
         case existingBackendDidNotExit
         case persistedBackendUnavailable(Int)
+        case persistedBackendStopping(Int)
 
         var errorDescription: String? {
             switch self {
@@ -812,6 +836,8 @@ private final class BackendManager {
                 return "旧版 SensUs 后台未能安全退出，请从旧窗口退出后重试"
             case .persistedBackendUnavailable(let port):
                 return "检测到上次 SensUs 后台仍占用本地端口 \(port)，但它没有正常响应。为避免同时占用硬件，本次不会启动第二个后台；请先重启电脑后再打开。"
+            case .persistedBackendStopping(let port):
+                return "上次异常退出的 SensUs 后台仍在端口 \(port) 安全释放硬件。请稍等片刻后重新打开；本次不会启动第二个后台。"
             }
         }
     }
