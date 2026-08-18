@@ -18,10 +18,23 @@ PREFIX="$BUILD_ROOT/prefix"
 DOWNLOADS="$BUILD_ROOT/downloads"
 mkdir -p "$DOWNLOADS" "$PREFIX"
 
+sha256_file() {
+  local path="$1" digest
+  digest="$(sha256sum "$path" | awk '{print $1}')"
+  # GNU coreutils prefixes a backslash when an MSYS path needs filename
+  # escaping. It is not part of the digest.
+  digest="${digest#\\}"
+  [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || {
+    echo "Invalid SHA-256 output for $path: $digest" >&2
+    return 1
+  }
+  printf '%s\n' "${digest,,}"
+}
+
 download_verified() {
   local url="$1" expected="$2" output="$3" actual
   curl --fail --location --silent --show-error "$url" -o "$output"
-  actual="$(sha256sum "$output" | awk '{print $1}')"
+  actual="$(sha256_file "$output")"
   [[ "$actual" == "$expected" ]] || {
     echo "SHA-256 mismatch for $url: expected $expected, got $actual" >&2
     exit 1
@@ -115,8 +128,8 @@ adapters="$(PATH="$DEST/bin:$PATH" "$DEST/bin/openocd.exe" -c 'echo [adapter lis
   exit 1
 }
 
-openocd_binary_sha="$(sha256sum "$DEST/bin/openocd.exe" | awk '{print $1}')"
-libusb_binary_sha="$(sha256sum "$DEST/bin/libusb-1.0.dll" | awk '{print $1}')"
+openocd_binary_sha="$(sha256_file "$DEST/bin/openocd.exe")"
+libusb_binary_sha="$(sha256_file "$DEST/bin/libusb-1.0.dll")"
 cat > "$DEST/COMPONENTS.json" <<EOF
 {
   "schema": 1,

@@ -198,6 +198,9 @@ def test_bundled_openocd_carries_exact_corresponding_source() -> None:
     assert "openocd-0.12.0.tar.bz2" in macos
     assert "build_macos_openocd.sh" in macos
     assert 'OPENOCD_ASSET="openocd-$OPENOCD_VERSION.tar.bz2"' in windows_build
+    assert 'digest="${digest#\\\\}"' in windows_build
+    assert '[[ "$digest" =~ ^[[:xdigit:]]{64}$ ]]' in windows_build
+    assert windows_build.count('sha256_file "') >= 3
     assert "build_windows_openocd.sh" in windows_build
     assert "bundle_windows_openocd.ps1" in windows_bundle
     assert "source_sha256" in windows_bundle
