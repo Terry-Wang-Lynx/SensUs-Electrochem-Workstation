@@ -1,65 +1,95 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Destination
+  [Parameter(Mandatory = $true)][string]$Source,
+  [Parameter(Mandatory = $true)][string]$Destination
 )
 
 $ErrorActionPreference = "Stop"
+$Source = [IO.Path]::GetFullPath($Source)
+$Destination = [IO.Path]::GetFullPath($Destination)
+if ($Source -eq $Destination -or $Destination -eq [IO.Path]::GetPathRoot($Destination)) {
+  throw "Unsafe OpenOCD source or destination"
+}
 
-# The official Windows archive is 32-bit, but runs on supported Windows x64
-# through WOW64. It is built with libjaylink, so the portable package can use
-# a J-Link without redistributing SEGGER's proprietary JLink.exe.
-$OpenOcdVersion = "0.12.0"
-$OpenOcdAsset = "openocd-v0.12.0-i686-w64-mingw32.tar.gz"
-$OpenOcdUrl = "https://github.com/openocd-org/openocd/releases/download/v$OpenOcdVersion/$OpenOcdAsset"
-$OpenOcdSha256 = "d7168545a6d5df4772b6090d470650f3eb8c9732dbd19b1f9027824c7f4a6fa3"
+$Required = @(
+  "bin\openocd.exe",
+  "bin\libusb-1.0.dll",
+  "share\openocd\scripts\interface\jlink.cfg",
+  "share\openocd\scripts\target\nrf52.cfg",
+  "source\openocd-0.12.0.tar.bz2",
+  "source\libusb-1.0.29.tar.bz2",
+  "licenses\OpenOCD-COPYING",
+  "licenses\libusb-COPYING",
+  "BINARY_DEPENDENCIES.txt",
+  "COMPONENTS.json"
+)
+foreach ($Relative in $Required) {
+  if (-not (Test-Path (Join-Path $Source $Relative))) {
+    throw "Pinned OpenOCD build is incomplete; missing: $Relative"
+  }
+}
 
-$TempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sensus-openocd-" + [guid]::NewGuid().ToString("N"))
-$Archive = Join-Path $TempRoot $OpenOcdAsset
-$Extracted = Join-Path $TempRoot "extracted"
+$Manifest = Get-Content (Join-Path $Source "COMPONENTS.json") -Raw |
+  ConvertFrom-Json
+if ($Manifest.schema -ne 1 -or $Manifest.platform -ne "windows-x64") {
+  throw "Pinned OpenOCD component manifest has an unexpected schema or platform"
+}
+$ExpectedComponents = @{
+  "OpenOCD" = "bin\openocd.exe"
+  "libusb" = "bin\libusb-1.0.dll"
+}
+foreach ($Name in $ExpectedComponents.Keys) {
+  $Component = @($Manifest.components | Where-Object name -eq $Name)
+  if ($Component.Count -ne 1) {
+    throw "Pinned OpenOCD manifest must contain exactly one $Name component"
+  }
+  $Binary = Join-Path $Source $ExpectedComponents[$Name]
+  $Actual = (Get-FileHash -Algorithm SHA256 $Binary).Hash.ToLowerInvariant()
+  if ($Actual -ne $Component[0].binary_sha256) {
+    throw "$Name binary hash does not match COMPONENTS.json"
+  }
+  $SourceArchive = Join-Path $Source $Component[0].source
+  $SourceHash = (Get-FileHash -Algorithm SHA256 $SourceArchive).Hash.ToLowerInvariant()
+  if ($SourceHash -ne $Component[0].source_sha256) {
+    throw "$Name source hash does not match COMPONENTS.json"
+  }
+}
 
+$RuntimeDlls = @(Get-ChildItem (Join-Path $Source "bin") -File -Filter "*.dll" |
+  ForEach-Object { $_.Name.ToLowerInvariant() })
+if ($RuntimeDlls.Count -ne 1 -or $RuntimeDlls[0] -ne "libusb-1.0.dll") {
+  throw "Pinned OpenOCD contains an unexpected runtime DLL set: $($RuntimeDlls -join ', ')"
+}
+$Dependencies = @(Get-Content (Join-Path $Source "BINARY_DEPENDENCIES.txt") |
+  ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$AllowedDependencies = @(
+  "libusb-1.0.dll", "kernel32.dll", "msvcrt.dll", "ws2_32.dll",
+  "advapi32.dll", "user32.dll", "shell32.dll", "ole32.dll",
+  "setupapi.dll", "cfgmgr32.dll", "ntdll.dll"
+)
+$UnexpectedDependencies = @($Dependencies | Where-Object {
+  $_.ToLowerInvariant() -notin $AllowedDependencies
+})
+if ($UnexpectedDependencies.Count -gt 0) {
+  throw "Pinned OpenOCD contains unexpected native dependencies: $($UnexpectedDependencies -join ', ')"
+}
+
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Destination
+New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+Copy-Item -Recurse (Join-Path $Source "*") $Destination
+
+$OldPath = $env:PATH
 try {
-    New-Item -ItemType Directory -Force -Path $TempRoot, $Extracted | Out-Null
-    Write-Host "Downloading OpenOCD $OpenOcdVersion..."
-    Invoke-WebRequest -Uri $OpenOcdUrl -OutFile $Archive -UseBasicParsing
-
-    $actualHash = (Get-FileHash -Path $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actualHash -ne $OpenOcdSha256) {
-        throw "OpenOCD archive SHA-256 mismatch: expected $OpenOcdSha256, got $actualHash"
-    }
-
-    $tar = (Get-Command tar.exe -ErrorAction SilentlyContinue).Source
-    if (-not $tar) {
-        throw "Windows tar.exe is required to unpack the OpenOCD archive"
-    }
-    & $tar -xzf $Archive -C $Extracted
-    if ($LASTEXITCODE -ne 0) {
-        throw "OpenOCD archive extraction failed with exit code $LASTEXITCODE"
-    }
-
-    # The official archive stores bin/ and share/ directly at its root. Keep
-    # support for a future archive that adds a single top-level directory.
-    $bundleRoot = $Extracted
-    if (-not (Test-Path (Join-Path $bundleRoot "bin\openocd.exe"))) {
-        $nestedRoot = Get-ChildItem -Path $Extracted -Directory | Select-Object -First 1
-        if ($nestedRoot) {
-            $bundleRoot = $nestedRoot.FullName
-        }
-    }
-    $sourceBin = Join-Path $bundleRoot "bin"
-    $sourceScripts = Join-Path $bundleRoot "share\openocd\scripts"
-    $sourceExecutable = Join-Path $sourceBin "openocd.exe"
-    if (-not (Test-Path $sourceExecutable) -or -not (Test-Path $sourceScripts)) {
-        throw "OpenOCD archive is missing openocd.exe or its scripts"
-    }
-
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Destination
-    $destinationBin = Join-Path $Destination "bin"
-    $destinationScripts = Join-Path $Destination "share\openocd\scripts"
-    New-Item -ItemType Directory -Force -Path $destinationBin, $destinationScripts | Out-Null
-    Copy-Item -Path (Join-Path $sourceBin "*") -Destination $destinationBin -Recurse -Force
-    Copy-Item -Path (Join-Path $sourceScripts "*") -Destination $destinationScripts -Recurse -Force
-    Write-Host "Bundled OpenOCD at $Destination"
+  $env:PATH = (Join-Path $Destination "bin") + ";" + $OldPath
+  $OpenOcd = Join-Path $Destination "bin\openocd.exe"
+  $VersionOutput = (& $OpenOcd --version 2>&1) -join "`n"
+  if ($LASTEXITCODE -ne 0 -or $VersionOutput -notmatch "Open On-Chip Debugger 0\.12\.0") {
+    throw "Bundled OpenOCD failed its version smoke test: $VersionOutput"
+  }
+  $AdapterOutput = (& $OpenOcd -c "echo [adapter list]; shutdown" 2>&1) -join "`n"
+  if ($LASTEXITCODE -ne 0 -or $AdapterOutput -notmatch "(?i)jlink") {
+    throw "Bundled OpenOCD does not expose the J-Link adapter: $AdapterOutput"
+  }
+} finally {
+  $env:PATH = $OldPath
 }
-finally {
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $TempRoot
-}
+Write-Host "Bundled pinned J-Link-only OpenOCD at $Destination"

@@ -7,16 +7,20 @@ private let defaultServerPort = 8765
 
 private final class BackendManager {
     private(set) var process: Process?
-    private(set) var serverPort = defaultServerPort
+    private(set) var serverPort: Int
     private var logHandle: FileHandle?
     private var watchdogTimer: Timer?
     private var consecutiveHealthFailures = 0
     private var recoveryInProgress = false
     private var intentionalShutdown = false
+    private let strictServerPort: Bool
+    private let expectedLaunchToken: String
+    private var usingExistingServer = false
     var onServerRecovered: ((URL) -> Void)?
     let projectRoot: URL
     let stateURL: URL
     let logURL: URL
+    let expectedVersion: String
 
     var serverURL: URL {
         URL(string: "http://127.0.0.1:\(serverPort)/")!
@@ -27,6 +31,14 @@ private final class BackendManager {
     }
 
     init() {
+        serverPort = Self.preferredServerPort()
+        expectedLaunchToken = ProcessInfo.processInfo.environment[
+            "SENSUS_LAUNCH_TOKEN"
+        ] ?? ""
+        strictServerPort = !expectedLaunchToken.isEmpty
+        expectedVersion = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? ""
         projectRoot = Self.resolveProjectRoot()
         stateURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/SensUs Workstation", isDirectory: true)
@@ -38,21 +50,99 @@ private final class BackendManager {
     }
 
     func ensureServer(completion: @escaping (Result<URL, Error>) -> Void) {
-        healthCheck { [weak self] available in
-            guard let self else { return }
-            if available {
-                DispatchQueue.main.async {
-                    self.beginHealthMonitoring()
-                    completion(.success(self.serverURL))
+        let preferred = serverPort
+        let strict = strictServerPort
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard self != nil else { return }
+            do {
+                let resolution = try Self.resolveStartPort(
+                    preferred: preferred, strict: strict
+                )
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    if resolution.reuseExisting {
+                        self.adoptExistingServer(
+                            port: resolution.port,
+                            completion: completion
+                        )
+                    } else if let version = resolution.existingVersion {
+                        let alert = NSAlert()
+                        alert.alertStyle = .warning
+                        alert.messageText = "检测到空闲的旧版 SensUs 后台"
+                        alert.informativeText =
+                            "SensUs \(version) 仍在后台运行。为避免两个程序同时占用硬件，需要先安全关闭旧后台。"
+                        alert.addButton(withTitle: "安全关闭并继续")
+                        alert.addButton(withTitle: "保留并打开旧后台")
+                        guard alert.runModal() == .alertFirstButtonReturn else {
+                            self.adoptExistingServer(
+                                port: resolution.port,
+                                completion: completion
+                            )
+                            return
+                        }
+                        self.retireExistingServer(
+                            port: resolution.port,
+                            completion: completion
+                        )
+                    } else {
+                        self.launchResolvedServer(
+                            port: resolution.port,
+                            completion: completion
+                        )
+                    }
                 }
-                return
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
             }
-            DispatchQueue.main.async {
-                do {
-                    self.serverPort = try Self.findAvailablePort(preferred: defaultServerPort)
-                    try self.launchServer()
-                    self.pollUntilReady(attempt: 0, completion: completion)
-                } catch {
+        }
+    }
+
+    private func adoptExistingServer(
+        port: Int,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) {
+        usingExistingServer = true
+        serverPort = port
+        completion(.success(serverURL))
+    }
+
+    private func launchResolvedServer(
+        port: Int,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) {
+        do {
+            serverPort = port
+            try launchServer()
+            pollUntilReady(attempt: 0, completion: completion)
+        } catch {
+            completion(.failure(error))
+        }
+    }
+
+    private func retireExistingServer(
+        port: Int,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                try Self.requestExistingShutdown(port: port)
+                let deadline = Date().addingTimeInterval(30)
+                while Date() < deadline && !Self.canBind(port: port) {
+                    Thread.sleep(forTimeInterval: 0.2)
+                }
+                guard Self.canBind(port: port) else {
+                    throw BackendError.existingBackendDidNotExit
+                }
+                DispatchQueue.main.async {
+                    self.launchResolvedServer(
+                        port: port, completion: completion
+                    )
+                }
+            } catch {
+                DispatchQueue.main.async {
                     completion(.failure(error))
                 }
             }
@@ -108,6 +198,7 @@ private final class BackendManager {
         environment["SENSUS_PROJECT_DIR"] = projectRoot.path
         environment["SENSUS_RESOURCE_DIR"] = projectRoot.path
         environment["SENSUS_STATE_DIR"] = stateURL.path
+        environment["SENSUS_SERVER_PORT"] = String(serverPort)
         environment["PYTHONUNBUFFERED"] = "1"
         if usingBundledBackend {
             environment["SENSUS_APP_BUNDLE"] = Bundle.main.bundleURL.path
@@ -160,11 +251,19 @@ private final class BackendManager {
         var request = URLRequest(url: healthURL)
         request.timeoutInterval = 0.7
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        URLSession.shared.dataTask(with: request) { [projectRoot] data, response, error in
+        URLSession.shared.dataTask(with: request) {
+            [projectRoot, expectedVersion, expectedLaunchToken] data, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode
             guard error == nil, status == 200, let data,
                   let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let project = payload["project"] as? String else {
+                  payload["product"] as? String == "SensUs-Electrochem-Workstation",
+                  let project = payload["project"] as? String,
+                  let version = payload["version"] as? String,
+                  expectedVersion.isEmpty || version == expectedVersion,
+                  String(describing: payload["launcher_pid"] ?? "")
+                    == String(ProcessInfo.processInfo.processIdentifier),
+                  expectedLaunchToken.isEmpty
+                    || payload["launch_token"] as? String == expectedLaunchToken else {
                 completion(false)
                 return
             }
@@ -180,6 +279,142 @@ private final class BackendManager {
             return port
         }
         throw BackendError.noPortAvailable
+    }
+
+    private struct StartPortResolution {
+        let port: Int
+        let existingVersion: String?
+        let reuseExisting: Bool
+    }
+
+    private static func resolveStartPort(
+        preferred: Int, strict: Bool
+    ) throws -> StartPortResolution {
+        if canBind(port: preferred) {
+            return StartPortResolution(
+                port: preferred, existingVersion: nil, reuseExisting: false
+            )
+        }
+        if strict {
+            throw BackendError.configuredPortUnavailable(preferred)
+        }
+        guard let health = fetchJSON(port: preferred, path: "/api/health"),
+              isSensUsHealth(health) else {
+            return StartPortResolution(
+                port: try findAvailablePort(preferred: preferred),
+                existingVersion: nil,
+                reuseExisting: false
+            )
+        }
+        let version = health["version"] as? String ?? "未知版本"
+        let idle = existingSensUsIsIdle(port: preferred, health: health)
+        return StartPortResolution(
+            port: preferred,
+            existingVersion: version,
+            reuseExisting: idle != true
+        )
+    }
+
+    private static func fetchJSON(
+        port: Int, path: String, timeout: TimeInterval = 1.5
+    ) -> [String: Any]? {
+        guard let url = URL(
+            string: "http://127.0.0.1:\(port)\(path)"
+        ) else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: [String: Any]?
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+            defer { semaphore.signal() }
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  let data,
+                  let payload = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any] else { return }
+            result = payload
+        }
+        task.resume()
+        if semaphore.wait(timeout: .now() + timeout + 0.5) == .timedOut {
+            task.cancel()
+            return nil
+        }
+        return result
+    }
+
+    private static func isSensUsHealth(_ payload: [String: Any]) -> Bool {
+        guard payload["ok"] as? Bool == true else { return false }
+        if payload["product"] as? String == "SensUs-Electrochem-Workstation" {
+            return true
+        }
+        guard let project = payload["project"] as? String, !project.isEmpty,
+              let version = payload["version"] as? String,
+              let session = payload["diagnostic_session"] as? String,
+              !session.isEmpty else { return false }
+        let normalizedProject = project.replacingOccurrences(
+            of: "\\", with: "/"
+        ).lowercased()
+        return normalizedProject.hasSuffix("/workstation") && version.range(
+            of: #"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func existingSensUsIsIdle(
+        port: Int, health: [String: Any]
+    ) -> Bool? {
+        if health["product"] as? String == "SensUs-Electrochem-Workstation" {
+            guard let busy = health["hardware_busy"] as? Bool else { return nil }
+            let updateBusy = health["app_update_busy"] as? Bool ?? false
+            return !busy && !updateBusy
+        }
+        guard let status = fetchJSON(port: port, path: "/api/status"),
+              let schedule = fetchJSON(port: port, path: "/api/schedule"),
+              let settings = fetchJSON(port: port, path: "/api/settings"),
+              let state = status["state"] as? String,
+              let scheduleActive = schedule["active"] as? Bool,
+              let settingsState = settings["state"] as? String else {
+            return nil
+        }
+        let measurementBusy = (status["busy"] as? Bool ?? false)
+            || state == "running"
+        return !measurementBusy && !scheduleActive && settingsState != "applying"
+    }
+
+    private static func requestExistingShutdown(port: Int) throws {
+        guard let url = URL(
+            string: "http://127.0.0.1:\(port)/api/shutdown"
+        ) else { throw BackendError.existingBackendDidNotExit }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = Data("{}".utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 10
+        let semaphore = DispatchSemaphore(value: 0)
+        var status = 0
+        var requestError: Error?
+        let task = URLSession.shared.dataTask(with: request) { _, response, error in
+            status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            requestError = error
+            semaphore.signal()
+        }
+        task.resume()
+        if semaphore.wait(timeout: .now() + 11) == .timedOut {
+            task.cancel()
+            throw BackendError.existingBackendDidNotExit
+        }
+        if let requestError { throw requestError }
+        guard status == 200 else {
+            throw BackendError.existingBackendBusy("HTTP \(status)")
+        }
+    }
+
+    private static func preferredServerPort() -> Int {
+        guard let raw = ProcessInfo.processInfo.environment["SENSUS_SERVER_PORT"],
+              let port = Int(raw), (1...65535).contains(port) else {
+            return defaultServerPort
+        }
+        return port
     }
 
     private static func canBind(port: Int) -> Bool {
@@ -226,6 +461,38 @@ private final class BackendManager {
         )
     }
 
+    func requestSafeShutdown(
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        var request = URLRequest(
+            url: serverURL.appendingPathComponent("api/shutdown")
+        )
+        request.httpMethod = "POST"
+        request.httpBody = Data("{}".utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 900
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200 else {
+                var detail = "HTTP \(status)"
+                if let data,
+                   let payload = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                   let message = payload["error"] as? String,
+                   !message.isEmpty {
+                    detail = message
+                }
+                completion(.failure(BackendError.shutdownRejected(detail)))
+                return
+            }
+            completion(.success(()))
+        }.resume()
+    }
+
     private func waitForServerExit(
         deadline: Date,
         completion: @escaping () -> Void
@@ -240,7 +507,8 @@ private final class BackendManager {
     }
 
     private func beginHealthMonitoring() {
-        guard watchdogTimer == nil, !intentionalShutdown else { return }
+        guard watchdogTimer == nil, !intentionalShutdown,
+              !usingExistingServer else { return }
         let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.checkForRecovery()
         }
@@ -267,14 +535,26 @@ private final class BackendManager {
     private func recoverServer() {
         guard !recoveryInProgress, !intentionalShutdown else { return }
         recoveryInProgress = true
-        if let process, process.isRunning {
-            process.terminate()
+        if process?.isRunning == true {
+            // A transiently slow health response must never terminate an active
+            // flash, driver preparation, or measurement. Only relaunch a backend
+            // that has actually exited.
+            recoveryInProgress = false
+            return
         }
         process = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             do {
-                self.serverPort = try Self.findAvailablePort(preferred: self.serverPort)
+                if self.strictServerPort {
+                    guard Self.canBind(port: self.serverPort) else {
+                        throw BackendError.configuredPortUnavailable(self.serverPort)
+                    }
+                } else {
+                    self.serverPort = try Self.findAvailablePort(
+                        preferred: self.serverPort
+                    )
+                }
                 try self.launchServer()
                 self.pollUntilReady(attempt: 0) { [weak self] result in
                     guard let self else { return }
@@ -363,6 +643,12 @@ private final class BackendManager {
         case serverExited(String)
         case serverTimeout(String)
         case noPortAvailable
+        case shutdownRejected(String)
+        case configuredPortUnavailable(Int)
+        case existingBackendBusy(String)
+        case existingBackendStateUnknown(String)
+        case existingBackendCancelled
+        case existingBackendDidNotExit
 
         var errorDescription: String? {
             switch self {
@@ -376,6 +662,18 @@ private final class BackendManager {
                 return "后台服务启动超时。日志：\(log)"
             case .noPortAvailable:
                 return "找不到可用的本地服务端口，请关闭占用本地端口的程序后重试"
+            case .shutdownRejected(let detail):
+                return "硬件尚未安全释放：\(detail)"
+            case .configuredPortUnavailable(let port):
+                return "更新使用的本地端口 \(port) 已被占用；新版本未启动，更新将自动回滚"
+            case .existingBackendBusy(let version):
+                return "SensUs \(version) 正在测量或执行硬件操作。请回到旧窗口停止任务并退出后再试；本次不会启动第二个后台。"
+            case .existingBackendStateUnknown(let version):
+                return "无法确认 SensUs \(version) 已处于空闲状态。请先从旧窗口退出后再启动。"
+            case .existingBackendCancelled:
+                return "已取消启动；旧版后台保持运行"
+            case .existingBackendDidNotExit:
+                return "旧版 SensUs 后台未能安全退出，请从旧窗口退出后重试"
             }
         }
     }
@@ -403,6 +701,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var overlayPanel: OverlayPanel!
     private var overlayWebView: WKWebView!
     private var workspacePanel: NSOpenPanel?
+    private var terminationRequestInFlight = false
     private weak var pinButton: NSButton?
     private var pinned: Bool = {
         if UserDefaults.standard.object(forKey: "alwaysOnTop") == nil {
@@ -412,6 +711,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let pidFile = ProcessInfo.processInfo.environment[
+            "SENSUS_LAUNCH_PID_FILE"
+        ], !pidFile.isEmpty {
+            try? "\(ProcessInfo.processInfo.processIdentifier)\n".write(
+                toFile: pidFile, atomically: true, encoding: .utf8
+            )
+        }
         configureMenus()
         configureMainWindow()
         configureOverlayPanel()
@@ -444,6 +750,37 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     func applicationWillTerminate(_ notification: Notification) {
         backend.stopServer()
+    }
+
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        guard backend.process?.isRunning == true else { return .terminateNow }
+        if terminationRequestInFlight { return .terminateLater }
+        terminationRequestInFlight = true
+        backend.requestSafeShutdown { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else {
+                    sender.reply(toApplicationShouldTerminate: false)
+                    return
+                }
+                switch result {
+                case .success:
+                    self.backend.beginApplicationShutdown {
+                        sender.reply(toApplicationShouldTerminate: true)
+                    }
+                case .failure(let error):
+                    self.terminationRequestInFlight = false
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = "暂时无法安全退出"
+                    alert.informativeText = error.localizedDescription
+                    alert.runModal()
+                    sender.reply(toApplicationShouldTerminate: false)
+                }
+            }
+        }
+        return .terminateLater
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {

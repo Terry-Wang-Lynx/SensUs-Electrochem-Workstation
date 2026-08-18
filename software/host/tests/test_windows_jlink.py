@@ -1,7 +1,10 @@
 import base64
 import subprocess
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -32,11 +35,33 @@ def _port(
     )
 
 
+def _binding(
+    interface: windows_jlink.JLinkUsbInterface,
+    *,
+    probe_serial: str = "",
+    ready: bool = False,
+) -> windows_jlink.JLinkUsbBinding:
+    return windows_jlink.JLinkUsbBinding(
+        interface=interface,
+        probe_serial=probe_serial,
+        parent_id="",
+        container_id="container",
+        status="OK",
+        problem_code=0,
+        service="WinUSB" if ready else "",
+        driver_inf_path="oem55.inf" if ready else "",
+        driver_provider="libwdi" if ready else "",
+    )
+
+
 @pytest.mark.parametrize(
     "output",
     [
         "LIBUSB_ERROR_NOT_FOUND",
         "libusb_error_not_supported",
+        "LIBUSB_ERROR_ACCESS",
+        "access denied",
+        "cannot open J-Link",
         "Error: No J-Link device found",
     ],
 )
@@ -66,6 +91,22 @@ def test_target_swd_error_is_not_a_probe_communication_error() -> None:
     assert windows_jlink.openocd_reports_probe_communication_error(
         "Error: Could not find MEM-AP to control the core"
     ) is False
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("LIBUSB_ERROR_BUSY", True),
+        ("J-Link is already in use", True),
+        ("LIBUSB_ERROR_ACCESS", False),
+        ("access denied", False),
+        ("cannot open J-Link", False),
+    ],
+)
+def test_probe_busy_requires_an_explicit_ownership_error(
+    output: str, expected: bool,
+) -> None:
+    assert windows_jlink.reports_probe_busy(output) is expected
 
 
 def test_repairable_interfaces_only_selects_verified_debug_interface(
@@ -162,6 +203,47 @@ def test_repairable_interfaces_repairs_broken_winusb_binding(monkeypatch) -> Non
     assert [(item.pid, item.mi) for item in interfaces] == [(0x0101, None)]
 
 
+def test_composite_binding_reads_probe_serial_from_parent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        windows_jlink,
+        "_problem_device_payload",
+        lambda _vid, _pid: [{
+            "instance_id": r"USB\VID_1366&PID_0105&MI_02\7&ABC&0&0002",
+            "parent": r"USB\VID_1366&PID_0105\000029734569",
+            "status": "Error",
+            "problem_code": 28,
+        }],
+    )
+
+    bindings = windows_jlink.jlink_bindings(0x1366, 0x0105)
+
+    assert len(bindings) == 1
+    assert bindings[0].probe_serial == "29734569"
+    assert bindings[0].interface.mi == 0x02
+
+
+def test_same_pid_physical_probes_are_not_collapsed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        windows_jlink,
+        "_problem_device_payload",
+        lambda _vid, _pid: [
+            {
+                "instance_id": r"USB\VID_1366&PID_0101\000000123456",
+                "status": "Error", "problem_code": 28,
+            },
+            {
+                "instance_id": r"USB\VID_1366&PID_0101\000000654321",
+                "status": "Error", "problem_code": 28,
+            },
+        ],
+    )
+
+    bindings = windows_jlink.jlink_bindings(0x1366, 0x0101)
+
+    assert {binding.probe_serial for binding in bindings} == {"123456", "654321"}
+    assert len(windows_jlink.problem_interfaces(0x1366, 0x0101)) == 2
+
+
 def test_problem_interfaces_rejects_non_segger_vendor() -> None:
     with pytest.raises(ValueError, match="SEGGER"):
         windows_jlink.problem_interfaces(0x1234, 0x0105)
@@ -184,7 +266,9 @@ def test_install_winusb_uses_only_supported_interface(
 
     def fake_run(
         executable, arguments, *, timeout_s, restart_instance_id, cleanup_paths,
+        status_callback,
     ):
+        assert status_callback is None
         commands.append(
             (executable, arguments, timeout_s, restart_instance_id, cleanup_paths)
         )
@@ -232,7 +316,9 @@ def test_install_winusb_legacy_device_does_not_guess_an_interface_id(
 
     def fake_run(
         _executable, arguments, *, timeout_s, restart_instance_id, cleanup_paths,
+        status_callback,
     ):
+        assert status_callback is None
         assert timeout_s == 180.0
         assert restart_instance_id == interface.instance_id
         assert len(cleanup_paths) == 1
@@ -330,6 +416,42 @@ def test_elevated_helper_log_acl_cannot_turn_success_into_failure(
     assert result.returncode == 0
     assert result.stdout == ""
     assert result.stderr == ""
+
+
+def test_elevated_helper_timeout_is_reported_as_actionable_error(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    helper = tmp_path / "wdi-simple.exe"
+    helper.write_bytes(b"helper")
+    monkeypatch.setattr(windows_jlink, "_is_administrator", lambda: False)
+    monkeypatch.setattr(
+        windows_jlink.subprocess,
+        "run",
+        Mock(side_effect=subprocess.TimeoutExpired("powershell.exe", 2)),
+    )
+
+    with pytest.raises(RuntimeError, match="管理员确认.*超时"):
+        windows_jlink._run_elevated(helper, [], timeout_s=1)
+
+
+def test_uac_status_is_emitted_only_immediately_before_elevation(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    helper = tmp_path / "wdi-simple.exe"
+    helper.write_bytes(b"helper")
+    statuses: list[str] = []
+    monkeypatch.setattr(windows_jlink, "_is_administrator", lambda: False)
+    monkeypatch.setattr(
+        windows_jlink.subprocess,
+        "run",
+        Mock(return_value=subprocess.CompletedProcess([], 0, "", "")),
+    )
+
+    windows_jlink._run_elevated(
+        helper, [], timeout_s=1, status_callback=statuses.append,
+    )
+
+    assert statuses == ["请确认 Windows 管理员权限提示"]
 
 
 def test_resolve_helper_finds_portable_sibling(tmp_path: Path, monkeypatch) -> None:
@@ -457,6 +579,167 @@ def test_jlink_driver_is_missing_only_after_pnp_confirmation(
     )
 
 
+def test_ready_winusb_binding_is_not_reprepared_after_transient_probe_failure(
+    monkeypatch,
+) -> None:
+    interface = windows_jlink.JLinkUsbInterface(
+        0x1366, 0x0101, None,
+        r"USB\VID_1366&PID_0101\000000123456",
+    )
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", [{
+        "kind": "jlink", "probe_serial": "123456",
+        "vid": 0x1366, "pid": 0x0101,
+    }])
+    monkeypatch.setattr(
+        gui_server, "jlink_bindings",
+        lambda _vid, _pid: [_binding(
+            interface, probe_serial="123456", ready=True,
+        )],
+    )
+
+    assert gui_server._jlink_requires_winusb("123456") is False
+
+
+def test_target_probe_prefers_bundled_openocd_over_system_commander(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    commander = tmp_path / "JLink.exe"
+    commander.touch()
+    commander_probe = Mock(return_value=(False, "incompatible Commander"))
+    monkeypatch.setattr(gui_server, "JLINK_EXE", commander)
+    monkeypatch.setattr(gui_server, "_openocd_jlink_available", lambda: True)
+    monkeypatch.setattr(
+        gui_server, "_openocd_target_probe",
+        lambda _serial: (True, "SENSUS_INFO_PART=0x00052833"),
+    )
+    monkeypatch.setattr(gui_server, "probe_jlink_target", commander_probe)
+    with gui_server.JLINK_TARGET_CACHE_LOCK:
+        gui_server.JLINK_TARGET_CACHE.clear()
+
+    status = gui_server._probe_jlink_target_status("123456", force=True)
+
+    assert status["target_state"] == "reachable"
+    assert status["target_backend"] == "OpenOCD / libjaylink"
+    commander_probe.assert_not_called()
+
+
+def test_target_probe_cache_age_starts_after_slow_probe(monkeypatch) -> None:
+    ticks = iter((10.0, 10.0, 25.0))
+    monkeypatch.setattr(gui_server.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(gui_server, "_openocd_jlink_available", lambda: True)
+    monkeypatch.setattr(
+        gui_server, "_openocd_target_probe",
+        lambda _serial: (True, "SENSUS_INFO_PART=0x00052833"),
+    )
+    with gui_server.JLINK_TARGET_CACHE_LOCK:
+        gui_server.JLINK_TARGET_CACHE.clear()
+
+    status = gui_server._probe_jlink_target_status("123456", force=True)
+
+    assert status["target_checked_at"] == 25.0
+
+
+def test_commander_probe_access_keeps_optional_winusb_action(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    helper = tmp_path / "wdi-simple.exe"
+    helper.touch()
+    commander = tmp_path / "JLink.exe"
+    commander.touch()
+    monkeypatch.setattr(gui_server, "_IS_WIN", True)
+    monkeypatch.setattr(gui_server, "WINUSB_HELPER", helper)
+    monkeypatch.setattr(gui_server, "JLINK_EXE", commander)
+    monkeypatch.setattr(gui_server, "_openocd_jlink_available", lambda: True)
+    monkeypatch.setattr(
+        gui_server, "_openocd_target_probe",
+        lambda _serial: (False, "LIBUSB_ERROR_NOT_FOUND\nNo J-Link device found"),
+    )
+    monkeypatch.setattr(
+        gui_server, "probe_jlink_target",
+        lambda *_args, **_kwargs: (
+            False, "Connecting to J-Link via USB...O.K.\nHardware version: 1.00",
+        ),
+    )
+    monkeypatch.setattr(gui_server, "_jlink_requires_winusb", lambda _serial: True)
+    with gui_server.JLINK_TARGET_CACHE_LOCK:
+        gui_server.JLINK_TARGET_CACHE.clear()
+
+    status = gui_server._probe_jlink_target_status("123456", force=True)
+
+    assert status["driver_state"] == "ready"
+    assert status["target_failure"] == "target_unreachable"
+    assert status["driver_action"] == "install_winusb"
+
+
+def test_commander_fallback_can_recover_openocd_usb_timeout(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    commander = tmp_path / "JLink.exe"
+    commander.touch()
+    monkeypatch.setattr(gui_server, "JLINK_EXE", commander)
+    monkeypatch.setattr(gui_server, "_openocd_jlink_available", lambda: True)
+    monkeypatch.setattr(
+        gui_server, "_openocd_target_probe",
+        lambda _serial: (False, "LIBUSB_ERROR_TIMEOUT"),
+    )
+    commander_probe = Mock(return_value=(True, "10000100 = 00052833"))
+    monkeypatch.setattr(gui_server, "probe_jlink_target", commander_probe)
+    with gui_server.JLINK_TARGET_CACHE_LOCK:
+        gui_server.JLINK_TARGET_CACHE.clear()
+
+    status = gui_server._probe_jlink_target_status("123456", force=True)
+
+    assert status["target_state"] == "reachable"
+    assert status["target_backend"] == "SEGGER J-Link Commander"
+    commander_probe.assert_called_once()
+
+
+def test_commander_fallback_can_recover_openocd_access_error(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    commander = tmp_path / "JLink.exe"
+    commander.touch()
+    monkeypatch.setattr(gui_server, "JLINK_EXE", commander)
+    monkeypatch.setattr(gui_server, "_openocd_jlink_available", lambda: True)
+    monkeypatch.setattr(
+        gui_server, "_openocd_target_probe",
+        lambda _serial: (False, "LIBUSB_ERROR_ACCESS"),
+    )
+    commander_probe = Mock(return_value=(True, "10000100 = 00052833"))
+    monkeypatch.setattr(gui_server, "probe_jlink_target", commander_probe)
+    with gui_server.JLINK_TARGET_CACHE_LOCK:
+        gui_server.JLINK_TARGET_CACHE.clear()
+
+    status = gui_server._probe_jlink_target_status("123456", force=True)
+
+    assert status["target_state"] == "reachable"
+    assert status["target_backend"] == "SEGGER J-Link Commander"
+    commander_probe.assert_called_once()
+
+
+def test_openocd_access_error_offers_winusb_when_pnp_binding_is_not_ready(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    helper = tmp_path / "wdi-simple.exe"
+    helper.touch()
+    monkeypatch.setattr(gui_server, "_IS_WIN", True)
+    monkeypatch.setattr(gui_server, "WINUSB_HELPER", helper)
+    monkeypatch.setattr(gui_server, "JLINK_EXE", tmp_path / "missing-jlink")
+    monkeypatch.setattr(gui_server, "_openocd_jlink_available", lambda: True)
+    monkeypatch.setattr(
+        gui_server, "_openocd_target_probe",
+        lambda _serial: (False, "LIBUSB_ERROR_ACCESS"),
+    )
+    monkeypatch.setattr(gui_server, "_jlink_requires_winusb", lambda _serial: True)
+    with gui_server.JLINK_TARGET_CACHE_LOCK:
+        gui_server.JLINK_TARGET_CACHE.clear()
+
+    status = gui_server._probe_jlink_target_status("123456", force=True)
+
+    assert status["target_failure"] == "driver_missing"
+    assert status["driver_action"] == "install_winusb"
+
+
 def test_jlink_probe_timeout_is_not_reported_as_a_target_wiring_fault(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -486,12 +769,18 @@ def test_jlink_pnp_confirmation_uses_the_discovered_vid_pid(monkeypatch) -> None
         "COM11", description="J-Link", manufacturer="SEGGER",
         serial_number="000029734569", vid=0x1366, pid=0x0105,
     )
+    interface = windows_jlink.JLinkUsbInterface(
+        0x1366, 0x0105, 0x02,
+        r"USB\VID_1366&PID_0105&MI_02\7&ABC&0&0002",
+    )
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(gui_server, "_all_serial_port_infos", lambda: [info])
     monkeypatch.setattr(
         gui_server,
-        "repairable_interfaces",
-        lambda vid, pid: calls.append((vid, pid)) or [object()],
+        "jlink_bindings",
+        lambda vid, pid: calls.append((vid, pid)) or [
+            _binding(interface, probe_serial="29734569")
+        ],
     )
 
     assert gui_server._jlink_requires_winusb("29734569") is True
@@ -510,23 +799,21 @@ def test_driver_preparation_refuses_multiple_connected_jlinks(
     monkeypatch.setattr(gui_server, "_IS_WIN", True)
     monkeypatch.setattr(gui_server, "WINUSB_HELPER", helper)
     monkeypatch.setattr(gui_server, "_find_jlink_for_id", lambda _id: selected)
-    monkeypatch.setattr(
-        gui_server,
-        "repairable_interfaces",
-        lambda _vid, _pid: [
-            windows_jlink.JLinkUsbInterface(
-                0x1366, 0x0105, 0x02,
-                r"USB\VID_1366&PID_0105&MI_02\000029734569",
-            ),
-            windows_jlink.JLinkUsbInterface(
-                0x1366, 0x0105, 0x02,
-                r"USB\VID_1366&PID_0105&MI_02\000012345678",
-            ),
-        ],
+    first = windows_jlink.JLinkUsbInterface(
+        0x1366, 0x0105, 0x02,
+        r"USB\VID_1366&PID_0105&MI_02\7&ABC&0&0002",
     )
+    second = windows_jlink.JLinkUsbInterface(
+        0x1366, 0x0105, 0x02,
+        r"USB\VID_1366&PID_0105&MI_02\8&DEF&0&0002",
+    )
+    monkeypatch.setattr(gui_server, "jlink_bindings", lambda _vid, _pid: [
+        _binding(first, probe_serial="29734569"),
+        _binding(second, probe_serial="12345678"),
+    ])
     monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", [])
 
-    with pytest.raises(RuntimeError, match="只保留这一只 J-Link"):
+    with pytest.raises(RuntimeError, match="只保留目标探头"):
         gui_server._prepare_jlink_winusb("jlink:29734569")
 
 
@@ -545,12 +832,14 @@ def test_driver_preparation_reaches_uac_without_reprobing_openocd(
         r"USB\VID_1366&PID_0101\000000123456",
     )
     order: list[str] = []
-    pnp_results = iter(([interface], []))
+    initial = _binding(interface, probe_serial="123456", ready=False)
+    ready = _binding(interface, probe_serial="123456", ready=True)
+    pnp_results = iter(([initial], [], [ready], [ready]))
     monkeypatch.setattr(gui_server, "_IS_WIN", True)
     monkeypatch.setattr(gui_server, "WINUSB_HELPER", helper)
     monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", [device])
     monkeypatch.setattr(
-        gui_server, "repairable_interfaces",
+        gui_server, "jlink_bindings",
         lambda _vid, _pid: order.append("pnp") or next(pnp_results),
     )
     monkeypatch.setattr(
@@ -565,11 +854,125 @@ def test_driver_preparation_reaches_uac_without_reprobing_openocd(
         },
     )
     monkeypatch.setattr(gui_server, "_start_device_discovery", lambda: True)
+    monkeypatch.setattr(gui_server.time, "sleep", lambda _seconds: None)
 
     result = gui_server._prepare_jlink_winusb("jlink:123456")
 
-    assert order == ["pnp", "install", "pnp", "probe"]
+    assert order == ["pnp", "install", "pnp", "pnp", "pnp", "probe"]
     assert result["message"] == "J-Link 已准备并连上 nRF52833"
+
+
+def test_driver_preparation_never_treats_absent_pnp_device_as_ready(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    helper = tmp_path / "wdi-simple.exe"
+    helper.write_bytes(b"helper")
+    device = {
+        "id": "jlink:123456", "kind": "jlink", "probe_serial": "123456",
+        "serial_number": "000000123456", "vid": 0x1366, "pid": 0x0101,
+    }
+    interface = windows_jlink.JLinkUsbInterface(
+        0x1366, 0x0101, None,
+        r"USB\VID_1366&PID_0101\000000123456",
+    )
+    calls = 0
+
+    def bindings(_vid, _pid):
+        nonlocal calls
+        calls += 1
+        return [_binding(interface, probe_serial="123456")] if calls == 1 else []
+
+    monkeypatch.setattr(gui_server, "_IS_WIN", True)
+    monkeypatch.setattr(gui_server, "WINUSB_HELPER", helper)
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CACHE", [device])
+    monkeypatch.setattr(gui_server, "jlink_bindings", bindings)
+    monkeypatch.setattr(
+        gui_server, "install_winusb_driver", lambda *_args, **_kwargs: {},
+    )
+    probe = Mock()
+    monkeypatch.setattr(gui_server, "_probe_jlink_target_status", probe)
+    monkeypatch.setattr(gui_server.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="未确认调试接口稳定恢复"):
+        gui_server._prepare_jlink_winusb("jlink:123456")
+
+    probe.assert_not_called()
+
+
+def test_driver_task_is_idempotent_and_survives_request_completion(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def prepare(device_id: str, **_kwargs) -> dict[str, str]:
+        calls.append(device_id)
+        started.set()
+        assert release.wait(2)
+        return {"message": "ready"}
+
+    app = SimpleNamespace(
+        operation_lock=threading.RLock(),
+        hardware_idle=lambda: True,
+    )
+    monkeypatch.setattr(gui_server, "APP", app)
+    monkeypatch.setattr(gui_server, "JLINK_DRIVER_INSTALL_LOCK", threading.Lock())
+    monkeypatch.setattr(gui_server, "DEVICE_DISCOVERY_CANCEL", threading.Event())
+    monkeypatch.setattr(gui_server, "JLINK_DRIVER_TASK", {
+        "state": "idle", "device_id": "", "message": "", "error": "",
+        "diagnostic_id": "", "started_at": None, "finished_at": None,
+    })
+    monkeypatch.setattr(gui_server, "_prepare_jlink_winusb", prepare)
+    monkeypatch.setattr(gui_server, "_start_device_discovery", Mock(return_value=True))
+
+    first = gui_server._start_jlink_driver_task("jlink:123456")
+    assert first["state"] == "running"
+    assert started.wait(1)
+    second = gui_server._start_jlink_driver_task("jlink:123456")
+    assert second["state"] == "running"
+    assert calls == ["jlink:123456"]
+
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        snapshot = gui_server._jlink_driver_task_snapshot()
+        if snapshot["state"] == "succeeded" and not snapshot["running"]:
+            break
+        time.sleep(0.01)
+
+    assert snapshot["state"] == "succeeded"
+    assert snapshot["message"] == "ready"
+
+
+def test_driver_task_rechecks_shutdown_after_claiming_driver_lock(
+    monkeypatch,
+) -> None:
+    shutdown = threading.Event()
+
+    class RacingLock:
+        held = False
+
+        def acquire(self, blocking=True):
+            del blocking
+            self.held = True
+            shutdown.set()
+            return True
+
+        def release(self):
+            self.held = False
+
+        def locked(self):
+            return self.held
+
+    driver_lock = RacingLock()
+    app = SimpleNamespace(hardware_idle=lambda: True)
+    monkeypatch.setattr(gui_server, "APP", app)
+    monkeypatch.setattr(gui_server, "SHUTDOWN_INTENT", shutdown)
+    monkeypatch.setattr(gui_server, "JLINK_DRIVER_INSTALL_LOCK", driver_lock)
+
+    with pytest.raises(RuntimeError, match="安全退出"):
+        gui_server._start_jlink_driver_task("jlink:123456")
+
+    assert driver_lock.locked() is False
 
 
 def test_empty_device_cache_returns_immediately_and_starts_one_probe(

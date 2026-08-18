@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -84,6 +85,7 @@ class AppUpdateManager:
         package_kind: str | None = None,
         target_path: Path | None = None,
         app_pid: int | None = None,
+        server_port: int | None = None,
         frozen: bool | None = None,
         event_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
@@ -98,6 +100,15 @@ class AppUpdateManager:
         except ValueError:
             detected_pid = 0
         self.app_pid = int(app_pid or detected_pid or 0)
+        raw_server_port = str(os.environ.get("SENSUS_SERVER_PORT", "")).strip()
+        try:
+            detected_server_port = int(raw_server_port) if raw_server_port else 0
+        except ValueError:
+            detected_server_port = 0
+        selected_server_port = int(server_port or detected_server_port or 8765)
+        self.server_port = (
+            selected_server_port if 1 <= selected_server_port <= 65535 else 8765
+        )
         self._event_callback = event_callback
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -415,7 +426,10 @@ class AppUpdateManager:
                 raise AppUpdateError("当前安装位置不可写，无法自动更新")
             helper = self._write_helper()
             log_path = self.root / "update-helper.log"
-            command = self._helper_command(helper, target, staged, log_path)
+            launch_token = secrets.token_hex(24)
+            command = self._helper_command(
+                helper, target, staged, log_path, launch_token,
+            )
             kwargs: dict[str, Any] = {
                 "stdin": subprocess.DEVNULL,
                 "stdout": subprocess.DEVNULL,
@@ -448,11 +462,13 @@ class AppUpdateManager:
         return path
 
     def _helper_command(
-        self, helper: Path, target: Path, staged: Path, log_path: Path
+        self, helper: Path, target: Path, staged: Path, log_path: Path,
+        launch_token: str,
     ) -> list[str]:
         arguments = [
             str(target), str(staged), str(self.app_pid), str(os.getpid()),
-            str(log_path), self._latest_version,
+            str(log_path), self._latest_version, str(self.server_port),
+            launch_token,
         ]
         if self.package_kind == "macos-arm64":
             return ["/bin/zsh", str(helper), *arguments]
@@ -476,6 +492,8 @@ app_pid="$3"
 backend_pid="$4"
 log_path="$5"
 expected_version="$6"
+server_port="$7"
+launch_token="$8"
 exec >>"$log_path" 2>&1
 echo "[$(/bin/date -u +%FT%TZ)] update helper started"
 /bin/sleep 1
@@ -501,10 +519,39 @@ if ! /bin/mv -- "$staged" "$target"; then
 fi
 /usr/bin/xattr -cr "$target" 2>/dev/null || true
 ready=0
-if /usr/bin/open "$target"; then
+expected_project="$(/usr/bin/dirname "$target")/$(/usr/bin/basename "$target")/Contents/Resources/workstation"
+expected_binary="$target/Contents/MacOS/SensUsWorkstation"
+pid_file="${log_path}.launcher-pid"
+/bin/rm -f -- "$pid_file"
+new_app_pid=""
+if /usr/bin/open -n \
+    --env "SENSUS_SERVER_PORT=${server_port}" \
+    --env "SENSUS_LAUNCH_TOKEN=${launch_token}" \
+    --env "SENSUS_LAUNCH_PID_FILE=${pid_file}" "$target"; then
   for _ in {1..360}; do
-    health="$(/usr/bin/curl -fsS --max-time 1 http://127.0.0.1:8765/api/health 2>/dev/null || true)"
-    if echo "$health" | /usr/bin/grep -Eq "\"version\"[[:space:]]*:[[:space:]]*\"${expected_version}\""; then
+    if [[ -z "$new_app_pid" && -f "$pid_file" ]]; then
+      candidate_pid="$(/usr/bin/tr -cd '0-9' < "$pid_file")"
+      if [[ "$candidate_pid" == <-> ]]; then new_app_pid="$candidate_pid"; fi
+    fi
+    health="$(/usr/bin/curl -fsS --max-time 1 "http://127.0.0.1:${server_port}/api/health" 2>/dev/null || true)"
+    health_version="$(echo "$health" | /usr/bin/plutil -extract version raw -o - - 2>/dev/null || true)"
+    health_product="$(echo "$health" | /usr/bin/plutil -extract product raw -o - - 2>/dev/null || true)"
+    health_token="$(echo "$health" | /usr/bin/plutil -extract launch_token raw -o - - 2>/dev/null || true)"
+    health_project="$(echo "$health" | /usr/bin/plutil -extract project raw -o - - 2>/dev/null || true)"
+    health_launcher_pid="$(echo "$health" | /usr/bin/plutil -extract launcher_pid raw -o - - 2>/dev/null || true)"
+    normalized_expected="$(cd "$expected_project" 2>/dev/null && /bin/pwd -P || true)"
+    normalized_project="$(cd "$health_project" 2>/dev/null && /bin/pwd -P || true)"
+    launcher_command=""
+    if [[ "$health_launcher_pid" == <-> ]]; then
+      launcher_command="$(/bin/ps -p "$health_launcher_pid" -o command= 2>/dev/null || true)"
+    fi
+    if [[ "$health_version" == "$expected_version" \
+          && "$health_product" == "SensUs-Electrochem-Workstation" \
+          && "$health_token" == "$launch_token" \
+          && -n "$normalized_expected" \
+          && "$normalized_project" == "$normalized_expected" \
+          && "$health_launcher_pid" == "$new_app_pid" \
+          && "$launcher_command" == "$expected_binary"* ]]; then
       ready=1
       break
     fi
@@ -512,11 +559,15 @@ if /usr/bin/open "$target"; then
   done
 fi
 if [[ "$ready" == "1" ]]; then
+  /bin/rm -f -- "$pid_file"
   /bin/rm -rf -- "$backup"
   echo "update installed"
   exit 0
 fi
-/usr/bin/pkill -TERM -f "$target/Contents/MacOS/SensUsWorkstation" 2>/dev/null || true
+if [[ "$new_app_pid" == <-> ]]; then
+  /bin/kill -TERM "$new_app_pid" 2>/dev/null || true
+fi
+/bin/rm -f -- "$pid_file"
 /bin/sleep 1
 /bin/rm -rf -- "$target"
 /bin/mv -- "$backup" "$target" || true
@@ -532,7 +583,9 @@ _WINDOWS_HELPER = r'''param(
   [Parameter(Mandatory=$true)][int]$AppPid,
   [Parameter(Mandatory=$true)][int]$BackendPid,
   [Parameter(Mandatory=$true)][string]$LogPath,
-  [Parameter(Mandatory=$true)][string]$ExpectedVersion
+  [Parameter(Mandatory=$true)][string]$ExpectedVersion,
+  [Parameter(Mandatory=$true)][int]$ServerPort,
+  [Parameter(Mandatory=$true)][string]$LaunchToken
 )
 $ErrorActionPreference = "Stop"
 Start-Transcript -Path $LogPath -Append | Out-Null
@@ -551,12 +604,25 @@ try {
   Move-Item -LiteralPath $Target -Destination $Backup
   try {
     Move-Item -LiteralPath $Staged -Destination $Target
+    $env:SENSUS_SERVER_PORT = [string]$ServerPort
+    $env:SENSUS_LAUNCH_TOKEN = $LaunchToken
     $NewProcess = Start-Process -FilePath (Join-Path $Target "SensUsBackend.exe") -PassThru
+    $ExpectedProject = [IO.Path]::GetFullPath((Join-Path $Target "workstation"))
     $Ready = $false
     for ($Attempt = 0; $Attempt -lt 180; $Attempt++) {
       try {
-        $Health = Invoke-RestMethod -Uri "http://127.0.0.1:8765/api/health" -TimeoutSec 2
-        if ($Health.version -eq $ExpectedVersion) { $Ready = $true; break }
+        $Health = Invoke-RestMethod -Uri "http://127.0.0.1:$ServerPort/api/health" -TimeoutSec 2
+        $ReportedProject = [IO.Path]::GetFullPath([string]$Health.project)
+        $ProjectMatches = [StringComparer]::OrdinalIgnoreCase.Equals(
+          $ReportedProject, $ExpectedProject
+        )
+        if (
+          $Health.product -eq "SensUs-Electrochem-Workstation" -and
+          $Health.version -eq $ExpectedVersion -and
+          $Health.launch_token -eq $LaunchToken -and
+          [string]$Health.launcher_pid -eq [string]$NewProcess.Id -and
+          $ProjectMatches
+        ) { $Ready = $true; break }
       } catch {}
       Start-Sleep -Seconds 1
     }
@@ -568,6 +634,8 @@ try {
   } catch {
     if (Test-Path -LiteralPath $Target) { Remove-Item -LiteralPath $Target -Recurse -Force }
     Move-Item -LiteralPath $Backup -Destination $Target
+    $env:SENSUS_LAUNCH_TOKEN = ""
+    $env:SENSUS_SERVER_PORT = [string]$ServerPort
     Start-Process -FilePath (Join-Path $Target "SensUsBackend.exe")
     throw
   }

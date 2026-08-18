@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -53,13 +55,31 @@ def linked_libraries(output: str) -> list[str]:
     return libraries
 
 
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def verify(app: Path, minimum_version: str) -> None:
+    openocd_root = app / "Contents/Resources/tools/openocd"
     required = (
         app / "Contents/Resources/backend/SensUsBackend/SensUsBackend",
         app / "Contents/Resources/workstation/PORTABLE_RESOURCES.txt",
         app / "Contents/Resources/tools/openocd/bin/openocd",
+        app / "Contents/Resources/tools/openocd/lib/libusb-1.0.0.dylib",
+        app / "Contents/Resources/tools/openocd/COMPONENTS.json",
+        app / "Contents/Resources/tools/openocd/BINARY_DEPENDENCIES.txt",
+        app / "Contents/Resources/tools/openocd/licenses/OpenOCD-COPYING",
+        app / "Contents/Resources/tools/openocd/licenses/libusb-COPYING",
+        app / "Contents/Resources/tools/openocd/source/openocd-0.12.0.tar.bz2",
+        app / "Contents/Resources/tools/openocd/source/libusb-1.0.29.tar.bz2",
         app / "Contents/Resources/tools/openocd/share/openocd/scripts/interface/jlink.cfg",
         app / "Contents/Resources/tools/openocd/share/openocd/scripts/target/nrf52.cfg",
+        app / "Contents/Resources/THIRD_PARTY_LICENSES/PYTHON_PACKAGES.json",
+        app / "Contents/Resources/THIRD_PARTY_LICENSES/SBOM.spdx.json",
     )
     missing = [str(path) for path in required if not path.exists()]
     if missing:
@@ -67,6 +87,14 @@ def verify(app: Path, minimum_version: str) -> None:
 
     declared = version_tuple(minimum_version)
     failures: list[str] = []
+    openocd_libraries = {
+        path.name for path in (openocd_root / "lib").iterdir() if path.is_file()
+    }
+    if openocd_libraries != {"libusb-1.0.0.dylib"}:
+        failures.append(
+            "OpenOCD must contain only the reviewed libusb runtime; found: "
+            + ", ".join(sorted(openocd_libraries))
+        )
     files = macho_files(app)
     if not files:
         failures.append("bundle contains no Mach-O files")
@@ -92,10 +120,70 @@ def verify(app: Path, minimum_version: str) -> None:
     openocd = required[2]
     try:
         output = command(openocd, "--version")
-        if "Open On-Chip Debugger" not in output:
+        if "Open On-Chip Debugger 0.12.0" not in output:
             failures.append(f"{openocd}: unexpected --version output")
+        adapters = command(
+            openocd, "-c", "echo [adapter list]; shutdown",
+        )
+        adapter_names = re.findall(r"^\s*\d+:\s+(\S+)\s*$", adapters, re.MULTILINE)
+        if adapter_names != ["jlink"]:
+            failures.append(
+                f"{openocd}: expected only the jlink adapter, got {adapter_names}"
+            )
     except subprocess.CalledProcessError as exc:
         failures.append(f"{openocd}: cannot execute: {exc.stderr.strip()}")
+
+    try:
+        component_path = openocd_root / "COMPONENTS.json"
+        manifest = json.loads(component_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != 1:
+            raise ValueError("unexpected component schema")
+        if manifest.get("platform") != "macos-arm64":
+            raise ValueError("unexpected component platform")
+        if manifest.get("minimum_macos") != minimum_version:
+            raise ValueError("component minimum macOS does not match Info.plist")
+        components = {
+            str(item["name"]): item for item in manifest.get("components", [])
+        }
+        expected_components = {
+            "OpenOCD": {
+                "binary": "bin/openocd",
+                "source": "source/openocd-0.12.0.tar.bz2",
+                "license": "licenses/OpenOCD-COPYING",
+            },
+            "libusb": {
+                "binary": "lib/libusb-1.0.0.dylib",
+                "source": "source/libusb-1.0.29.tar.bz2",
+                "license": "licenses/libusb-COPYING",
+            },
+        }
+        if set(components) != set(expected_components):
+            raise ValueError(f"unexpected component set: {sorted(components)}")
+        for name, expected_paths in expected_components.items():
+            component = components[name]
+            for field in ("binary", "source"):
+                if component.get(field) != expected_paths[field]:
+                    raise ValueError(f"{name} has unexpected {field} path")
+            binary = openocd_root / expected_paths["binary"]
+            source = openocd_root / expected_paths["source"]
+            license_path = openocd_root / expected_paths["license"]
+            if not license_path.is_file():
+                raise ValueError(f"{name} license file is missing")
+            expected = str(component["binary_sha256"])
+            actual = sha256(binary)
+            if actual != expected:
+                failures.append(
+                    f"{binary}: component hash mismatch {actual} != {expected}"
+                )
+            expected_source = str(component["source_sha256"])
+            actual_source = sha256(source)
+            if actual_source != expected_source:
+                failures.append(
+                    f"{source}: source hash mismatch "
+                    f"{actual_source} != {expected_source}"
+                )
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        failures.append(f"OpenOCD component manifest is invalid: {exc}")
 
     if failures:
         raise SystemExit("macOS portable compatibility check failed:\n" + "\n".join(failures))

@@ -7,6 +7,7 @@ import runpy
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -44,10 +45,14 @@ def test_portable_builds_pin_python_and_enforce_macos_compatibility() -> None:
         encoding="utf-8"
     )
 
-    assert 'SENSUS_PORTABLE_PYTHON_MINOR:-3.12' in macos_build
-    assert "Portable Windows builds require Python 3.12" in windows_build
+    assert 'SENSUS_PORTABLE_PYTHON_VERSION:-3.12.13' in macos_build
+    assert "Portable Windows builds require Python $RequiredPythonVersion" in windows_build
     assert "verify_macos_bundle.py" in macos_build
-    assert "OpenOCD is required for a self-contained J-Link package" in macos_build
+    assert "bundle_macos_openocd.sh" in macos_build
+    assert "portable-macos.lock" in macos_build
+    assert "portable-windows.lock" in windows_build
+    assert "--require-hashes" in macos_build
+    assert "--require-hashes" in windows_build
     for command_name in ('"lipo"', '"vtool"', '"otool"'):
         assert command_name in verifier
 
@@ -113,7 +118,7 @@ def test_windows_portable_builds_and_bundles_pinned_winusb_helper() -> None:
     assert '"pa_host.windows_jlink"' in spec
 
 
-def test_portable_release_builds_only_windows_by_default() -> None:
+def test_tag_release_builds_both_platforms_and_only_final_assets() -> None:
     root = Path(__file__).parents[3]
     workflow = (root / ".github" / "workflows" / "portable-release.yml").read_text(
         encoding="utf-8"
@@ -121,10 +126,61 @@ def test_portable_release_builds_only_windows_by_default() -> None:
 
     assert "build_macos:" in workflow
     assert "default: false" in workflow
-    assert (
-        "if: github.event_name == 'workflow_dispatch' "
-        "&& inputs.build_macos == true"
-    ) in workflow
+    assert "if: github.event_name == 'push' || inputs.build_macos == true" in workflow
+    assert "needs: [release-metadata, macos-arm64, windows-x64]" in workflow
+    assert "Validate tag against package version" in workflow
+    assert '"$GITHUB_REF_NAME" != "v$VERSION"' in workflow
+    assert "Create Chinese draft release" in workflow
+    assert "SensUs-Workstation-macOS-arm64-*.dmg" in workflow
+    assert "SensUs-Workstation-Windows-x64-*.zip" in workflow
+    assert "artifacts/releases/**/*.zip" not in workflow
+    assert "Smoke test frozen macOS backend" in workflow
+    assert "Smoke test frozen Windows backend" in workflow
+    assert "echo [adapter list]" in workflow
+    assert "Expand-Archive" in workflow
+    assert "hdiutil verify" in workflow
+
+
+def test_macos_package_carries_notices_and_supports_real_signing() -> None:
+    root = Path(__file__).parents[3]
+    build = (root / "packaging" / "build_macos_portable.sh").read_text(
+        encoding="utf-8"
+    )
+    dmg = (root / "packaging" / "create_dmg.sh").read_text(encoding="utf-8")
+
+    assert "THIRD_PARTY_NOTICES.txt" in build
+    assert "THIRD_PARTY_NOTICES.txt" in dmg
+    assert "SENSUS_MACOS_SIGN_IDENTITY" in build
+    assert "--options runtime --timestamp" in build
+    assert "SENSUS_NOTARY_PROFILE" in dmg
+    assert "notarytool submit" in dmg
+
+
+def test_bundled_openocd_carries_exact_corresponding_source() -> None:
+    root = Path(__file__).parents[3]
+    macos = (root / "packaging" / "bundle_macos_openocd.sh").read_text(
+        encoding="utf-8"
+    )
+    windows_build = (root / "packaging" / "build_windows_openocd.sh").read_text(
+        encoding="utf-8"
+    )
+    windows_bundle = (root / "packaging" / "bundle_windows_openocd.ps1").read_text(
+        encoding="utf-8"
+    )
+    notices = (root / "packaging" / "THIRD_PARTY_NOTICES.txt").read_text(
+        encoding="utf-8"
+    )
+    source_sha = "af254788be98861f2bd9103fe6e60a774ec96a8c374744eef9197f6043075afa"
+
+    assert source_sha in macos
+    assert source_sha in windows_build
+    assert "openocd-0.12.0.tar.bz2" in macos
+    assert 'OPENOCD_ASSET="openocd-$OPENOCD_VERSION.tar.bz2"' in windows_build
+    assert "source_sha256" in windows_bundle
+    assert "libusb-1.0.dll" in windows_bundle
+    assert "complete corresponding OpenOCD and libusb source archives" in (
+        notices.replace("\n", " ")
+    )
 
 
 def test_windows_first_launch_allows_defender_cold_start() -> None:
@@ -134,6 +190,132 @@ def test_windows_first_launch_allows_defender_cold_start() -> None:
     )
 
     assert entry["WINDOWS_COLD_START_TIMEOUT_S"] >= 120
+    assert entry["WINDOWS_SHUTDOWN_TIMEOUT_S"] >= 330
+    assert entry["WINDOWS_MUTEX_NAME"].startswith("Local\\")
+
+
+def test_windows_launcher_safely_replaces_confirmed_legacy_backend(
+    monkeypatch,
+) -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+    checks = iter((False, True))
+    shutdowns: list[str] = []
+    resolve = entry["_resolve_windows_start_port"]
+    globals_ = resolve.__globals__
+    monkeypatch.setitem(globals_, "_port_is_available", lambda _port: next(checks))
+    monkeypatch.setitem(globals_, "_sensus_health", lambda _port: {
+        "ok": True, "project": "legacy", "version": "0.4.9",
+        "diagnostic_session": "legacy-session",
+    })
+    monkeypatch.setitem(globals_, "_existing_sensus_is_idle", lambda *_args: True)
+    monkeypatch.setitem(globals_, "_windows_confirm", lambda *_args: True)
+    monkeypatch.setitem(
+        globals_, "_request_shutdown_once", lambda url: shutdowns.append(url),
+    )
+
+    assert resolve(8765) == 8765
+    assert shutdowns == ["http://127.0.0.1:8765/"]
+
+
+def test_windows_launcher_does_not_stop_legacy_backend_without_confirmation(
+    monkeypatch,
+) -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+    resolve = entry["_resolve_windows_start_port"]
+    globals_ = resolve.__globals__
+    monkeypatch.setitem(globals_, "_port_is_available", lambda _port: False)
+    monkeypatch.setitem(globals_, "_sensus_health", lambda _port: {
+        "ok": True, "project": "legacy", "version": "0.4.9",
+        "diagnostic_session": "legacy-session",
+    })
+    monkeypatch.setitem(globals_, "_existing_sensus_is_idle", lambda *_args: True)
+    monkeypatch.setitem(globals_, "_windows_confirm", lambda *_args: False)
+
+    with pytest.raises(RuntimeError, match="打开原界面"):
+        resolve(8765)
+
+
+@pytest.mark.parametrize("idle,detail", [(False, "正在测量"), (None, "无法确认")])
+def test_windows_launcher_never_stops_busy_or_unknown_sensus_backend(
+    monkeypatch, idle: bool | None, detail: str,
+) -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+    resolve = entry["_resolve_windows_start_port"]
+    globals_ = resolve.__globals__
+    monkeypatch.setitem(globals_, "_port_is_available", lambda _port: False)
+    monkeypatch.setitem(globals_, "_sensus_health", lambda _port: {
+        "ok": True, "project": "legacy", "version": "0.4.9",
+        "diagnostic_session": "legacy-session",
+    })
+    monkeypatch.setitem(globals_, "_existing_sensus_is_idle", lambda *_args: idle)
+    confirm = Mock()
+    shutdown = Mock()
+    monkeypatch.setitem(globals_, "_windows_confirm", confirm)
+    monkeypatch.setitem(globals_, "_request_shutdown_once", shutdown)
+
+    with pytest.raises(RuntimeError, match=detail):
+        resolve(8765)
+
+    confirm.assert_not_called()
+    shutdown.assert_not_called()
+
+
+def test_windows_launcher_recognises_real_v049_health_shape(monkeypatch) -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+    health = entry["_sensus_health"]
+    monkeypatch.setitem(health.__globals__, "_read_local_json", lambda *_args: {
+        "ok": True,
+        "project": r"C:\\old\\workstation",
+        "version": "0.4.9",
+        "diagnostic_session": "20260818-old",
+    })
+
+    assert health(8765) is not None
+
+
+def test_update_launch_never_moves_off_its_authenticated_port(
+    monkeypatch,
+) -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+    resolve = entry["_resolve_windows_start_port"]
+    globals_ = resolve.__globals__
+    monkeypatch.setenv("SENSUS_LAUNCH_TOKEN", "a" * 48)
+    monkeypatch.setitem(globals_, "_port_is_available", lambda _port: False)
+    monkeypatch.setitem(globals_, "_sensus_health", lambda _port: None)
+
+    with pytest.raises(RuntimeError, match="更新指定"):
+        resolve(54321)
+
+
+def test_windows_launcher_uses_dynamic_port_for_unrelated_local_service(
+    monkeypatch,
+) -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+    resolve = entry["_resolve_windows_start_port"]
+    globals_ = resolve.__globals__
+    monkeypatch.setitem(globals_, "_port_is_available", lambda _port: False)
+    monkeypatch.setitem(globals_, "_sensus_health", lambda _port: None)
+    monkeypatch.setitem(globals_, "_available_port", lambda preferred: 54321)
+
+    assert resolve(8765) == 54321
 
 
 def test_portable_launchers_expose_their_installed_location_to_app_updates() -> None:
@@ -172,15 +354,46 @@ def test_windows_background_tools_never_create_console_windows(monkeypatch) -> N
     assert 'getattr(subprocess, "CREATE_NO_WINDOW", 0)' in portable_entry
 
 
-def test_macos_openocd_bundler_reuses_already_relocated_libraries() -> None:
+def test_macos_openocd_bundler_builds_only_the_reviewed_native_dependency() -> None:
     root = Path(__file__).parents[3]
     bundler = (root / "packaging" / "bundle_macos_openocd.sh").read_text(
         encoding="utf-8"
     )
 
-    assert "@executable_path/../lib/*|@loader_path/*" in bundler
-    assert 'source_lib_dir="$prefix/lib"' in bundler
-    assert 'source_dependency="$source_lib_dir/${dependency:t}"' in bundler
+    assert "--enable-jlink" in bundler
+    assert "--without-capstone" in bundler
+    assert "dummy rshim ftdi stlink" in bundler
+    assert 'configure_flags+=("--disable-$adapter")' in bundler
+    assert "--disable-hidapi" not in bundler
+    assert "libusb-1.0.0.dylib" in bundler
+    assert "Homebrew" not in bundler
+    assert "@executable_path/../lib/libusb-1.0.0.dylib" in bundler
+
+
+def test_python_runtime_license_collection_has_audited_fallbacks() -> None:
+    root = Path(__file__).parents[3]
+    collector = runpy.run_path(str(root / "packaging" / "collect_python_licenses.py"))
+
+    supplement = collector["supplemental_license"]("pyserial", "3.5")
+    assert supplement is not None
+    assert supplement["source_sha256"] == (
+        "3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb"
+    )
+    assert Path(supplement["path"]).read_text(encoding="utf-8").startswith(
+        "Copyright (c) 2001-2020 Chris Liechti"
+    )
+    assert collector["metadata_license_text"]({"License": "MIT"}) is None
+
+
+def test_macos_openocd_bundler_resigns_before_executing_rewritten_binary() -> None:
+    root = Path(__file__).parents[3]
+    bundler = (root / "packaging" / "bundle_macos_openocd.sh").read_text(
+        encoding="utf-8"
+    )
+
+    resign = 'codesign --force --sign - "$DEST/bin/openocd"'
+    smoke_test = 'version_output="$("$DEST/bin/openocd" --version 2>&1)"'
+    assert bundler.index(resign) < bundler.index(smoke_test)
 
 
 def test_macos_bundle_verifier_ignores_otool_header_path() -> None:
@@ -234,6 +447,32 @@ def test_windows_portable_falls_back_to_system_browser(monkeypatch) -> None:
     fallback = entry["_fallback_to_system_browser"]
     assert fallback("http://127.0.0.1:8765/", Child(), RuntimeError("WebView2")) == 17
     assert opened == ["http://127.0.0.1:8765/"]
+
+
+def test_windows_browser_fallback_waits_for_web_exit_after_message(
+    monkeypatch,
+) -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+    fallback = entry["_fallback_to_system_browser"]
+    globals_ = fallback.__globals__
+    waited: list[bool] = []
+    messages: list[str] = []
+
+    class Child:
+        def wait(self) -> int:
+            waited.append(True)
+            return 23
+
+    monkeypatch.setattr(globals_["sys"], "platform", "win32")
+    monkeypatch.setitem(globals_, "_windows_message", lambda _title, body: messages.append(body))
+    monkeypatch.setattr(globals_["webbrowser"], "open", lambda _url: True)
+
+    assert fallback("http://127.0.0.1:54321/", Child()) == 23
+    assert waited == [True]
+    assert "右上角" in messages[0]
 
 
 def test_prebuilt_firmware_selection(tmp_path: Path, monkeypatch) -> None:

@@ -1,5 +1,6 @@
 from argparse import Namespace
 from pathlib import Path
+import subprocess
 from unittest.mock import Mock, patch
 
 import pytest
@@ -184,6 +185,7 @@ def test_source_usb_upgrade_pins_upload_to_selected_smp(
     monkeypatch.setattr(gui_server, "DIAGNOSTICS", Mock())
     ready = Mock()
     monkeypatch.setattr(gui_server, "_wait_for_usb_transport_ready", ready)
+    monkeypatch.setattr(gui_server, "_usb_physical_snapshot_for_port", lambda _port: {})
     monkeypatch.setattr(
         gui_server.subprocess, "run", Mock(side_effect=[reset, upgraded]),
     )
@@ -224,6 +226,114 @@ def test_usb_upgrade_wait_reports_last_transport_error(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="应用 DATA CDC 未恢复.*无响应"):
         gui_server._wait_for_usb_transport_ready(timeout_s=0.5)
+
+
+def test_bootloader_smp_wait_follows_windows_com_renumbering(monkeypatch) -> None:
+    from serial.tools import list_ports
+
+    old = _PortInfo("COM9")
+    new = _PortInfo("COM12")
+    new.product = "MCUboot SMP"
+    snapshots = iter(([old], [], [new], [new]))
+    monkeypatch.setattr(
+        list_ports, "comports", lambda: next(snapshots, [new]),
+    )
+    monkeypatch.setattr(gui_server.time, "sleep", lambda _seconds: None)
+
+    port = gui_server._wait_for_bootloader_smp_port(
+        "COM9",
+        {"serial_number": "board", "location": "1-1", "ports": ["COM9"]},
+        timeout_s=2,
+    )
+
+    assert port == "COM12"
+
+
+def test_bootloader_wait_does_not_reuse_lingering_application_smp(
+    monkeypatch,
+) -> None:
+    from serial.tools import list_ports
+
+    old_smp = _PortInfo("COM9")
+    new_smp = _PortInfo("COM12")
+    new_smp.product = "MCUboot SMP"
+    snapshots = iter(([old_smp], [old_smp], [new_smp], [new_smp]))
+    monkeypatch.setattr(
+        list_ports, "comports", lambda: next(snapshots, [new_smp]),
+    )
+    monkeypatch.setattr(gui_server.time, "sleep", lambda _seconds: None)
+
+    port = gui_server._wait_for_bootloader_smp_port(
+        "COM9",
+        {
+            "serial_number": "board", "location": "1-1",
+            "ports": ["COM8", "COM9"],
+        },
+        timeout_s=2,
+    )
+
+    assert port == "COM12"
+
+
+def test_bootloader_wait_uses_location_when_clone_serials_match(
+    monkeypatch,
+) -> None:
+    from serial.tools import list_ports
+
+    old_smp = _PortInfo("COM9")
+    old_smp.serial_number = "cloned-board"
+    old_smp.location = "1-1"
+    other_board = _PortInfo("COM10")
+    other_board.serial_number = "cloned-board"
+    other_board.location = "1-2"
+    new_smp = _PortInfo("COM12")
+    new_smp.serial_number = "cloned-board"
+    new_smp.location = "1-1"
+    new_smp.product = "MCUboot SMP"
+    snapshots = iter((
+        [old_smp, other_board],
+        [other_board],
+        [other_board, new_smp],
+        [other_board, new_smp],
+    ))
+    monkeypatch.setattr(
+        list_ports, "comports", lambda: next(snapshots, [other_board, new_smp]),
+    )
+    monkeypatch.setattr(gui_server.time, "sleep", lambda _seconds: None)
+
+    port = gui_server._wait_for_bootloader_smp_port(
+        "COM9",
+        {
+            "serial_number": "cloned-board",
+            "location": "1-1",
+            "ports": ["COM9"],
+        },
+        timeout_s=2,
+    )
+
+    assert port == "COM12"
+
+
+def test_linux_interface_suffixes_still_group_one_usb_board() -> None:
+    data = _PortInfo("/dev/ttyACM0")
+    smp = _PortInfo("/dev/ttyACM1")
+    data.serial_number = smp.serial_number = ""
+    data.location = "1-1:1.0"
+    smp.location = "1-1:1.1"
+
+    assert gui_server._same_usb_device(data, smp) is True
+    assert gui_server._usb_identity(data) == gui_server._usb_identity(smp)
+
+
+def test_usb_interfaces_without_shared_identity_are_never_auto_paired() -> None:
+    first = _PortInfo("/dev/ttyACM0")
+    second = _PortInfo("/dev/ttyACM1")
+    first.serial_number = "board-a"
+    first.location = ""
+    second.serial_number = ""
+    second.location = ""
+
+    assert gui_server._same_usb_device(first, second) is False
 
 
 def test_usb_display_name_falls_back_to_short_data_port() -> None:
@@ -298,7 +408,7 @@ def test_auto_transport_refreshes_after_usb_is_inserted(monkeypatch) -> None:
     monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
     monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "")
     monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "")
-    monkeypatch.setattr(gui_server, "_discover_devices", lambda *, probe=True: [])
+    monkeypatch.setattr(gui_server, "_discover_devices", lambda **_kwargs: [])
     monkeypatch.setattr(
         gui_server,
         "_discover_serial_data_port",
@@ -320,7 +430,7 @@ def test_auto_transport_refreshes_after_usb_is_inserted(monkeypatch) -> None:
 def test_auto_transport_rejects_multiple_usable_devices(monkeypatch) -> None:
     monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT", "rtt")
     monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
-    monkeypatch.setattr(gui_server, "_discover_devices", lambda *, probe=True: [
+    monkeypatch.setattr(gui_server, "_discover_devices", lambda **_kwargs: [
         {"id": "jlink:1", "kind": "jlink", "selectable": True,
          "probe_serial": "1", "name": "J-Link 1"},
         {"id": "usb:2", "kind": "usb", "selectable": True,
@@ -337,7 +447,7 @@ def test_refresh_rejects_a_stale_serial_path_after_usb_reenumeration(monkeypatch
     monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT_REQUESTED", "auto")
     monkeypatch.setattr(gui_server, "SERIAL_DATA_PORT", "/dev/cu.usbmodem1103")
     monkeypatch.setattr(gui_server, "SERIAL_SMP_PORT", "/dev/cu.usbmodem1101")
-    monkeypatch.setattr(gui_server, "_discover_devices", lambda *, probe=True: [])
+    monkeypatch.setattr(gui_server, "_discover_devices", lambda **_kwargs: [])
     monkeypatch.setattr(
         gui_server, "_discover_serial_data_port",
         lambda *, force=False: None,
@@ -384,6 +494,56 @@ def test_process_tail_omits_openocd_shutdown_banner() -> None:
     assert gui_server._meaningful_process_tail(
         "Error: no J-Link found\nshutdown command invoked\n"
     ) == ["Error: no J-Link found"]
+
+
+def test_bounded_openocd_probe_requests_shutdown_before_termination(
+    monkeypatch,
+) -> None:
+    sent: list[bytes] = []
+
+    class Control:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def sendall(self, payload: bytes) -> None:
+            sent.append(payload)
+
+    class Process:
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.communications = 0
+            self.terminated = False
+            self.killed = False
+
+        def communicate(self, timeout=None):
+            self.communications += 1
+            if self.communications == 1:
+                raise subprocess.TimeoutExpired("openocd", timeout)
+            return ("stopped", "")
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = Process()
+    monkeypatch.setattr(gui_server, "_free_local_tcp_port", lambda: 19099)
+    monkeypatch.setattr(gui_server.subprocess, "Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(
+        gui_server.socket, "create_connection", lambda *_a, **_k: Control(),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        gui_server._run_openocd_bounded(["openocd", "-c", "init"], timeout_s=1)
+
+    assert sent == [b"shutdown\n"]
+    assert process.terminated is False
+    assert process.killed is False
 
 
 def test_it_tool_serial_mode_does_not_start_jlink() -> None:

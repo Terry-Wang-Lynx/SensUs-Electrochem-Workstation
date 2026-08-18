@@ -8,7 +8,7 @@ const state = {
   refreshing: false,
   measurementAction: null
 };
-const MEASUREMENT_START_TIMEOUT_MS = 45000;
+const MEASUREMENT_START_TIMEOUT_MS = 180000;
 
 async function api(path, options = {}) {
   const {timeoutMs = 5000, ...fetchOptions} = options;

@@ -66,7 +66,12 @@ async function api(path, options = {}) {
     return data;
   } catch (error) {
     let surfaced=error;
-    if(error?.name==='AbortError')surfaced=new Error('请求超时，设备正在重新连接');
+    if(error?.name==='AbortError'){
+      surfaced=new Error('请求超时，设备正在重新连接');
+      surfaced.resultUncertain=true;
+    }else if(!error?.httpStatus){
+      surfaced.resultUncertain=true;
+    }
     if(!surfaced?.diagnosticId&&path!=='/api/diagnostics/client')reportClientIssue('request_failed',surfaced,{path,method:fetchOptions.method||'GET',timeout_ms:timeoutMs});
     throw surfaced;
   } finally {
@@ -75,7 +80,7 @@ async function api(path, options = {}) {
 }
 function post(path, body = {}) { return api(path, {method: 'POST', body: JSON.stringify(body)}); }
 const SETTINGS_APPLY_TIMEOUT_MS = 900000;
-const MEASUREMENT_START_TIMEOUT_MS = 45000;
+const MEASUREMENT_START_TIMEOUT_MS = 180000;
 const WORKSPACE_BROWSE_TIMEOUT_MS = 125000;
 const nativeWorkspaceBrowseRequests = new Map();
 
@@ -450,7 +455,7 @@ function hardwareOperationStatus(){
   }
   if(active.kind==='jlink'){
     if(active.target_state==='reachable')return {ready:true,message:''};
-    if(active.driver_state==='missing')return {ready:false,message:'请先在“选择设备”中准备 J-Link Windows 驱动'};
+    if(active.driver_state==='missing')return {ready:false,message:'请点击右上角“选择设备”，再点击该 J-Link 的“准备 J-Link”'};
     return {ready:false,message:active.target_state==='unreachable'?String(active.target_detail||'目标板无响应，请检查板卡供电和 SWD 排线'):'正在核对 J-Link 目标板'};
   }
   return active.selectable
@@ -1077,13 +1082,15 @@ function renderHardwareConnection(data=state.measurement){
   }else if(activeDevice?.kind==='jlink'){
     const targetState=String((payload.probing&&activeDevice.target_state==='unknown')?'checking':(activeDevice.target_state||'unknown'));
     if(activeDevice.driver_state==='missing'){
-      dotClass='error';title='J-Link 驱动待准备';detail=String(activeDevice.driver_message||'请打开“选择设备”准备 Windows 驱动');
+      const guidance='请点击右上角“选择设备”，再点击该 J-Link 的“准备 J-Link”';
+      const driverMessage=String(activeDevice.driver_message||'').trim();
+      dotClass='error';title='J-Link 驱动待准备';detail=driverMessage.includes('右上角')?driverMessage:`${driverMessage?`${driverMessage}；`:''}${guidance}`;
     }else if(targetState==='reachable'){
       dotClass='ok';title='目标板已连接';detail=String(activeDevice.name||'J-Link');
     }else if(targetState==='checking'){
       dotClass='probing';title='正在核对目标板';detail=String(activeDevice.name||'J-Link 探头已连接');
     }else if(targetState==='unreachable'){
-      dotClass='error';title=activeDevice.target_failure==='probe_communication'?'J-Link 通信异常':'目标板无响应';detail=String(activeDevice.target_detail||'请检查板卡供电和 SWD 排线');
+      dotClass='error';title=activeDevice.target_failure==='probe_busy'?'J-Link 被其他软件占用':activeDevice.target_failure==='probe_communication'?'J-Link 通信异常':'目标板无响应';detail=String(activeDevice.target_detail||'请检查板卡供电和 SWD 排线');
     }else{
       dotClass='warning';title='J-Link 探头已连接';detail=String(activeDevice.target_detail||'目标板连接尚未确认');
     }
@@ -1158,18 +1165,23 @@ $('exitApp').addEventListener('click',async()=>{
   const activeMeasurement=state.measurement?.state==='running';
   const activeSchedule=Boolean(state.schedule?.active);
   if((activeMeasurement||activeSchedule)&&!confirm('当前仍有硬件任务，退出会先停止任务并关闭后端。确定退出吗？'))return;
-  state.exiting=true;
   const button=$('exitApp');
   button.disabled=true;button.textContent='退出中…';
-  let acknowledged=false;
-  try{await post('/api/shutdown');acknowledged=true}catch{}
+  try{
+    await api('/api/shutdown',{method:'POST',body:'{}',timeoutMs:900000});
+  }catch(e){
+    button.disabled=false;button.textContent='退出';
+    showGlobalError('暂时无法安全退出',e);
+    return;
+  }
+  state.exiting=true;
   const nativeApp=window.webkit?.messageHandlers?.sensusApp;
   if(nativeApp){nativeApp.postMessage('quit');return}
   try{window.open('','_self');window.close()}catch{}
   setTimeout(()=>{
     if(window.closed)return;
     button.disabled=false;
-    button.textContent=acknowledged?'后端已退出，请关闭标签页':'后端未响应，请检查运行进程';
+    button.textContent='后端已退出，请关闭标签页';
   },350);
 });
 function renderAppUpdate(data){
@@ -1212,7 +1224,7 @@ $('appUpdate').onclick=async()=>{
 function deviceCardDetail(device){
   if(device.kind==='jlink'){
     if(device.driver_state==='missing')return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探针 SN ${device.probe_serial}`:''} · Windows 驱动待准备`;
-    const stateText=device.target_state==='reachable'?'目标板已响应':device.target_failure==='probe_communication'?'探头 USB 通信超时':device.target_state==='unreachable'?'目标板无响应':state.devices.probing?'正在核对目标板':'目标板尚未核对';
+    const stateText=device.target_state==='reachable'?'目标板已响应':device.target_failure==='probe_busy'?'被其他调试软件占用':device.target_failure==='probe_communication'?'探头 USB 通信超时':device.target_state==='unreachable'?'目标板无响应':state.devices.probing?'正在核对目标板':'目标板尚未核对';
     return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探头 SN ${device.probe_serial}`:''} · ${stateText}`;
   }
   const ports=[device.data_port&&`DATA ${device.data_port}`,device.smp_port&&`SMP ${device.smp_port}`].filter(Boolean);
@@ -1222,7 +1234,9 @@ function deviceCardDetail(device){
 function renderDeviceList(payload=state.devices){
   state.devices=payload||{devices:[],selected_device_id:null,busy:false,probing:false};
   const devices=Array.isArray(state.devices.devices)?state.devices.devices:[];
-  const driverPreparing=Boolean(state.jlinkDriverPreparePending||state.devices.driver_preparing);
+  const driverTask=state.devices.driver_task||{};
+  const driverPreparing=Boolean(state.jlinkDriverPreparePending||state.devices.driver_preparing||driverTask.state==='running');
+  const driverError=driverTask.state==='error'?String(driverTask.error||'J-Link 驱动准备失败'):'';
   const selected=state.devices.selected_device_id;
   const list=$('deviceList'); list.replaceChildren();
   const auto=document.createElement('article'); auto.className=`device-card ${selected?'':'selected'}`;
@@ -1247,10 +1261,10 @@ function renderDeviceList(payload=state.devices){
   const count=devices.length?`${devices.length} 个设备`:'未发现设备';
   $('deviceDialogSummary').textContent=driverPreparing?`${count} · 正在准备 J-Link Windows 驱动`:state.devices.busy?`${count} · 硬件操作进行中，暂不能切换`:`${count} · 选择后会锁定该设备`;
   const discoveryError=String(state.devices.error||'');
-  $('deviceDialogBusy').classList.toggle('error',!driverPreparing&&(Boolean(state.devices.busy)||Boolean(discoveryError)));
+  $('deviceDialogBusy').classList.toggle('error',!driverPreparing&&(Boolean(state.devices.busy)||Boolean(discoveryError)||Boolean(driverError)));
   $('deviceDialogBusy').classList.toggle('progress',driverPreparing);
-  $('deviceDialogBusy').hidden=!driverPreparing&&!state.devices.busy&&!discoveryError;
-  $('deviceDialogBusy').textContent=driverPreparing?'请确认 Windows 管理员权限提示；驱动安装及设备恢复会自动完成':state.devices.busy?'硬件操作期间不能切换设备':discoveryError?`设备探测失败：${discoveryError}`:'';
+  $('deviceDialogBusy').hidden=!driverPreparing&&!state.devices.busy&&!discoveryError&&!driverError;
+  $('deviceDialogBusy').textContent=driverPreparing?String(driverTask.message||'正在准备 J-Link Windows 驱动，请按界面提示操作'):driverError?`${driverError}${driverTask.diagnostic_id?`（诊断 ${driverTask.diagnostic_id}）`:''}`:state.devices.busy?'硬件操作期间不能切换设备':discoveryError?`设备探测失败：${discoveryError}`:'';
   renderHardwareConnection();updateStartState();updateScheduleStartState();if(state.settings)updateSettingsApplyState();
 }
 async function refreshDevices(open=false){
@@ -1276,7 +1290,7 @@ async function refreshDevices(open=false){
 async function chooseDevice(deviceId){
   const buttons=$('deviceList').querySelectorAll('button');buttons.forEach(button=>{button.disabled=true});
   try{
-    const data=await post('/api/devices/select',{device_id:deviceId});
+    const data=await api('/api/devices/select',{method:'POST',body:JSON.stringify({device_id:deviceId}),timeoutMs:20000});
     renderDeviceList(data); await refreshMeasurement();
     const dialog=$('deviceDialog');if(typeof dialog.close==='function')dialog.close();else dialog.removeAttribute('open');
     toast(data.message||'设备选择已更新');
@@ -1286,10 +1300,20 @@ async function prepareJlinkDriver(deviceId){
   if(state.jlinkDriverPreparePending)return;
   state.jlinkDriverPreparePending=true;
   const buttons=$('deviceList').querySelectorAll('button');buttons.forEach(button=>{button.disabled=true});
-  $('deviceDialogBusy').hidden=false;$('deviceDialogBusy').classList.remove('error');$('deviceDialogBusy').classList.add('progress');$('deviceDialogBusy').textContent='请确认 Windows 弹出的管理员权限提示，完成后会自动重新检测';
+  $('deviceDialogBusy').hidden=false;$('deviceDialogBusy').classList.remove('error');$('deviceDialogBusy').classList.add('progress');$('deviceDialogBusy').textContent='正在等待后台设备核对结束';
   try{
-    const data=await api('/api/devices/jlink-driver/install',{method:'POST',body:JSON.stringify({device_id:deviceId}),timeoutMs:210000});
-    renderDeviceList(data);toast(data.message||'J-Link Windows 驱动已准备');await refreshMeasurement();
+    let task=await api('/api/devices/jlink-driver/install',{method:'POST',body:JSON.stringify({device_id:deviceId}),timeoutMs:8000});
+    for(let attempt=0;attempt<600&&(task.state==='running'||task.running);attempt++){
+      await new Promise(resolve=>setTimeout(resolve,800));
+      task=await api('/api/devices/jlink-driver/status',{timeoutMs:5000});
+    }
+    if(task.state==='error'){
+      const error=new Error(task.error||'J-Link 驱动准备失败');
+      error.diagnosticId=task.diagnostic_id||'';
+      throw error;
+    }
+    if(task.state!=='succeeded')throw new Error('J-Link 驱动准备仍在后台运行，请稍后刷新设备列表');
+    await refreshDevices(false);toast(task.message||'J-Link Windows 驱动已准备');await refreshMeasurement();
   }catch(e){$('deviceDialogBusy').classList.remove('progress');$('deviceDialogBusy').classList.add('error');$('deviceDialogBusy').textContent=diagnosticMessage(e)}
   finally{state.jlinkDriverPreparePending=false;void refreshDevices(false)}
 }
@@ -1310,10 +1334,29 @@ $('startMeasure').addEventListener('click',async()=>{
   const issue=measurementInputIssue();
   if(issue){const input=$(issue.field);input.setAttribute('aria-invalid','true');input.focus();errorBox('measureError',issue.message);return}
   state.measurementStartPending=true;updateStartState();
+  const startRequestId=globalThis.crypto?.randomUUID?.()||`measure-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   try{
-    const payload={sample_name:$('sampleName').value,known_concentration_um:concentrationValue(),sample_role:state.sampleRole,source:'manual_gui'};
+    const payload={sample_name:$('sampleName').value,known_concentration_um:concentrationValue(),sample_role:state.sampleRole,source:'manual_gui',start_request_id:startRequestId};
     updateMeasurement(await api('/api/measurement/start',{method:'POST',body:JSON.stringify(payload),timeoutMs:MEASUREMENT_START_TIMEOUT_MS}));
-  }catch(e){errorBox('measureError',e)}finally{state.measurementStartPending=false;updateStartState()}
+  }catch(e){
+    if(!e?.resultUncertain){errorBox('measureError',e)}
+    else{
+      $('measureMessage').textContent='启动请求仍在后台处理，正在确认硬件状态…';
+      try{
+        const deadline=Date.now()+MEASUREMENT_START_TIMEOUT_MS;
+        let resolved=false;
+        while(Date.now()<deadline){
+          const snapshot=await api('/api/status',{timeoutMs:3000});
+          updateMeasurement(snapshot);
+          const sameRequest=String(snapshot.metadata?.start_request_id||'')===startRequestId;
+          if(snapshot.state==='running'&&(sameRequest||!snapshot.metadata?.start_request_id)){resolved=true;break}
+          if(snapshot.state==='error'&&sameRequest)throw new Error(snapshot.error||'测量启动失败');
+          await new Promise(resolve=>setTimeout(resolve,800));
+        }
+        if(!resolved)throw new Error('未能确认测量已启动；请查看诊断日志后重试');
+      }catch(reconcileError){errorBox('measureError',reconcileError)}
+    }
+  }finally{state.measurementStartPending=false;updateStartState()}
 });
 $('stopMeasure').addEventListener('click',async()=>{clearMeasureError();try{updateMeasurement(await post('/api/measurement/stop'))}catch(e){errorBox('measureError',e)}});
 $('sampleRole').addEventListener('click',event=>{const button=event.target.closest('button[data-role]');if(button)setSampleRole(button.dataset.role)});

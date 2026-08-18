@@ -53,6 +53,29 @@ def test_windows_discovery_uses_parent_serial_when_only_interface_is_visible() -
     assert infos[0].interface == "MI_02"
 
 
+def test_windows_discovery_preserves_duplicate_serials_without_container_id() -> None:
+    rows = [
+        {
+            "instance_id": r"USB\VID_1366&PID_0101\5&AAA&0&1",
+            "serial_number": "000000123456",
+            "friendly_name": "J-Link",
+        },
+        {
+            "instance_id": r"USB\VID_1366&PID_0101\5&BBB&0&1",
+            "serial_number": "000000123456",
+            "friendly_name": "J-Link",
+        },
+    ]
+
+    infos = jlink_usb._windows_infos(rows)
+
+    assert len(infos) == 2
+    assert {info.instance_id for info in infos} == {
+        row["instance_id"] for row in rows
+    }
+    assert {info.serial_number for info in infos} == {"000000123456"}
+
+
 def test_macos_ioreg_discovery_does_not_require_a_serial_port() -> None:
     payload = {
         "IORegistryEntryChildren": [{

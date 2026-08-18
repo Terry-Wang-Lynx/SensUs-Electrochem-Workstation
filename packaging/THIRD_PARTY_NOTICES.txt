@@ -1,17 +1,42 @@
-SensUs Electrochem Workstation portable package
+SensUs Electrochem Workstation portable packages
 
-This package includes OpenOCD 0.12.0 for Windows (i686-w64-mingw32 archive).
-OpenOCD is distributed under the GNU General Public License, version 2 or
-later. Source and license information:
+The portable packages include a CPython runtime and open-source Python
+dependencies. THIRD_PARTY_LICENSES/PYTHON_PACKAGES.json records the exact
+versions installed in the release build, THIRD_PARTY_LICENSES/SBOM.spdx.json
+contains the SPDX inventory, and the adjacent component directories contain
+the license texts copied from those distributions. The CPython license is
+included as Python-<version>/LICENSE.txt. The platform-specific portable lock
+files pin every package version and accepted distribution SHA-256 hash used by
+the release runners.
+
+Both platforms include a J-Link-only OpenOCD 0.12.0 runtime built by this
+project from pinned source. The only non-system native dependency is libusb
+1.0.29. OpenOCD is distributed under GPL-2.0-or-later; libusb is distributed
+under LGPL-2.1-or-later. Each tools/openocd directory contains:
+
+- COMPONENTS.json with binary and source hashes;
+- BINARY_DEPENDENCIES.txt with the audited native dependency list;
+- licenses/ with the applicable license texts; and
+- source/ with the complete corresponding OpenOCD and libusb source archives.
+
+OpenOCD's source archive includes the Jim Tcl and libjaylink sources used by
+the build. The packaged runtime does not include Homebrew libraries, SEGGER's
+proprietary J-Link software, FTDI, HIDAPI, Capstone, or MinGW runtime DLLs.
+
+The Windows package also includes the wdi-simple utility built from the pinned
+libwdi 1.5.1 source. It runs only after the user explicitly chooses "Prepare J-Link"
+and approves Windows elevation. tools/winusb contains libwdi's LGPL/GPL terms
+and source, the exact libusb-win32 and libusbK corresponding source archives,
+Microsoft WDK License.rtf and REDIST.TXT terms, and COMPONENTS.json with the
+pinned inputs and hashes.
+
+The application may use a separately installed SEGGER J-Link Commander when
+one is already present. That installation is selected only as a compatibility
+fallback and is not modified or redistributed by SensUs.
+
+Upstream projects:
 https://github.com/openocd-org/openocd
-
-The bundled OpenOCD build includes libjaylink support for SEGGER J-Link
-compatible probes. SEGGER trademarks and proprietary J-Link software are not
-included in this package.
-
-The Windows package also includes the unmodified wdi-simple utility from
-libwdi 1.5.1, used to prepare the supported J-Link WinUSB interface after the
-user explicitly confirms the action. libwdi is distributed under the GNU
-Lesser General Public License, version 3 or later. The package includes
-COPYING, COPYING-LGPL, build provenance, and the complete pinned source archive
-under tools/winusb. Upstream: https://github.com/pbatard/libwdi
+https://github.com/libusb/libusb
+https://github.com/pbatard/libwdi
+https://github.com/mcuee/libusb-win32
+https://github.com/mcuee/libusbk

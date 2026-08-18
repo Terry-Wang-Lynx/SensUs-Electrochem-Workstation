@@ -33,7 +33,7 @@ from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from .it import (
@@ -96,10 +96,12 @@ from . import __version__
 from . import runtime
 from .windows_jlink import (
     JLINK_VENDOR_ID,
+    commander_reports_probe_connected,
     install_winusb_driver,
+    jlink_bindings,
     openocd_reports_missing_driver,
     openocd_reports_probe_communication_error,
-    repairable_interfaces,
+    reports_probe_busy,
     resolve_helper as resolve_winusb_helper,
 )
 from .jlink_usb import discover_jlink_usb_devices
@@ -154,6 +156,7 @@ SERIAL_SMP_PORT = os.environ.get("SENSUS_SMP_PORT", "").strip()
 HARDWARE_TRANSPORT = os.environ.get("SENSUS_TRANSPORT", "auto").lower()
 HARDWARE_TRANSPORT_REQUESTED = HARDWARE_TRANSPORT
 JLINK_CDC_SERIAL = os.environ.get("SENSUS_JLINK_CDC_SERIAL", "0000297345691")
+SENSUS_USB_IDS = {(0x2FE3, 0x0100)}
 # A manual selection is intentionally process-local. It is cleared by the
 # "自动检测" choice and is never changed while a hardware operation is busy.
 DEVICE_SELECTION_LOCK = threading.RLock()
@@ -169,12 +172,24 @@ DEVICE_DISCOVERY_ERROR = ""
 DEVICE_DISCOVERY_LOG_SIGNATURE: tuple[Any, ...] | None = None
 DEVICE_DISCOVERY_LOG_ERROR = ""
 DEVICE_DISCOVERY_TTL_S = 1.0
+DEVICE_DISCOVERY_CANCEL = threading.Event()
 DEVICE_PROBE_LOCK = threading.Lock()
 JLINK_TARGET_PROBE_LOCK = threading.Lock()
 JLINK_TARGET_CACHE_LOCK = threading.RLock()
 JLINK_TARGET_CACHE: dict[str, dict[str, Any]] = {}
 JLINK_TARGET_CACHE_TTL_S = 5.0
 JLINK_DRIVER_INSTALL_LOCK = threading.Lock()
+SHUTDOWN_INTENT = threading.Event()
+JLINK_DRIVER_TASK_LOCK = threading.RLock()
+JLINK_DRIVER_TASK: dict[str, Any] = {
+    "state": "idle",
+    "device_id": "",
+    "message": "",
+    "error": "",
+    "diagnostic_id": "",
+    "started_at": None,
+    "finished_at": None,
+}
 SMPMGR_EXE = Path(
     os.environ.get("SENSUS_SMPMGR")
     or shutil.which("smpmgr")
@@ -190,6 +205,11 @@ V51_RESOURCE_DIR = next(
 )
 V51_UPLOAD_SCRIPT = V51_RESOURCE_DIR / "scripts" / "03-usb-upload.sh"
 V51_PREBUILT_IMAGE = V51_RESOURCE_DIR / "images" / "app.signed.bin"
+
+
+def _ensure_not_shutting_down() -> None:
+    if SHUTDOWN_INTENT.is_set():
+        raise RuntimeError("应用正在安全退出，不能再启动新的硬件任务")
 
 
 def _transport_status(transport: str | None = None) -> dict[str, Any]:
@@ -570,26 +590,19 @@ def _all_serial_port_infos() -> list[Any]:
         device = str(getattr(info, "device", "") or "")
         if not device:
             return False
-        lowered = device.lower()
-        if "usbmodem" in lowered or "usbserial" in lowered:
+        if device in {SERIAL_DATA_PORT, SERIAL_SMP_PORT}:
             return True
-        if not (_IS_WIN and device.upper().startswith("COM")):
-            return False
-        # Windows may expose Bluetooth and motherboard UARTs as COM ports.
-        # Opening every one adds several seconds per port and can write GET to
-        # unrelated hardware. Keep only descriptors that are actually USB.
         descriptor = _port_descriptor(info).lower()
+        vid = getattr(info, "vid", None)
+        pid = getattr(info, "pid", None)
         return bool(
-            getattr(info, "vid", None) is not None
-            or "usb" in descriptor
+            (vid, pid) in SENSUS_USB_IDS
+            or vid == JLINK_VENDOR_ID
+            or "pa-converter" in descriptor
+            or "sensus" in descriptor
             or "segger" in descriptor
             or "j-link" in descriptor
             or "jlink" in descriptor
-            or (
-                JLINK_CDC_SERIAL
-                and re.sub(r"\D", "", str(JLINK_CDC_SERIAL))
-                in re.sub(r"\D", "", descriptor)
-            )
         )
 
     infos = (
@@ -604,15 +617,23 @@ def _all_serial_port_infos() -> list[Any]:
             "Native J-Link USB discovery failed", error=str(exc),
         )
         native_jlinks = []
-    existing_serials = {
-        _normalise_probe_serial(getattr(info, "serial_number", ""))
-        for info in infos if _is_jlink_port(info)
-    }
-    infos.extend(
-        info for info in native_jlinks
-        if not _normalise_probe_serial(info.serial_number)
-        or _normalise_probe_serial(info.serial_number) not in existing_serials
-    )
+    existing_counts: dict[str, int] = {}
+    for info in infos:
+        if _is_jlink_port(info):
+            serial = _normalise_probe_serial(getattr(info, "serial_number", ""))
+            if serial:
+                existing_counts[serial] = existing_counts.get(serial, 0) + 1
+    native_groups: dict[str, list[Any]] = {}
+    for info in native_jlinks:
+        native_groups.setdefault(
+            _normalise_probe_serial(info.serial_number), []
+        ).append(info)
+    for serial, native_group in native_groups.items():
+        if not serial:
+            infos.extend(native_group)
+            continue
+        missing_count = max(0, len(native_group) - existing_counts.get(serial, 0))
+        infos.extend(native_group[:missing_count])
     return infos
 
 
@@ -732,6 +753,63 @@ def _openocd_identity_verified(output: str) -> bool:
     ))
 
 
+def _run_openocd_bounded(
+    command: list[str], *, timeout_s: float,
+) -> subprocess.CompletedProcess[str]:
+    """Run one-shot OpenOCD with a graceful shutdown path before termination."""
+    control_port = _free_local_tcp_port()
+    controlled = [
+        command[0],
+        "-c", "gdb_port disabled",
+        "-c", "tcl_port disabled",
+        "-c", f"telnet_port {control_port}",
+        *command[1:],
+    ]
+    process = subprocess.Popen(
+        controlled,
+        cwd=PROJECT_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **runtime.hidden_subprocess_kwargs(new_process_group=True),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        stdout = str(exc.stdout or "")
+        stderr = str(exc.stderr or "")
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", control_port), timeout=0.7,
+            ) as control:
+                control.sendall(b"shutdown\n")
+        except OSError:
+            pass
+        try:
+            final_stdout, final_stderr = process.communicate(timeout=2.0)
+            stdout += final_stdout or ""
+            stderr += final_stderr or ""
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                final_stdout, final_stderr = process.communicate(timeout=2.0)
+                stdout += final_stdout or ""
+                stderr += final_stderr or ""
+            except subprocess.TimeoutExpired:
+                process.kill()
+                final_stdout, final_stderr = process.communicate()
+                stdout += final_stdout or ""
+                stderr += final_stderr or ""
+        raise subprocess.TimeoutExpired(
+            controlled, timeout_s, output=stdout, stderr=stderr,
+        )
+    return subprocess.CompletedProcess(
+        controlled, process.returncode, stdout, stderr,
+    )
+
+
 def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
     if not _openocd_jlink_available():
         return False, "随包 OpenOCD 不可用"
@@ -747,17 +825,7 @@ def _openocd_target_probe(probe_serial: str) -> tuple[bool, str]:
         "-c", f"init; {_openocd_identity_command()}; shutdown",
     ]
     try:
-        done = subprocess.run(
-            command,
-            cwd=PROJECT_DIR,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-            **runtime.hidden_subprocess_kwargs(),
-        )
+        done = _run_openocd_bounded(command, timeout_s=10)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     output = f"{done.stdout}\n{done.stderr}"
@@ -793,11 +861,7 @@ def _openocd_rtt_layout_probe(
         ),
     ]
     try:
-        done = subprocess.run(
-            command, cwd=PROJECT_DIR, check=False, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=10,
-            **runtime.hidden_subprocess_kwargs(),
-        )
+        done = _run_openocd_bounded(command, timeout_s=10)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, False, str(exc)
     output = f"{done.stdout}\n{done.stderr}"
@@ -814,6 +878,7 @@ def _probe_jlink_target_status(
     probe_serial: str,
     *,
     force: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Check the target without reset/write and cache the result briefly."""
     now = time.monotonic()
@@ -844,7 +909,42 @@ def _probe_jlink_target_status(
         backend = ""
         openocd_driver_missing = False
         openocd_probe_communication_error = False
-        if JLINK_EXE.is_file():
+        commander_probe_connected = False
+        probe_busy = False
+        if cancel_event is not None and cancel_event.is_set():
+            return _unknown_jlink_target_status(probe_serial)
+        openocd_available = _openocd_jlink_available()
+        openocd_output = ""
+        if openocd_available:
+            reachable, openocd_output = _openocd_target_probe(probe_serial)
+            probe_busy = reports_probe_busy(openocd_output)
+            openocd_probe_communication_error = bool(
+                openocd_reports_probe_communication_error(openocd_output)
+            )
+            if reachable:
+                backend = "OpenOCD / libjaylink"
+            else:
+                tail = _meaningful_process_tail(openocd_output, limit=3)
+                attempts.append("OpenOCD: " + (" | ".join(tail) or "目标无响应"))
+
+        # Portable packages own a tested OpenOCD build. Use it first so an
+        # unrelated or incompatible system Commander cannot delay discovery or
+        # hide the WinUSB action. Commander is still the compatibility path for
+        # computers whose probe remains on SEGGER's official Windows driver.
+        commander_needed = bool(
+            not reachable
+            and JLINK_EXE.is_file()
+            and (
+                not openocd_available
+                or openocd_reports_missing_driver(openocd_output)
+                or openocd_probe_communication_error
+            )
+            and not probe_busy
+            and not (
+                cancel_event is not None and cancel_event.is_set()
+            )
+        )
+        if commander_needed:
             reachable, output = probe_jlink_target(
                 probe_serial,
                 executable=JLINK_EXE,
@@ -853,23 +953,27 @@ def _probe_jlink_target_status(
             if reachable:
                 backend = "SEGGER J-Link Commander"
             else:
+                probe_busy = probe_busy or reports_probe_busy(output)
+                commander_probe_connected = commander_reports_probe_connected(
+                    output
+                )
                 tail = _meaningful_process_tail(output, limit=3)
                 attempts.append("SEGGER: " + (" | ".join(tail) or "目标无响应"))
-        if not reachable:
-            reachable, output = _openocd_target_probe(probe_serial)
-            openocd_driver_missing = bool(
-                _IS_WIN
-                and openocd_reports_missing_driver(output)
-                and _jlink_requires_winusb(probe_serial)
-            )
-            openocd_probe_communication_error = bool(
-                openocd_reports_probe_communication_error(output)
-            )
-            if reachable:
-                backend = "OpenOCD / libjaylink"
-            else:
-                tail = _meaningful_process_tail(output, limit=3)
-                attempts.append("OpenOCD: " + (" | ".join(tail) or "目标无响应"))
+
+        winusb_binding_available = bool(
+            _IS_WIN
+            and openocd_reports_missing_driver(openocd_output)
+            and _jlink_requires_winusb(probe_serial)
+            and not reachable
+            and not probe_busy
+        )
+        openocd_driver_missing = bool(
+            winusb_binding_available and not commander_probe_connected
+        )
+        probe_communication_failed = bool(
+            openocd_probe_communication_error
+            and not commander_probe_connected
+        )
 
         if reachable:
             result = {
@@ -888,9 +992,12 @@ def _probe_jlink_target_status(
             target_failure = (
                 "driver_missing"
                 if openocd_driver_missing else (
-                    "probe_communication"
-                    if openocd_probe_communication_error else (
-                        "target_unreachable" if attempts else "tool_unavailable"
+                    "probe_busy"
+                    if probe_busy else (
+                        "probe_communication"
+                        if probe_communication_failed else (
+                            "target_unreachable" if attempts else "tool_unavailable"
+                        )
                     )
                 )
             )
@@ -899,33 +1006,48 @@ def _probe_jlink_target_status(
                 "target_detail": (
                     "J-Link 已识别，但 Windows 调试接口驱动尚未准备"
                     if openocd_driver_missing else (
-                        "J-Link USB 通信超时；请断开 J-Link、目标板供电及 "
-                        "3V3/VTref 10 秒后重插"
-                        if openocd_probe_communication_error else (
-                            "J-Link 探针在线，但 nRF52833 未响应；"
-                            "请检查板卡供电、SWD 排线和接口方向"
-                            if attempts else "没有可用的 SWD 核对工具"
+                        "J-Link 正被其他软件占用；请关闭 Ozone、IDE、"
+                        "J-Link Commander 或其他调试工具后刷新"
+                        if probe_busy else (
+                            "J-Link USB 通信超时；请断开 J-Link、目标板供电及 "
+                            "3V3/VTref 10 秒后重插"
+                            if probe_communication_failed else (
+                                "J-Link 探针在线，但 nRF52833 未响应；"
+                                "请检查板卡供电、SWD 排线和接口方向"
+                                if attempts else "没有可用的 SWD 核对工具"
+                            )
                         )
                     )
                 ),
-                "target_backend": "",
+                "target_backend": (
+                    "SEGGER J-Link Commander"
+                    if commander_probe_connected else ""
+                ),
                 "target_failure": target_failure,
                 "target_diagnostics": diagnostics,
-                "driver_state": "missing" if openocd_driver_missing else "unknown",
+                "driver_state": (
+                    "missing" if openocd_driver_missing else (
+                        "ready" if commander_probe_connected else "unknown"
+                    )
+                ),
                 "driver_action": (
                     "install_winusb"
-                    if openocd_driver_missing and helper_available else ""
+                    if winusb_binding_available and helper_available else ""
                 ),
                 "driver_message": (
-                    "点击‘准备 J-Link’并确认 Windows 权限提示"
-                    if openocd_driver_missing and helper_available else (
-                        "当前便携包缺少 WinUSB 准备工具，请更新软件"
-                        if openocd_driver_missing else ""
+                    "系统 SEGGER J-Link 驱动可访问探针；如确认板卡供电正常，"
+                    "可在设备栏手动切换到随包 OpenOCD"
+                    if commander_probe_connected and winusb_binding_available else (
+                        "请点击右上角“选择设备”，再点击该 J-Link 的“准备 J-Link”"
+                        if openocd_driver_missing and helper_available else (
+                            "当前便携包缺少 WinUSB 准备工具，请更新软件"
+                            if openocd_driver_missing else ""
+                        )
                     )
                 ),
             }
         result.update({
-            "target_checked_at": now,
+            "target_checked_at": time.monotonic(),
             "probe_serial": probe_serial,
         })
         with JLINK_TARGET_CACHE_LOCK:
@@ -954,12 +1076,21 @@ def _annotate_target_states(
     devices: list[dict[str, Any]],
     *,
     refresh_jlink: bool,
+    cancel_event: threading.Event | None = None,
 ) -> list[dict[str, Any]]:
     for device in devices:
         if device.get("kind") == "jlink":
+            if device.get("target_failure") == "duplicate_probe_serial":
+                continue
             probe_serial = str(device.get("probe_serial") or "")
             status = (
-                _probe_jlink_target_status(probe_serial)
+                (
+                    _probe_jlink_target_status(probe_serial)
+                    if cancel_event is None
+                    else _probe_jlink_target_status(
+                        probe_serial, cancel_event=cancel_event,
+                    )
+                )
                 if refresh_jlink and probe_serial
                 else _cached_jlink_target_status(probe_serial)
             )
@@ -1207,8 +1338,12 @@ def _probe_jlink_runtime_firmware(
     return _runtime_response_state(text, request_id), detail
 
 
-def _probe_serial_data_candidate(candidate: str) -> bool:
+def _probe_serial_data_candidate(
+    candidate: str, *, cancel_event: threading.Event | None = None,
+) -> bool:
     """Read-only probe for one CDC candidate; never resets or writes firmware."""
+    if cancel_event is not None and cancel_event.is_set():
+        return False
     try:
         import serial
     except ImportError:
@@ -1220,6 +1355,8 @@ def _probe_serial_data_candidate(candidate: str) -> bool:
             # USB1 firmware predates request IDs and only understands a bare
             # GET. Both forms are read-only and do not alter hardware state.
             for probe in (b"GET req=workstation-probe\n", b"GET\n"):
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
                 try:
                     stream.reset_input_buffer()
                 except (AttributeError, OSError, ValueError):
@@ -1229,6 +1366,8 @@ def _probe_serial_data_candidate(candidate: str) -> bool:
                 deadline = time.monotonic() + 1.5
                 received = bytearray()
                 while time.monotonic() < deadline:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return False
                     chunk = stream.read(256)
                     if chunk:
                         received.extend(chunk)
@@ -1251,23 +1390,32 @@ def _discover_serial_data_port(*, force: bool = False) -> str | None:
     return None
 
 
+def _usb_physical_location(info: Any) -> str:
+    """Normalize interface-qualified locations to one physical USB port."""
+    return re.sub(
+        r":\d+(?:\.\d+)?$", "",
+        str(getattr(info, "location", "") or "").strip(),
+    )
+
+
 def _same_usb_device(left: Any, right: Any) -> bool:
     """Match CDC interfaces by stable USB identity, never by device suffix."""
     # VID/PID alone cannot distinguish two identical boards. Prefer a shared
     # serial or physical location; without either, keep interfaces separate
     # rather than accidentally merging two USB devices into one choice.
+    shared_identity = False
     for field in ("serial_number", "location"):
-        left_value = getattr(left, field, None)
-        right_value = getattr(right, field, None)
+        if field == "location":
+            left_value = _usb_physical_location(left)
+            right_value = _usb_physical_location(right)
+        else:
+            left_value = getattr(left, field, None)
+            right_value = getattr(right, field, None)
         if left_value not in (None, "") and right_value not in (None, ""):
+            shared_identity = True
             if left_value != right_value:
                 return False
-    stable = any(
-        getattr(item, field, None) not in (None, "")
-        for item in (left, right)
-        for field in ("serial_number", "location")
-    )
-    if not stable:
+    if not shared_identity:
         return str(getattr(left, "device", "")) == str(getattr(right, "device", ""))
     return (
         getattr(left, "vid", None) == getattr(right, "vid", None)
@@ -1298,10 +1446,9 @@ def _discover_serial_smp_port(
 
 def _usb_identity(info: Any) -> str:
     """Build an ID that survives CDC interface renumbering and reboots."""
-    location = str(getattr(info, "location", "") or "").strip()
     # Linux may append an interface suffix (for example :1.0/:1.1) to the
     # same physical USB location; it must not split DATA and SMP into devices.
-    location = re.sub(r":\d+(?:\.\d+)?$", "", location)
+    location = _usb_physical_location(info)
     fields = (
         str(getattr(info, "vid", "") or "").lower(),
         str(getattr(info, "pid", "") or "").lower(),
@@ -1343,7 +1490,9 @@ def _device_sort_key(device: dict[str, Any]) -> tuple[int, str]:
     return (0 if device.get("kind") == "usb" else 1, str(device.get("name", "")))
 
 
-def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
+def _discover_devices(
+    *, probe: bool = True, cancel_event: threading.Event | None = None,
+) -> list[dict[str, Any]]:
     """Enumerate J-Link probes and V5.1 USB boards without flashing/resetting."""
     devices: list[dict[str, Any]] = []
     all_infos = _all_serial_port_infos()
@@ -1365,6 +1514,24 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
             "location": str(getattr(info, "location", "") or ""),
             "selectable": bool(probe_serial),
         })
+
+    duplicate_jlink_ids = {
+        device["id"] for device in devices
+        if sum(candidate["id"] == device["id"] for candidate in devices) > 1
+    }
+    for device in devices:
+        if device["id"] not in duplicate_jlink_ids:
+            continue
+        physical = str(device.get("location") or device.get("cdc_port") or "")
+        suffix = hashlib.sha256(physical.encode("utf-8")).hexdigest()[:8]
+        device["id"] = f"{device['id']}:{suffix}"
+        device["selectable"] = False
+        device["target_state"] = "unreachable"
+        device["target_failure"] = "duplicate_probe_serial"
+        device["target_detail"] = (
+            "检测到重复的 J-Link 序列号，无法可靠选择；"
+            "请只保留一只探头"
+        )
 
     candidates = [info for info in all_infos if not _is_jlink_port(info)]
     groups: list[list[Any]] = []
@@ -1389,7 +1556,17 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
                 ),
             )
             for info in ordered_group:
-                if _probe_serial_data_candidate(str(getattr(info, "device", "") or "")):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                candidate = str(getattr(info, "device", "") or "")
+                responsive = (
+                    _probe_serial_data_candidate(candidate)
+                    if cancel_event is None
+                    else _probe_serial_data_candidate(
+                        candidate, cancel_event=cancel_event,
+                    )
+                )
+                if responsive:
                     data_info = info
                     break
         elif SERIAL_DATA_PORT:
@@ -1431,10 +1608,12 @@ def _discover_devices(*, probe: bool = True) -> list[dict[str, Any]]:
     )
 
 
-def _discover_devices_with_probe() -> list[dict[str, Any]]:
+def _discover_devices_with_probe(
+    *, cancel_event: threading.Event | None = None,
+) -> list[dict[str, Any]]:
     """Serialize port probes so a hot-plug refresh cannot race selection."""
     with DEVICE_PROBE_LOCK:
-        return _discover_devices(probe=True)
+        return _discover_devices(probe=True, cancel_event=cancel_event)
 
 
 def _selected_device_copy() -> dict[str, Any] | None:
@@ -1491,7 +1670,24 @@ def _jlink_usb_ids(info: Any) -> tuple[int, int]:
 
 
 def _jlink_requires_winusb(probe_serial: str) -> bool:
-    """Confirm the missing driver against the exact PnP debug interface."""
+    """Confirm that OpenOCD can repair the exact supported PnP interface."""
+    def has_target_binding(vid: int, pid: int) -> bool:
+        bindings = jlink_bindings(vid, pid)
+        exact = [
+            binding for binding in bindings
+            if binding.probe_serial == probe_serial
+        ]
+        if exact:
+            return any(not binding.ready for binding in exact)
+        # With one physical interface there is no ambiguity even when Windows
+        # omitted its serial property. Multiple anonymous interfaces are never
+        # eligible for an automatic driver action.
+        return bool(
+            len(bindings) == 1
+            and not bindings[0].probe_serial
+            and not bindings[0].ready
+        )
+
     with DEVICE_DISCOVERY_LOCK:
         cached = next(
             (
@@ -1504,7 +1700,7 @@ def _jlink_requires_winusb(probe_serial: str) -> bool:
     if cached is not None:
         try:
             vid, pid = int(cached["vid"]), int(cached["pid"])
-            return bool(repairable_interfaces(vid, pid))
+            return has_target_binding(vid, pid)
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             pass
     info = next(
@@ -1519,16 +1715,22 @@ def _jlink_requires_winusb(probe_serial: str) -> bool:
         return False
     try:
         vid, pid = _jlink_usb_ids(info)
-        return bool(repairable_interfaces(vid, pid))
+        return has_target_binding(vid, pid)
     except (OSError, RuntimeError, ValueError):
         return False
 
 
-def _prepare_jlink_winusb(device_id: str) -> dict[str, Any]:
+def _prepare_jlink_winusb(
+    device_id: str,
+    *,
+    status_callback: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     if not _IS_WIN:
         raise RuntimeError("WinUSB 准备仅适用于 Windows")
     if not WINUSB_HELPER.is_file():
         raise RuntimeError("当前便携包缺少 WinUSB 准备工具，请更新软件")
+    if status_callback is not None:
+        status_callback("正在核对所选 J-Link 调试接口")
     with DEVICE_DISCOVERY_LOCK:
         cached_device = next(
             (
@@ -1554,33 +1756,23 @@ def _prepare_jlink_winusb(device_id: str) -> dict[str, Any]:
             raise RuntimeError("无法读取该 J-Link 的 USB VID/PID") from exc
     else:
         vid, pid = _jlink_usb_ids(info)
-    interfaces = repairable_interfaces(vid, pid)
-    if not interfaces:
-        status = _probe_jlink_target_status(probe_serial, force=True)
-        if status.get("target_state") == "reachable":
-            devices = [cached_device] if cached_device else _discover_devices(probe=False)
-            if devices and cached_device:
-                devices[0].update(status)
-                _remember_device_discovery(devices)
-            return {
-                **_devices_payload_from_devices(devices),
-                "message": "J-Link 调试接口已经就绪",
-            }
+    bindings = jlink_bindings(vid, pid)
+    if not bindings:
         raise RuntimeError(
-            str(status.get("target_detail") or "J-Link 的 Windows 驱动无需更改")
+            "没有找到可准备的 J-Link 调试接口；请重新插拔后刷新"
         )
-
-    interface_serials = {
-        _normalise_probe_serial(interface.instance_id.rsplit("\\", 1)[-1])
-        for interface in interfaces
-    }
-    interface_serials.discard("")
-    if len(interfaces) > 1 or (
-        interface_serials and interface_serials != {probe_serial}
-    ):
+    if len(bindings) > 1:
         raise RuntimeError(
-            "准备 Windows 驱动时请只保留这一只 J-Link，完成后可重新插回其他探头"
+            "检测到多只同型号 J-Link；准备驱动时请只保留目标探头，"
+            "完成后可重新插回其他探头"
         )
+    binding = bindings[0]
+    if binding.probe_serial and binding.probe_serial != probe_serial:
+        raise RuntimeError(
+            "Windows 调试接口与所选 J-Link 身份不一致；"
+            "请只保留目标探头后刷新"
+        )
+    interfaces = [binding.interface]
 
     DIAGNOSTICS.record(
         "info", "device.jlink.driver_install.started",
@@ -1590,8 +1782,13 @@ def _prepare_jlink_winusb(device_id: str) -> dict[str, Any]:
     )
     started_at = time.monotonic()
     try:
+        if status_callback is not None:
+            status_callback(
+                "接口核对完成，即将弹出 Windows 管理员权限提示"
+            )
         installation = install_winusb_driver(
             WINUSB_HELPER, vid=vid, pid=pid, interfaces=interfaces,
+            status_callback=status_callback,
         )
     except Exception as exc:
         diagnostic_id = DIAGNOSTICS.exception(
@@ -1609,22 +1806,65 @@ def _prepare_jlink_winusb(device_id: str) -> dict[str, Any]:
 
     with JLINK_TARGET_CACHE_LOCK:
         JLINK_TARGET_CACHE.pop(probe_serial, None)
+    if status_callback is not None:
+        status_callback("驱动已处理，正在等待 J-Link 重新连接")
     # wdi-simple returns before every Windows PnP view has converged. It also
     # runs elevated, so the helper restarts the exact interface and scans for
     # devices before returning. Verify the service binding directly here;
     # requiring the CDC descriptor would incorrectly reject legacy ARM-OBs.
-    remaining_interfaces = interfaces
-    for _ in range(40):
-        remaining_interfaces = repairable_interfaces(vid, pid)
-        if not remaining_interfaces:
-            break
+    stable_ready = 0
+    seen_after_install = False
+    last_binding_detail = "设备正在重新枚举"
+    for _ in range(60):
+        try:
+            current_bindings = jlink_bindings(vid, pid)
+        except (OSError, RuntimeError, ValueError) as exc:
+            current_bindings = []
+            last_binding_detail = str(exc)
+        matching = next(
+            (
+                current for current in current_bindings
+                if current.interface.instance_id.lower()
+                == binding.interface.instance_id.lower()
+            ),
+            None,
+        )
+        if matching is None and len(current_bindings) == 1:
+            candidate = current_bindings[0]
+            if (
+                not binding.probe_serial
+                or not candidate.probe_serial
+                or candidate.probe_serial == binding.probe_serial
+            ):
+                matching = candidate
+        if matching is not None:
+            seen_after_install = True
+            last_binding_detail = (
+                f"Status={matching.status or 'unknown'}, "
+                f"Problem={matching.problem_code}, "
+                f"Service={matching.service or 'none'}"
+            )
+        if matching is not None and matching.ready:
+            stable_ready += 1
+            if stable_ready >= 2:
+                break
+        else:
+            stable_ready = 0
         time.sleep(0.5)
-    if remaining_interfaces:
+    if stable_ready < 2:
+        action = (
+            "请断开 J-Link 10 秒后重新插入，再点击刷新"
+            if not seen_after_install
+            else "请点击刷新；若仍未就绪，请断开 J-Link 10 秒后重插"
+        )
         raise RuntimeError(
-            "WinUSB 已安装，但 Windows 尚未启用新驱动；请稍后点击刷新"
+            "WinUSB 已安装，但 Windows 未确认调试接口稳定恢复"
+            f"（{last_binding_detail}）；{action}"
         )
 
     status: dict[str, Any] = _unknown_jlink_target_status(probe_serial)
+    if status_callback is not None:
+        status_callback("J-Link 已重新枚举，正在核对目标板")
     for attempt in range(3):
         if attempt:
             time.sleep(1.0)
@@ -1675,6 +1915,100 @@ def _prepare_jlink_winusb(device_id: str) -> dict[str, Any]:
         else "WinUSB 已准备；请检查目标板供电和 SWD 连线"
     )
     return result
+
+
+def _jlink_driver_task_snapshot() -> dict[str, Any]:
+    with JLINK_DRIVER_TASK_LOCK:
+        snapshot = copy.deepcopy(JLINK_DRIVER_TASK)
+    snapshot["running"] = JLINK_DRIVER_INSTALL_LOCK.locked()
+    return snapshot
+
+
+def _set_jlink_driver_task(**values: Any) -> dict[str, Any]:
+    with JLINK_DRIVER_TASK_LOCK:
+        JLINK_DRIVER_TASK.update(values)
+        return copy.deepcopy(JLINK_DRIVER_TASK)
+
+
+def _run_jlink_driver_task(device_id: str) -> None:
+    try:
+        _set_jlink_driver_task(
+            message="正在等待后台设备核对结束",
+        )
+        with APP.operation_lock:
+            _ensure_not_shutting_down()
+            if not APP.hardware_idle():
+                raise RuntimeError("测量或硬件参数更新期间不能准备 J-Link 驱动")
+            _set_jlink_driver_task(
+                message="正在核对 Windows 中的 J-Link 调试接口",
+            )
+            result = _prepare_jlink_winusb(
+                device_id,
+                status_callback=lambda message: _set_jlink_driver_task(
+                    message=message,
+                ),
+            )
+        _set_jlink_driver_task(
+            state="succeeded",
+            message=str(result.get("message") or "J-Link Windows 驱动已准备"),
+            error="",
+            diagnostic_id="",
+            finished_at=time.time(),
+        )
+    except Exception as exc:
+        diagnostic_id = str(getattr(exc, "diagnostic_id", "") or "")
+        if not diagnostic_id:
+            diagnostic_id = DIAGNOSTICS.exception(
+                "device.jlink.driver_task.failed",
+                "Background J-Link driver preparation failed",
+                exc,
+                device_id=device_id,
+            )
+        _set_jlink_driver_task(
+            state="error",
+            message="",
+            error=str(exc),
+            diagnostic_id=diagnostic_id,
+            finished_at=time.time(),
+        )
+    finally:
+        JLINK_DRIVER_INSTALL_LOCK.release()
+        DEVICE_DISCOVERY_CANCEL.clear()
+        _start_device_discovery()
+
+
+def _start_jlink_driver_task(device_id: str) -> dict[str, Any]:
+    _ensure_not_shutting_down()
+    if not APP.hardware_idle():
+        raise RuntimeError("测量或硬件参数更新期间不能准备 J-Link 驱动")
+    if not JLINK_DRIVER_INSTALL_LOCK.acquire(blocking=False):
+        return _jlink_driver_task_snapshot()
+    if SHUTDOWN_INTENT.is_set():
+        JLINK_DRIVER_INSTALL_LOCK.release()
+        raise RuntimeError("应用正在安全退出，不能再启动 J-Link 驱动准备")
+    DEVICE_DISCOVERY_CANCEL.set()
+    _set_jlink_driver_task(
+        state="running",
+        device_id=device_id,
+        message="正在等待后台设备核对结束",
+        error="",
+        diagnostic_id="",
+        started_at=time.time(),
+        finished_at=None,
+    )
+    worker = threading.Thread(
+        target=_run_jlink_driver_task,
+        args=(device_id,),
+        name="jlink-driver-preparation",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        JLINK_DRIVER_INSTALL_LOCK.release()
+        DEVICE_DISCOVERY_CANCEL.clear()
+        raise
+    return _jlink_driver_task_snapshot()
 
 
 def _set_device_selection(device: dict[str, Any] | None) -> None:
@@ -1745,6 +2079,7 @@ def _devices_payload_from_devices(
         "selection_mode": "manual" if selected_id else "auto",
         "busy": busy,
         "driver_preparing": JLINK_DRIVER_INSTALL_LOCK.locked(),
+        "driver_task": _jlink_driver_task_snapshot(),
         "probing": probing,
         **_transport_status(),
     }
@@ -1777,6 +2112,7 @@ def _run_device_discovery() -> None:
     global DEVICE_DISCOVERY_LOG_SIGNATURE, DEVICE_DISCOVERY_LOG_ERROR
     error = ""
     devices: list[dict[str, Any]] = []
+    cancelled = False
     app = globals().get("APP")
     operation_lock = getattr(app, "operation_lock", None)
     driver_preparing = JLINK_DRIVER_INSTALL_LOCK.locked()
@@ -1796,14 +2132,25 @@ def _run_device_discovery() -> None:
             with DEVICE_DISCOVERY_LOCK:
                 devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
         else:
-            devices = _discover_devices_with_probe()
+            devices = _discover_devices_with_probe(
+                cancel_event=DEVICE_DISCOVERY_CANCEL,
+            )
+            cancelled = DEVICE_DISCOVERY_CANCEL.is_set()
+            if cancelled:
+                with DEVICE_DISCOVERY_LOCK:
+                    devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
             # A driver request may arrive while CDC probing is in progress.
             # Skip the slower OpenOCD target check so the UAC request can take
             # ownership of the operation lock as soon as enumeration finishes.
             _annotate_target_states(
                 devices,
                 refresh_jlink=not JLINK_DRIVER_INSTALL_LOCK.locked(),
+                cancel_event=DEVICE_DISCOVERY_CANCEL,
             )
+            cancelled = cancelled or DEVICE_DISCOVERY_CANCEL.is_set()
+            if cancelled:
+                with DEVICE_DISCOVERY_LOCK:
+                    devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
     except (OSError, RuntimeError, ValueError) as exc:
         error = str(exc)
         # Preserve the last known list during a transient USB re-enumeration;
@@ -1813,7 +2160,8 @@ def _run_device_discovery() -> None:
     finally:
         if operation_acquired:
             operation_lock.release()
-        _remember_device_discovery(devices, error)
+        if not cancelled:
+            _remember_device_discovery(devices, error)
         signature = tuple(sorted(
             (
                 str(device.get("id") or ""),
@@ -1853,6 +2201,9 @@ def _start_device_discovery() -> bool:
     with DEVICE_DISCOVERY_LOCK:
         if DEVICE_DISCOVERY_THREAD is not None and DEVICE_DISCOVERY_THREAD.is_alive():
             return False
+        if JLINK_DRIVER_INSTALL_LOCK.locked():
+            return False
+        DEVICE_DISCOVERY_CANCEL.clear()
         worker = threading.Thread(
             target=_run_device_discovery,
             name="device-discovery",
@@ -2015,6 +2366,126 @@ def _wait_for_usb_transport_ready(timeout_s: float = 12.0) -> None:
         time.sleep(min(0.2, remaining))
     detail = str(last_error or "DATA CDC 未出现")
     raise RuntimeError(f"USB 固件已上传，但应用 DATA CDC 未恢复：{detail}")
+
+
+def _usb_physical_snapshot_for_port(port: str) -> dict[str, Any]:
+    infos = _serial_port_infos()
+    info = next(
+        (
+            candidate for candidate in infos
+            if str(getattr(candidate, "device", "") or "") == port
+        ),
+        None,
+    )
+    if info is None:
+        return {}
+    identity = _usb_identity(info)
+    return {
+        "serial_number": str(
+            getattr(info, "serial_number", "") or ""
+        ).strip(),
+        "location": _usb_physical_location(info),
+        "ports": sorted(
+            str(getattr(candidate, "device", "") or "")
+            for candidate in infos
+            if _usb_identity(candidate) == identity
+        ),
+    }
+
+
+def _wait_for_bootloader_smp_port(
+    previous_port: str,
+    physical: dict[str, Any],
+    *,
+    timeout_s: float = 20.0,
+) -> str:
+    """Follow one board's CDC path across application-to-MCUboot re-enumeration."""
+    stable_identity = bool(
+        physical.get("serial_number") or physical.get("location")
+    )
+    if not stable_identity:
+        return previous_port
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return previous_port
+    started_at = time.monotonic()
+    deadline = started_at + max(0.0, timeout_s)
+    original_ports = {
+        str(port) for port in physical.get("ports", []) if str(port)
+    }
+    observed_transition = not original_ports
+    stable_port = ""
+    stable_count = 0
+    while True:
+        candidates: list[Any] = []
+        for info in list_ports.comports():
+            if _is_jlink_port(info):
+                continue
+            serial = str(getattr(info, "serial_number", "") or "").strip()
+            location = _usb_physical_location(info)
+            serial_match = bool(
+                physical.get("serial_number")
+                and serial == physical["serial_number"]
+            )
+            location_match = bool(
+                physical.get("location")
+                and location == physical["location"]
+            )
+            # Physical USB location wins when available. Clone boards may ship
+            # with the same serial number, so an OR match could upload firmware
+            # to the wrong board while the selected one is re-enumerating.
+            same_board = (
+                location_match
+                if physical.get("location")
+                else serial_match
+            )
+            if same_board:
+                candidates.append(info)
+        live_ports = {
+            str(getattr(info, "device", "") or "") for info in candidates
+        }
+        if (
+            any("mcuboot" in _port_descriptor(info).lower() for info in candidates)
+            or any(port not in original_ports for port in live_ports)
+            or bool(original_ports - live_ports)
+        ):
+            observed_transition = True
+        candidates.sort(key=lambda info: (
+            "mcuboot" not in _port_descriptor(info).lower(),
+            str(getattr(info, "device", "") or "") in original_ports,
+            str(getattr(info, "device", "") or "") == SERIAL_DATA_PORT,
+            str(getattr(info, "device", "") or "") != previous_port,
+        ))
+        port = (
+            str(getattr(candidates[0], "device", "") or "")
+            if candidates else ""
+        )
+        port_is_bootloader = bool(
+            candidates
+            and "mcuboot" in _port_descriptor(candidates[0]).lower()
+        )
+        if port and port == stable_port:
+            stable_count += 1
+        else:
+            stable_port, stable_count = port, 1 if port else 0
+        settled_same_path = time.monotonic() - started_at >= 1.0
+        if (
+            stable_port and stable_count >= 2
+            and (
+                port_is_bootloader
+                or stable_port not in original_ports
+                or (observed_transition and settled_same_path)
+            )
+        ):
+            return stable_port
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.2, remaining))
+    raise RuntimeError(
+        "进入 MCUboot 后未找到同一块板的 SMP 串口；请重新插拔 USB 后重试"
+    )
 
 
 def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
@@ -2670,17 +3141,7 @@ class SettingsController:
     ) -> tuple[int, str]:
         command = cls._openocd_command(speed, *commands)
         try:
-            done = subprocess.run(
-                command,
-                cwd=PROJECT_DIR,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_s,
-                **runtime.hidden_subprocess_kwargs(),
-            )
+            done = _run_openocd_bounded(command, timeout_s=timeout_s)
             return done.returncode, f"{done.stdout}\n{done.stderr}"
         except subprocess.TimeoutExpired as exc:
             return 124, f"{exc.stdout or ''}\n{exc.stderr or ''}\nTIMEOUT"
@@ -2978,6 +3439,7 @@ class SettingsController:
     @staticmethod
     def _upgrade_v51_firmware(image: Path | None = None) -> None:
         """Reset the V5.1 app over SMP, then upload its signed image via USB."""
+        global SERIAL_SMP_PORT
         if image is None:
             image = FIRMWARE_BUILD_DIR / "zephyr.signed.bin"
             if not image.exists() and V51_PREBUILT_IMAGE.exists():
@@ -2997,6 +3459,8 @@ class SettingsController:
             runtime.module_command("smpmgr")
             if runtime.is_frozen() else [str(SMPMGR_EXE)]
         )
+        previous_smp_port = SERIAL_SMP_PORT
+        physical_usb = _usb_physical_snapshot_for_port(previous_smp_port)
         DIAGNOSTICS.record(
             "info", "firmware.usb_upgrade.started", "USB firmware upgrade started",
             image=image, smp_port=SERIAL_SMP_PORT,
@@ -3010,6 +3474,9 @@ class SettingsController:
                 **runtime.hidden_subprocess_kwargs(),
             )
             reset_output = f"{reset.stdout}\n{reset.stderr}"
+            SERIAL_SMP_PORT = _wait_for_bootloader_smp_port(
+                previous_smp_port, physical_usb,
+            )
             if runtime.is_frozen() or _IS_WIN:
                 done = subprocess.run(
                     [*smpmgr, "--port", SERIAL_SMP_PORT, "--timeout", "10", "upgrade",
@@ -3031,7 +3498,7 @@ class SettingsController:
                     env=upload_environment,
                 )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-                OSError) as exc:
+                OSError, RuntimeError) as exc:
             DIAGNOSTICS.exception(
                 "firmware.usb_upgrade.failed", "USB firmware upgrade tool failed",
                 exc,
@@ -3051,7 +3518,17 @@ class SettingsController:
             )
             tail = [line for line in blob.strip().splitlines() if line.strip()][-3:]
             raise RuntimeError("V5.1 USB 更新未确认成功:" + " | ".join(tail))
-        _wait_for_usb_transport_ready()
+        try:
+            _wait_for_usb_transport_ready()
+        except RuntimeError as exc:
+            DIAGNOSTICS.exception(
+                "firmware.usb_upgrade.application_recovery_failed",
+                "USB firmware uploaded but application CDC did not recover",
+                exc,
+                image=image, data_port=SERIAL_DATA_PORT,
+                smp_port=SERIAL_SMP_PORT,
+            )
+            raise
         DIAGNOSTICS.record(
             "info", "firmware.usb_upgrade.completed",
             "USB firmware upgrade completed and application CDC recovered",
@@ -4304,8 +4781,16 @@ class MeasurementController:
                 self.thread is not None and self.thread.is_alive()
             ):
                 raise RuntimeError("已有测量正在运行或正在保存结果")
-            if HARDWARE_TRANSPORT == "rtt":
-                _require_jlink_target(JLINK_SERIAL)
+        # External tools may take several seconds on a cold Windows machine.
+        # Keep the live status lock free so the UI remains responsive while the
+        # start request is in its explicit configuring phase.
+        if HARDWARE_TRANSPORT == "rtt":
+            _require_jlink_target(JLINK_SERIAL)
+        with self.lock:
+            if self.state == "running" or (
+                self.thread is not None and self.thread.is_alive()
+            ):
+                raise RuntimeError("已有测量正在运行或正在保存结果")
             self.settings = SettingsController.validate(settings or self.settings)
             self.filter_config = validate_filter_config(filter_config or self.filter_config)
             self.plateau_config = PlateauConfig.validate(
@@ -9454,6 +9939,44 @@ def _request_server_shutdown() -> None:
         ).start()
 
 
+def _release_hardware_for_shutdown(timeout_s: float = 330.0) -> dict[str, Any]:
+    """Wait out non-interruptible operations, then stop acquisition normally."""
+    SHUTDOWN_INTENT.set()
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    try:
+        # Driver preparation acquires its own lock before APP.operation_lock.
+        # Waiting here avoids taking those locks in the reverse order when the
+        # user closes the application immediately after clicking Prepare.
+        while JLINK_DRIVER_INSTALL_LOCK.locked():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "J-Link 驱动仍在安全准备，请稍后再次点击退出"
+                )
+            time.sleep(min(0.1, remaining))
+        with APP.operation_lock:
+            if APP.schedule.snapshot()["active"]:
+                APP.schedule.stop()
+            if APP.measurement.is_busy():
+                APP.measurement.stop()
+            while time.monotonic() < deadline:
+                if APP.hardware_idle():
+                    return {
+                        "ok": True,
+                        "message": "硬件已安全释放，后端正在退出",
+                    }
+                time.sleep(0.1)
+            if APP.hardware_idle():
+                return {
+                    "ok": True,
+                    "message": "硬件已安全释放，后端正在退出",
+                }
+            raise RuntimeError("硬件任务仍在安全停止，请稍后再次点击退出")
+    except Exception:
+        SHUTDOWN_INTENT.clear()
+        raise
+
+
 class DiagnosticHTTPServer(ThreadingHTTPServer):
     """Keep failures outside an API handler inside the diagnostic timeline."""
 
@@ -9655,6 +10178,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             result["busy"] = busy
             self._send_json(result)
             return
+        if parsed.path == "/api/devices/jlink-driver/status":
+            self._send_json(_jlink_driver_task_snapshot())
+            return
         if parsed.path == "/api/calibration":
             self._send_json(APP.model_payload())
             return
@@ -9688,11 +10214,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
         if parsed.path == "/api/health":
+            server_port = (
+                int(HTTP_SERVER.server_address[1])
+                if HTTP_SERVER is not None else DEFAULT_PORT
+            )
             self._send_json({
                 "ok": True,
+                "product": "SensUs-Electrochem-Workstation",
+                "health_schema": 2,
                 "project": str(PROJECT_DIR),
                 "version": __version__,
                 "diagnostic_session": DIAGNOSTICS.session_id,
+                "backend_pid": os.getpid(),
+                "launcher_pid": str(os.environ.get("SENSUS_APP_PID", "")),
+                "launch_token": str(
+                    os.environ.get("SENSUS_LAUNCH_TOKEN", "")
+                ),
+                "server_port": server_port,
+                "hardware_busy": bool(
+                    not APP.hardware_idle()
+                    or JLINK_DRIVER_INSTALL_LOCK.locked()
+                ),
+                "measurement_state": APP.measurement.state,
+                "schedule_active": bool(APP.schedule.snapshot()["active"]),
+                "settings_state": APP.settings.snapshot()["state"],
+                "app_update_busy": bool(APP_UPDATER.busy),
             })
             return
         if parsed.path == "/api/diagnostics":
@@ -9738,6 +10284,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         shutdown_requested = False
         try:
             payload = self._body()
+            if SHUTDOWN_INTENT.is_set() and self.path != "/api/shutdown":
+                raise RuntimeError("应用正在安全退出，不能再启动新的硬件任务")
             update_blocked_paths = {
                 "/api/devices/select", "/api/devices/jlink-driver/install",
                 "/api/measurement/start", "/api/range",
@@ -9747,6 +10295,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             }
             if APP_UPDATER.busy and self.path in update_blocked_paths:
                 raise RuntimeError("软件更新正在准备，暂时不能启动测量、烧录或硬件操作")
+            driver_blocked_paths = {
+                "/api/devices/select", "/api/measurement/start",
+                "/api/range", "/api/range/measurement", "/api/range/auto",
+                "/api/debug/start", "/api/debug/begin", "/api/debug/cmd",
+                "/api/schedule/start", "/api/settings/apply",
+            }
+            if (
+                JLINK_DRIVER_INSTALL_LOCK.locked()
+                and self.path in driver_blocked_paths
+            ):
+                raise RuntimeError("J-Link 驱动正在准备，请等待设备自动恢复")
             if self.path == "/api/frontend/ready":
                 result = FRONTEND_UPDATER.mark_ready()
             elif self.path == "/api/diagnostics/client":
@@ -9766,35 +10325,38 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
                 result = {"ok": True, "diagnostic_id": diagnostic_id}
             elif self.path == "/api/shutdown":
-                # The normal ``serve()`` finalizer stops schedules, ends an
-                # active acquisition,收回采集子进程/J-Link, then closes the HTTP server.
-                result = {"ok": True, "message": "后端正在退出"}
+                # Wait for firmware/driver operations to leave their
+                # non-interruptible section. Active acquisition is stopped via
+                # its normal protocol before the server process may exit.
+                result = _release_hardware_for_shutdown()
                 shutdown_requested = True
             elif self.path == "/api/app-update/start":
                 with APP.operation_lock:
+                    _ensure_not_shutting_down()
                     if not APP.hardware_idle():
                         raise RuntimeError("请先停止测量、自动任务或硬件参数更新")
                     result = APP_UPDATER.start_download()
             elif self.path == "/api/app-update/apply":
                 with APP.operation_lock:
+                    _ensure_not_shutting_down()
                     if not APP.hardware_idle():
                         raise RuntimeError("请先停止测量、自动任务或硬件参数更新")
                     result = APP_UPDATER.begin_install()
                     shutdown_requested = True
             elif self.path == "/api/devices/select":
                 with APP.operation_lock:
+                    _ensure_not_shutting_down()
                     if not APP.hardware_idle():
                         raise RuntimeError("测量或自动任务运行期间不能切换设备")
                     requested_id = str(payload.get("device_id") or "").strip()
                     if requested_id in {"", "auto"}:
                         _set_device_selection(None)
                         APP.settings.restore_for_transport(HARDWARE_TRANSPORT)
-                        result = _devices_payload(probe=True)
+                        result = _cached_devices_payload()
                         result["message"] = "已恢复自动检测"
                     else:
-                        devices = _discover_devices_with_probe()
-                        _annotate_target_states(devices, refresh_jlink=True)
-                        _remember_device_discovery(devices)
+                        with DEVICE_DISCOVERY_LOCK:
+                            devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
                         device = next(
                             (item for item in devices if item.get("id") == requested_id),
                             None,
@@ -9808,27 +10370,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                                 )
                             raise RuntimeError("该 J-Link 没有可用的探头序列号")
                         _set_device_selection(device)
+                        try:
+                            _refresh_usb_transport()
+                        except Exception:
+                            _set_device_selection(None)
+                            raise
                         APP.settings.restore_for_transport(HARDWARE_TRANSPORT)
                         result = _devices_payload_from_devices(devices)
                         result["message"] = f"已选择 {device.get('name', '设备')}"
             elif self.path == "/api/devices/jlink-driver/install":
-                if not JLINK_DRIVER_INSTALL_LOCK.acquire(blocking=False):
-                    result = _cached_devices_payload(busy=True)
-                    result["message"] = "J-Link 驱动正在准备，请完成当前管理员确认"
-                else:
-                    try:
-                        with APP.operation_lock:
-                            if not APP.hardware_idle():
-                                raise RuntimeError("测量或自动任务运行期间不能准备 J-Link 驱动")
-                            requested_id = str(payload.get("device_id") or "").strip()
-                            if not requested_id.startswith("jlink:"):
-                                raise ValueError("请选择需要准备的 J-Link")
-                            result = _prepare_jlink_winusb(requested_id)
-                    finally:
-                        JLINK_DRIVER_INSTALL_LOCK.release()
-                    result["driver_preparing"] = False
+                requested_id = str(payload.get("device_id") or "").strip()
+                if not requested_id.startswith("jlink:"):
+                    raise ValueError("请选择需要准备的 J-Link")
+                result = _start_jlink_driver_task(requested_id)
             elif self.path == "/api/measurement/start":
                 with APP.operation_lock:
+                    _ensure_not_shutting_down()
                     if APP.schedule.snapshot()["active"]:
                         raise RuntimeError("自动测量运行期间不能插入手动测量")
                     if not APP.settings.snapshot()["applied"]:
@@ -9847,6 +10404,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             # 只是打上 debug 标记并**不传 live_raw_path** ⇒ raw 留在 run_dir。
             elif self.path == "/api/debug/start":
                 with APP.operation_lock:
+                    _ensure_not_shutting_down()
                     result = APP.start_debug_run(payload)
             elif self.path == "/api/debug/stop":
                 with APP.measurement.lock:
@@ -9883,11 +10441,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = APP.predict(payload)
             elif self.path == "/api/schedule/start":
                 with APP.operation_lock:
+                    _ensure_not_shutting_down()
                     result = APP.start_schedule(payload)
             elif self.path == "/api/schedule/stop":
                 result = APP.schedule.stop()
             elif self.path == "/api/settings/apply":
                 with APP.operation_lock:
+                    _ensure_not_shutting_down()
                     if (APP.measurement.is_busy()
                             or APP.schedule.snapshot()["active"]):
                         raise RuntimeError("测量或自动任务运行期间不能修改硬件参数")
@@ -9906,6 +10466,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     APP.measurement.set_filter_config(result["settings"])
             elif self.path == "/api/plateau/apply":
                 with APP.operation_lock, APP.measurement.lock:
+                    _ensure_not_shutting_down()
                     if APP.schedule.snapshot()["active"]:
                         raise RuntimeError(
                             "自动任务运行期间不能修改自动停止参数"
@@ -9934,9 +10495,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
             elif self.path == "/api/workflow/config":
                 with APP.operation_lock:
+                    _ensure_not_shutting_down()
                     result = APP.configure_workflow(payload)
             elif self.path == "/api/workflow/reset-calibration":
                 with APP.operation_lock:
+                    _ensure_not_shutting_down()
                     result = APP.reset_calibration(payload)
             elif self.path == "/api/history/register":
                 result = APP.register_history(payload)
@@ -10003,6 +10566,7 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
     with _SHUTDOWN_LOCK:
         HTTP_SERVER = server
         _SHUTDOWN_REQUESTED = False
+    SHUTDOWN_INTENT.clear()
     FRONTEND_UPDATER.start(APP.hardware_idle)
     url = f"http://{host}:{server.server_port}/"
     DIAGNOSTICS.record(
@@ -10025,7 +10589,27 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
             "info", "application.signal", "Shutdown signal received",
             signal=int(_sig),
         )
-        threading.Thread(target=server.shutdown, daemon=True).start()
+
+        def release_and_shutdown() -> None:
+            released = False
+            try:
+                _release_hardware_for_shutdown(timeout_s=330.0)
+                released = True
+            except Exception as exc:
+                DIAGNOSTICS.exception(
+                    "application.signal_release_failed",
+                    "Hardware could not be released cleanly after a signal",
+                    exc,
+                    signal=int(_sig),
+                )
+            if released:
+                server.shutdown()
+
+        threading.Thread(
+            target=release_and_shutdown,
+            name="signal-safe-shutdown",
+            daemon=True,
+        ).start()
 
     _signals = (signal.SIGBREAK, signal.SIGINT) if _IS_WIN else (signal.SIGTERM, signal.SIGINT)  # type: ignore[attr-defined]
     for sig in _signals:

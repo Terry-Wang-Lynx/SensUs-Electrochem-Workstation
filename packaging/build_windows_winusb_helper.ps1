@@ -13,6 +13,10 @@ $Libusb0Url = "https://github.com/mcuee/libusb-win32/releases/download/release_1
 $Libusb0Sha256 = "9950b7a226e3ea387365c046d13b68bd0b0b18c015c034363601ff601c5b5585"
 $LibusbKUrl = "https://github.com/mcuee/libusbk/releases/download/V3.1.0.0/libusbK-3.1.0.0-bin.7z"
 $LibusbKSha256 = "38605d8d5a86f408a4b7bec60f6d4a096050eee72f89a63a8d5be125252d3fe7"
+$Libusb0SourceUrl = "https://github.com/mcuee/libusb-win32/archive/refs/tags/release_1.4.0.0.tar.gz"
+$Libusb0SourceSha256 = "78a002442e98d2f01c469ac7d01283f9655e257e18c4ad7670d00494b48deb8d"
+$LibusbKSourceUrl = "https://github.com/mcuee/libusbk/releases/download/V3.1.0.0/libusbK-3.1.0.0-src.7z"
+$LibusbKSourceSha256 = "e10210802d234d2ba3ad233089bb4e94a3b9e1ec5d38fc887868d3c7a6e7d477"
 
 if (-not $Source) {
   $Source = Join-Path $Root "artifacts\vendor\libwdi"
@@ -70,9 +74,15 @@ New-Item -ItemType Directory -Force -Path $DownloadCache | Out-Null
 $WdkMsi = Join-Path $DownloadCache "wdk-redist.msi"
 $Libusb0Archive = Join-Path $DownloadCache "libusb0-redist.zip"
 $LibusbKArchive = Join-Path $DownloadCache "libusbk-redist.7z"
+$Libusb0SourceArchive = Join-Path $DownloadCache "libusb-win32-1.4.0.0-source.tar.gz"
+$LibusbKSourceArchive = Join-Path $DownloadCache "libusbK-3.1.0.0-source.7z"
 Get-VerifiedDownload -Url $WdkUrl -Sha256 $WdkSha256 -Path $WdkMsi
 Get-VerifiedDownload -Url $Libusb0Url -Sha256 $Libusb0Sha256 -Path $Libusb0Archive
 Get-VerifiedDownload -Url $LibusbKUrl -Sha256 $LibusbKSha256 -Path $LibusbKArchive
+Get-VerifiedDownload -Url $Libusb0SourceUrl -Sha256 $Libusb0SourceSha256 `
+  -Path $Libusb0SourceArchive
+Get-VerifiedDownload -Url $LibusbKSourceUrl -Sha256 $LibusbKSourceSha256 `
+  -Path $LibusbKSourceArchive
 
 $WdkRoot = Join-Path $Source "wdk"
 $Libusb0Root = Join-Path $Source "libusb0"
@@ -84,6 +94,15 @@ New-Item -ItemType Directory -Force -Path $WdkRoot, $ExtractRoot | Out-Null
 & msiexec.exe /a $WdkMsi /qn "TARGETDIR=$WdkRoot"
 if ($LASTEXITCODE -notin @(0, 3010)) {
   throw "WDK redistributable extraction failed with exit code $LASTEXITCODE"
+}
+$WdkLicense = Get-ChildItem -Path $WdkRoot -Recurse -File |
+  Where-Object { $_.Name -ieq "License.rtf" } |
+  Select-Object -First 1
+$WdkRedist = Get-ChildItem -Path $WdkRoot -Recurse -File |
+  Where-Object { $_.Name -ieq "REDIST.TXT" } |
+  Select-Object -First 1
+if (-not $WdkLicense -or -not $WdkRedist) {
+  throw "WDK redistributable terms are missing License.rtf or REDIST.TXT"
 }
 
 $Libusb0Extract = Join-Path $ExtractRoot "libusb0"
@@ -140,6 +159,12 @@ Copy-Item $Helper (Join-Path $Destination "wdi-simple.exe")
 Copy-Item (Join-Path $Source "COPYING") (Join-Path $Destination "COPYING")
 Copy-Item (Join-Path $Source "COPYING-LGPL") (Join-Path $Destination "COPYING-LGPL")
 Copy-Item (Join-Path $Source "README.md") (Join-Path $Destination "libwdi-README.md")
+Copy-Item $Libusb0SourceArchive `
+  (Join-Path $Destination "libusb-win32-1.4.0.0-source.tar.gz")
+Copy-Item $LibusbKSourceArchive `
+  (Join-Path $Destination "libusbK-3.1.0.0-source.7z")
+Copy-Item $WdkLicense.FullName (Join-Path $Destination "WDK-License.rtf")
+Copy-Item $WdkRedist.FullName (Join-Path $Destination "WDK-REDIST.txt")
 
 $SourceArchive = Join-Path $Destination "libwdi-1.5.1-source.zip"
 & git -C $Source archive --format=zip "--output=$SourceArchive" $LibwdiCommit
@@ -152,10 +177,57 @@ Upstream: https://github.com/pbatard/libwdi
 Commit: $LibwdiCommit
 Build script: packaging/build_windows_winusb_helper.ps1
 
-The bundled wdi-simple.exe is unmodified and is used as a separate process.
-Complete source for this exact binary is in libwdi-1.5.1-source.zip.
-COPYING and COPYING-LGPL contain the applicable license terms.
+The bundled wdi-simple.exe is built directly from the pinned source without
+source patches and is used as a separate process.
+Its libwdi source is in libwdi-1.5.1-source.zip. The exact libusb-win32 and
+libusbK sources used for the embedded driver payloads are included beside it.
+WDK-License.rtf and WDK-REDIST.txt contain Microsoft's redistribution terms.
+COPYING and COPYING-LGPL contain libwdi's applicable license terms.
 "@ | Set-Content -Encoding ascii (Join-Path $Destination "SOURCE.txt")
+
+$Components = [ordered]@{
+  schema = 1
+  platform = "windows-x64"
+  components = @(
+    [ordered]@{
+      name = "libwdi"
+      version = "1.5.1"
+      commit = $LibwdiCommit
+      license = "LGPL-3.0-or-later"
+      source = "libwdi-1.5.1-source.zip"
+      upstream = $LibwdiUpstream
+    },
+    [ordered]@{
+      name = "Microsoft WDK WinUSB/WDF redistributables"
+      version = "8.0"
+      license = "LicenseRef-Microsoft-WDK-Redistributable"
+      input_url = $WdkUrl
+      input_sha256 = $WdkSha256
+      license_file = "WDK-License.rtf"
+      redist_file = "WDK-REDIST.txt"
+    },
+    [ordered]@{
+      name = "libusb-win32"
+      version = "1.4.0.0"
+      license = "GPL-2.0-only AND LGPL-2.1-only"
+      source = "libusb-win32-1.4.0.0-source.tar.gz"
+      source_url = $Libusb0SourceUrl
+      source_sha256 = $Libusb0SourceSha256
+      binary_input_sha256 = $Libusb0Sha256
+    },
+    [ordered]@{
+      name = "libusbK"
+      version = "3.1.0.0"
+      license = "BSD-3-Clause AND GPL-2.0-or-later"
+      source = "libusbK-3.1.0.0-source.7z"
+      source_url = $LibusbKSourceUrl
+      source_sha256 = $LibusbKSourceSha256
+      binary_input_sha256 = $LibusbKSha256
+    }
+  )
+}
+$Components | ConvertTo-Json -Depth 6 |
+  Set-Content -Encoding utf8 (Join-Path $Destination "COMPONENTS.json")
 
 Get-FileHash -Algorithm SHA256 (Join-Path $Destination "wdi-simple.exe")
 Write-Output $Destination

@@ -1,5 +1,8 @@
 name: portable-release
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,14 +16,34 @@ on:
       - "v*"
 
 jobs:
+  release-metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag against package version
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' pyproject.toml)"
+          test -n "$VERSION"
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   macos-arm64:
-    if: github.event_name == 'workflow_dispatch' && inputs.build_macos == true
+    if: github.event_name == 'push' || inputs.build_macos == true
+    needs: release-metadata
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
           cache: pip
       - uses: actions/setup-node@v4
         with:
@@ -29,20 +52,74 @@ jobs:
         run: python -m pip install -e ".[dev,analysis]"
       - name: Run host tests
         run: make test VENV_PYTHON=python
-      - name: Install packaged OpenOCD fallback
-        run: brew install open-ocd
+      - name: Install pinned OpenOCD build prerequisite
+        run: brew install pkgconf
       - name: Build portable DMG
         env:
           SENSUS_FRONTEND_MANIFEST_URL: ${{ vars.SENSUS_FRONTEND_MANIFEST_URL }}
           SENSUS_FRONTEND_PUBLIC_KEY: ${{ vars.SENSUS_FRONTEND_PUBLIC_KEY }}
         run: make dmg VENV_PYTHON=python PYTHON=python
+      - name: Smoke test frozen macOS backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python -c 'import pa_host; print(pa_host.__version__)')"
+          test "$VERSION" = "${{ needs.release-metadata.outputs.version }}"
+          DMG="$(find "artifacts/releases/$VERSION" -maxdepth 1 -name 'SensUs-Workstation-macOS-arm64-*.dmg' -print -quit)"
+          test -n "$DMG"
+          hdiutil verify "$DMG"
+          MOUNT="$RUNNER_TEMP/sensus-dmg-mount"
+          mkdir -p "$MOUNT"
+          hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "$DMG"
+          APP="$MOUNT/SensUs Workstation.app"
+          BACKEND="$APP/Contents/Resources/backend/SensUsBackend/SensUsBackend"
+          WORKSTATION="$APP/Contents/Resources/workstation"
+          OPENOCD="$APP/Contents/Resources/tools/openocd/bin/openocd"
+          test -f "$APP/Contents/Resources/tools/openocd/COMPONENTS.json"
+          test -f "$APP/Contents/Resources/tools/openocd/licenses/OpenOCD-COPYING"
+          test -f "$APP/Contents/Resources/tools/openocd/licenses/libusb-COPYING"
+          test -f "$APP/Contents/Resources/tools/openocd/source/openocd-0.12.0.tar.bz2"
+          test -f "$APP/Contents/Resources/tools/openocd/source/libusb-1.0.29.tar.bz2"
+          test -f "$APP/Contents/Resources/THIRD_PARTY_LICENSES/SBOM.spdx.json"
+          ADAPTERS="$("$OPENOCD" -c 'echo [adapter list]; shutdown' 2>&1)"
+          grep -qi 'jlink' <<<"$ADAPTERS"
+          PORT="$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+          export SENSUS_PROJECT_DIR="$WORKSTATION"
+          export SENSUS_RESOURCE_DIR="$WORKSTATION"
+          export SENSUS_STATE_DIR="$RUNNER_TEMP/sensus-smoke-macos"
+          "$BACKEND" gui --host 127.0.0.1 --port "$PORT" >"$RUNNER_TEMP/sensus-macos-smoke.log" 2>&1 &
+          BACKEND_PID=$!
+          cleanup() {
+            kill "$BACKEND_PID" 2>/dev/null || true
+            hdiutil detach "$MOUNT" -quiet 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 180); do
+            if curl --fail --silent "http://127.0.0.1:$PORT/api/health" >"$RUNNER_TEMP/sensus-health.json"; then
+              break
+            fi
+            sleep 0.5
+          done
+          python - "$VERSION" "$RUNNER_TEMP/sensus-health.json" <<'PY'
+          import json, pathlib, sys
+          expected, path = sys.argv[1:]
+          payload = json.loads(pathlib.Path(path).read_text())
+          assert payload["ok"] is True
+          assert payload["version"] == expected, payload
+          PY
+          curl --fail --silent -X POST -H 'Content-Type: application/json' \
+            -d '{}' "http://127.0.0.1:$PORT/api/shutdown" >/dev/null
+          wait "$BACKEND_PID"
+          hdiutil detach "$MOUNT" -quiet
+          trap - EXIT
       - uses: actions/upload-artifact@v4
         with:
           name: SensUs-Workstation-macOS-arm64
-          path: artifacts/releases/**/*.dmg
+          path: artifacts/releases/*/SensUs-Workstation-macOS-arm64-*.dmg
           if-no-files-found: error
 
   windows-x64:
+    needs: release-metadata
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -55,11 +132,22 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
           cache: pip
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            autoconf
+            automake
+            libtool
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
       - uses: microsoft/setup-msbuild@v2
       - name: Install test dependencies
         run: python -m pip install -e ".[dev,analysis]"
@@ -72,14 +160,118 @@ jobs:
       - name: Build pinned WinUSB helper
         shell: pwsh
         run: ./packaging/build_windows_winusb_helper.ps1
+      - name: Build pinned J-Link-only OpenOCD
+        shell: msys2 {0}
+        run: ./packaging/build_windows_openocd.sh artifacts/build/windows-x64/openocd
       - name: Build portable ZIP
         shell: pwsh
         env:
           SENSUS_FRONTEND_MANIFEST_URL: ${{ vars.SENSUS_FRONTEND_MANIFEST_URL }}
           SENSUS_FRONTEND_PUBLIC_KEY: ${{ vars.SENSUS_FRONTEND_PUBLIC_KEY }}
         run: ./windows/build_portable.ps1 -Python python
+      - name: Smoke test frozen Windows backend
+        shell: pwsh
+        run: |
+          $Version = python -c "import pa_host; print(pa_host.__version__)"
+          if ($Version -ne "${{ needs.release-metadata.outputs.version }}") {
+            throw "Package version does not match validated release metadata"
+          }
+          $Zip = Get-ChildItem "artifacts/releases/$Version/SensUs-Workstation-Windows-x64-*.zip" |
+            Select-Object -First 1
+          if (-not $Zip) { throw "Windows ZIP was not created" }
+          $Extracted = Join-Path $env:RUNNER_TEMP "sensus-final-windows"
+          Expand-Archive -LiteralPath $Zip.FullName -DestinationPath $Extracted
+          $Backend = Join-Path $Extracted "SensUsBackend.exe"
+          $OpenOcd = Join-Path $Extracted "tools/openocd/bin/openocd.exe"
+          if (-not (Test-Path (Join-Path $Extracted "tools/openocd/COMPONENTS.json"))) {
+            throw "OpenOCD component manifest is missing from final ZIP"
+          }
+          if (-not (Test-Path (Join-Path $Extracted "tools/openocd/licenses/OpenOCD-COPYING"))) {
+            throw "OpenOCD license is missing from final ZIP"
+          }
+          if (-not (Test-Path (Join-Path $Extracted "tools/openocd/source/openocd-0.12.0.tar.bz2"))) {
+            throw "OpenOCD source is missing from final ZIP"
+          }
+          if (-not (Test-Path (Join-Path $Extracted "tools/openocd/source/libusb-1.0.29.tar.bz2"))) {
+            throw "libusb source is missing from final ZIP"
+          }
+          if (-not (Test-Path (Join-Path $Extracted "THIRD_PARTY_LICENSES/SBOM.spdx.json"))) {
+            throw "Python runtime SBOM is missing from final ZIP"
+          }
+          $Adapters = (& $OpenOcd -c "echo [adapter list]; shutdown" 2>&1) -join "`n"
+          if ($Adapters -notmatch "(?i)jlink") {
+            throw "Final Windows OpenOCD does not contain the jlink adapter"
+          }
+          $env:SENSUS_PROJECT_DIR = Join-Path $Extracted "workstation"
+          $env:SENSUS_RESOURCE_DIR = $env:SENSUS_PROJECT_DIR
+          $env:SENSUS_STATE_DIR = Join-Path $env:RUNNER_TEMP "sensus-smoke-windows"
+          $Port = python -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()"
+          $Process = Start-Process -FilePath $Backend `
+            -ArgumentList @("gui", "--host", "127.0.0.1", "--port", $Port) `
+            -WindowStyle Hidden -PassThru
+          try {
+            $Health = $null
+            for ($Attempt = 0; $Attempt -lt 360; $Attempt++) {
+              try {
+                $Health = Invoke-RestMethod "http://127.0.0.1:$Port/api/health" `
+                  -TimeoutSec 2
+                break
+              } catch {
+                Start-Sleep -Milliseconds 500
+              }
+            }
+            if (-not $Health) { throw "Frozen Windows backend did not become ready" }
+            if ($Health.version -ne $Version) {
+              throw "Frozen backend version mismatch: $($Health.version) != $Version"
+            }
+            Invoke-RestMethod "http://127.0.0.1:$Port/api/shutdown" `
+              -Method Post -ContentType "application/json" -Body "{}" `
+              -TimeoutSec 30 | Out-Null
+            Wait-Process -Id $Process.Id -Timeout 30
+          } finally {
+            if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: SensUs-Workstation-Windows-x64
-          path: artifacts/releases/**/*.zip
+          path: artifacts/releases/*/SensUs-Workstation-Windows-x64-*.zip
           if-no-files-found: error
+
+  draft-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [release-metadata, macos-arm64, windows-x64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: SensUs-Workstation-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify both platform assets and write checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find release-assets -maxdepth 1 -name '*.dmg' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name '*.zip' | wc -l)" -eq 1
+          cd release-assets
+          sha256sum ./*.dmg ./*.zip > SHA256SUMS.txt
+      - name: Create Chinese draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: false
+          body: |
+            本版本同时提供 Windows 和 macOS 分发包，内置上位机后端、稳定固件、OpenOCD、USB 更新工具及所需 Python 运行环境。
+
+            - Windows 10/11 x64：请完整解压 ZIP 后运行 `SensUsBackend.exe`。首次启动可能出现 SmartScreen“未知发布者”提示；首次使用未安装兼容驱动的 J-Link 时，在右上角“选择设备”中点击“准备 J-Link”，并确认 Windows 管理员权限提示。
+            - macOS 14 及以上、Apple Silicon：打开 DMG 后拖入“应用程序”。当前构建尚无 Apple Developer ID 公证，首次启动请在 Finder 中右键应用并选择“打开”。
+            - 支持 V4 板卡通过 J-Link 连接，以及 V5.1 板卡通过 USB DATA/SMP 或 J-Link 连接；检测到多个设备时可手动选择。
+            - 修复其他版本 SEGGER 工具兼容、J-Link 驱动准备、USB 重枚举、测量启动状态、退出清理及旧后台端口冲突问题。
+
+            SHA-256 校验值见 `SHA256SUMS.txt`。
+          files: |
+            release-assets/*.dmg
+            release-assets/*.zip
+            release-assets/SHA256SUMS.txt

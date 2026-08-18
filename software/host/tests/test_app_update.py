@@ -1,6 +1,7 @@
 import hashlib
 import io
 import os
+import re
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -174,7 +175,7 @@ def test_install_handoff_uses_external_helper_after_process_exit(
     staged.mkdir()
     manager = AppUpdateManager(
         "0.4.6", tmp_path / "state", package_kind=package_kind,
-        target_path=target, app_pid=123,
+        target_path=target, app_pid=123, server_port=54321,
     )
     manager._state = "ready"
     manager._available = True
@@ -195,6 +196,33 @@ def test_install_handoff_uses_external_helper_after_process_exit(
     assert "123" in command
     assert str(os.getpid()) in command
     assert "0.4.7" in command
+    assert "54321" in command
+    assert re.fullmatch(r"[0-9a-f]{48}", command[-1])
+    assert "SENSUS_SERVER_PORT" in helper_text
+    assert "SENSUS_LAUNCH_TOKEN" in helper_text
+    assert "SensUs-Electrochem-Workstation" in helper_text
+    assert "launch_token" in helper_text
+    assert "project" in helper_text
+    assert "127.0.0.1:8765/api/health" not in helper_text
+    if package_kind == "macos-arm64":
+        assert "/usr/bin/open -n" in helper_text
+        assert "SENSUS_LAUNCH_PID_FILE" in helper_text
+        assert 'health_launcher_pid" == "$new_app_pid' in helper_text
+    else:
+        assert "launcher_pid" in helper_text
+        assert "$NewProcess.Id" in helper_text
+
+
+def test_update_helper_inherits_dynamic_server_port_from_launcher(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("SENSUS_SERVER_PORT", "51234")
+    manager = AppUpdateManager(
+        "0.4.6", tmp_path / "state", package_kind="windows-x64",
+        target_path=tmp_path / "installed", app_pid=123,
+    )
+
+    assert manager.server_port == 51234
 
 
 def test_macos_update_rejects_running_from_downloaded_disk_image(

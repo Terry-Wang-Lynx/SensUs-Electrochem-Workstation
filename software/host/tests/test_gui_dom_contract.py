@@ -484,7 +484,7 @@ def test_measurement_start_validates_inputs_keeps_errors_and_waits_for_gate() ->
     assert 'id="sampleName" placeholder="例如：未知样品 01" required' in html
     assert 'id="knownConcentration" type="number" min="0" step="any"' in html
     assert 'placeholder="请输入标定浓度" required' in html
-    assert "MEASUREMENT_START_TIMEOUT_MS = 45000" in app
+    assert "MEASUREMENT_START_TIMEOUT_MS = 180000" in app
     assert "timeoutMs:MEASUREMENT_START_TIMEOUT_MS" in app
     assert "function measurementInputIssue()" in app
     assert "function clearMeasurementInputState()" in app
@@ -555,7 +555,7 @@ updateButton();const stopping=capture();
         "{disconnected,unreachable,ready,starting,running,stopping}",
     )
 
-    assert "MEASUREMENT_START_TIMEOUT_MS = 45000" in compact
+    assert "MEASUREMENT_START_TIMEOUT_MS = 180000" in compact
     assert "if (state.measurementAction) return" in compact
     assert "state.measurementAction = stopping ? 'stopping' : 'starting'" in compact
     assert "}, MEASUREMENT_START_TIMEOUT_MS)" in compact
@@ -654,6 +654,7 @@ def test_gui_exposes_manual_multi_device_picker() -> None:
     assert "/api/devices/select" in app
     assert "/api/devices/jlink-driver/install" in app
     assert "准备 J-Link" in app
+    assert "请点击右上角“选择设备”，再点击该 J-Link 的“准备 J-Link”" in app
     assert "device-card" in styles
 
 

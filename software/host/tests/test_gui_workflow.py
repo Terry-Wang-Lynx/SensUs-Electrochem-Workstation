@@ -2465,10 +2465,8 @@ def test_openocd_target_probe_accepts_explicit_read_memory_identity(
         patch("pa_host.gui_server.OPENOCD_EXE", openocd),
         patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
         patch(
-            "pa_host.gui_server.runtime.hidden_subprocess_kwargs",
-            return_value={"creationflags": 0x08000000},
-        ),
-        patch("pa_host.gui_server.subprocess.run", return_value=completed) as run,
+            "pa_host.gui_server._run_openocd_bounded", return_value=completed,
+        ) as run,
     ):
         reachable, output = gui_server._openocd_target_probe("29734569")
 
@@ -2477,7 +2475,7 @@ def test_openocd_target_probe_accepts_explicit_read_memory_identity(
     command = run.call_args.args[0]
     assert any("read_memory 0x10000100 32 1" in arg for arg in command)
     assert not any("mdw " in arg for arg in command)
-    assert run.call_args.kwargs["creationflags"] == 0x08000000
+    assert run.call_args.kwargs["timeout_s"] == 10
 
 
 def test_openocd_target_probe_rejects_connection_log_without_identity(
@@ -2495,7 +2493,7 @@ def test_openocd_target_probe_rejects_connection_log_without_identity(
     with (
         patch("pa_host.gui_server.OPENOCD_EXE", openocd),
         patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
-        patch("pa_host.gui_server.subprocess.run", return_value=completed),
+        patch("pa_host.gui_server._run_openocd_bounded", return_value=completed),
     ):
         reachable, _output = gui_server._openocd_target_probe("29734569")
 
@@ -2517,7 +2515,9 @@ def test_openocd_rtt_layout_probe_accepts_unpadded_signature_words(
     with (
         patch("pa_host.gui_server.OPENOCD_EXE", openocd),
         patch("pa_host.gui_server.OPENOCD_SCRIPTS", scripts),
-        patch("pa_host.gui_server.subprocess.run", return_value=completed) as run,
+        patch(
+            "pa_host.gui_server._run_openocd_bounded", return_value=completed,
+        ) as run,
     ):
         reachable, layout_ready, output = gui_server._openocd_rtt_layout_probe(
             0x20001100, "29734569",
@@ -3355,6 +3355,82 @@ def test_server_shutdown_waits_for_measurement_finalization() -> None:
     app.measurement.stop.assert_called_once_with()
     app.measurement.wait_for_completion.assert_called_once_with()
     server.server_close.assert_called_once_with()
+
+
+def test_safe_shutdown_stops_measurement_and_waits_until_idle(monkeypatch) -> None:
+    schedule = Mock()
+    schedule.snapshot.return_value = {"active": True}
+    measurement = Mock()
+    measurement.is_busy.return_value = True
+    idle_states = iter((False, True))
+    app = Mock(
+        operation_lock=threading.RLock(),
+        schedule=schedule,
+        measurement=measurement,
+    )
+    app.hardware_idle.side_effect = lambda: next(idle_states, True)
+    monkeypatch.setattr(gui_server, "APP", app)
+    monkeypatch.setattr(gui_server, "JLINK_DRIVER_INSTALL_LOCK", threading.Lock())
+    monkeypatch.setattr(gui_server, "SHUTDOWN_INTENT", threading.Event())
+    monkeypatch.setattr(gui_server.time, "sleep", lambda _seconds: None)
+
+    result = gui_server._release_hardware_for_shutdown(timeout_s=1)
+
+    assert result["ok"] is True
+    schedule.stop.assert_called_once_with()
+    measurement.stop.assert_called_once_with()
+
+
+def test_safe_shutdown_refuses_to_exit_while_driver_task_is_active(
+    monkeypatch,
+) -> None:
+    driver_lock = threading.Lock()
+    driver_lock.acquire()
+    app = Mock(operation_lock=threading.RLock())
+    app.schedule.snapshot.return_value = {"active": False}
+    app.measurement.is_busy.return_value = False
+    app.hardware_idle.return_value = True
+    monkeypatch.setattr(gui_server, "APP", app)
+    monkeypatch.setattr(gui_server, "JLINK_DRIVER_INSTALL_LOCK", driver_lock)
+    monkeypatch.setattr(gui_server, "SHUTDOWN_INTENT", threading.Event())
+    try:
+        with pytest.raises(RuntimeError, match="驱动仍在安全准备"):
+            gui_server._release_hardware_for_shutdown(timeout_s=0)
+    finally:
+        driver_lock.release()
+
+
+def test_queued_measurement_start_rechecks_shutdown_inside_operation_lock(
+    monkeypatch,
+) -> None:
+    shutdown = threading.Event()
+
+    class RacingOperationLock:
+        def __enter__(self):
+            shutdown.set()
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    app = Mock(operation_lock=RacingOperationLock())
+    app.schedule.snapshot.return_value = {"active": False}
+    app.settings.snapshot.return_value = {"applied": True}
+    handler = RequestHandler.__new__(RequestHandler)
+    handler.path = "/api/measurement/start"
+    handler._body = Mock(return_value={"sample_name": "queued"})
+    handler._send_json = Mock()
+    monkeypatch.setattr(gui_server, "APP", app)
+    monkeypatch.setattr(gui_server, "APP_UPDATER", Mock(busy=False))
+    monkeypatch.setattr(gui_server, "SHUTDOWN_INTENT", shutdown)
+    monkeypatch.setattr(gui_server, "JLINK_DRIVER_INSTALL_LOCK", threading.Lock())
+
+    handler.do_POST()
+
+    app.start_measurement.assert_not_called()
+    response, status = handler._send_json.call_args.args
+    assert "安全退出" in response["error"]
+    assert status == 409
 
 
 def test_debug_probe_arms_rtt_without_starting_and_begin_queues_set_first(

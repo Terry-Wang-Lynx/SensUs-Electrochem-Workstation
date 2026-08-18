@@ -148,7 +148,15 @@ def _windows_infos(rows: Iterable[dict[str, Any]]) -> list[JLinkUsbInfo]:
             problem_code=problem_code,
         )
         container = str(row.get("container_id") or "").strip()
-        key = container or f"{vid:04x}:{pid:04x}:{serial.lower()}"
+        parent = str(row.get("parent") or "").strip()
+        # ContainerId is the strongest physical identity. When Windows omits
+        # it, group composite children under their parent instance while
+        # preserving separate non-MI instances even if cloned probes report the
+        # same serial number.
+        key = container or (
+            parent.lower() if mi is not None and parent
+            else instance_id.lower()
+        )
         # The non-MI parent represents the physical probe. Keep an interface
         # only when Windows did not expose that parent in the PnP snapshot.
         rank = 0 if mi is None else 1
@@ -226,9 +234,17 @@ def _macos_payload() -> Any:
         timeout=8,
     )
     if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", "replace").strip()
+        detail = (
+            completed.stderr.decode("utf-8", "replace")
+            if isinstance(completed.stderr, bytes)
+            else str(completed.stderr or "")
+        ).strip()
         raise RuntimeError(detail or "macOS J-Link discovery failed")
-    return plistlib.loads(completed.stdout)
+    payload = (
+        completed.stdout.encode("utf-8")
+        if isinstance(completed.stdout, str) else completed.stdout
+    )
+    return plistlib.loads(payload)
 
 
 def discover_jlink_usb_devices(

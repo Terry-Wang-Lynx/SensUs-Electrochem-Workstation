@@ -9,9 +9,11 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 JLINK_VENDOR_ID = 0x1366
@@ -20,6 +22,9 @@ _IS_WIN = os.name == "nt"
 _DRIVER_ERROR_MARKERS = (
     "libusb_error_not_found",
     "libusb_error_not_supported",
+    "libusb_error_access",
+    "access denied",
+    "cannot open j-link",
     "no j-link device found",
 )
 _PROBE_COMMUNICATION_ERROR_MARKERS = (
@@ -27,6 +32,17 @@ _PROBE_COMMUNICATION_ERROR_MARKERS = (
     "sending data to device timed out",
     "jaylink_get_firmware_version() failed",
     "transport_write() failed: timeout occurred",
+)
+_COMMANDER_PROBE_CONNECTED_MARKERS = (
+    "connecting to j-link via usb...o.k.",
+    "connecting to j-link via usb...ok",
+    "hardware version:",
+    "s/n:",
+)
+_PROBE_BUSY_MARKERS = (
+    "libusb_error_busy",
+    "device is already in use",
+    "j-link is already in use",
 )
 _LIBUSB_COMPATIBLE_SERVICES = {"winusb", "libusbk", "libusb0"}
 # Driver replacement must be interface-specific. Rebinding the composite
@@ -52,6 +68,29 @@ class JLinkUsbInterface:
     instance_id: str
 
 
+@dataclass(frozen=True)
+class JLinkUsbBinding:
+    """One physical J-Link debug interface and its current PnP binding."""
+
+    interface: JLinkUsbInterface
+    probe_serial: str
+    parent_id: str
+    container_id: str
+    status: str
+    problem_code: int
+    service: str
+    driver_inf_path: str
+    driver_provider: str
+
+    @property
+    def ready(self) -> bool:
+        return (
+            self.status.strip().lower() == "ok"
+            and self.problem_code == 0
+            and self.service.strip().lower() in _LIBUSB_COMPATIBLE_SERVICES
+        )
+
+
 def openocd_reports_missing_driver(output: object) -> bool:
     text = str(output or "").lower()
     return any(marker in text for marker in _DRIVER_ERROR_MARKERS)
@@ -61,6 +100,17 @@ def openocd_reports_probe_communication_error(output: object) -> bool:
     """Identify failures that happen before OpenOCD reaches the SWD target."""
     text = str(output or "").lower()
     return any(marker in text for marker in _PROBE_COMMUNICATION_ERROR_MARKERS)
+
+
+def commander_reports_probe_connected(output: object) -> bool:
+    """Return true only when Commander opened the probe before SWD failed."""
+    text = str(output or "").lower()
+    return any(marker in text for marker in _COMMANDER_PROBE_CONNECTED_MARKERS)
+
+
+def reports_probe_busy(output: object) -> bool:
+    text = str(output or "").lower()
+    return any(marker in text for marker in _PROBE_BUSY_MARKERS)
 
 
 def resolve_helper(project_dir: Path) -> Path:
@@ -103,6 +153,9 @@ $items = Get-PnpDevice -PresentOnly |
       service = [string](Read-DeviceProperty $instanceId 'DEVPKEY_Device_Service')
       driver_inf_path = [string](Read-DeviceProperty $instanceId 'DEVPKEY_Device_DriverInfPath')
       driver_provider = [string](Read-DeviceProperty $instanceId 'DEVPKEY_Device_DriverProvider')
+      parent = [string](Read-DeviceProperty $instanceId 'DEVPKEY_Device_Parent')
+      container_id = [string](Read-DeviceProperty $instanceId 'DEVPKEY_Device_ContainerId')
+      serial_number = [string](Read-DeviceProperty $instanceId 'DEVPKEY_Device_SerialNumber')
     }}
   }}
 @($items) | ConvertTo-Json -Compress
@@ -133,27 +186,35 @@ $items = Get-PnpDevice -PresentOnly |
     return [item for item in payload if isinstance(item, dict)]
 
 
-def _interface_requires_winusb(item: dict[str, Any]) -> bool:
-    status = str(item.get("status") or "").strip().lower()
-    try:
-        problem_code = int(item.get("problem_code") or 0)
-    except (TypeError, ValueError):
-        problem_code = 0
-    service = str(item.get("service") or "").strip().lower()
-    return (
-        (bool(status) and status != "ok")
-        or problem_code != 0
-        or service not in _LIBUSB_COMPATIBLE_SERVICES
-    )
+def _normalise_probe_serial(value: object) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if not digits:
+        return ""
+    return str(int(digits, 10))
 
 
-def problem_interfaces(vid: int, pid: int) -> list[JLinkUsbInterface]:
+def _binding_probe_serial(
+    item: dict[str, Any], instance_id: str, mi: int | None,
+) -> str:
+    explicit = _normalise_probe_serial(item.get("serial_number"))
+    if explicit:
+        return explicit
+    parent = str(item.get("parent") or "")
+    if mi is not None and _INSTANCE_ID_RE.match(parent):
+        return _normalise_probe_serial(parent.rsplit("\\", 1)[-1])
+    if mi is None:
+        return _normalise_probe_serial(instance_id.rsplit("\\", 1)[-1])
+    # Composite child instance tails such as 7&ABC&0&0002 are opaque PnP
+    # addresses, not J-Link serial numbers.
+    return ""
+
+
+def jlink_bindings(vid: int, pid: int) -> list[JLinkUsbBinding]:
+    """Return every supported debug interface without collapsing probes."""
     if int(vid) != JLINK_VENDOR_ID:
         raise ValueError("Only SEGGER J-Link USB interfaces may be prepared")
-    matches: dict[tuple[int, int, int | None], JLinkUsbInterface] = {}
+    matches: dict[str, JLinkUsbBinding] = {}
     for item in _problem_device_payload(int(vid), int(pid)):
-        if not _interface_requires_winusb(item):
-            continue
         instance_id = str(item.get("instance_id") or "")
         match = _INSTANCE_ID_RE.match(instance_id)
         if match is None:
@@ -163,9 +224,32 @@ def problem_interfaces(vid: int, pid: int) -> list[JLinkUsbInterface]:
         if (found_vid, found_pid) != (int(vid), int(pid)):
             continue
         mi = int(match.group(3), 16) if match.group(3) else None
+        if (found_pid, mi) not in _SUPPORTED_WINUSB_INTERFACES:
+            continue
+        try:
+            problem_code = int(item.get("problem_code") or 0)
+        except (TypeError, ValueError):
+            problem_code = 0
         interface = JLinkUsbInterface(found_vid, found_pid, mi, instance_id)
-        matches[(found_vid, found_pid, mi)] = interface
+        matches[instance_id.lower()] = JLinkUsbBinding(
+            interface=interface,
+            probe_serial=_binding_probe_serial(item, instance_id, mi),
+            parent_id=str(item.get("parent") or ""),
+            container_id=str(item.get("container_id") or ""),
+            status=str(item.get("status") or ""),
+            problem_code=problem_code,
+            service=str(item.get("service") or ""),
+            driver_inf_path=str(item.get("driver_inf_path") or ""),
+            driver_provider=str(item.get("driver_provider") or ""),
+        )
     return list(matches.values())
+
+
+def problem_interfaces(vid: int, pid: int) -> list[JLinkUsbInterface]:
+    return [
+        binding.interface for binding in jlink_bindings(vid, pid)
+        if not binding.ready
+    ]
 
 
 def repairable_interfaces(vid: int, pid: int) -> list[JLinkUsbInterface]:
@@ -192,6 +276,7 @@ def _run_elevated(
     timeout_s: float,
     restart_instance_id: str = "",
     cleanup_paths: tuple[Path, ...] = (),
+    status_callback: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [str(executable), *arguments]
     common = {
@@ -204,7 +289,10 @@ def _run_elevated(
         "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
     }
     if _is_administrator():
+        if status_callback is not None:
+            status_callback("正在安装 J-Link Windows 驱动")
         completed = subprocess.run(command, **common)
+        pnp_lines: list[str] = []
         if completed.returncode == 0 and restart_instance_id:
             restart_common = {
                 "check": False,
@@ -215,38 +303,78 @@ def _run_elevated(
                 "timeout": 30,
                 "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
             }
-            subprocess.run(
-                ["pnputil.exe", "/restart-device", restart_instance_id],
-                **restart_common,
-            )
-            subprocess.run(["pnputil.exe", "/scan-devices"], **restart_common)
-        return completed
+            for label, pnp_command in (
+                (
+                    "RESTART",
+                    ["pnputil.exe", "/restart-device", restart_instance_id],
+                ),
+                ("SCAN", ["pnputil.exe", "/scan-devices"]),
+            ):
+                try:
+                    pnp = subprocess.run(pnp_command, **restart_common)
+                    pnp_lines.append(f"SENSUS_PNP_{label}_EXIT={pnp.returncode}")
+                    detail = f"{pnp.stdout}\n{pnp.stderr}".strip()
+                    if detail:
+                        pnp_lines.append(detail)
+                except subprocess.TimeoutExpired:
+                    pnp_lines.append(f"SENSUS_PNP_{label}_EXIT=124")
+        stdout = "\n".join(
+            part for part in (completed.stdout, *pnp_lines) if str(part).strip()
+        )
+        return subprocess.CompletedProcess(
+            completed.args, completed.returncode, stdout, completed.stderr,
+        )
 
     with tempfile.TemporaryDirectory(
         prefix="sensus-jlink-elevation-", ignore_cleanup_errors=True,
     ) as output_dir:
         stdout_path = Path(output_dir) / "stdout.txt"
         stderr_path = Path(output_dir) / "stderr.txt"
+        status_path = Path(output_dir) / "status.txt"
         # Keep ownership on the unelevated caller. If the elevated process
         # creates these files itself, Windows may give the caller no read ACL.
         stdout_path.touch()
         stderr_path.touch()
+        status_path.touch()
 
         def ps_literal(value: object) -> str:
             return "'" + str(value).replace("'", "''") + "'"
 
+        deadline_ms = int((time.time() + max(1.0, timeout_s)) * 1000)
         wrapper_lines = [
             "$ErrorActionPreference = 'Stop'",
+            (
+                f"Set-Content -LiteralPath {ps_literal(status_path)} "
+                "-Value 'installing' -Encoding ASCII"
+            ),
             f"$argumentLine = {ps_literal(subprocess.list2cmdline(arguments))}",
+            f"$deadlineMs = [int64]{deadline_ms}",
+            (
+                "function Get-RemainingMilliseconds { "
+                "$remaining = $deadlineMs - "
+                "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); "
+                "return [int][Math]::Max(0, [Math]::Min(2147483647, $remaining)) }"
+            ),
+            (
+                "function Wait-Bounded([System.Diagnostics.Process]$process) { "
+                "$remaining = Get-RemainingMilliseconds; "
+                "if ($remaining -le 0 -or -not $process.WaitForExit($remaining)) { "
+                "try { $process.Kill() } catch {}; return $false }; return $true }"
+            ),
             "$exitCode = 1",
             "try {",
             (
                 f"$process = Start-Process -FilePath {ps_literal(executable)} "
-                f"-ArgumentList $argumentLine -WindowStyle Hidden -Wait -PassThru "
+                f"-ArgumentList $argumentLine -WindowStyle Hidden -PassThru "
                 f"-RedirectStandardOutput {ps_literal(stdout_path)} "
                 f"-RedirectStandardError {ps_literal(stderr_path)}"
             ),
-            "  $exitCode = $process.ExitCode",
+            (
+                "  if (Wait-Bounded $process) { $exitCode = $process.ExitCode } "
+                "else { $exitCode = 124; "
+                f"Add-Content -LiteralPath {ps_literal(stderr_path)} "
+                "-Value 'J-Link WinUSB helper timed out' }"
+            ),
         ]
         if restart_instance_id:
             restart_arguments = subprocess.list2cmdline(
@@ -256,15 +384,26 @@ def _run_elevated(
                 "  if ($exitCode -eq 0) {",
                 f"    $restartArguments = {ps_literal(restart_arguments)}",
                 (
-                    "    $null = Start-Process -FilePath 'pnputil.exe' "
+                    "    $restart = Start-Process -FilePath 'pnputil.exe' "
                     "-ArgumentList $restartArguments -WindowStyle Hidden "
-                    "-Wait -PassThru"
+                    "-PassThru"
                 ),
                 (
-                    "    $null = Start-Process -FilePath 'pnputil.exe' "
-                    "-ArgumentList '/scan-devices' -WindowStyle Hidden "
-                    "-Wait -PassThru"
+                    "    $restartCode = if (Wait-Bounded $restart) { "
+                    "$restart.ExitCode } else { 124 }"
                 ),
+                f"    Add-Content -LiteralPath {ps_literal(stdout_path)} "
+                "-Value ('SENSUS_PNP_RESTART_EXIT=' + $restartCode)",
+                (
+                    "    $scan = Start-Process -FilePath 'pnputil.exe' "
+                    "-ArgumentList '/scan-devices' -WindowStyle Hidden -PassThru"
+                ),
+                (
+                    "    $scanCode = if (Wait-Bounded $scan) { "
+                    "$scan.ExitCode } else { 124 }"
+                ),
+                f"    Add-Content -LiteralPath {ps_literal(stdout_path)} "
+                "-Value ('SENSUS_PNP_SCAN_EXIT=' + $scanCode)",
                 "  }",
             ))
         wrapper_lines.extend(("} finally {",))
@@ -292,14 +431,49 @@ $process = Start-Process `
   -Verb RunAs -WindowStyle Hidden -Wait -PassThru
 exit $process.ExitCode
 """
-        launcher = subprocess.run(
-            [
-                "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-                "-ExecutionPolicy", "Bypass", "-Command", script,
-            ],
-            env=environment,
-            **common,
+        launcher_common = dict(common)
+        launcher_common["timeout"] = max(1.0, timeout_s) + 15.0
+        if status_callback is not None:
+            status_callback("请确认 Windows 管理员权限提示")
+        watcher_stop = threading.Event()
+
+        def watch_elevated_status() -> None:
+            while not watcher_stop.wait(0.1):
+                try:
+                    installing = status_path.read_text(
+                        encoding="ascii", errors="replace",
+                    ).strip() == "installing"
+                except OSError:
+                    installing = False
+                if installing:
+                    if status_callback is not None:
+                        status_callback(
+                            "管理员权限已确认，正在安装 J-Link Windows 驱动"
+                        )
+                    return
+
+        watcher = threading.Thread(
+            target=watch_elevated_status,
+            name="jlink-uac-status",
+            daemon=True,
         )
+        watcher.start()
+        try:
+            launcher = subprocess.run(
+                [
+                    "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-Command", script,
+                ],
+                env=environment,
+                **launcher_common,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "等待 Windows 管理员确认或驱动安装超时；请确认提示后重试"
+            ) from exc
+        finally:
+            watcher_stop.set()
+            watcher.join(timeout=1)
         def readable_output(path: Path) -> str:
             try:
                 return path.read_text(encoding="utf-8", errors="replace")
@@ -325,6 +499,7 @@ def install_winusb_driver(
     pid: int,
     timeout_s: float = 180.0,
     interfaces: list[JLinkUsbInterface] | None = None,
+    status_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     helper = Path(helper).resolve()
     if not _IS_WIN:
@@ -367,13 +542,19 @@ def install_winusb_driver(
             ]
             if interface.mi is not None:
                 arguments.extend(("--iid", f"0x{interface.mi:02x}"))
-            completed = _run_elevated(
-                helper,
-                arguments,
-                timeout_s=timeout_s,
-                restart_instance_id=interface.instance_id,
-                cleanup_paths=(Path(temporary),),
-            )
+            try:
+                completed = _run_elevated(
+                    helper,
+                    arguments,
+                    timeout_s=timeout_s,
+                    restart_instance_id=interface.instance_id,
+                    cleanup_paths=(Path(temporary),),
+                    status_callback=status_callback,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    "J-Link 驱动准备超时；请确认 Windows 权限提示后重试"
+                ) from exc
             if completed.returncode != 0:
                 detail = " | ".join(
                     line.strip()
