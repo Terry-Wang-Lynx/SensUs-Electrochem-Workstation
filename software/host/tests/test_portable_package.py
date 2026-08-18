@@ -111,6 +111,9 @@ def test_windows_portable_builds_and_bundles_pinned_winusb_helper() -> None:
     assert commit in workflow
     assert "microsoft/setup-msbuild@v2" in workflow
     assert "build_windows_winusb_helper.ps1" in workflow
+    assert "Start-Process -FilePath msiexec.exe" in helper_build
+    assert ") -Wait -PassThru" in helper_build
+    assert "$WdkExtraction.ExitCode" in helper_build
     for name in (
         "wdi-simple.exe",
         "COPYING-LGPL",
@@ -713,6 +716,31 @@ def test_macos_portable_launcher_never_falls_back_to_a_saved_source_tree() -> No
     assert resolver.index("if resolveBundledBackend() != nil") < resolver.index(
         'UserDefaults.standard.string(forKey: "projectRoot")'
     )
+
+
+def test_macos_launcher_recovers_a_persisted_dynamic_backend_before_8765() -> None:
+    root = Path(__file__).parents[3]
+    swift = (root / "macos" / "Sources" / "main.swift").read_text(
+        encoding="utf-8"
+    )
+    ensure_start = swift.index("func ensureServer(")
+    ensure_end = swift.index("private func adoptExistingServer", ensure_start)
+    ensure = swift[ensure_start:ensure_end]
+    resolver_start = swift.index("private static func resolveStartupPort(")
+    resolver_end = swift.index("private static func resolveStartPort(", resolver_start)
+    resolver = swift[resolver_start:resolver_end]
+
+    assert 'appendingPathComponent("backend-port.json")' in swift
+    assert "persistBackendOwnership()" in swift
+    assert 'environment["SENSUS_LAUNCH_TOKEN"] = expectedLaunchToken' in swift
+    assert "resolveStartupPort(" in ensure
+    assert "loadPersistedBackend(" in resolver
+    assert resolver.index("loadPersistedBackend(") < resolver.index(
+        "resolveStartPort(preferred: preferred"
+    )
+    assert "persisted.matches(health: health)" in resolver
+    assert "persistedBackendUnavailable" in resolver
+    assert "clearPersistedBackendIfExited()" in swift
 
 
 def test_command_stream_keeps_partial_lines() -> None:

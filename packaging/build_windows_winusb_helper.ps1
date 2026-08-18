@@ -91,9 +91,14 @@ $ExtractRoot = Join-Path $Source "extract"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $WdkRoot, $Libusb0Root, $LibusbKRoot, $ExtractRoot
 New-Item -ItemType Directory -Force -Path $WdkRoot, $ExtractRoot | Out-Null
 
-& msiexec.exe /a $WdkMsi /qn "TARGETDIR=$WdkRoot"
-if ($LASTEXITCODE -notin @(0, 3010)) {
-  throw "WDK redistributable extraction failed with exit code $LASTEXITCODE"
+$WdkExtraction = Start-Process -FilePath msiexec.exe -ArgumentList @(
+  "/a",
+  "`"$WdkMsi`"",
+  "/qn",
+  "TARGETDIR=`"$WdkRoot`""
+) -Wait -PassThru
+if ($WdkExtraction.ExitCode -notin @(0, 3010)) {
+  throw "WDK redistributable extraction failed with exit code $($WdkExtraction.ExitCode)"
 }
 $WdkLicense = Get-ChildItem -Path $WdkRoot -Recurse -File |
   Where-Object { $_.Name -ieq "License.rtf" } |

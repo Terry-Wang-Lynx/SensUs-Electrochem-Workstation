@@ -4,6 +4,7 @@ import Foundation
 import WebKit
 
 private let defaultServerPort = 8765
+private let backendProduct = "SensUs-Electrochem-Workstation"
 
 private final class BackendManager {
     private(set) var process: Process?
@@ -21,6 +22,7 @@ private final class BackendManager {
     let stateURL: URL
     let logURL: URL
     let expectedVersion: String
+    let persistedBackendURL: URL
 
     var serverURL: URL {
         URL(string: "http://127.0.0.1:\(serverPort)/")!
@@ -31,11 +33,14 @@ private final class BackendManager {
     }
 
     init() {
+        let environment = ProcessInfo.processInfo.environment
+        let configuredLaunchToken = environment["SENSUS_LAUNCH_TOKEN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         serverPort = Self.preferredServerPort()
-        expectedLaunchToken = ProcessInfo.processInfo.environment[
-            "SENSUS_LAUNCH_TOKEN"
-        ] ?? ""
-        strictServerPort = !expectedLaunchToken.isEmpty
+        expectedLaunchToken = configuredLaunchToken.isEmpty
+            ? UUID().uuidString.lowercased()
+            : configuredLaunchToken
+        strictServerPort = !configuredLaunchToken.isEmpty
         expectedVersion = Bundle.main.object(
             forInfoDictionaryKey: "CFBundleShortVersionString"
         ) as? String ?? ""
@@ -47,16 +52,20 @@ private final class BackendManager {
         try? FileManager.default.createDirectory(at: stateURL, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
         logURL = logs.appendingPathComponent("server.log")
+        persistedBackendURL = stateURL.appendingPathComponent("backend-port.json")
     }
 
     func ensureServer(completion: @escaping (Result<URL, Error>) -> Void) {
         let preferred = serverPort
         let strict = strictServerPort
+        let persistedBackendURL = persistedBackendURL
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard self != nil else { return }
             do {
-                let resolution = try Self.resolveStartPort(
-                    preferred: preferred, strict: strict
+                let resolution = try Self.resolveStartupPort(
+                    preferred: preferred,
+                    strict: strict,
+                    persistedBackendURL: persistedBackendURL
                 )
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
@@ -114,7 +123,7 @@ private final class BackendManager {
     ) {
         do {
             serverPort = port
-            try launchServer()
+            try launchOwnedServer()
             pollUntilReady(attempt: 0, completion: completion)
         } catch {
             completion(.failure(error))
@@ -199,6 +208,7 @@ private final class BackendManager {
         environment["SENSUS_RESOURCE_DIR"] = projectRoot.path
         environment["SENSUS_STATE_DIR"] = stateURL.path
         environment["SENSUS_SERVER_PORT"] = String(serverPort)
+        environment["SENSUS_LAUNCH_TOKEN"] = expectedLaunchToken
         environment["PYTHONUNBUFFERED"] = "1"
         if usingBundledBackend {
             environment["SENSUS_APP_BUNDLE"] = Bundle.main.bundleURL.path
@@ -220,6 +230,23 @@ private final class BackendManager {
         process.standardError = handle
         try process.run()
         self.process = process
+        process.terminationHandler = { [weak self] terminated in
+            DispatchQueue.main.async {
+                guard let self, self.process === terminated else { return }
+                self.clearPersistedBackendIfExited()
+            }
+        }
+    }
+
+    private func launchOwnedServer() throws {
+        usingExistingServer = false
+        try persistBackendOwnership()
+        do {
+            try launchServer()
+        } catch {
+            clearPersistedBackendIfExited()
+            throw error
+        }
     }
 
     private func pollUntilReady(
@@ -227,6 +254,7 @@ private final class BackendManager {
         completion: @escaping (Result<URL, Error>) -> Void
     ) {
         if let process, !process.isRunning {
+            clearPersistedBackendIfExited()
             completion(.failure(BackendError.serverExited(logURL.path)))
             return
         }
@@ -287,6 +315,59 @@ private final class BackendManager {
         let reuseExisting: Bool
     }
 
+    private struct PersistedBackend: Codable, Equatable {
+        let product: String
+        let version: String
+        let project: String
+        let port: Int
+        let launcherPID: Int32
+        let launchToken: String
+
+        enum CodingKeys: String, CodingKey {
+            case product, version, project, port
+            case launcherPID = "launcher_pid"
+            case launchToken = "launch_token"
+        }
+
+        func matches(health: [String: Any]) -> Bool {
+            guard health["product"] as? String == product,
+                  health["version"] as? String == version,
+                  String(describing: health["launcher_pid"] ?? "")
+                    == String(launcherPID),
+                  health["launch_token"] as? String == launchToken,
+                  let reportedProject = health["project"] as? String else {
+                return false
+            }
+            return URL(fileURLWithPath: reportedProject, isDirectory: true)
+                .standardizedFileURL.path
+                == URL(fileURLWithPath: project, isDirectory: true)
+                    .standardizedFileURL.path
+        }
+    }
+
+    private static func resolveStartupPort(
+        preferred: Int,
+        strict: Bool,
+        persistedBackendURL: URL
+    ) throws -> StartPortResolution {
+        if !strict, let persisted = loadPersistedBackend(from: persistedBackendURL) {
+            if let health = fetchJSON(port: persisted.port, path: "/api/health"),
+               persisted.matches(health: health) {
+                return resolutionForExistingSensUs(
+                    port: persisted.port, health: health
+                )
+            }
+            if canBind(port: persisted.port) {
+                removePersistedBackend(
+                    persisted, from: persistedBackendURL
+                )
+            } else {
+                throw BackendError.persistedBackendUnavailable(persisted.port)
+            }
+        }
+        return try resolveStartPort(preferred: preferred, strict: strict)
+    }
+
     private static func resolveStartPort(
         preferred: Int, strict: Bool
     ) throws -> StartPortResolution {
@@ -306,13 +387,65 @@ private final class BackendManager {
                 reuseExisting: false
             )
         }
+        return resolutionForExistingSensUs(port: preferred, health: health)
+    }
+
+    private static func resolutionForExistingSensUs(
+        port: Int, health: [String: Any]
+    ) -> StartPortResolution {
         let version = health["version"] as? String ?? "未知版本"
-        let idle = existingSensUsIsIdle(port: preferred, health: health)
+        let idle = existingSensUsIsIdle(port: port, health: health)
         return StartPortResolution(
-            port: preferred,
+            port: port,
             existingVersion: version,
             reuseExisting: idle != true
         )
+    }
+
+    private static func loadPersistedBackend(from url: URL) -> PersistedBackend? {
+        guard let data = try? Data(contentsOf: url),
+              let persisted = try? JSONDecoder().decode(PersistedBackend.self, from: data),
+              persisted.product == backendProduct,
+              (1...65535).contains(persisted.port),
+              !persisted.project.isEmpty,
+              !persisted.launchToken.isEmpty else { return nil }
+        return persisted
+    }
+
+    private static func removePersistedBackend(
+        _ expected: PersistedBackend, from url: URL
+    ) {
+        guard loadPersistedBackend(from: url) == expected,
+              canBind(port: expected.port) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func persistBackendOwnership() throws {
+        let persisted = PersistedBackend(
+            product: backendProduct,
+            version: expectedVersion,
+            project: projectRoot.standardizedFileURL.path,
+            port: serverPort,
+            launcherPID: ProcessInfo.processInfo.processIdentifier,
+            launchToken: expectedLaunchToken
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(persisted)
+        try data.write(to: persistedBackendURL, options: .atomic)
+    }
+
+    private func clearPersistedBackendIfExited() {
+        guard !usingExistingServer else { return }
+        let expected = PersistedBackend(
+            product: backendProduct,
+            version: expectedVersion,
+            project: projectRoot.standardizedFileURL.path,
+            port: serverPort,
+            launcherPID: ProcessInfo.processInfo.processIdentifier,
+            launchToken: expectedLaunchToken
+        )
+        Self.removePersistedBackend(expected, from: persistedBackendURL)
     }
 
     private static func fetchJSON(
@@ -447,6 +580,7 @@ private final class BackendManager {
             process.terminate()
         }
         process = nil
+        clearPersistedBackendIfExited()
         try? logHandle?.close()
         logHandle = nil
     }
@@ -498,6 +632,7 @@ private final class BackendManager {
         completion: @escaping () -> Void
     ) {
         guard process?.isRunning == true, Date() < deadline else {
+            clearPersistedBackendIfExited()
             completion()
             return
         }
@@ -555,7 +690,7 @@ private final class BackendManager {
                         preferred: self.serverPort
                     )
                 }
-                try self.launchServer()
+                try self.launchOwnedServer()
                 self.pollUntilReady(attempt: 0) { [weak self] result in
                     guard let self else { return }
                     self.consecutiveHealthFailures = 0
@@ -649,6 +784,7 @@ private final class BackendManager {
         case existingBackendStateUnknown(String)
         case existingBackendCancelled
         case existingBackendDidNotExit
+        case persistedBackendUnavailable(Int)
 
         var errorDescription: String? {
             switch self {
@@ -674,6 +810,8 @@ private final class BackendManager {
                 return "已取消启动；旧版后台保持运行"
             case .existingBackendDidNotExit:
                 return "旧版 SensUs 后台未能安全退出，请从旧窗口退出后重试"
+            case .persistedBackendUnavailable(let port):
+                return "检测到上次 SensUs 后台仍占用本地端口 \(port)，但它没有正常响应。为避免同时占用硬件，本次不会启动第二个后台；请先重启电脑后再打开。"
             }
         }
     }
