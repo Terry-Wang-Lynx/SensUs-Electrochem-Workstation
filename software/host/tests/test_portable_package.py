@@ -763,6 +763,32 @@ def test_macos_launcher_recovers_a_persisted_dynamic_backend_before_8765() -> No
     assert "clearPersistedBackendIfExited()" in swift
 
 
+def test_macos_launcher_avoids_stale_port_after_orphan_shutdown() -> None:
+    root = Path(__file__).parents[3]
+    swift = (root / "macos" / "Sources" / "main.swift").read_text(
+        encoding="utf-8"
+    )
+    resolver_start = swift.index("private static func resolveStartupPort(")
+    resolver_end = swift.index("private static func resolveStartPort(", resolver_start)
+    resolver = swift[resolver_start:resolver_end]
+    waiter_start = swift.index("private static func waitForPersistedBackendToStop(")
+    waiter_end = swift.index(
+        "private static func recoverStoppedPersistedBackend(", waiter_start
+    )
+    waiter = swift[waiter_start:waiter_end]
+    recovery_start = waiter_end
+    recovery_end = swift.index("private static func resolveStartPort(", recovery_start)
+    recovery = swift[recovery_start:recovery_end]
+
+    assert resolver.count("launcherProcessIsAlive(persisted.launcherPID)") >= 2
+    assert "localPortConnectionState(port: persisted.port) == .refused" in resolver
+    assert "persisted.matches(health: health)" in waiter
+    assert "localPortConnectionState(port: persisted.port) == .refused" in waiter
+    assert "recoverStoppedPersistedBackend(" in resolver
+    assert "requirePortAvailable: false" in recovery
+    assert "resolveStartPort(preferred: preferred" in recovery
+
+
 def test_command_stream_keeps_partial_lines() -> None:
     lines, pending = collect._split_complete_lines("SET fsr=2", "")
     assert lines == []

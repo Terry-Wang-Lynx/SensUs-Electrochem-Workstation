@@ -315,6 +315,18 @@ private final class BackendManager {
         let reuseExisting: Bool
     }
 
+    private enum PersistedBackendStopResolution {
+        case stopped
+        case replacedBySensUs([String: Any])
+        case stillStopping
+    }
+
+    private enum LocalPortConnectionState: Equatable {
+        case accepting
+        case refused
+        case unknown
+    }
+
     private struct PersistedBackend: Codable, Equatable {
         let product: String
         let version: String
@@ -351,25 +363,38 @@ private final class BackendManager {
         persistedBackendURL: URL
     ) throws -> StartPortResolution {
         if !strict, let persisted = loadPersistedBackend(from: persistedBackendURL) {
-            if let health = fetchJSON(port: persisted.port, path: "/api/health"),
-               persisted.matches(health: health) {
+            let health = fetchJSON(port: persisted.port, path: "/api/health")
+            if let health, persisted.matches(health: health) {
                 guard launcherProcessIsAlive(persisted.launcherPID) else {
-                    let deadline = Date().addingTimeInterval(8)
-                    while Date() < deadline && !canBind(port: persisted.port) {
-                        Thread.sleep(forTimeInterval: 0.2)
-                    }
-                    guard canBind(port: persisted.port) else {
+                    switch waitForPersistedBackendToStop(persisted) {
+                    case .stopped:
+                        return try recoverStoppedPersistedBackend(
+                            persisted,
+                            from: persistedBackendURL,
+                            preferred: preferred,
+                            strict: strict
+                        )
+                    case .replacedBySensUs(let replacementHealth):
+                        removePersistedBackend(
+                            persisted,
+                            from: persistedBackendURL,
+                            requirePortAvailable: false
+                        )
+                        return resolutionForExistingSensUs(
+                            port: persisted.port,
+                            health: replacementHealth
+                        )
+                    case .stillStopping:
                         throw BackendError.persistedBackendStopping(
                             persisted.port
                         )
                     }
-                    removePersistedBackend(
-                        persisted, from: persistedBackendURL
-                    )
-                    return try resolveStartPort(
-                        preferred: preferred, strict: strict
-                    )
                 }
+                return resolutionForExistingSensUs(
+                    port: persisted.port, health: health
+                )
+            }
+            if let health, isSensUsHealth(health) {
                 return resolutionForExistingSensUs(
                     port: persisted.port, health: health
                 )
@@ -378,10 +403,64 @@ private final class BackendManager {
                 removePersistedBackend(
                     persisted, from: persistedBackendURL
                 )
+            } else if !launcherProcessIsAlive(persisted.launcherPID),
+                      health != nil
+                        || localPortConnectionState(port: persisted.port) == .refused {
+                return try recoverStoppedPersistedBackend(
+                    persisted,
+                    from: persistedBackendURL,
+                    preferred: preferred,
+                    strict: strict
+                )
             } else {
                 throw BackendError.persistedBackendUnavailable(persisted.port)
             }
         }
+        return try resolveStartPort(preferred: preferred, strict: strict)
+    }
+
+    private static func waitForPersistedBackendToStop(
+        _ persisted: PersistedBackend
+    ) -> PersistedBackendStopResolution {
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline {
+            if canBind(port: persisted.port) {
+                return .stopped
+            }
+            if let health = fetchJSON(
+                port: persisted.port,
+                path: "/api/health",
+                timeout: 0.35
+            ) {
+                if persisted.matches(health: health) {
+                    Thread.sleep(forTimeInterval: 0.15)
+                    continue
+                }
+                return isSensUsHealth(health)
+                    ? .replacedBySensUs(health)
+                    : .stopped
+            }
+            // The backend watchdog releases hardware before closing its TCP
+            // listener. Only an explicit refusal crosses that cleanup boundary.
+            if localPortConnectionState(port: persisted.port) == .refused {
+                return .stopped
+            }
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        return .stillStopping
+    }
+
+    private static func recoverStoppedPersistedBackend(
+        _ persisted: PersistedBackend,
+        from persistedBackendURL: URL,
+        preferred: Int,
+        strict: Bool
+    ) throws -> StartPortResolution {
+        removePersistedBackend(
+            persisted,
+            from: persistedBackendURL,
+            requirePortAvailable: false
+        )
         return try resolveStartPort(preferred: preferred, strict: strict)
     }
 
@@ -436,10 +515,12 @@ private final class BackendManager {
     }
 
     private static func removePersistedBackend(
-        _ expected: PersistedBackend, from url: URL
+        _ expected: PersistedBackend,
+        from url: URL,
+        requirePortAvailable: Bool = true
     ) {
         guard loadPersistedBackend(from: url) == expected,
-              canBind(port: expected.port) else { return }
+              !requirePortAvailable || canBind(port: expected.port) else { return }
         try? FileManager.default.removeItem(at: url)
     }
 
@@ -593,6 +674,42 @@ private final class BackendManager {
             }
         }
         return result == 0
+    }
+
+    private static func localPortConnectionState(
+        port: Int
+    ) -> LocalPortConnectionState {
+        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return .unknown }
+        defer { Darwin.close(descriptor) }
+
+        var timeout = timeval(tv_sec: 0, tv_usec: 250_000)
+        let timeoutConfigured = withUnsafePointer(to: &timeout) { pointer in
+            Darwin.setsockopt(
+                descriptor,
+                SOL_SOCKET,
+                SO_SNDTIMEO,
+                pointer,
+                socklen_t(MemoryLayout<timeval>.size)
+            )
+        }
+        guard timeoutConfigured == 0 else { return .unknown }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(UInt16(port).bigEndian)
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(
+                    descriptor,
+                    $0,
+                    socklen_t(MemoryLayout<sockaddr_in>.size)
+                )
+            }
+        }
+        if connected == 0 { return .accepting }
+        return errno == ECONNREFUSED ? .refused : .unknown
     }
 
     func stopServer() {
