@@ -201,6 +201,7 @@ def test_bundled_openocd_carries_exact_corresponding_source() -> None:
     assert 'digest="${digest#\\\\}"' in windows_build
     assert '[[ "$digest" =~ ^[[:xdigit:]]{64}$ ]]' in windows_build
     assert windows_build.count('sha256_file "') >= 3
+    assert 'TEMP_ROOT="$(cygpath -u "$TEMP_ROOT")"' in windows_build
     assert "build_windows_openocd.sh" in windows_build
     assert "bundle_windows_openocd.ps1" in windows_bundle
     assert "source_sha256" in windows_bundle

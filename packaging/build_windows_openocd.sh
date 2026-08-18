@@ -12,7 +12,11 @@ LIBUSB_ASSET="libusb-$LIBUSB_VERSION.tar.bz2"
 LIBUSB_URL="https://github.com/libusb/libusb/releases/download/v$LIBUSB_VERSION/$LIBUSB_ASSET"
 LIBUSB_SHA256="5977fc950f8d1395ccea9bd48c06b3f808fd3c2c961b44b0c2e6e29fc3a70a85"
 
-BUILD_ROOT="$(mktemp -d "${RUNNER_TEMP:-/tmp}/sensus-openocd-windows.XXXXXX")"
+TEMP_ROOT="${RUNNER_TEMP:-/tmp}"
+if command -v cygpath >/dev/null 2>&1; then
+  TEMP_ROOT="$(cygpath -u "$TEMP_ROOT")"
+fi
+BUILD_ROOT="$(mktemp -d "$TEMP_ROOT/sensus-openocd-windows.XXXXXX")"
 trap 'rm -rf "$BUILD_ROOT"' EXIT
 PREFIX="$BUILD_ROOT/prefix"
 DOWNLOADS="$BUILD_ROOT/downloads"
