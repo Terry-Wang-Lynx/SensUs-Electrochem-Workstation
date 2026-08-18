@@ -13,7 +13,8 @@ Windows 与 macOS 使用同一套 Python LTS 后端和本地 HTTP API。后端�
   准备工具和固件资源的 ZIP。
   WebView2 Runtime 是可选的；若系统没有它，启动器自动退回系统默认浏览器。
 - 源码开发：`make app`、`make run`、现有烧录和测量命令保持不变。
-- 便携版数据：配置和缓存放系统用户目录，实验数据默认放 `Documents/SensUs Measurements`。
+- 便携版数据：配置和缓存放系统用户目录；首次测量前必须由用户选择工作区，软件会在
+  该工作区中为每个批次新建子目录，不会把实验数据写入临时目录。
 
 本机构建：
 
@@ -28,10 +29,11 @@ Windows 原生构建：
 ./windows/build_portable.ps1
 ```
 
-构建脚本会从 OpenOCD 官方 v0.12.0 Release 下载固定 SHA-256 的 Windows 归档，
-并将 `openocd.exe`、运行库和 `interface/jlink.cfg` 等 scripts 放入 ZIP。运行时不
-需要目标电脑安装 Python、OpenOCD、nRF Connect SDK 或 SEGGER J-Link 软件。它还会
-从固定的 libwdi 1.5.1 提交构建 `wdi-simple.exe`，并把完整对应源码和许可证随包分发。
+构建脚本会下载经过固定 SHA-256 校验的 OpenOCD 0.12.0 和 libusb 1.0.29 源码，
+在 Windows CI 中构建只启用 J-Link 的 `openocd.exe`，并将运行库、scripts、完整对应
+源码和许可证放入 ZIP。运行时不需要目标电脑安装 Python、OpenOCD、nRF Connect SDK
+或 SEGGER J-Link 软件。它还会从固定的 libwdi 1.5.1 提交构建 `wdi-simple.exe`，并把
+完整对应源码和许可证随包分发。
 J-Link 发现同时读取 CDC 和系统 USB 设备树，所以没有 COM 口的老式 ARM-OB 也会显示。
 只有 OpenOCD 报告不可访问、且 Windows 设备管理器确认受支持的 J-Link 调试接口异常
 时，界面才允许用户点击“准备 J-Link”并确认一次 UAC。老式 `PID 0101` 是单接口设备；

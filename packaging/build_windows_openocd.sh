@@ -3,6 +3,11 @@ set -euo pipefail
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DEST="${1:?destination required}"
+DEST="${DEST%/}"
+[[ -n "$DEST" && "$(basename "$DEST")" == "openocd" ]] || {
+  echo "Refusing unsafe destination (expected a directory named openocd): $DEST" >&2
+  exit 2
+}
 OPENOCD_VERSION="0.12.0"
 OPENOCD_ASSET="openocd-$OPENOCD_VERSION.tar.bz2"
 OPENOCD_URL="https://downloads.sourceforge.net/project/openocd/openocd/$OPENOCD_VERSION/$OPENOCD_ASSET"
@@ -37,7 +42,9 @@ sha256_file() {
 
 download_verified() {
   local url="$1" expected="$2" output="$3" actual
-  curl --fail --location --silent --show-error "$url" -o "$output"
+  curl --fail --location --silent --show-error \
+    --retry 3 --retry-all-errors --connect-timeout 30 \
+    "$url" -o "$output"
   actual="$(sha256_file "$output")"
   [[ "$actual" == "$expected" ]] || {
     echo "SHA-256 mismatch for $url: expected $expected, got $actual" >&2
