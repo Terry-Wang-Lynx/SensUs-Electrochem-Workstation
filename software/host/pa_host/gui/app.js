@@ -1298,6 +1298,7 @@ async function chooseDevice(deviceId){
 }
 async function prepareJlinkDriver(deviceId){
   if(state.jlinkDriverPreparePending)return;
+  if(!confirm('“准备 J-Link”会把所选探针的调试接口切换为本软件随包 OpenOCD 使用的 WinUSB 驱动。\n\n如果该探针正在被 IDE、Ozone 或 J-Link Commander 使用，请先关闭它们。继续后 Windows 会请求一次管理员确认，设备也可能需要重新插拔。\n\n确定继续吗？'))return;
   state.jlinkDriverPreparePending=true;
   const buttons=$('deviceList').querySelectorAll('button');buttons.forEach(button=>{button.disabled=true});
   $('deviceDialogBusy').hidden=false;$('deviceDialogBusy').classList.remove('error');$('deviceDialogBusy').classList.add('progress');$('deviceDialogBusy').textContent='正在等待后台设备核对结束';

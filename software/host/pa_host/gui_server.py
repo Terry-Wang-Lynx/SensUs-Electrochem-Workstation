@@ -1393,7 +1393,7 @@ def _discover_serial_data_port(*, force: bool = False) -> str | None:
 def _usb_physical_location(info: Any) -> str:
     """Normalize interface-qualified locations to one physical USB port."""
     return re.sub(
-        r":\d+(?:\.\d+)?$", "",
+        r":(?:\d+|[xX])(?:\.\d+)?$", "",
         str(getattr(info, "location", "") or "").strip(),
     )
 
@@ -9959,19 +9959,22 @@ def _release_hardware_for_shutdown(timeout_s: float = 330.0) -> dict[str, Any]:
                 APP.schedule.stop()
             if APP.measurement.is_busy():
                 APP.measurement.stop()
-            while time.monotonic() < deadline:
-                if APP.hardware_idle():
-                    return {
-                        "ok": True,
-                        "message": "硬件已安全释放，后端正在退出",
-                    }
-                time.sleep(0.1)
+        # Measurement completion exports and history registration acquire the
+        # operation lock. Release it before waiting for the watcher thread, or
+        # shutdown can deadlock against its own completion callback.
+        while time.monotonic() < deadline:
             if APP.hardware_idle():
                 return {
                     "ok": True,
                     "message": "硬件已安全释放，后端正在退出",
                 }
-            raise RuntimeError("硬件任务仍在安全停止，请稍后再次点击退出")
+            time.sleep(0.1)
+        if APP.hardware_idle():
+            return {
+                "ok": True,
+                "message": "硬件已安全释放，后端正在退出",
+            }
+        raise RuntimeError("硬件任务仍在安全停止，请稍后再次点击退出")
     except Exception:
         SHUTDOWN_INTENT.clear()
         raise

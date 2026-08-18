@@ -76,6 +76,8 @@ if ($UnexpectedDependencies.Count -gt 0) {
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Destination
 New-Item -ItemType Directory -Force -Path $Destination | Out-Null
 Copy-Item -Recurse (Join-Path $Source "*") $Destination
+Copy-Item $PSCommandPath `
+  (Join-Path $Destination "source\bundle_windows_openocd.ps1")
 
 $OldPath = $env:PATH
 try {

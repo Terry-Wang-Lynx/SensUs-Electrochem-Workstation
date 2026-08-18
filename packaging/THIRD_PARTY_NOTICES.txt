@@ -17,7 +17,8 @@ under LGPL-2.1-or-later. Each tools/openocd directory contains:
 - COMPONENTS.json with binary and source hashes;
 - BINARY_DEPENDENCIES.txt with the audited native dependency list;
 - licenses/ with the applicable license texts; and
-- source/ with the complete corresponding OpenOCD and libusb source archives.
+- source/ with the complete corresponding OpenOCD and libusb source archives
+  plus the exact build script used by this project.
 
 OpenOCD's source archive includes the Jim Tcl and libjaylink sources used by
 the build. The packaged runtime does not include Homebrew libraries, SEGGER's
@@ -27,8 +28,9 @@ The Windows package also includes the wdi-simple utility built from the pinned
 libwdi 1.5.1 source. It runs only after the user explicitly chooses "Prepare J-Link"
 and approves Windows elevation. tools/winusb contains libwdi's LGPL/GPL terms
 and source, the exact libusb-win32 and libusbK corresponding source archives,
-Microsoft WDK License.rtf and REDIST.TXT terms, and COMPONENTS.json with the
-pinned inputs and hashes.
+their directly accessible license texts, Microsoft WDK License.rtf and
+REDIST.TXT terms, the exact helper build script, and COMPONENTS.json with the
+pinned binary, source, and input hashes.
 
 The application may use a separately installed SEGGER J-Link Commander when
 one is already present. That installation is selected only as a compatibility

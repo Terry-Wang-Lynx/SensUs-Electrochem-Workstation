@@ -3381,6 +3381,44 @@ def test_safe_shutdown_stops_measurement_and_waits_until_idle(monkeypatch) -> No
     measurement.stop.assert_called_once_with()
 
 
+def test_safe_shutdown_releases_operation_lock_for_completion_callback(
+    monkeypatch,
+) -> None:
+    operation_lock = threading.RLock()
+    completion_finished = threading.Event()
+    worker: threading.Thread | None = None
+
+    class Measurement:
+        def is_busy(self) -> bool:
+            return not completion_finished.is_set()
+
+        def stop(self) -> None:
+            nonlocal worker
+
+            def finish() -> None:
+                with operation_lock:
+                    completion_finished.set()
+
+            worker = threading.Thread(target=finish)
+            worker.start()
+
+    measurement = Measurement()
+    app = Mock(operation_lock=operation_lock, measurement=measurement)
+    app.schedule.snapshot.return_value = {"active": False}
+    app.hardware_idle.side_effect = lambda: not measurement.is_busy()
+    monkeypatch.setattr(gui_server, "APP", app)
+    monkeypatch.setattr(gui_server, "JLINK_DRIVER_INSTALL_LOCK", threading.Lock())
+    monkeypatch.setattr(gui_server, "SHUTDOWN_INTENT", threading.Event())
+
+    result = gui_server._release_hardware_for_shutdown(timeout_s=1)
+
+    assert result["ok"] is True
+    assert completion_finished.is_set()
+    assert worker is not None
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+
+
 def test_safe_shutdown_refuses_to_exit_while_driver_task_is_active(
     monkeypatch,
 ) -> None:

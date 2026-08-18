@@ -655,6 +655,7 @@ def test_gui_exposes_manual_multi_device_picker() -> None:
     assert "/api/devices/jlink-driver/install" in app
     assert "准备 J-Link" in app
     assert "请点击右上角“选择设备”，再点击该 J-Link 的“准备 J-Link”" in app
+    assert "会把所选探针的调试接口切换" in app
     assert "device-card" in styles
 
 

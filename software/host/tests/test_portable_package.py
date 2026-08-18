@@ -45,7 +45,7 @@ def test_portable_builds_pin_python_and_enforce_macos_compatibility() -> None:
         encoding="utf-8"
     )
 
-    assert 'SENSUS_PORTABLE_PYTHON_VERSION:-3.12.13' in macos_build
+    assert 'SENSUS_PORTABLE_PYTHON_VERSION:-3.12.10' in macos_build
     assert "Portable Windows builds require Python $RequiredPythonVersion" in windows_build
     assert "verify_macos_bundle.py" in macos_build
     assert "bundle_macos_openocd.sh" in macos_build
@@ -112,9 +112,21 @@ def test_windows_portable_builds_and_bundles_pinned_winusb_helper() -> None:
     assert "microsoft/setup-msbuild@v2" in workflow
     assert "build_windows_winusb_helper.ps1" in workflow
     for name in (
-        "wdi-simple.exe", "COPYING-LGPL", "libwdi-1.5.1-source.zip", "SOURCE.txt"
+        "wdi-simple.exe",
+        "COPYING-LGPL",
+        "libwdi-1.5.1-source.zip",
+        "libusb-win32-COPYING-GPL.txt",
+        "libusb-win32-COPYING-LGPL.txt",
+        "libusbK-LICENSE-BSD.txt",
+        "libusbK-LICENSE-GPL3.txt",
+        "libusbK-LICENSE-LGPL3.txt",
+        "build_windows_winusb_helper.ps1",
+        "SOURCE.txt",
     ):
         assert name in windows_build
+        assert name in helper_build
+    assert "binary_sha256" in helper_build
+    assert "source_sha256" in helper_build
     assert '"pa_host.windows_jlink"' in spec
 
 
@@ -139,6 +151,10 @@ def test_tag_release_builds_both_platforms_and_only_final_assets() -> None:
     assert "echo [adapter list]" in workflow
     assert "Expand-Archive" in workflow
     assert "hdiutil verify" in workflow
+    assert "build_macos_openocd.sh" in workflow
+    assert "build_windows_openocd.sh" in workflow
+    assert "build_windows_winusb_helper.ps1" in workflow
+    assert "Final WinUSB helper hashes" in workflow
 
 
 def test_macos_package_carries_notices_and_supports_real_signing() -> None:
@@ -175,7 +191,10 @@ def test_bundled_openocd_carries_exact_corresponding_source() -> None:
     assert source_sha in macos
     assert source_sha in windows_build
     assert "openocd-0.12.0.tar.bz2" in macos
+    assert "build_macos_openocd.sh" in macos
     assert 'OPENOCD_ASSET="openocd-$OPENOCD_VERSION.tar.bz2"' in windows_build
+    assert "build_windows_openocd.sh" in windows_build
+    assert "bundle_windows_openocd.ps1" in windows_bundle
     assert "source_sha256" in windows_bundle
     assert "libusb-1.0.dll" in windows_bundle
     assert "complete corresponding OpenOCD and libusb source archives" in (
@@ -383,6 +402,21 @@ def test_python_runtime_license_collection_has_audited_fallbacks() -> None:
         "Copyright (c) 2001-2020 Chris Liechti"
     )
     assert collector["metadata_license_text"]({"License": "MIT"}) is None
+
+    proxy = collector["supplemental_license"]("proxy_tools", "0.1.0")
+    assert proxy is not None
+    assert proxy["license_expression"] == "BSD-3-Clause"
+    assert Path(proxy["path"]).is_file()
+
+    for package in (
+        "winrt-runtime",
+        "winrt-windows-devices-bluetooth",
+        "winrt-windows-storage-streams",
+    ):
+        pywinrt = collector["supplemental_license"](package, "3.2.1")
+        assert pywinrt is not None
+        assert pywinrt["license_expression"] == "MIT"
+        assert Path(pywinrt["path"]).is_file()
 
 
 def test_macos_openocd_bundler_resigns_before_executing_rewritten_binary() -> None:

@@ -29,6 +29,31 @@ SUPPLEMENTAL_LICENSES = {
             "3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb"
         ),
     },
+    ("proxy-tools", "0.1.0"): {
+        "path": LICENSE_DIR / "proxy_tools-0.1.0-LICENSE.txt",
+        "sha256": "e91e13d5d5e3782c7f11006c2f6585079bede422f63589a1b6bcd1afcf24e1fd",
+        "source": "proxy_tools commit 70b751ef LICENSE.txt",
+        "source_url": (
+            "https://raw.githubusercontent.com/jtushman/proxy_tools/"
+            "70b751ef5e0647d974506fd5871903711b5e1811/LICENSE.txt"
+        ),
+        "source_sha256": (
+            "a428fb8a2e762af3eb0a6edbbb88e9b42ccfee80fd9b423958bcacf9b9abbfe4"
+        ),
+        "license_expression": "BSD-3-Clause",
+    },
+}
+PYWINRT_LICENSE = {
+    "path": LICENSE_DIR / "pywinrt-3.2.1-LICENSE.txt",
+    "sha256": "6e898069e8b3c6d8d23dc70ac7067cc2b7c9db14c36df873026758db82c0891d",
+    "source": "PyWinRT v3.2.1 LICENSE",
+    "source_url": (
+        "https://raw.githubusercontent.com/pywinrt/pywinrt/v3.2.1/LICENSE"
+    ),
+    "source_sha256": (
+        "6e898069e8b3c6d8d23dc70ac7067cc2b7c9db14c36df873026758db82c0891d"
+    ),
+    "license_expression": "MIT",
 }
 
 
@@ -87,7 +112,14 @@ def metadata_license_text(
 
 
 def supplemental_license(name: str, version: str) -> dict[str, object] | None:
-    entry = SUPPLEMENTAL_LICENSES.get((canonical_name(name), version))
+    canonical = canonical_name(name)
+    entry = SUPPLEMENTAL_LICENSES.get((canonical, version))
+    if (
+        entry is None
+        and version == "3.2.1"
+        and (canonical == "winrt-runtime" or canonical.startswith("winrt-windows-"))
+    ):
+        entry = PYWINRT_LICENSE
     if entry is None:
         return None
     path = Path(entry["path"])
@@ -200,8 +232,16 @@ def collect(destination: Path) -> dict[str, object]:
         component: dict[str, object] = {
             "name": name,
             "version": version,
-            "declared_license": declared_license(distribution.metadata),
-            "license_expression": license_expression(distribution.metadata),
+            "declared_license": (
+                str(supplement["license_expression"])
+                if supplement is not None and supplement.get("license_expression")
+                else declared_license(distribution.metadata)
+            ),
+            "license_expression": (
+                str(supplement["license_expression"])
+                if supplement is not None and supplement.get("license_expression")
+                else license_expression(distribution.metadata)
+            ),
             "homepage": str(
                 distribution.metadata.get("Home-page")
                 or distribution.metadata.get("Project-URL")

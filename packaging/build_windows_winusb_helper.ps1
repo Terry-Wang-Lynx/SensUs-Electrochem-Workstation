@@ -152,6 +152,24 @@ $Helper = Join-Path $Source "Win32\Release\examples\wdi-simple.exe"
 if (-not (Test-Path $Helper)) {
   throw "wdi-simple.exe was not produced at $Helper"
 }
+$Libusb0Gpl = Join-Path $Libusb0Root "COPYING_GPL.txt"
+$Libusb0Lgpl = Join-Path $Libusb0Root "COPYING_LGPL.txt"
+$Libusb0InstallerLicense = Join-Path $Libusb0Root "installer_license.txt"
+$LibusbKBsd = Join-Path $LibusbKRoot "license\LICENSE-bsd.txt"
+$LibusbKGpl = Join-Path $LibusbKRoot "license\LICENSE-gpl3.txt"
+$LibusbKLgpl = Join-Path $LibusbKRoot "license\LICENSE-lgpl3.txt"
+foreach ($LicensePath in @(
+  $Libusb0Gpl,
+  $Libusb0Lgpl,
+  $Libusb0InstallerLicense,
+  $LibusbKBsd,
+  $LibusbKGpl,
+  $LibusbKLgpl
+)) {
+  if (-not (Test-Path $LicensePath)) {
+    throw "A WinUSB payload license is missing: $LicensePath"
+  }
+}
 
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Destination
 New-Item -ItemType Directory -Force -Path $Destination | Out-Null
@@ -165,6 +183,17 @@ Copy-Item $LibusbKSourceArchive `
   (Join-Path $Destination "libusbK-3.1.0.0-source.7z")
 Copy-Item $WdkLicense.FullName (Join-Path $Destination "WDK-License.rtf")
 Copy-Item $WdkRedist.FullName (Join-Path $Destination "WDK-REDIST.txt")
+Copy-Item $Libusb0Gpl `
+  (Join-Path $Destination "libusb-win32-COPYING-GPL.txt")
+Copy-Item $Libusb0Lgpl `
+  (Join-Path $Destination "libusb-win32-COPYING-LGPL.txt")
+Copy-Item $Libusb0InstallerLicense `
+  (Join-Path $Destination "libusb-win32-installer-license.txt")
+Copy-Item $LibusbKBsd (Join-Path $Destination "libusbK-LICENSE-BSD.txt")
+Copy-Item $LibusbKGpl (Join-Path $Destination "libusbK-LICENSE-GPL3.txt")
+Copy-Item $LibusbKLgpl (Join-Path $Destination "libusbK-LICENSE-LGPL3.txt")
+Copy-Item $PSCommandPath `
+  (Join-Path $Destination "build_windows_winusb_helper.ps1")
 
 $SourceArchive = Join-Path $Destination "libwdi-1.5.1-source.zip"
 & git -C $Source archive --format=zip "--output=$SourceArchive" $LibwdiCommit
@@ -175,16 +204,21 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path $SourceArchive)) {
 libwdi 1.5.1
 Upstream: https://github.com/pbatard/libwdi
 Commit: $LibwdiCommit
-Build script: packaging/build_windows_winusb_helper.ps1
+Build script: build_windows_winusb_helper.ps1 (included in this directory)
 
 The bundled wdi-simple.exe is built directly from the pinned source without
 source patches and is used as a separate process.
 Its libwdi source is in libwdi-1.5.1-source.zip. The exact libusb-win32 and
 libusbK sources used for the embedded driver payloads are included beside it.
 WDK-License.rtf and WDK-REDIST.txt contain Microsoft's redistribution terms.
-COPYING and COPYING-LGPL contain libwdi's applicable license terms.
+The libusb-win32 and libusbK license texts are included directly beside their
+source archives. COPYING and COPYING-LGPL contain libwdi's applicable terms.
 "@ | Set-Content -Encoding ascii (Join-Path $Destination "SOURCE.txt")
 
+$HelperSha256 = (Get-FileHash -Algorithm SHA256 $Helper).Hash.ToLowerInvariant()
+$LibwdiSourceSha256 = (
+  Get-FileHash -Algorithm SHA256 $SourceArchive
+).Hash.ToLowerInvariant()
 $Components = [ordered]@{
   schema = 1
   platform = "windows-x64"
@@ -194,7 +228,11 @@ $Components = [ordered]@{
       version = "1.5.1"
       commit = $LibwdiCommit
       license = "LGPL-3.0-or-later"
+      binary = "wdi-simple.exe"
+      binary_sha256 = $HelperSha256
       source = "libwdi-1.5.1-source.zip"
+      source_sha256 = $LibwdiSourceSha256
+      build_script = "build_windows_winusb_helper.ps1"
       upstream = $LibwdiUpstream
     },
     [ordered]@{
@@ -214,15 +252,25 @@ $Components = [ordered]@{
       source_url = $Libusb0SourceUrl
       source_sha256 = $Libusb0SourceSha256
       binary_input_sha256 = $Libusb0Sha256
+      license_files = @(
+        "libusb-win32-COPYING-GPL.txt",
+        "libusb-win32-COPYING-LGPL.txt",
+        "libusb-win32-installer-license.txt"
+      )
     },
     [ordered]@{
       name = "libusbK"
       version = "3.1.0.0"
-      license = "BSD-3-Clause AND GPL-2.0-or-later"
+      license = "BSD-3-Clause OR GPL-3.0-or-later"
       source = "libusbK-3.1.0.0-source.7z"
       source_url = $LibusbKSourceUrl
       source_sha256 = $LibusbKSourceSha256
       binary_input_sha256 = $LibusbKSha256
+      license_files = @(
+        "libusbK-LICENSE-BSD.txt",
+        "libusbK-LICENSE-GPL3.txt",
+        "libusbK-LICENSE-LGPL3.txt"
+      )
     }
   )
 }

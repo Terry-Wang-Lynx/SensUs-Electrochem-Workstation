@@ -325,6 +325,17 @@ def test_linux_interface_suffixes_still_group_one_usb_board() -> None:
     assert gui_server._usb_identity(data) == gui_server._usb_identity(smp)
 
 
+def test_windows_interface_suffixes_still_group_one_usb_board() -> None:
+    data = _PortInfo("COM7")
+    smp = _PortInfo("COM8")
+    data.serial_number = smp.serial_number = ""
+    data.location = "1-2:x.0"
+    smp.location = "1-2:x.1"
+
+    assert gui_server._same_usb_device(data, smp) is True
+    assert gui_server._usb_identity(data) == gui_server._usb_identity(smp)
+
+
 def test_usb_interfaces_without_shared_identity_are_never_auto_paired() -> None:
     first = _PortInfo("/dev/ttyACM0")
     second = _PortInfo("/dev/ttyACM1")

@@ -11,7 +11,7 @@ $Venv = Join-Path $Artifacts "build-env\windows-x64"
 $Release = Join-Path $Artifacts "releases\$Version\SensUs-Workstation-Windows-x64-$Version"
 $VenvPython = Join-Path $Venv "Scripts\python.exe"
 
-$RequiredPythonVersion = "3.12.13"
+$RequiredPythonVersion = "3.12.10"
 $SelectedVersion = & $Python -c "import platform; print(platform.python_version())"
 if ($LASTEXITCODE -ne 0 -or $SelectedVersion.Trim() -ne $RequiredPythonVersion) {
   throw "Portable Windows builds require Python $RequiredPythonVersion; selected: $SelectedVersion"
@@ -25,6 +25,13 @@ $WinUsbRequired = @(
   "libusbK-3.1.0.0-source.7z",
   "WDK-License.rtf",
   "WDK-REDIST.txt",
+  "libusb-win32-COPYING-GPL.txt",
+  "libusb-win32-COPYING-LGPL.txt",
+  "libusb-win32-installer-license.txt",
+  "libusbK-LICENSE-BSD.txt",
+  "libusbK-LICENSE-GPL3.txt",
+  "libusbK-LICENSE-LGPL3.txt",
+  "build_windows_winusb_helper.ps1",
   "COMPONENTS.json",
   "SOURCE.txt"
 )
@@ -39,6 +46,23 @@ foreach ($Name in $WinUsbRequired) {
   if (-not (Test-Path (Join-Path $WinUsb $Name))) {
     throw "WinUSB helper bundle is incomplete after build; missing: $Name"
   }
+}
+$WinUsbManifest = Get-Content (Join-Path $WinUsb "COMPONENTS.json") -Raw |
+  ConvertFrom-Json
+$Libwdi = @($WinUsbManifest.components | Where-Object name -eq "libwdi")
+if ($WinUsbManifest.schema -ne 1 -or $WinUsbManifest.platform -ne "windows-x64" `
+    -or $Libwdi.Count -ne 1) {
+  throw "WinUSB component manifest has an unexpected schema or component set"
+}
+$HelperHash = (
+  Get-FileHash -Algorithm SHA256 (Join-Path $WinUsb $Libwdi[0].binary)
+).Hash.ToLowerInvariant()
+$LibwdiSourceHash = (
+  Get-FileHash -Algorithm SHA256 (Join-Path $WinUsb $Libwdi[0].source)
+).Hash.ToLowerInvariant()
+if ($HelperHash -ne $Libwdi[0].binary_sha256 `
+    -or $LibwdiSourceHash -ne $Libwdi[0].source_sha256) {
+  throw "WinUSB helper binary or corresponding-source hash does not match its manifest"
 }
 
 New-Item -ItemType Directory -Force -Path $Build, (Split-Path $Venv), (Split-Path $Release) | Out-Null

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="${0:A:h:h}"
 VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "$ROOT/pyproject.toml")"
 PYTHON="${PYTHON:-python3}"
-REQUIRED_PYTHON_VERSION="${SENSUS_PORTABLE_PYTHON_VERSION:-3.12.13}"
+REQUIRED_PYTHON_VERSION="${SENSUS_PORTABLE_PYTHON_VERSION:-3.12.10}"
 MINIMUM_MACOS_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$ROOT/macos/Info.plist")"
 ARTIFACTS="$ROOT/artifacts"
 BUILD="$ARTIFACTS/build/macos-arm64"

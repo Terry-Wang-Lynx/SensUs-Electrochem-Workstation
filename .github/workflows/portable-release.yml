@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12.13"
+          python-version: "3.12.10"
           cache: pip
       - uses: actions/setup-node@v4
         with:
@@ -80,6 +80,7 @@ jobs:
           test -f "$APP/Contents/Resources/tools/openocd/licenses/libusb-COPYING"
           test -f "$APP/Contents/Resources/tools/openocd/source/openocd-0.12.0.tar.bz2"
           test -f "$APP/Contents/Resources/tools/openocd/source/libusb-1.0.29.tar.bz2"
+          test -f "$APP/Contents/Resources/tools/openocd/source/build_macos_openocd.sh"
           test -f "$APP/Contents/Resources/THIRD_PARTY_LICENSES/SBOM.spdx.json"
           ADAPTERS="$("$OPENOCD" -c 'echo [adapter list]; shutdown' 2>&1)"
           grep -qi 'jlink' <<<"$ADAPTERS"
@@ -132,7 +133,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12.13"
+          python-version: "3.12.10"
           cache: pip
       - uses: actions/setup-node@v4
         with:
@@ -194,6 +195,36 @@ jobs:
           }
           if (-not (Test-Path (Join-Path $Extracted "tools/openocd/source/libusb-1.0.29.tar.bz2"))) {
             throw "libusb source is missing from final ZIP"
+          }
+          foreach ($Relative in @(
+            "tools/openocd/source/build_windows_openocd.sh",
+            "tools/openocd/source/bundle_windows_openocd.ps1",
+            "tools/winusb/wdi-simple.exe",
+            "tools/winusb/libwdi-1.5.1-source.zip",
+            "tools/winusb/libusb-win32-COPYING-GPL.txt",
+            "tools/winusb/libusb-win32-COPYING-LGPL.txt",
+            "tools/winusb/libusbK-LICENSE-BSD.txt",
+            "tools/winusb/libusbK-LICENSE-GPL3.txt",
+            "tools/winusb/libusbK-LICENSE-LGPL3.txt",
+            "tools/winusb/build_windows_winusb_helper.ps1",
+            "tools/winusb/COMPONENTS.json"
+          )) {
+            if (-not (Test-Path (Join-Path $Extracted $Relative))) {
+              throw "Required WinUSB/OpenOCD source material is missing: $Relative"
+            }
+          }
+          $WinUsbRoot = Join-Path $Extracted "tools/winusb"
+          $WinUsbManifest = Get-Content (Join-Path $WinUsbRoot "COMPONENTS.json") -Raw |
+            ConvertFrom-Json
+          $Libwdi = @($WinUsbManifest.components | Where-Object name -eq "libwdi")
+          if ($Libwdi.Count -ne 1) { throw "Final WinUSB manifest is invalid" }
+          $HelperHash = (Get-FileHash -Algorithm SHA256 `
+            (Join-Path $WinUsbRoot $Libwdi[0].binary)).Hash.ToLowerInvariant()
+          $SourceHash = (Get-FileHash -Algorithm SHA256 `
+            (Join-Path $WinUsbRoot $Libwdi[0].source)).Hash.ToLowerInvariant()
+          if ($HelperHash -ne $Libwdi[0].binary_sha256 `
+              -or $SourceHash -ne $Libwdi[0].source_sha256) {
+            throw "Final WinUSB helper hashes do not match COMPONENTS.json"
           }
           if (-not (Test-Path (Join-Path $Extracted "THIRD_PARTY_LICENSES/SBOM.spdx.json"))) {
             throw "Python runtime SBOM is missing from final ZIP"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DEST="${1:?destination required}"
 OPENOCD_VERSION="0.12.0"
 OPENOCD_ASSET="openocd-$OPENOCD_VERSION.tar.bz2"
@@ -79,6 +80,7 @@ cp "$PREFIX/bin/libusb-1.0.dll" "$DEST/bin/libusb-1.0.dll"
 cp -R "$PREFIX/openocd/share/openocd/scripts" "$DEST/share/openocd/scripts"
 cp "$DOWNLOADS/$OPENOCD_ASSET" "$DEST/source/$OPENOCD_ASSET"
 cp "$DOWNLOADS/$LIBUSB_ASSET" "$DEST/source/$LIBUSB_ASSET"
+cp "$SCRIPT_PATH" "$DEST/source/build_windows_openocd.sh"
 tar -xOf "$DOWNLOADS/$OPENOCD_ASSET" \
   "openocd-$OPENOCD_VERSION/COPYING" > "$DEST/licenses/OpenOCD-COPYING"
 tar -xOf "$DOWNLOADS/$LIBUSB_ASSET" \
@@ -146,5 +148,5 @@ EOF
 printf '%s\n' \
   "This runtime was built from the pinned OpenOCD and libusb source archives." \
   "OpenOCD includes its bundled Jim Tcl and libjaylink sources in $OPENOCD_ASSET." \
-  "Build script: packaging/build_windows_openocd.sh" \
+  "Build script: build_windows_openocd.sh (included in this directory)." \
   > "$DEST/source/SOURCE.txt"

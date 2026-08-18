@@ -76,6 +76,7 @@ def verify(app: Path, minimum_version: str) -> None:
         app / "Contents/Resources/tools/openocd/licenses/libusb-COPYING",
         app / "Contents/Resources/tools/openocd/source/openocd-0.12.0.tar.bz2",
         app / "Contents/Resources/tools/openocd/source/libusb-1.0.29.tar.bz2",
+        app / "Contents/Resources/tools/openocd/source/build_macos_openocd.sh",
         app / "Contents/Resources/tools/openocd/share/openocd/scripts/interface/jlink.cfg",
         app / "Contents/Resources/tools/openocd/share/openocd/scripts/target/nrf52.cfg",
         app / "Contents/Resources/THIRD_PARTY_LICENSES/PYTHON_PACKAGES.json",

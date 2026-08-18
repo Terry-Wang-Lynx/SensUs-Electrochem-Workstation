@@ -1,6 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 
+SCRIPT_PATH="${0:A}"
 DEST="${1:?destination required}"
 MINIMUM_MACOS_VERSION="${2:?minimum macOS version required}"
 OPENOCD_VERSION="0.12.0"
@@ -93,6 +94,7 @@ cp -L "$PREFIX/lib/libusb-1.0.0.dylib" "$DEST/lib/libusb-1.0.0.dylib"
 ditto "$OPENOCD_PREFIX/share/openocd/scripts" "$DEST/share/openocd/scripts"
 cp "$DOWNLOADS/$OPENOCD_ASSET" "$DEST/source/$OPENOCD_ASSET"
 cp "$DOWNLOADS/$LIBUSB_ASSET" "$DEST/source/$LIBUSB_ASSET"
+cp "$SCRIPT_PATH" "$DEST/source/build_macos_openocd.sh"
 tar -xOf "$DOWNLOADS/$OPENOCD_ASSET" \
   "openocd-$OPENOCD_VERSION/COPYING" > "$DEST/licenses/OpenOCD-COPYING"
 tar -xOf "$DOWNLOADS/$LIBUSB_ASSET" \
@@ -180,7 +182,7 @@ unset SENSUS_OPENOCD_MANIFEST SENSUS_OPENOCD_BINARY_SHA \
 printf '%s\n' \
   "This runtime was built from the pinned OpenOCD and libusb source archives." \
   "OpenOCD includes its bundled Jim Tcl and libjaylink sources in $OPENOCD_ASSET." \
-  "Build script: packaging/bundle_macos_openocd.sh" \
+  "Build script: build_macos_openocd.sh (included in this directory)." \
   > "$DEST/source/SOURCE.txt"
 
 version_output="$("$DEST/bin/openocd" --version 2>&1)"
