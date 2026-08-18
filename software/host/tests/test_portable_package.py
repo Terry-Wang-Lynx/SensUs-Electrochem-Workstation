@@ -148,8 +148,14 @@ def test_tag_release_builds_both_platforms_and_only_final_assets() -> None:
     assert "Validate tag against package version" in workflow
     assert '"$GITHUB_REF_NAME" != "v$VERSION"' in workflow
     assert "Create Chinese draft release" in workflow
+    assert "SensUs 电化学工作站 v${{ needs.release-metadata.outputs.version }}" in workflow
     assert "SensUs-Workstation-macOS-arm64-*.dmg" in workflow
     assert "SensUs-Workstation-Windows-x64-*.zip" in workflow
+    assert "find release-assets -type f" in workflow
+    assert 'find release-assets -type f -name "$DMG_NAME"' in workflow
+    assert 'find release-assets -type f -name "$ZIP_NAME"' in workflow
+    assert "release-files/*.dmg" in workflow
+    assert "release-files/*.zip" in workflow
     assert "artifacts/releases/**/*.zip" not in workflow
     assert "Smoke test frozen macOS backend" in workflow
     assert "Smoke test frozen Windows backend" in workflow

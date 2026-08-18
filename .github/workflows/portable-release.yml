@@ -284,13 +284,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(find release-assets -maxdepth 1 -name '*.dmg' | wc -l)" -eq 1
-          test "$(find release-assets -maxdepth 1 -name '*.zip' | wc -l)" -eq 1
-          cd release-assets
+          VERSION="${{ needs.release-metadata.outputs.version }}"
+          DMG_NAME="SensUs-Workstation-macOS-arm64-$VERSION.dmg"
+          ZIP_NAME="SensUs-Workstation-Windows-x64-$VERSION.zip"
+          test "$(find release-assets -type f -name "$DMG_NAME" | wc -l)" -eq 1
+          test "$(find release-assets -type f -name "$ZIP_NAME" | wc -l)" -eq 1
+          DMG="$(find release-assets -type f -name "$DMG_NAME" -print -quit)"
+          ZIP="$(find release-assets -type f -name "$ZIP_NAME" -print -quit)"
+          mkdir release-files
+          cp -- "$DMG" "$ZIP" release-files/
+          cd release-files
           sha256sum ./*.dmg ./*.zip > SHA256SUMS.txt
       - name: Create Chinese draft release
         uses: softprops/action-gh-release@v2
         with:
+          name: SensUs 电化学工作站 v${{ needs.release-metadata.outputs.version }}
           draft: true
           generate_release_notes: false
           body: |
@@ -303,6 +311,6 @@ jobs:
 
             SHA-256 校验值见 `SHA256SUMS.txt`。
           files: |
-            release-assets/*.dmg
-            release-assets/*.zip
-            release-assets/SHA256SUMS.txt
+            release-files/*.dmg
+            release-files/*.zip
+            release-files/SHA256SUMS.txt
