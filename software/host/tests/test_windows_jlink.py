@@ -560,6 +560,7 @@ def test_jlink_driver_is_missing_only_after_pnp_confirmation(
     monkeypatch.setattr(gui_server, "_IS_WIN", True)
     monkeypatch.setattr(gui_server, "WINUSB_HELPER", helper)
     monkeypatch.setattr(gui_server, "JLINK_EXE", tmp_path / "missing-jlink")
+    monkeypatch.setattr(gui_server, "_openocd_jlink_available", lambda: True)
     monkeypatch.setattr(
         gui_server,
         "_openocd_target_probe",
@@ -744,6 +745,7 @@ def test_jlink_probe_timeout_is_not_reported_as_a_target_wiring_fault(
     tmp_path: Path, monkeypatch,
 ) -> None:
     monkeypatch.setattr(gui_server, "JLINK_EXE", tmp_path / "missing-jlink")
+    monkeypatch.setattr(gui_server, "_openocd_jlink_available", lambda: True)
     monkeypatch.setattr(
         gui_server,
         "_openocd_target_probe",
