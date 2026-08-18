@@ -26,6 +26,47 @@ SENSUS_PRODUCT = "SensUs-Electrochem-Workstation"
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 
 
+def _utf8_output_stream(fd: int):
+    """Recover a redirected stream in PyInstaller's Windows noconsole mode."""
+    try:
+        duplicate = os.dup(fd)
+    except OSError:
+        return open(
+            os.devnull, "w", encoding="utf-8", errors="replace", buffering=1,
+        )
+    try:
+        return os.fdopen(
+            duplicate, "w", encoding="utf-8", errors="replace", buffering=1,
+        )
+    except OSError:
+        os.close(duplicate)
+        return open(
+            os.devnull, "w", encoding="utf-8", errors="replace", buffering=1,
+        )
+
+
+def _prepare_standard_streams() -> None:
+    """Make frozen CLI children safe for Chinese logs and redirected output."""
+    if sys.stdin is None:
+        sys.stdin = open(os.devnull, "r", encoding="utf-8", errors="replace")
+    for name, fd in (("stdout", 1), ("stderr", 2)):
+        stream = getattr(sys, name)
+        if stream is None:
+            setattr(sys, name, _utf8_output_stream(fd))
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(
+                    encoding="utf-8",
+                    errors="replace",
+                    line_buffering=True,
+                    write_through=True,
+                )
+            except (OSError, ValueError):
+                pass
+
+
 class ExistingSensusBackend(RuntimeError):
     """A verified SensUs backend must be reused instead of duplicated."""
 
@@ -415,6 +456,7 @@ def _windows_app() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _prepare_standard_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
     commands = {"gui", "it-tool", "collect", "smpmgr"}
     command = argv.pop(0) if argv and argv[0] in commands else ""

@@ -1,11 +1,13 @@
 import json
 import hashlib
+import io
 import os
 import plistlib
 import re
 import runpy
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -166,7 +168,9 @@ def test_tag_release_builds_both_platforms_and_only_final_assets() -> None:
     assert "Smoke test frozen macOS backend" in workflow
     assert "Smoke test frozen Windows backend" in workflow
     assert '"$BACKEND" collect --help' in workflow
-    assert "$Backend collect --help" in workflow
+    assert '-ArgumentList @("collect", "--help")' in workflow
+    assert "did not exit within 60 seconds" in workflow
+    assert "timeout-minutes: 8" in workflow
     assert "echo [adapter list]" in workflow
     assert "Expand-Archive" in workflow
     assert "hdiutil verify" in workflow
@@ -236,6 +240,35 @@ def test_windows_first_launch_allows_defender_cold_start() -> None:
     assert entry["WINDOWS_COLD_START_TIMEOUT_S"] >= 120
     assert entry["WINDOWS_SHUTDOWN_TIMEOUT_S"] >= 330
     assert entry["WINDOWS_MUTEX_NAME"].startswith("Local\\")
+
+
+def test_frozen_cli_reconfigures_redirected_windows_streams_to_utf8(
+    monkeypatch,
+) -> None:
+    entry = runpy.run_path(
+        str(Path(__file__).parents[3] / "packaging" / "portable_entry.py"),
+        run_name="portable_entry",
+    )
+    stdout_bytes = io.BytesIO()
+    stderr_bytes = io.BytesIO()
+    fake_sys = SimpleNamespace(
+        stdin=io.StringIO(""),
+        stdout=io.TextIOWrapper(stdout_bytes, encoding="cp1252"),
+        stderr=io.TextIOWrapper(stderr_bytes, encoding="cp1252"),
+    )
+    prepare = entry["_prepare_standard_streams"]
+    monkeypatch.setitem(prepare.__globals__, "sys", fake_sys)
+
+    prepare()
+    fake_sys.stdout.write("从 collector 启动\n")
+    fake_sys.stderr.write("硬件日志\n")
+    fake_sys.stdout.flush()
+    fake_sys.stderr.flush()
+
+    assert fake_sys.stdout.encoding.lower().replace("-", "") == "utf8"
+    assert fake_sys.stderr.encoding.lower().replace("-", "") == "utf8"
+    assert "从 collector 启动" in stdout_bytes.getvalue().decode("utf-8")
+    assert "硬件日志" in stderr_bytes.getvalue().decode("utf-8")
 
 
 def test_windows_child_keeps_single_instance_mutex_until_backend_exits() -> None:

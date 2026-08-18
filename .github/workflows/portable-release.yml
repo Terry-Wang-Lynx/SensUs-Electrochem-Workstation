@@ -172,6 +172,7 @@ jobs:
           SENSUS_FRONTEND_PUBLIC_KEY: ${{ vars.SENSUS_FRONTEND_PUBLIC_KEY }}
         run: ./windows/build_portable.ps1 -Python python
       - name: Smoke test frozen Windows backend
+        timeout-minutes: 8
         shell: pwsh
         run: |
           $Version = python -c "import pa_host; print(pa_host.__version__)"
@@ -234,8 +235,23 @@ jobs:
           if ($Adapters -notmatch "(?i)jlink") {
             throw "Final Windows OpenOCD does not contain the jlink adapter"
           }
-          & $Backend collect --help | Out-Null
-          if ($LASTEXITCODE -ne 0) {
+          $CollectorStdout = Join-Path $env:RUNNER_TEMP "sensus-collector-help.out"
+          $CollectorStderr = Join-Path $env:RUNNER_TEMP "sensus-collector-help.err"
+          $CollectorCheck = Start-Process -FilePath $Backend `
+            -ArgumentList @("collect", "--help") -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $CollectorStdout `
+            -RedirectStandardError $CollectorStderr
+          try {
+            Wait-Process -Id $CollectorCheck.Id -Timeout 60 -ErrorAction Stop
+          } catch {
+            if (-not $CollectorCheck.HasExited) {
+              Stop-Process -Id $CollectorCheck.Id -Force
+            }
+            throw "Frozen Windows collector entry point did not exit within 60 seconds"
+          }
+          $CollectorCheck.Refresh()
+          if ($CollectorCheck.ExitCode -ne 0) {
+            Get-Content $CollectorStderr -ErrorAction SilentlyContinue
             throw "Frozen Windows collector entry point failed its smoke test"
           }
           $env:SENSUS_PROJECT_DIR = Join-Path $Extracted "workstation"
