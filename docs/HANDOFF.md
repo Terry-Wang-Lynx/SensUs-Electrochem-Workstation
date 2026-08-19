@@ -184,6 +184,37 @@ brew install pkgconf
 make dmg VENV_PYTHON=python PYTHON=python
 ```
 
+构建脚本对 Python 版本是硬校验（`3.12.10`，不匹配直接退出）。这个版本决定打进包里的解释器与
+`packaging/portable-macos.lock` 的依赖集，不要放宽。若本机是别的版本，取一个独立的 3.12.10
+即可，不必改动系统 Python：
+
+```bash
+uv python install 3.12.10
+UVPY="$(uv python find 3.12.10)"
+make dmg VENV_PYTHON="$UVPY" PYTHON="$UVPY"
+```
+
+**带宽受限时先预取依赖再离线构建（2026-08-19 实测踩过）。** lock 里有 matplotlib、numpy
+这类大包；在 ~110 kB/s 的链路上，`pip install` 会在某个大文件上耗尽读超时，导致整个构建
+在中途失败——即便已经调大 `PIP_TIMEOUT` / `PIP_RETRIES` 也一样。先把整份 lock 抓成本地
+wheelhouse（可反复重跑，已下载的自动跳过），再让构建完全离线：
+
+```bash
+"$UVPY" -m pip download --require-hashes -r packaging/portable-macos.lock \
+  -d /tmp/wheelhouse --timeout 300 --retries 30
+PIP_NO_INDEX=1 PIP_FIND_LINKS=/tmp/wheelhouse \
+  make dmg VENV_PYTHON="$UVPY" PYTHON="$UVPY"
+```
+
+`--require-hashes` 在预取阶段就逐包校验，所以离线安装的安全性没有打折；也因此**没有必要换
+镜像源**。⚠️ 排查网络时不要手写 `files.pythonhosted.org` 的 wheel URL——真实路径带 hash
+前缀，手写必然 404，会被误读成"仓库不可达"。要测连通性请从 `https://pypi.org/pypi/<包>/<版本>/json`
+取真实 URL。
+
+发版还需同步**三处**版本号，`test_release_versions_stay_in_sync` 会校验：`pyproject.toml`、
+`software/host/pa_host/__init__.py`、`macos/Info.plist`（`CFBundleShortVersionString` 与
+`CFBundleVersion` 两个键）。
+
 Windows 的零依赖 ZIP 不能只运行 `build_portable.ps1`：干净构建机还要先生成 WinUSB helper 和 OpenOCD。准备 Git、Python `3.12.10`、Node.js `22`、Visual Studio 2022/MSBuild、7-Zip，以及 MSYS2 MINGW64 的 `autoconf automake libtool make mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf`。在 Visual Studio Developer PowerShell 中执行 helper：
 
 ```powershell
