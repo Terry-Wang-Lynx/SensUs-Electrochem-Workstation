@@ -1472,6 +1472,67 @@ def test_calibration_and_test_points_can_be_copied_between_lists_and_persisted()
                    for point in reloaded.manual_validation_points)
 
 
+def test_hidden_validation_points_can_be_restored() -> None:
+    """隐藏必须可逆 —— 用户反馈「现在删掉好像就弄不回来了」的回归钉子。
+
+    覆盖:① 记录来源的点能恢复 ② 手动点也能恢复(它 2026-08-19 前是真删)
+    ③ hidden_validation_points() 带出样品名/浓度,恢复列表不是一堆裸 ID
+    ④ 隐藏状态跨重启保留 ⑤ 重复恢复要报错而非静默成功
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "restore-validation"
+        app = AppState()
+        app.save_dir = workspace
+        app._load_workspace()
+        app.fit({
+            "points": [_point("zero", 0, 10), _point("ten", 10, 30)],
+            "selected_point_ids": ["zero", "ten"],
+        })
+        app._append_record({
+            "finished_at": float(app.model_created_at or 0) + 10,
+            "run_id": "test-restore", "sample_name": "可恢复样品",
+            "sample_role": "test", "known_concentration_um": 5,
+            "steady_current_nA": 20, "state": "completed",
+            "data_path": "test.csv", "raw_path": "test-raw.csv",
+        })
+        app.add_calibration_to_validation({"point_id": "zero"})
+
+        def visible(payload):
+            return {pt["point_id"] for pt in payload["validation_points"]}
+
+        assert visible(app.model_payload()) == {"test-restore", "manual-test-zero"}
+
+        result = app.delete_validation_point({"point_id": "test-restore"})
+        assert visible(result) == {"manual-test-zero"}
+        hidden = {pt["point_id"]: pt for pt in result["hidden_validation_points"]}
+        assert set(hidden) == {"test-restore"}
+        assert hidden["test-restore"]["sample_name"] == "可恢复样品"
+        assert float(hidden["test-restore"]["concentration_um"]) == 5
+        result = app.restore_validation_point({"point_id": "test-restore"})
+        assert visible(result) == {"test-restore", "manual-test-zero"}
+        assert result["hidden_validation_points"] == []
+
+        app.delete_validation_point({"point_id": "manual-test-zero"})
+        assert visible(app.model_payload()) == {"test-restore"}
+        result = app.restore_validation_point({"point_id": "manual-test-zero"})
+        assert visible(result) == {"test-restore", "manual-test-zero"}
+
+        app.delete_validation_point({"point_id": "test-restore"})
+        reloaded = AppState()
+        reloaded.save_dir = workspace
+        reloaded._load_workspace()
+        assert visible(reloaded.model_payload()) == {"manual-test-zero"}
+        reloaded.restore_validation_point({"point_id": "test-restore"})
+        assert visible(reloaded.model_payload()) == {"test-restore", "manual-test-zero"}
+
+        try:
+            reloaded.restore_validation_point({"point_id": "test-restore"})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("恢复一个未隐藏的点应当报错")
+
+
 def test_validation_points_can_be_deleted_without_rewriting_raw_records() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp) / "delete-validation"
@@ -1510,8 +1571,11 @@ def test_validation_points_can_be_deleted_without_rewriting_raw_records() -> Non
         saved = json.loads(
             (workspace / "calibration-validation.json").read_text(encoding="utf-8")
         )
-        assert saved["deleted_point_ids"] == ["test-delete"]
-        assert saved["manual_points"] == []
+        # 🔴 2026-08-19:手动点也改为软删除(可恢复)。旧断言编码的是"手动点真删"的
+        #    旧行为 —— 那正是用户反馈"删掉就弄不回来了"的根源。
+        assert saved["deleted_point_ids"] == ["manual-test-zero", "test-delete"]
+        # 条目保留(只打隐藏标记),这样 restore_validation_point 才能拿回来
+        assert [pt["point_id"] for pt in saved["manual_points"]] == ["manual-test-zero"]
 
 
 def test_ap_scoring_keeps_the_complete_index_beyond_one_hundred_rows() -> None:

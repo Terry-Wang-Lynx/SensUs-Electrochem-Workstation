@@ -515,3 +515,10 @@ main{height:100vh;display:grid;grid-template-rows:60px minmax(0,1fr);overflow:hi
 }
 .app-update-button{margin-left:auto;border:1px solid #70ad9b;border-radius:5px;background:#eaf7f2;color:#0c624f;padding:6px 8px;font:inherit;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap}.app-update-button:hover{background:#d9eee7}.app-update-button:disabled{cursor:wait}.app-update-button[hidden]{display:none}
 @media(min-width:621px) and (max-width:980px){.brand{flex-direction:column;gap:6px}.app-update-button{margin-left:0;width:34px;height:26px;padding:0;font-size:0}.app-update-button::before{content:'↻';font-size:15px}}
+
+/* 已隐藏的测试点（2026-08-19：把"删除"改为可恢复的"隐藏"后新增） */
+.hidden-points{margin-top:10px;border:1px dashed var(--border,#3a4048);border-radius:8px;padding:8px 10px}
+.hidden-points-head{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px;opacity:.85}
+.hidden-points-list{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+.hidden-point-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 6px;border-radius:6px;background:rgba(127,127,127,.08)}
+.hidden-point-name{font-variant-numeric:tabular-nums;font-size:13px;opacity:.75}

@@ -1469,3 +1469,38 @@ def test_plateau_input_bounds_match_backend_validation() -> None:
     ):
         pattern = rf'<input type="number" min="{minimum}" max="{maximum}"[^>]*data-plateau-key="{key}">'
         assert len(re.findall(pattern, html)) == 2, key
+
+
+def test_post_routes_dispatch_to_existing_attributes() -> None:
+    """POST 路由分派的 `APP.<method>(...)` 必须在 AppState 上真实存在。
+
+    🔴 2026-08-19 回归钉子:新增 /api/calibration/validation/restore 时误写成
+    `APP.calibration.restore_validation_point(...)`(邻居全是 `APP.xxx`),
+    方法其实定义在 AppState 上 ⇒ 运行时 AttributeError ⇒ 该接口 500。
+    单测直接调 app.restore_validation_point() 所以测不到 —— **路由层此前零覆盖**。
+
+    只查一层 `APP.name(...)` 且 name 在类上是可调用属性;不解引用实例值
+    (`APP.measurement.raw_log` 这类运行时才赋值的对象会误报)。
+    """
+    import ast
+
+    from pa_host.gui_server import AppState
+
+    source = (Path(__file__).resolve().parents[1] / "pa_host" / "gui_server.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "APP"):
+            name = node.func.attr
+            assert callable(getattr(AppState, name, None)), (
+                f"gui_server.py 第 {node.lineno} 行调用了 APP.{name}(...),"
+                f" 但 AppState 上没有这个可调用属性"
+            )
+            seen.add(name)
+    # 关键路由必须在扫描范围内,否则这个测试等于没测
+    for required in ("restore_validation_point", "delete_validation_point"):
+        assert required in seen, f"路由里没找到 APP.{required}(...) 的调用"

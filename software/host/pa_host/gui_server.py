@@ -9079,33 +9079,87 @@ class AppState:
         return self.model_payload()
 
     def delete_validation_point(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Hide one test point while preserving its underlying measurement files."""
+        """Hide one test point while preserving its underlying measurement files.
+
+        🔴 2026-08-19 用户反馈「删掉就弄不回来了」后改为**纯隐藏,一律可恢复**:
+        - 记录来源的点:point_id 进 deleted_validation_point_ids(原本就是软删)
+        - **手动添加的点:原先是从 manual_validation_points 里真删 ⇒ 不可恢复。**
+          现在同样只打隐藏标记,条目保留 ⇒ restore_validation_point 能拿回来。
+        - validation_overrides(用户对该点的手工编辑)**不再丢弃** —— 否则恢复回来
+          编辑值就没了。
+        """
         point_id = str(payload.get("point_id") or "").strip()
         if not point_id:
-            raise ValueError("请选择要删除的测试点")
+            raise ValueError("请选择要隐藏的测试点")
         if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
-            raise RuntimeError("测量或自动任务运行期间不能删除测试点")
+            raise RuntimeError("测量或自动任务运行期间不能隐藏测试点")
         with self.operation_lock, self.lock:
-            manual_before = len(self.manual_validation_points)
-            self.manual_validation_points = [
-                point for point in self.manual_validation_points
-                if str(point.get("point_id") or "") != point_id
-            ]
-            removed_manual = len(self.manual_validation_points) != manual_before
+            manual_exists = any(
+                str(point.get("point_id") or "") == point_id
+                for point in self.manual_validation_points
+            )
             record_exists = any(
                 str(row.get("run_id") or f"validation-{index:04d}") == point_id
                 and row.get("sample_role") == "test"
                 and row.get("state") == "completed"
                 for index, row in enumerate(self.records, 1)
             )
-            if not removed_manual and not record_exists:
+            if not manual_exists and not record_exists:
                 raise ValueError("测试点记录不存在")
-            if record_exists:
-                self.deleted_validation_point_ids.add(point_id)
-            self.validation_overrides.pop(point_id, None)
+            self.deleted_validation_point_ids.add(point_id)
             self._save_validation_overrides()
         self._refresh_history_best_effort()
         return self.model_payload()
+
+    def restore_validation_point(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Un-hide a previously hidden test point (inverse of delete_validation_point)."""
+        point_id = str(payload.get("point_id") or "").strip()
+        if not point_id:
+            raise ValueError("请选择要恢复的测试点")
+        if self.measurement.is_busy() or self.schedule.snapshot()["active"]:
+            raise RuntimeError("测量或自动任务运行期间不能恢复测试点")
+        with self.operation_lock, self.lock:
+            if point_id not in self.deleted_validation_point_ids:
+                raise ValueError("该测试点未被隐藏")
+            self.deleted_validation_point_ids.discard(point_id)
+            self._save_validation_overrides()
+        self._refresh_history_best_effort()
+        return self.model_payload()
+
+    def hidden_validation_points(self) -> list[dict[str, Any]]:
+        """Hidden test points, for the "显示已隐藏" toggle in the UI.
+
+        Rebuilt from records + manual points so a hidden point still shows its
+        sample name and numbers — otherwise the restore list would be opaque IDs.
+        """
+        hidden: list[dict[str, Any]] = []
+        if not self.deleted_validation_point_ids:
+            return hidden
+        for index, row in enumerate(self.records, 1):
+            if row.get("sample_role") != "test" or row.get("state") != "completed":
+                continue
+            point_id = str(row.get("run_id") or f"validation-{index:04d}")
+            if point_id not in self.deleted_validation_point_ids:
+                continue
+            override = self.validation_overrides.get(point_id, {})
+            hidden.append({
+                "point_id": point_id,
+                "sample_name": str(
+                    override.get("sample_name", row.get("sample_name") or "")
+                ),
+                "concentration_um": override.get(
+                    "concentration_um", row.get("known_concentration_um")
+                ),
+                "current_nA": override.get("current_nA", row.get("steady_current_nA")),
+                "source": "record",
+            })
+        for point in self.manual_validation_points:
+            point_id = str(point.get("point_id") or "")
+            if point_id and point_id in self.deleted_validation_point_ids:
+                entry = dict(point)
+                entry["source"] = "manual"
+                hidden.append(entry)
+        return hidden
 
     def _stabilization_records(self) -> list[dict[str, Any]]:
         if self.model_created_at is None or self.model_settings is None:
@@ -9675,6 +9729,7 @@ class AppState:
                     "points": points_payload["points"],
                     "points_revision": points_payload["points_revision"],
                     "validation_points": [],
+                    "hidden_validation_points": self.hidden_validation_points(),
                     "ap_score": evaluate_ap_score([]),
                     "selected_point_ids": self.selected_point_ids,
                     "model_created_at": self.model_created_at,
@@ -9712,6 +9767,7 @@ class AppState:
                 "points_revision": points_payload["points_revision"],
                 "curve": {"concentration_um": xs, "current_nA": ys},
                 "validation_points": validation_points,
+                "hidden_validation_points": self.hidden_validation_points(),
                 "ap_score": ap_score,
                 "measurement_settings": self.model_settings,
                 "selected_point_ids": self.selected_point_ids,
@@ -9805,6 +9861,10 @@ class AppState:
             })
         for point in self.manual_validation_points:
             point_id = str(point.get("point_id") or "")
+            # 🔴 手动点自 2026-08-19 起改为软删除(条目保留、只打隐藏标记),
+            #    所以这里必须与记录来源的点一样过滤,否则"隐藏"对手动点无效。
+            if point_id and point_id in self.deleted_validation_point_ids:
+                continue
             try:
                 measured_current = float(point["current_nA"])
                 finished_at = float(point.get("finished_at") or 0)
@@ -10620,6 +10680,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = APP.fit(payload)
             elif self.path == "/api/calibration/validation":
                 result = APP.update_validation_points(payload)
+            elif self.path == "/api/calibration/validation/restore":
+                result = APP.restore_validation_point(payload)
             elif self.path == "/api/calibration/validation/delete":
                 result = APP.delete_validation_point(payload)
             elif self.path == "/api/calibration/promote-validation":

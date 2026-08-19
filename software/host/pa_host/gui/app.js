@@ -721,6 +721,28 @@ function paddedBounds(points) {
  * ⇒ 现有两个调用点(itChart / calibrationChart)一个字都不用改。
  * 左右轴共用同一组分数网格位置(6 条线),否则两侧刻度视觉上对不齐,
  * 人会误读成"两条线在同一个值上交叉"。 */
+/*
+ * 取整刻度（nice numbers）——2026-08-19 用户反馈「标定界面的纵坐标轴，每个显示数字
+ * 最好相差 5/10 之类的整的」。原实现把数据范围直接五等分，标签成了 2.63/3.41/4.19…
+ *
+ * 做法：把步长吸附到 1/2/2.5/5 ×10ⁿ，再把上下界向外扩到步长的整数倍。
+ * 返回 {min,max,step,digits}；digits 由步长决定，避免 "5.0" 这种多余小数。
+ */
+function niceScale(lo, hi, targetTicks = 5) {
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;
+  if (hi === lo) { const pad = Math.abs(hi) > 0 ? Math.abs(hi) * 0.1 : 1; lo -= pad; hi += pad; }
+  const raw = (hi - lo) / targetTicks;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const mult = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10;
+  const step = mult * mag;
+  const min = Math.floor(lo / step) * step;
+  const max = Math.ceil(hi / step) * step;
+  // 步长的小数位数：0.5→1 位，5→0 位；用 step 而非数据大小来定，标签才齐整
+  const digits = step >= 1 ? 0 : Math.min(6, Math.ceil(-Math.log10(step)));
+  return {min, max, step, digits};
+}
+
 function drawChart(canvas, series, options = {}) {
   const {ctx, w, h} = setupCanvas(canvas); ctx.clearRect(0, 0, w, h);
   const left = series.filter(s => s.axis !== 'right'), right = series.filter(s => s.axis === 'right');
@@ -732,6 +754,9 @@ function drawChart(canvas, series, options = {}) {
   let xmin = options.xmin ?? xBounds[0], xmax = options.xmax ?? xBounds[1];
   if(options.integerX){xmin=Math.floor(xmin);xmax=Math.ceil(xmax);if(xmin===xmax){xmin-=1;xmax+=1}}
   let [ymin, ymax] = paddedBounds(allL);
+  // options.niceY：把左轴吸附到取整刻度（标定图用）
+  let niceY = options.niceY ? niceScale(ymin, ymax, options.yTicks ?? 5) : null;
+  if (niceY) { ymin = niceY.min; ymax = niceY.max; }
   const [y2min, y2max] = paddedBounds(allR);
   if (xmax === xmin) xmax = xmin + 1;
   const m = {l:56, r: hasRight ? 56 : 18, t:18, b:38};
@@ -749,11 +774,23 @@ function drawChart(canvas, series, options = {}) {
     ctx.restore();
   }
   ctx.font = '10px system-ui'; ctx.fillStyle='#718086'; ctx.strokeStyle='#e2e7e8'; ctx.lineWidth=1;
-  for(let i=0;i<=5;i++){
-    const f=i/5, yy=m.t+(1-f)*(h-m.t-m.b);
+  const yLabels=[];
+  if(niceY){
+    for(let v=niceY.min;v<=niceY.max+niceY.step*1e-6;v+=niceY.step)
+      yLabels.push({value:v,frac:(v-ymin)/(ymax-ymin),digits:niceY.digits});
+  }else{
+    for(let i=0;i<=5;i++) yLabels.push({value:ymin+(ymax-ymin)*(i/5),frac:i/5,digits:yd});
+  }
+  yLabels.forEach((tick,i)=>{
+    const yy=m.t+(1-tick.frac)*(h-m.t-m.b);
     ctx.beginPath();ctx.moveTo(m.l,yy);ctx.lineTo(w-m.r,yy);ctx.stroke();
-    ctx.fillStyle='#718086';ctx.fillText((ymin+(ymax-ymin)*f).toFixed(yd),6,yy+3);
-    if(hasRight){ctx.fillStyle='#8a6fb0';ctx.fillText((y2min+(y2max-y2min)*f).toFixed(y2d),w-m.r+6,yy+3)}
+    ctx.fillStyle='#718086';ctx.fillText(tick.value.toFixed(tick.digits),6,yy+3);
+    // 右轴保持原来的五等分（它没有取整需求，且两轴刻度数可能不同）
+    if(hasRight&&!niceY){ctx.fillStyle='#8a6fb0';ctx.fillText((y2min+(y2max-y2min)*tick.frac).toFixed(y2d),w-m.r+6,yy+3)}
+  });
+  if(hasRight&&niceY){
+    for(let i=0;i<=5;i++){const f=i/5,yy=m.t+(1-f)*(h-m.t-m.b);
+      ctx.fillStyle='#8a6fb0';ctx.fillText((y2min+(y2max-y2min)*f).toFixed(y2d),w-m.r+6,yy+3)}
   }
   ctx.fillStyle='#718086';
   const xTicks=options.integerX?Array.from({length:Math.floor((xmax-xmin)/Math.max(1,Math.ceil((xmax-xmin)/6)))+1},(_,i)=>xmin+i*Math.max(1,Math.ceil((xmax-xmin)/6))).filter(x=>x<=xmax):Array.from({length:7},(_,i)=>xmin+(xmax-xmin)*i/6);
@@ -865,7 +902,7 @@ function drawAll(){
   if(state.showCalibrationPoints&&selected.length)series.push({points:selected.map(p=>[Number(p.concentration_um),Number(p.current_nA)]),color:'#28708c',dots:true,width:0,pointRadius:4});
   const validation=(c.validation_points||[]).filter(p=>hasFiniteConcentration(p)&&Number.isFinite(Number(p.current_nA)));
   if(state.showTestPoints&&validation.length)series.push({points:validation.map(p=>[Number(p.concentration_um),Number(p.current_nA)]),color:'#b54455',dots:true,width:0,pointRadius:4.5});
-  $('calibrationEmpty').hidden=series.length>0;drawChart($('calibrationChart'),series,{xlabel:'浓度 (µM)',ylabel:'电流 (nA)',integerX:true});
+  $('calibrationEmpty').hidden=series.length>0;drawChart($('calibrationChart'),series,{xlabel:'浓度 (µM)',ylabel:'电流 (nA)',integerX:true,niceY:true});
   drawApScoreChart(c.validation_points||[]);
 }
 [
@@ -1360,6 +1397,7 @@ $('startMeasure').addEventListener('click',async()=>{
   }finally{state.measurementStartPending=false;updateStartState()}
 });
 $('stopMeasure').addEventListener('click',async()=>{clearMeasureError();try{updateMeasurement(await post('/api/measurement/stop'))}catch(e){errorBox('measureError',e)}});
+$('toggleHiddenPoints')?.addEventListener('click',()=>{const l=$('hiddenPointsList');l.hidden=!l.hidden;$('toggleHiddenPoints').textContent=l.hidden?'展开':'收起'});
 $('sampleRole').addEventListener('click',event=>{const button=event.target.closest('button[data-role]');if(button)setSampleRole(button.dataset.role)});
 ['sampleName','knownConcentration'].forEach(id=>$(id).addEventListener('input',event=>{event.currentTarget.removeAttribute('aria-invalid');clearMeasureError();previewFilename()}));
 $('doubleKnownConcentration').addEventListener('click',()=>scaleKnownConcentration(2));
@@ -1614,10 +1652,37 @@ function updateValidationSummary(){
     : '暂无测试点';
   $('validationSummary').textContent=text;drawAll();
 }
+/*
+ * 已隐藏的测试点 —— 2026-08-19 用户反馈「测试点应该可以选择展示/不展示，而不是删掉；
+ * 现在删掉好像就弄不回来了」后新增。隐藏是可逆的：原始测量文件与手工编辑值都保留，
+ * 后端只在 deleted_validation_point_ids 里打标记（已持久化到工作区）。
+ */
+function renderHiddenValidationPoints(){
+  const block=$('hiddenPointsBlock'),list=$('hiddenPointsList'),label=$('hiddenPointsLabel'),toggle=$('toggleHiddenPoints');
+  if(!block) return;
+  const hidden=state.calibration?.hidden_validation_points||[];
+  block.hidden=hidden.length===0;
+  if(hidden.length===0){list.hidden=true;toggle.textContent='展开';return}
+  label.textContent=`已隐藏 ${hidden.length} 个测试点（不参与统计与图，可恢复）`;
+  list.replaceChildren();
+  hidden.forEach(point=>{
+    const row=document.createElement('div');row.className='hidden-point-row';
+    const name=document.createElement('span');name.className='hidden-point-name';
+    const conc=point.concentration_um==null||point.concentration_um===''?'—':Number(point.concentration_um).toFixed(3).replace(/\.?0+$/,'');
+    const cur=point.current_nA==null||point.current_nA===''?'—':Number(point.current_nA).toFixed(3);
+    name.textContent=`${point.sample_name||point.point_id}　${conc} µM　${cur} nA`;
+    const restore=document.createElement('button');restore.className='text-button';restore.type='button';
+    restore.textContent='恢复显示';restore.title='让该测试点重新参与统计与图';
+    restore.onclick=async()=>{try{restore.disabled=true;state.calibration=await post('/api/calibration/validation/restore',{point_id:point.point_id});renderCalibration();toast('已恢复显示')}catch(e){restore.disabled=false;toast(diagnosticMessage(e))}};
+    row.append(name,restore);list.appendChild(row);
+  });
+}
+
 function renderValidation(points){
   const body=$('validationBody');body.replaceChildren();const rows=state.calibration?.model?(points||[]):[];$('validationEmpty').hidden=rows.length>0;
-  rows.forEach((point,index)=>{const tr=document.createElement('tr');tr.dataset.pointId=point.point_id||point.run_id||`validation-${index+1}`;const number=document.createElement('td');number.textContent=String(index+1);tr.appendChild(number);[['sample_name',point.sample_name||''],['concentration_um',point.concentration_um],['current_nA',point.current_nA]].forEach(([key,value])=>{const td=document.createElement('td'),input=document.createElement('input');input.dataset.validationKey=key;input.value=value??'';if(key!=='sample_name'){input.type='number';input.step='0.001';input.min=key==='concentration_um'?'0':''}input.addEventListener('input',()=>{state.validationDirty=true;$('validationEditBadge').textContent='未保存修改';$('validationEditBadge').className='live-badge warn';$('saveValidation').disabled=false;updateValidationSummary()});td.appendChild(input);tr.appendChild(td)});for(let i=0;i<7;i++){const td=document.createElement('td');td.dataset.validationDerived='true';tr.appendChild(td)}const action=document.createElement('td'),actions=document.createElement('div'),promote=document.createElement('button'),remove=document.createElement('button');actions.className='validation-row-actions';promote.className='text-button';promote.type='button';promote.textContent='添加为标定点';promote.title='将该测试点复制到候选标定点列表';promote.onclick=async()=>{try{state.calibration=await post('/api/calibration/promote-validation',{point_id:tr.dataset.pointId});renderCalibration();toast('已添加为候选标定点，请选择后重新拟合')}catch(e){toast(diagnosticMessage(e))}};remove.className='delete-point';remove.type='button';remove.textContent='×';remove.title='删除该测试点（保留原始测量文件）';remove.setAttribute('aria-label',`删除测试点 ${point.sample_name||index+1}`);remove.onclick=async()=>{if(!confirm(`删除测试点“${point.sample_name||index+1}”？\n原始测量 CSV 会保留。`))return;try{remove.disabled=true;if(state.validationDirty)await persistValidationEdits();state.calibration=await post('/api/calibration/validation/delete',{point_id:tr.dataset.pointId});renderCalibration();toast('测试点已删除，原始测量文件仍保留')}catch(e){remove.disabled=false;toast(diagnosticMessage(e))}};actions.append(promote,remove);action.appendChild(actions);tr.appendChild(action);body.appendChild(tr);syncValidationRow(tr)});
+  rows.forEach((point,index)=>{const tr=document.createElement('tr');tr.dataset.pointId=point.point_id||point.run_id||`validation-${index+1}`;const number=document.createElement('td');number.textContent=String(index+1);tr.appendChild(number);[['sample_name',point.sample_name||''],['concentration_um',point.concentration_um],['current_nA',point.current_nA]].forEach(([key,value])=>{const td=document.createElement('td'),input=document.createElement('input');input.dataset.validationKey=key;input.value=value??'';if(key!=='sample_name'){input.type='number';input.step='0.001';input.min=key==='concentration_um'?'0':''}input.addEventListener('input',()=>{state.validationDirty=true;$('validationEditBadge').textContent='未保存修改';$('validationEditBadge').className='live-badge warn';$('saveValidation').disabled=false;updateValidationSummary()});td.appendChild(input);tr.appendChild(td)});for(let i=0;i<7;i++){const td=document.createElement('td');td.dataset.validationDerived='true';tr.appendChild(td)}const action=document.createElement('td'),actions=document.createElement('div'),promote=document.createElement('button'),remove=document.createElement('button');actions.className='validation-row-actions';promote.className='text-button';promote.type='button';promote.textContent='添加为标定点';promote.title='将该测试点复制到候选标定点列表';promote.onclick=async()=>{try{state.calibration=await post('/api/calibration/promote-validation',{point_id:tr.dataset.pointId});renderCalibration();toast('已添加为候选标定点，请选择后重新拟合')}catch(e){toast(diagnosticMessage(e))}};remove.className='delete-point';remove.type='button';remove.textContent='隐藏';remove.title='从统计与图中隐藏该测试点（可随时恢复，原始测量文件保留）';remove.setAttribute('aria-label',`隐藏测试点 ${point.sample_name||index+1}`);remove.onclick=async()=>{try{remove.disabled=true;if(state.validationDirty)await persistValidationEdits();state.calibration=await post('/api/calibration/validation/delete',{point_id:tr.dataset.pointId});renderCalibration();toast('已隐藏，可在下方「已隐藏」中恢复')}catch(e){remove.disabled=false;toast(diagnosticMessage(e))}};actions.append(promote,remove);action.appendChild(actions);tr.appendChild(action);body.appendChild(tr);syncValidationRow(tr)});
   state.validationDirty=false;$('validationEditBadge').textContent='已保存';$('validationEditBadge').className='live-badge running';$('saveValidation').disabled=true;updateValidationSummary();
+  renderHiddenValidationPoints();
 }
 function renderCalibration(){
   const c=state.calibration||{}, {model,points,validation_points=[],model_path,model_created_at,drift_bias_nA,model_compatible}=c;

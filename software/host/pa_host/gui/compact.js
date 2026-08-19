@@ -50,18 +50,45 @@ function setMessage(text, error = false) {
   $('message').classList.toggle('error', error);
 }
 
-function setRole(role) {
+/*
+ * 🔴 2026-08-19 修:启动时序竞态导致「界面显示标定、内部状态是测试」。
+ *
+ * 旧实现在 role==='test' 且标定未就绪时**直接 return** —— 而启动序列是
+ *     state.role = localStorage('compact-role')   // 可能是 'test'
+ *     setRole(state.role)                          // 此刻 state.workflow 还是 null
+ *     Promise.all([...settings, workflow...])      // workflow 之后才到
+ * 于是上次停在"测试"的用户重开小窗时必然命中那个 return:state.role 仍是 'test',
+ * 但按钮高亮停在 HTML 默认的"标定"。后果是 updateButton() 里
+ * `state.role==='calibration'` 判为 false ⇒ **标定模式下浓度留空也允许开始**,
+ * 且提交时 sample_role='test' ⇒ 该点不进标定集。用户反馈的"调浓度代码错乱"就是它。
+ *
+ * 现在:拒绝切换时也**把 UI 同步回真实的 state.role**,保证两者永不分叉。
+ */
+function setRole(role, options = {}) {
+  const {quiet = false} = options;
   if (role === 'test' && !state.workflow?.calibration_ready) {
-    setMessage('请先在完整工作站中生成标定曲线', true);
+    if (!quiet) setMessage('请先在完整工作站中生成标定曲线', true);
+    // 回落到标定,而不是留下 UI/state 不一致
+    if (state.role !== 'calibration') {
+      state.role = 'calibration';
+      localStorage.setItem('compact-role', 'calibration');
+    }
+    syncRoleUi();
+    updateButton();
     return;
   }
   state.role = role;
   localStorage.setItem('compact-role', role);
-  document.querySelectorAll('#sampleRole button').forEach(button => {
-    button.classList.toggle('active', button.dataset.role === role);
-  });
-  $('concentration').placeholder = role === 'calibration' ? '必填' : '可选';
+  syncRoleUi();
   updateButton();
+}
+
+/* UI 与 state.role 的唯一同步点 —— 任何改 role 的路径都必须过这里 */
+function syncRoleUi() {
+  document.querySelectorAll('#sampleRole button').forEach(button => {
+    button.classList.toggle('active', button.dataset.role === state.role);
+  });
+  $('concentration').placeholder = state.role === 'calibration' ? '必填' : '可选';
 }
 
 function renderSettings(payload) {
@@ -83,7 +110,14 @@ function renderWorkflow(payload) {
   state.workflow = payload;
   const testButton = document.querySelector('[data-role="test"]');
   testButton.disabled = !payload.calibration_ready;
-  if (state.role === 'test' && !payload.calibration_ready) setRole('calibration');
+  if (state.role === 'test' && !payload.calibration_ready) {
+    // 恢复出来的 role 不可用 ⇒ 拉回标定(quiet:启动时不该弹错误提示)
+    setRole('calibration', {quiet: true});
+  } else {
+    // 🔴 role 可用时也必须同步一次 UI —— 否则启动时若 role='test' 且标定已就绪,
+    //    按钮高亮会一直停在 HTML 默认的"标定",与 state 分叉(旧 bug 的另一半)。
+    syncRoleUi();
+  }
   updateButton();
 }
 
@@ -375,11 +409,16 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-setRole(state.role);
+/*
+ * 🔴 启动时先只同步 UI,**不做可用性判定** —— 此刻 state.workflow 还是 null,
+ * 任何 role==='test' 的判定都必然误判。等 renderWorkflow 拿到真实的
+ * calibration_ready 后再由它裁决(它会在不就绪时把 role 拉回标定)。
+ */
+syncRoleUi();
 Promise.all([api('/api/settings'), api('/api/workflow'), api('/api/status'), api('/api/devices', {timeoutMs: 3000})])
   .then(([settings, workflow, measurement, devices]) => {
     renderSettings(settings);
-    renderWorkflow(workflow);
+    renderWorkflow(workflow);   // ← 这里才裁决恢复出来的 role 是否可用
     renderDevices(devices);
     renderMeasurement(measurement);
     refresh();

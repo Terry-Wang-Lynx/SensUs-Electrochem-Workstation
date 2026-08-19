@@ -210,6 +210,15 @@
             <div class="panel-head"><div><h2>测试点与误差</h2><p>真实浓度、电流和样品名可修改；原始测量文件不会被覆盖</p></div><div class="validation-actions"><span class="live-badge" id="validationEditBadge">未保存修改</span><button class="primary" id="saveValidation" disabled>保存测试点修改</button></div></div>
             <div class="table-wrap validation-table-wrap"><table><thead><tr><th>#</th><th>样品</th><th>真实浓度 / µM</th><th>测量电流 / nA</th><th>理论电流 / nA</th><th>电流误差 / nA</th><th>预测浓度 / µM</th><th>绝对误差 / µM</th><th>误差 / %</th><th>区域</th><th>点分</th><th></th></tr></thead><tbody id="validationBody"></tbody></table><div class="empty-history" id="validationEmpty">生成测试曲线后，已完成的测试记录会出现在这里；真实浓度可随后补填</div></div>
             <div class="validation-summary" id="validationSummary">暂无测试点统计</div>
+            <!-- 已隐藏的测试点：2026-08-19 用户反馈「删掉就弄不回来了」后新增。
+                 隐藏只是从统计与图里排除，原始测量文件与手工编辑值都保留。 -->
+            <div class="hidden-points" id="hiddenPointsBlock" hidden>
+              <div class="hidden-points-head">
+                <span id="hiddenPointsLabel">已隐藏 0 个测试点</span>
+                <button class="text-button" type="button" id="toggleHiddenPoints">展开</button>
+              </div>
+              <div class="hidden-points-list" id="hiddenPointsList" hidden></div>
+            </div>
           </section>
           <section class="panel ap-panel">
             <div class="panel-head"><div><h2>AP 评分区间</h2><p>ETE July IP 算法：蓝区满分，绿区按边界线性插值，灰区 0 分；按测试顺序计算连续稳定性</p></div><div class="ap-score-badge" id="apFinalBadge">Final -- / 200</div></div>
