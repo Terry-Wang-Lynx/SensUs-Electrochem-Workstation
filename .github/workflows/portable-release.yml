@@ -296,6 +296,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 🔴 必须 checkout:本 job 用 `body_path: docs/RELEASE_NOTES.md`,而这个 job
+      #    原来只 download-artifact、不检出仓库 ⇒ 那个文件不在磁盘上。
+      #    0.4.16 实测踩过:action 打出
+      #      ⚠️ Failed to read body_path "docs/RELEASE_NOTES.md" (ENOENT).
+      #        Falling back to 'body' input.
+      #    而内联 body 已被移除 ⇒ **release note 整个是空的**,而且构建全绿、
+      #    只在发布前人工核对 body 才会发现。
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: SensUs-Workstation-*
