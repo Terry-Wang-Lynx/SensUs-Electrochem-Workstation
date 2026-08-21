@@ -1222,12 +1222,21 @@ $('exitApp').addEventListener('click',async()=>{
   },350);
 });
 function renderAppUpdate(data){
-  state.appUpdate=data||null;const button=$('appUpdate'),active=['downloading','preparing','ready','applying'].includes(data?.state),visible=Boolean(data?.available&&(active||data.state==='available'||data.state==='error'));
+  state.appUpdate=data||null;const button=$('appUpdate'),active=['downloading','preparing','ready','applying'].includes(data?.state);
+  /* 🔴 2026-08-21 修:检查失败必须可见。
+     旧写法把 error 也关在 `data.available &&` 里 —— 而"检查更新"本身失败时
+     available 必然是 false(根本没查到有没有新版),于是 state==='error' 这一支
+     永远走不到,界面上一点提示都没有。现场后果:某台机器连续三天 156 次检查
+     全部失败(冻结体缺 CA 证书),用户却一直以为自己是最新版,卡在 0.4.7。
+     ⇒ error 从 available 的与条件里提出来,单独作为可见条件。 */
+  const visible=Boolean((data?.available&&(active||data.state==='available'))||data?.state==='error');
   button.hidden=!visible;if(!visible)return;
   if(data.state==='downloading'||data.state==='preparing'){button.disabled=true;button.textContent=`↓ ${Math.round(Number(data.progress||0)*100)}%`;button.title='正在下载并校验新版本';return}
   if(data.state==='ready'){button.disabled=state.appUpdateRequested;button.textContent=state.appUpdateRequested?'↻ 正在重启…':'↻ 安装更新';return}
   if(data.state==='applying'){button.disabled=true;button.textContent='↻ 正在安装…';return}
-  button.disabled=false;button.textContent=data.state==='error'?'↻ 重试':'↻ 更新';button.title=data.error||`更新到 ${data.latest_version}`;
+  button.disabled=false;
+  if(data.state==='error'){button.textContent='⚠ 更新检查失败';button.title=`${data.error||'无法连接更新服务'}\n点击重试。若持续失败,请手动到 GitHub Releases 下载。`;return}
+  button.textContent='↻ 更新';button.title=`更新到 ${data.latest_version}`;
 }
 async function applyReadyAppUpdate(){
   if(!state.appUpdateRequested||state.appUpdateApplying||state.appUpdate?.state!=='ready')return;

@@ -138,6 +138,18 @@ TARGET_RATE_HZ = 10.0
 FIT_WINDOW_S = 20.0
 MAX_PLATEAU_BACKFILL_WINDOWS = 32
 LIVE_ANALYSIS_REFRESH_S = 0.9
+# 🔴 GET 请求原来**完全不写日志**(只有 POST 记 started/completed),
+# 于是 2026-08-21 那次"UI 卡死 10 分钟"的排查里,前端报了 149 次
+# frontend.request_failed(/api/status 阈值 1500ms、/api/devices 3000、
+# /api/debug 5000、/api/history 5000),而后端侧**一条记录都没有** ——
+# 无法判断到底是后端慢、还是前端 JS 线程卡住。
+# 只记"超过阈值的"请求:量很小不会淹日志,却正好补上这个盲区。
+# 阈值取 800ms:比前端最紧的 1500ms 早一档,能在用户可见之前看到爬升。
+SLOW_REQUEST_WARN_MS = 800.0
+# 同理,给采集监视循环里那次持锁的实时分析加计时告警。
+# ⚠️ _refresh_live_analysis_locked 自身已有 LIVE_ANALYSIS_REFRESH_S 的节流,
+# 所以它**不是**每轮都做重活;是否存在锁饥饿尚未证实,这条告警就是为了下次能证实。
+LIVE_ANALYSIS_WARN_MS = 500.0
 CLIENT_DIAGNOSTIC_MAX_LENGTH = 8_000
 CONFIG_GATE_GET_RETRY_S = 0.75
 CONFIG_GATE_LEGACY_PROBE_DELAY_S = 6.0
@@ -4478,11 +4490,18 @@ class MeasurementController:
             self._plateau_context_pending = True
 
     def is_busy(self) -> bool:
-        """Return true until the acquisition watcher has finished callbacks."""
-        with self.lock:
-            return self.state == "running" or bool(
-                self.thread is not None and self.thread.is_alive()
-            )
+        """Return true until the acquisition watcher has finished callbacks.
+
+        🔴 这里**故意不取 self.lock**。它只读两个独立字段(state 字符串、thread 引用)
+        再做一次或运算,没有需要锁来维持的复合不变量;而"忙不忙"这种查询天生就是
+        查完下一刻就可能变,加锁并不能让答案更准。
+        但加锁有实际代价:`add_validation_to_calibration` 等写接口**第一行**就调它,
+        采集期间 self.lock 由监视循环周期性持有,于是"点一下设为标定点"会卡在这里
+        (2026-08-21 现场:该端点自身中位仅 7.7ms,却表现为请求超时并连带堵住其它请求)。
+        """
+        return self.state == "running" or bool(
+            self.thread is not None and self.thread.is_alive()
+        )
 
     def wait_for_completion(self) -> None:
         """Wait until acquisition analysis, exports, and callbacks are complete."""
@@ -6652,8 +6671,19 @@ class MeasurementController:
             if not gate_checking:
                 self._scan_range_events()
                 self._maybe_auto_switch()
+                analysis_started = time.monotonic()
                 with self.lock:
                     self._refresh_live_analysis_locked()
+                analysis_ms = (time.monotonic() - analysis_started) * 1000.0
+                if analysis_ms >= LIVE_ANALYSIS_WARN_MS:
+                    # 持锁时间过长会饿死所有需要 self.lock 的 HTTP 处理线程
+                    DIAGNOSTICS.record(
+                        "warning", "measurement.live_analysis_slow",
+                        "Live analysis held the state lock too long",
+                        duration_ms=round(analysis_ms, 1),
+                        threshold_ms=LIVE_ANALYSIS_WARN_MS,
+                        run_id=str(self.run_id or ""),
+                    )
                 self._maybe_auto_stop()
             with self.lock:
                 gate_checking = self._config_gate.get("state") == "checking"
@@ -10389,13 +10419,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                 pass
         finally:
             status = int(getattr(self, "_response_status", 0) or 0)
+            duration_ms = round((time.monotonic() - started_at) * 1000, 1)
             if method == "POST" and 0 < status < 400:
                 DIAGNOSTICS.record(
                     "info", "api.request.completed", "Control request completed",
                     method=method, path=path, status=status,
                     request_id=self._request_id,
                     body_keys=self._request_body_keys,
-                    duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+                    duration_ms=duration_ms,
+                )
+            if duration_ms >= SLOW_REQUEST_WARN_MS:
+                # GET 也记 —— 这是唯一能区分"后端慢"与"前端卡"的证据
+                DIAGNOSTICS.record(
+                    "warning", "api.request.slow", "Request exceeded the slow threshold",
+                    method=method, path=path, status=status,
+                    request_id=self._request_id, duration_ms=duration_ms,
+                    threshold_ms=SLOW_REQUEST_WARN_MS,
                 )
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API

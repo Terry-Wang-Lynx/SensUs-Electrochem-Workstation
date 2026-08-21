@@ -5280,3 +5280,24 @@ def test_history_curve_select_all_keeps_total_point_budget_bounded(tmp_path: Pat
     assert sum(maximum_points_seen) == 36_000
     with pytest.raises(ValueError, match="最多叠加 80 条"):
         app.load_history_curves({"run_ids": [f"run-{index}" for index in range(81)]})
+
+def test_is_busy_does_not_block_on_the_state_lock() -> None:
+    """`is_busy()` 必须能在 self.lock 被别人持有时立刻返回。
+
+    2026-08-21 现场缺陷:`add_validation_to_calibration`(「设为标定点」)第一行就调
+    `is_busy()`,而它当时是 `with self.lock:`。采集期间监视循环周期性持有同一把锁,
+    于是该端点表现为请求超时并连带堵住其它请求 —— 尽管它自身中位仅 7.7 ms。
+    """
+    controller = MeasurementController()
+    done = threading.Event()
+    result: list[bool] = []
+
+    with controller.lock:                       # 模拟监视循环正持锁
+        def probe() -> None:
+            result.append(controller.is_busy())
+            done.set()
+
+        threading.Thread(target=probe, daemon=True).start()
+        assert done.wait(2.0), "is_busy() 在 self.lock 被持有时阻塞了"
+
+    assert result == [False]

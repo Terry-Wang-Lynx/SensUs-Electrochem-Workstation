@@ -1504,3 +1504,49 @@ def test_post_routes_dispatch_to_existing_attributes() -> None:
     # 关键路由必须在扫描范围内,否则这个测试等于没测
     for required in ("restore_validation_point", "delete_validation_point"):
         assert required in seen, f"路由里没找到 APP.{required}(...) 的调用"
+
+def test_checkbox_reset_has_zero_specificity_and_precedes_component_rules() -> None:
+    """全局 `input{width:100%;padding:9px 10px}` 会把复选框撑成大方块。
+
+    2026-08-21 现场:「当前批次历史曲线」里复选框实测 **156px**,把文字挤到 103px
+    并逐字换行(`.history-curve-option input{margin:0}` 只重置了 margin,漏了 width)。
+
+    复位规则必须满足两条,否则会引入新的回归:
+    1. 用 `:where()` 让特异度为 0 —— 否则 (0,1,1) 会盖掉
+       `.point-selector{width:16px}` (0,1,0) 这类刻意设定的尺寸;
+    2. 位置在全局 `input,select` **之后**(靠顺序赢它)、在组件规则**之前**
+       (让组件规则靠特异度继续赢)。
+    """
+    css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+    reset = 'input:where([type="checkbox"],[type="radio"]){'
+    assert reset in css, "缺少复选框复位规则(或被改成了带特异度的写法)"
+    for prop in ("width:auto", "padding:0"):
+        assert prop in css[css.index(reset):css.index(reset) + 220], f"复位规则缺 {prop}"
+    global_rule = css.index("input,select{width:100%")
+    assert css.index(reset) > global_rule, "复位规则必须排在全局 input,select 之后"
+    # 真正要守的是"特异度为 0":选择器里不能出现 :where() 之外的属性/类选择器
+    head = css[css.index(reset) - 0:css.index(reset) + len(reset)]
+    assert head.count("[type=") == 2, "属性选择器必须全部包在 :where() 里"
+    assert not head.startswith("."), "复位规则不能带类选择器"
+    # 组件侧刻意设定的尺寸必须仍然存在(否则复选框会退回浏览器默认大小)
+    for component in ('.point-selector{width:16px', '.checkbox-row input{width:16px'):
+        assert component in css, f"{component} 被删了 —— 复位规则不负责恢复这些尺寸"
+
+
+def test_update_check_failure_is_visible_without_a_known_update() -> None:
+    """更新**检查失败**时必须能在界面上看到。
+
+    2026-08-21 现场:某台机器连续三天 156 次更新检查全部失败(冻结体缺 CA 证书),
+    成功事件 0 条,而用户完全不知道 —— 因为旧代码把 error 也关在
+    `data.available && (...)` 里,而检查失败时 available 必然是 false
+    (根本没查到有没有新版),这一支永远走不到。
+    """
+    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    body = _extract_js_function(source, "renderAppUpdate")
+    visible = next(line for line in body.splitlines() if "const visible=" in line)
+    assert "data?.state==='error'" in visible, "error 必须是独立的可见条件"
+    error_pos = visible.index("data?.state==='error'")
+    available_pos = visible.index("data?.available")
+    assert error_pos > visible.index("||", available_pos), (
+        "error 仍被关在 available 的与条件里 —— 检查失败时不可见"
+    )

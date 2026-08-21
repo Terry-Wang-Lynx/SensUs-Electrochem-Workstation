@@ -2,13 +2,19 @@ import hashlib
 import io
 import os
 import re
+import ssl
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from pa_host.app_update import AppUpdateError, AppUpdateManager, _safe_zip_extract
+from pa_host.app_update import (
+    AppUpdateError,
+    AppUpdateManager,
+    _safe_zip_extract,
+    _ssl_context,
+)
 
 
 def _release(version: str, package: bytes) -> dict[str, object]:
@@ -240,3 +246,58 @@ def test_macos_update_rejects_running_from_downloaded_disk_image(
         AppUpdateError, match="应用程序"
     ):
         manager.begin_install()
+
+
+def test_ssl_context_never_disables_verification() -> None:
+    """回落逻辑只允许**补** CA,绝不允许降级成不校验。"""
+    context = _ssl_context()
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+
+
+def test_ssl_context_loads_a_fallback_when_the_bundle_has_no_ca(tmp_path: Path) -> None:
+    """冻结体里没有 CA 时必须回落到系统证书包。
+
+    这是 2026-08-21 的现场缺陷:PyInstaller 包内既无 certifi 也无 cacert.pem,
+    OpenSSL 的默认 CA 路径又是构建机上的路径 ⇒ 信任库为空,
+    每次更新检查都以 CERTIFICATE_VERIFY_FAILED 失败(实测 156 次全败、成功 0 次),
+    用户因此完全收不到新版本提示。
+    """
+    empty = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    assert empty.cert_store_stats()["x509_ca"] == 0
+    loaded: list[str] = []
+    real_load = ssl.SSLContext.load_verify_locations
+
+    def fake_load(self: ssl.SSLContext, cafile: str | None = None, **kwargs: object) -> None:
+        if cafile:
+            loaded.append(str(cafile))
+        real_load(self, cafile=cafile, **kwargs)  # type: ignore[arg-type]
+
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_bytes(Path(ssl.get_default_verify_paths().openssl_cafile).read_bytes()
+                        if Path(str(ssl.get_default_verify_paths().openssl_cafile)).is_file()
+                        else b"")
+    if not ca_file.stat().st_size:
+        pytest.skip("本机没有可用的系统 CA 包,无法构造回落素材")
+
+    with patch("pa_host.app_update.ssl.create_default_context", return_value=empty), \
+            patch.dict(os.environ, {"SSL_CERT_FILE": str(ca_file)}), \
+            patch.object(ssl.SSLContext, "load_verify_locations", fake_load):
+        context = _ssl_context()
+
+    assert loaded, "信任库为空时应当尝试加载回落 CA"
+    assert context.cert_store_stats()["x509_ca"] > 0
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_ssl_context_leaves_a_healthy_store_untouched() -> None:
+    """CA 本来就正常的平台(如 Windows 从系统证书库加载)行为必须完全不变。"""
+    healthy = ssl.create_default_context()
+    if healthy.cert_store_stats()["x509_ca"] == 0:
+        pytest.skip("本机默认信任库为空,该分支无法在此验证")
+    with patch("pa_host.app_update.ssl.create_default_context", return_value=healthy), \
+            patch.object(
+                ssl.SSLContext, "load_verify_locations",
+                side_effect=AssertionError("信任库正常时不应加载任何回落 CA"),
+            ):
+        assert _ssl_context() is healthy

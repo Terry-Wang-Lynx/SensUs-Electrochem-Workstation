@@ -9,6 +9,7 @@ import platform
 import re
 import secrets
 import shutil
+import ssl
 import stat
 import subprocess
 import sys
@@ -27,6 +28,56 @@ LATEST_RELEASE_API = (
     "SensUs-Electrochem-Workstation/releases/latest"
 )
 CHECK_TTL_S = 6 * 60 * 60
+
+# 🔴 冻结体(PyInstaller)里没有 CA 证书:包内既没有 certifi,也没有 cacert.pem,
+# 而 OpenSSL 的默认 CA 路径是构建机上的路径,到用户机器上并不存在。
+# 于是 ssl.create_default_context() 建出来的上下文**信任库是空的**,
+# 每次更新检查都以
+#   SSL: CERTIFICATE_VERIFY_FAILED - unable to get local issuer certificate
+# 失败。2026-08-21 现场实测:某台机器上 156 次 app_update.* 事件**全是 check_failed,
+# 成功事件 0 条**,持续三天;用户因此一直停在旧版本,而软件从未提示过有新版。
+# 排查时已用四项证据排除网络因素(curl 通、证书签发者是 Sectigo 无中间人、无代理、
+# 系统 python3 访问同一 URL 正常),确认是我们自己的缺陷。
+#
+# 判据用 cert_store_stats():信任库为空才回落,所以在 CA 本来就正常的平台
+# (例如 Windows 会从系统证书库加载)上**不改变任何行为**。
+_CA_FALLBACKS = (
+    "/etc/ssl/cert.pem",            # macOS 自带,128 张根证书
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+)
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """带 CA 回落的默认上下文;绝不降级为不校验。"""
+    context = ssl.create_default_context()
+    try:
+        if context.cert_store_stats().get("x509_ca", 0) > 0:
+            return context
+    except (AttributeError, OSError):
+        return context
+    candidates: list[str] = []
+    env_file = os.environ.get("SSL_CERT_FILE")
+    if env_file:
+        candidates.append(env_file)
+    try:
+        import certifi  # noqa: PLC0415 — 可选依赖,装了就用
+        candidates.append(certifi.where())
+    except Exception:  # noqa: BLE001 — 没装 certifi 是正常情况
+        pass
+    candidates.extend(_CA_FALLBACKS)
+    for candidate in candidates:
+        try:
+            if candidate and Path(candidate).is_file():
+                context.load_verify_locations(cafile=candidate)
+                if context.cert_store_stats().get("x509_ca", 0) > 0:
+                    return context
+        except (OSError, ssl.SSLError):
+            continue
+    # 一个都没找到:照原样返回。校验仍会失败,但**失败比静默不校验安全**,
+    # 且调用方会把错误上报成可见事件。
+    return context
+
 MAX_RELEASE_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_ASSET_BYTES = 700 * 1024 * 1024
 _ALLOWED_DOWNLOAD_HOSTS = {
@@ -211,7 +262,9 @@ class AppUpdateManager:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(
+            request, timeout=15, context=_ssl_context()
+        ) as response:
             data = response.read(MAX_RELEASE_RESPONSE_BYTES + 1)
         if len(data) > MAX_RELEASE_RESPONSE_BYTES:
             raise AppUpdateError("更新信息响应过大")
@@ -314,7 +367,9 @@ class AppUpdateManager:
             )
             digest = hashlib.sha256()
             total = int(release["size"])
-            with urllib.request.urlopen(request, timeout=30) as response, temporary.open("wb") as handle:
+            with urllib.request.urlopen(
+                request, timeout=30, context=_ssl_context()
+            ) as response, temporary.open("wb") as handle:
                 final = urlparse(response.geturl())
                 if final.scheme != "https" or final.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
                     raise AppUpdateError("安装包下载跳转到了不可信地址")
