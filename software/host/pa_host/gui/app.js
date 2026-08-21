@@ -135,10 +135,21 @@ function browseWorkspaceDirectory(initialPath) {
 
 const SETTINGS_INPUT_IDS = ['potentialV','workingElectrodeV','durationS','adaptiveStop','sensPeriodCode','sampleRateHz','fitWindowS','fsrNA','offsetNA','cvLowV','cvHighV','cvScanRate','cvCycles','cvQuietS','cvEisFsrUA'];
 function itPresetSettings(name){
-  const common={method:'it',prestep_s:0,duration_s:180,adaptive_stop:false,sens_period_code:0,target_rate_hz:10,fit_window_s:20};
+  // 四个预设 = 两种电极 × 两个工作电位。电极维度只改量程(微针 50 nA / 丝网印刷 1 µA),
+  // 电位维度只改 E、V_WE 与时长。offset 一律 20% FSR ⇒ offset_nA 必须与后端
+  // OFFSET_OPTIONS['20pct'] 的 round(fsr_nA*0.20) 一致,否则表单与硬件回读会对不上。
+  // 🔴 两种电极必须至少差一个 itPresetMatches 比较的字段(这里是 fsr_nA),否则同电位的
+  // 两个按钮会同时高亮 —— 该函数只比设置值,不记"点了哪个"。
+  const common={method:'it',prestep_s:0,adaptive_stop:false,sens_period_code:0,target_rate_hz:10,fit_window_s:20,offset_mode:'20pct'};
+  const oxidation={...common,initial_potential_v:.2,potential_v:.2,working_electrode_v:1.2,duration_s:180};
+  const reduction={...common,initial_potential_v:-.2,potential_v:-.2,working_electrode_v:.25,duration_s:120};
+  const needle={fsr_nA:50,offset_nA:10};
+  const printed={fsr_nA:1000,offset_nA:200};
   const preset={
-    oxidation:{...common,label:'+0.4V 氧化',initial_potential_v:.4,potential_v:.4,working_electrode_v:1.2,fsr_nA:50,offset_nA:9,offset_mode:'9nA'},
-    reduction:{...common,label:'-0.2V 还原',initial_potential_v:-.2,potential_v:-.2,working_electrode_v:.25,fsr_nA:100,offset_nA:80,offset_mode:'80nA'},
+    'needle-ox':{...oxidation,...needle,label:'微针 +0.2V'},
+    'printed-ox':{...oxidation,...printed,label:'丝网印刷 +0.2V'},
+    'needle-red':{...reduction,...needle,label:'微针 -0.2V'},
+    'printed-red':{...reduction,...printed,label:'丝网印刷 -0.2V'},
   }[name];
   return preset?{...preset}:null;
 }

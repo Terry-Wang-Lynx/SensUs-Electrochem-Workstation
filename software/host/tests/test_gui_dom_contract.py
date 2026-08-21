@@ -5,6 +5,8 @@ from pathlib import Path
 
 from PIL import Image
 
+from pa_host.gui_server import OFFSET_OPTIONS
+
 
 GUI_DIR = Path(__file__).parents[1] / "pa_host" / "gui"
 
@@ -223,39 +225,50 @@ def test_settings_apply_has_long_timeout_and_reload_safe_progress_polling() -> N
     assert "if(applying)ensureSettingsProgressPolling()" in app
 
 
-def test_it_quick_presets_match_verified_historical_conditions() -> None:
+def test_it_quick_presets_cover_both_electrodes_at_both_potentials() -> None:
     html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
     app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
-    presets = _evaluate_chart_js(
+    keys = ["needle-ox", "printed-ox", "needle-red", "printed-red"]
+    evaluated = _evaluate_chart_js(
         ["itPresetSettings", "itPresetMatches"],
-        "const oxidation=itPresetSettings('oxidation');const reduction=itPresetSettings('reduction');",
-        "{oxidation,reduction,oxidationMatches:itPresetMatches(oxidation,'oxidation'),reductionMatches:itPresetMatches(reduction,'reduction')}",
+        f"const keys={json.dumps(keys)};",
+        "Object.fromEntries(keys.map(key=>[key,{settings:itPresetSettings(key),"
+        "lit:keys.filter(other=>itPresetMatches(itPresetSettings(key),other))}]))",
     )
 
-    assert 'data-it-preset="oxidation"' in html
-    assert 'data-it-preset="reduction"' in html
-    assert "+0.4V 氧化" in html
-    assert "-0.2V 还原" in html
-    assert presets == {
-        "oxidation": {
-            "method": "it", "prestep_s": 0, "duration_s": 180,
-            "adaptive_stop": False, "sens_period_code": 0,
-            "target_rate_hz": 10, "fit_window_s": 20,
-            "label": "+0.4V 氧化", "initial_potential_v": 0.4,
-            "potential_v": 0.4, "working_electrode_v": 1.2,
-            "fsr_nA": 50, "offset_nA": 9, "offset_mode": "9nA",
-        },
-        "reduction": {
-            "method": "it", "prestep_s": 0, "duration_s": 180,
-            "adaptive_stop": False, "sens_period_code": 0,
-            "target_rate_hz": 10, "fit_window_s": 20,
-            "label": "-0.2V 还原", "initial_potential_v": -0.2,
-            "potential_v": -0.2, "working_electrode_v": 0.25,
-            "fsr_nA": 100, "offset_nA": 80, "offset_mode": "80nA",
-        },
-        "oxidationMatches": True,
-        "reductionMatches": True,
+    shared = {
+        "method": "it", "prestep_s": 0, "adaptive_stop": False,
+        "sens_period_code": 0, "target_rate_hz": 10, "fit_window_s": 20,
+        "offset_mode": "20pct",
     }
+    oxidation = {
+        **shared, "initial_potential_v": 0.2, "potential_v": 0.2,
+        "working_electrode_v": 1.2, "duration_s": 180,
+    }
+    reduction = {
+        **shared, "initial_potential_v": -0.2, "potential_v": -0.2,
+        "working_electrode_v": 0.25, "duration_s": 120,
+    }
+    needle = {"fsr_nA": 50, "offset_nA": 10}
+    printed = {"fsr_nA": 1000, "offset_nA": 200}
+    expected = {
+        "needle-ox": {**oxidation, **needle, "label": "微针 +0.2V"},
+        "printed-ox": {**oxidation, **printed, "label": "丝网印刷 +0.2V"},
+        "needle-red": {**reduction, **needle, "label": "微针 -0.2V"},
+        "printed-red": {**reduction, **printed, "label": "丝网印刷 -0.2V"},
+    }
+
+    for key, settings in expected.items():
+        assert evaluated[key]["settings"] == settings, key
+        assert f'data-it-preset="{key}"' in html
+        assert settings["label"] in html
+        # 🔴 同电位的两种电极只差量程。itPresetMatches 只比设置值、不记"点了哪个",
+        # 所以差异一旦被抹掉,同电位的两个按钮会一起高亮。
+        assert evaluated[key]["lit"] == [key], key
+        # 预设里的 offset_nA 必须与后端按 20% FSR 折算的值一致,否则表单与回读对不上
+        ratio = OFFSET_OPTIONS[settings["offset_mode"]][1]
+        assert settings["offset_nA"] == round(settings["fsr_nA"] * ratio), key
+
     preset_handler = _extract_js_function(app, "applyItPreset")
     assert "settingsChanged()" in preset_handler
     assert "/api/settings/apply" not in preset_handler
@@ -268,7 +281,7 @@ def test_it_quick_preset_populates_the_form_without_applying_hardware() -> None:
 const nodes={potentialV:{},workingElectrodeV:{},durationS:{},adaptiveStop:{},sensPeriodCode:{},sampleRateHz:{},fitWindowS:{},fsrNA:{},offsetNA:{}};
 const $=id=>nodes[id];const state={settings:{},settingsApplyActive:false,method:'cv'};
 let changed=0;const notices=[];const settingsChanged=()=>{changed+=1};const toast=message=>notices.push(message);
-const applied=applyItPreset('reduction');
+const applied=applyItPreset('printed-red');
 const values=Object.fromEntries(Object.entries(nodes).map(([key,node])=>[key,key==='adaptiveStop'?node.checked:node.value]));
 """,
         "{applied,method:state.method,changed,notices,values}",
@@ -278,17 +291,17 @@ const values=Object.fromEntries(Object.entries(nodes).map(([key,node])=>[key,key
         "applied": True,
         "method": "it",
         "changed": 1,
-        "notices": ["-0.2V 还原 已载入，请点击“应用条件”"],
+        "notices": ["丝网印刷 -0.2V 已载入，请点击“应用条件”"],
         "values": {
             "potentialV": -0.2,
             "workingElectrodeV": 0.25,
-            "durationS": 180,
+            "durationS": 120,
             "adaptiveStop": False,
             "sensPeriodCode": "0",
             "sampleRateHz": 10,
             "fitWindowS": 20,
-            "fsrNA": "100",
-            "offsetNA": "80nA",
+            "fsrNA": "1000",
+            "offsetNA": "20pct",
         },
     }
 
