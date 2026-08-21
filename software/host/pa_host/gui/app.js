@@ -858,9 +858,21 @@ function drawChart(canvas, series, options = {}) {
       ctx.fillStyle = s.color;
       const radius = s.pointRadius ?? 4;
       points.forEach(p => {
+        const cx = px(p[0]), cy = yf(p[1]);
         ctx.beginPath();
-        ctx.arc(px(p[0]), yf(p[1]), radius, 0, Math.PI * 2);
+        // 🔴 s.marker 是**可选**字段:不传就还是原来的圆点,itChart/dbgChart 的调用点因此
+        //    像素级不变。菱形只给标定图的测试点用 —— 冷/暖两族里有一对(粉 #ef79aa ↔
+        //    青 #1ab5a6)在 deutan 模拟下 ΔE 只有 4.1,形状是不依赖色觉的第二通道,
+        //    "这是标定点还是测试点"不能只靠色相承载。
+        if (s.marker === 'diamond') {
+          const r = radius * 1.18;
+          ctx.moveTo(cx, cy - r); ctx.lineTo(cx + r, cy); ctx.lineTo(cx, cy + r); ctx.lineTo(cx - r, cy);
+          ctx.closePath();
+        } else ctx.arc(cx, cy, radius, 0, Math.PI * 2);
         ctx.fill();
+        // s.pointRing 同样是可选字段。标定图上标定点与测试点可能落在同一个浓度上,
+        // 纯填充会让后画的那个把前一个整块吃掉;描一圈底色细边,叠起来还能看出是两个点。
+        if (s.pointRing) { ctx.strokeStyle = s.pointRing; ctx.lineWidth = 1; ctx.stroke(); }
       });
     }
     ctx.globalAlpha=1;
@@ -894,6 +906,51 @@ function drawApScoreChart(points){
   if(missing.length){ctx.strokeStyle='#7b686c';ctx.fillStyle='#7b686c';ctx.lineWidth=1.5;missing.forEach(p=>{const x=px(Number(p.concentration_um)),y=py(minValue+ySpan*.94);ctx.beginPath();ctx.moveTo(x-5,y-5);ctx.lineTo(x+5,y+5);ctx.moveTo(x+5,y-5);ctx.lineTo(x-5,y+5);ctx.stroke();ctx.font='bold 10px system-ui';ctx.fillText('?',x+7,y+3)})}
   ctx.restore();
   ctx.fillStyle='#68767b';ctx.fillText('真实浓度 x (µM)',w/2-42,h-8);ctx.save();ctx.translate(12,h/2+28);ctx.rotate(-Math.PI/2);ctx.fillText('测量浓度 y (µM)',0,0);ctx.restore();
+}
+// ── 标定图逐点配色 ────────────────────────────────────────────────────────────
+// 用户诉求:标定图上**每个点一个颜色**,而且能一眼对上下面表格的那一行;
+// 候选标定点与测试点各用一个色系(冷 / 暖)。
+// 🔴 两条硬规则:
+//   ① 颜色绑在 point_id 上(POINT_COLOR_SLOTS),**绝不能**按 filter 之后数组的下标取 ——
+//      否则取消勾选或删掉一个点,其余点会整排换色,图与表格行就再也对不上了。
+//   ② 槽位用满后**不循环复用颜色**:第 6 个点起统一落到中性灰,身份交回表格行的 # 序号
+//      (色块从来不是行里唯一的身份线索)。撞色比没色更糟 —— 会让人确信自己找对了行。
+// 调色板过检记录(dataviz scripts/validate_palette.js,2026-08-21):
+//   两族合并 10 色 `--mode light --surface #ffffff` → ALL CHECKS PASS(exit 0);
+//   每族单独再跑 `--pairs all`(散点该用的口径)→ 也 ALL CHECKS PASS,
+//   族内最差:冷 normal ΔE 16.7 / CVD 11.3,暖 normal ΔE 16.9 / CVD 11.9(硬底线 15 / 6)。
+//   4 个色对白底低于 3:1(validator 记 relief),补偿是图正下方就是带同色色块的表格。
+const CALIBRATION_POINT_COLORS=['#0d7fae','#1ab5a6','#5b4289','#8fa0f5','#0e6936'];
+const TEST_POINT_COLORS=['#a8368e','#ee9420','#8f3a1c','#ef79aa','#8b7b16'];
+// 槽位耗尽后的中性灰。它彩度低于 validator 的 chroma 下限 —— 这是故意的:
+// 它不是第 6 个"类别色",而是"这个点没有专属色,去看表格序号"的显式降级信号。
+const POINT_COLOR_OVERFLOW='#8a9296';
+// 拟合曲线是模型不是数据类别,必须是中性深色,不许跟暖色系抢身份(原来是 #c77a18,撞暖族)。
+const CALIBRATION_CURVE_COLOR='#3f4c51';
+// point_id → 槽位下标。画图和渲染表格都只从这里取色,两边拿到的必然是同一个颜色。
+const POINT_COLOR_SLOTS={calibration:new Map(),test:new Map()};
+// 测试点行的稳定 id。renderValidation 与 drawAll 必须用同一个算法,否则两边各自建槽位。
+function validationPointId(point,index){return point.point_id||point.run_id||`validation-${index+1}`}
+// reclaim=true:ids 是该族的**全量**名单,不在名单里的槽位要还回来,否则删点会把槽位漏掉,
+//              于此后新增的点只能吃溢出灰。表格渲染那边才是全量名单的持有者。
+// reclaim=false:调用方手里的名单可能被过滤过(drawAll 拿到的 c.points 已被 readPoints
+//              滤掉浓度/电流为空的行),只允许补新 id,不许回收。
+function assignPointColorSlots(family,ids,{reclaim=true}={}){
+  const table=POINT_COLOR_SLOTS[family];if(!table)return new Map();
+  const wanted=(ids||[]).filter(id=>id!==undefined&&id!==null&&id!=='');
+  if(reclaim){const present=new Set(wanted);[...table.keys()].forEach(id=>{if(!present.has(id))table.delete(id)})}
+  const used=new Set(table.values());
+  wanted.forEach(id=>{
+    if(table.has(id))return;
+    let slot=0;while(used.has(slot))slot++;
+    table.set(id,slot);used.add(slot);
+  });
+  return table;
+}
+function pointColorPalette(family){return family==='test'?TEST_POINT_COLORS:CALIBRATION_POINT_COLORS}
+function pointColor(family,pointId){
+  const palette=pointColorPalette(family),slot=POINT_COLOR_SLOTS[family]?.get(pointId);
+  return slot===undefined||slot>=palette.length?POINT_COLOR_OVERFLOW:palette[slot];
 }
 function drawAll(){
   if(document.visibilityState==='hidden')return;
@@ -946,11 +1003,24 @@ function drawAll(){
     const meta=filterValues(d.time_s||[],current,d.valid).meta;renderFilterControls(meta);drawChart($('itChart'),allSeries,{xmin,xmax,xlabel:'时间 (s)',ylabel:'电流 (nA)'});
   }
   const c=state.calibration, series=[];
-  if(c.curve)series.push({points:c.curve.concentration_um.map((x,i)=>[x,c.curve.current_nA[i]]),color:'#c77a18',width:2});
-  const selected=(c.points||[]).filter(p=>p.selected);
-  if(state.showCalibrationPoints&&selected.length)series.push({points:selected.map(p=>[Number(p.concentration_um),Number(p.current_nA)]),color:'#28708c',dots:true,width:0,pointRadius:4});
-  const validation=(c.validation_points||[]).filter(p=>hasFiniteConcentration(p)&&Number.isFinite(Number(p.current_nA)));
-  if(state.showTestPoints&&validation.length)series.push({points:validation.map(p=>[Number(p.concentration_um),Number(p.current_nA)]),color:'#b54455',dots:true,width:0,pointRadius:4.5});
+  if(c.curve)series.push({points:c.curve.concentration_um.map((x,i)=>[x,c.curve.current_nA[i]]),color:CALIBRATION_CURVE_COLOR,width:2});
+  // 逐点一个 series:颜色只能从 pointColor() 取(与表格色块同一个来源),
+  // 🔴 槽位按 point_id 查,不是按下面这次 forEach 的下标 —— 见 POINT_COLOR_SLOTS 的注释。
+  const calibrationPoints=c.points||[];
+  assignPointColorSlots('calibration',calibrationPoints.map(point=>point.point_id),{reclaim:false});
+  if(state.showCalibrationPoints)calibrationPoints.forEach(point=>{
+    if(!point.selected)return;
+    const xy=[Number(point.concentration_um),Number(point.current_nA)];
+    if(!Number.isFinite(xy[0])||!Number.isFinite(xy[1]))return;
+    series.push({points:[xy],color:pointColor('calibration',point.point_id),dots:true,width:0,pointRadius:4.6,pointRing:'#ffffff'});
+  });
+  const validationPoints=c.validation_points||[];
+  assignPointColorSlots('test',validationPoints.map((point,index)=>validationPointId(point,index)),{reclaim:false});
+  if(state.showTestPoints)validationPoints.forEach((point,index)=>{
+    if(!hasFiniteConcentration(point)||!Number.isFinite(Number(point.current_nA)))return;
+    series.push({points:[[Number(point.concentration_um),Number(point.current_nA)]],
+      color:pointColor('test',validationPointId(point,index)),dots:true,width:0,pointRadius:4,marker:'diamond',pointRing:'#ffffff'});
+  });
   $('calibrationEmpty').hidden=series.length>0;drawChart($('calibrationChart'),series,{xlabel:'浓度 (µM)',ylabel:'电流 (nA)',integerX:true,niceY:true});
   drawApScoreChart(c.validation_points||[]);
 }
@@ -1626,7 +1696,11 @@ function pointInput(key,value,type='text'){const input=document.createElement('i
 function row(point={},index=0){
   const tr=document.createElement('tr');tr.dataset.pointId=point.point_id||`manual-${Date.now()}-${index}`;tr.dataset.acquiredAt=point.acquired_at||0;tr.dataset.runId=point.run_id||'';tr.dataset.dataPath=point.data_path||'';
   const use=document.createElement('input');use.type='checkbox';use.className='point-selector';use.checked=Boolean(point.selected);use.addEventListener('change',syncCalibrationPreview);makeCell(tr,use);
-  makeCell(tr,String(index+1));
+  // 序号格里带一个色块:颜色与图上那个点严格一致(都从 pointColor() 取)。色块**不是**
+  // 唯一的身份线索 —— # 序号本来就在同一格里,色块只是让人不用数格子。
+  const numberBox=document.createElement('span'),colorSwatch=document.createElement('i');
+  numberBox.className='point-number';colorSwatch.className='point-color-swatch';
+  numberBox.append(colorSwatch,document.createTextNode(String(index+1)));makeCell(tr,numberBox);
   makeCell(tr,point.acquired_at?new Date(Number(point.acquired_at)*1000).toLocaleString('zh-CN',{hour12:false}):'手动');
   const labelInput=pointInput('label',point.label||'');labelInput.addEventListener('input',()=>{refreshRangeControls();syncCalibrationPreview()});makeCell(tr,labelInput);const concentrationInput=pointInput('concentration_um',point.concentration_um,'number'),currentInput=pointInput('current_nA',point.current_nA,'number');concentrationInput.addEventListener('input',syncCalibrationPreview);currentInput.addEventListener('input',syncCalibrationPreview);makeCell(tr,concentrationInput);makeCell(tr,currentInput);
   const actions=document.createElement('div');actions.className='point-actions';const asTest=document.createElement('button');asTest.className='text-button';asTest.type='button';asTest.textContent='添加为测试点';asTest.title='将此候选标定点加入测试点列表';asTest.onclick=async()=>{try{state.calibration=await post('/api/calibration/add-validation',{point_id:tr.dataset.pointId});renderCalibration();toast('已添加为测试点')}catch(e){toast(diagnosticMessage(e))}};const remove=document.createElement('button');remove.className='delete-point';remove.title='删除候选点';remove.textContent='×';remove.onclick=()=>{tr.remove();refreshRangeControls();syncCalibrationPreview()};actions.append(asTest,remove);makeCell(tr,actions);return tr;
@@ -1636,14 +1710,29 @@ function refreshRangeControls(){
   rows.forEach((tr,index)=>{const label=tr.querySelector('[data-k="label"]')?.value||`点 ${index+1}`;[start,end].forEach(select=>{const option=document.createElement('option');option.value=String(index);option.textContent=`#${index+1} ${label}`;select.appendChild(option)})});
   start.disabled=end.disabled=rows.length===0;$('applyPointRange').disabled=rows.length===0;if(rows.length){start.value=oldStart&&Number(oldStart)<rows.length?oldStart:'0';end.value=oldEnd&&Number(oldEnd)<rows.length?oldEnd:String(rows.length-1)}updateSelectedCount();
 }
-function renderPoints(points){const body=$('pointsBody');body.innerHTML='';(points||[]).forEach((p,index)=>body.appendChild(row(p,index)));refreshRangeControls()}
+function renderPoints(points){const body=$('pointsBody');body.innerHTML='';(points||[]).forEach((p,index)=>body.appendChild(row(p,index)));refreshPointColorSwatches();refreshRangeControls()}
+// 🔴 表格行的色块与图上那个点必须是同一个颜色 —— 两边都只调 pointColor(),谁都不许自己
+//    写一份色值。槽位是按**全量表格行**分配的,所以必须在所有行都建好之后再调这里。
+//    这里是 calibration 族全量名单的持有者(reclaim=true):删掉的行要把槽位还回来。
+function refreshPointColorSwatches(){
+  const rows=[...$('pointsBody').querySelectorAll('tr')];
+  assignPointColorSlots('calibration',rows.map(tr=>tr.dataset.pointId));
+  rows.forEach(tr=>{
+    const color=pointColor('calibration',tr.dataset.pointId);
+    tr.dataset.pointColor=color;
+    const swatch=tr.querySelector('.point-color-swatch');if(swatch)swatch.style.background=color;
+    const box=tr.querySelector('.point-number');
+    // 没勾选的点不画进图里,色块压暗,免得用户拿着这个颜色去图上找一个不存在的点
+    if(box)box.classList.toggle('is-unpicked',!tr.querySelector('.point-selector')?.checked);
+  });
+}
 function readPoints(){return [...$('pointsBody').querySelectorAll('tr')].map(tr=>({point_id:tr.dataset.pointId,acquired_at:Number(tr.dataset.acquiredAt||0),run_id:tr.dataset.runId,data_path:tr.dataset.dataPath,label:tr.querySelector('[data-k="label"]').value,concentration_um:tr.querySelector('[data-k="concentration_um"]').value,current_nA:tr.querySelector('[data-k="current_nA"]').value,selected:tr.querySelector('.point-selector').checked})).filter(p=>p.concentration_um!==''&&p.current_nA!=='').map(p=>({...p,concentration_um:Number(p.concentration_um),current_nA:Number(p.current_nA)}))}
 function updateSelectedCount(){const rows=[...$('pointsBody').querySelectorAll('tr')],selected=rows.filter(tr=>tr.querySelector('.point-selector').checked).length;$('selectedCount').textContent=`已选 ${selected} / ${rows.length}`}
-function syncCalibrationPreview(){state.calibrationDirty=true;updateSelectedCount();state.calibration.points=readPoints();drawAll()}
+function syncCalibrationPreview(){state.calibrationDirty=true;updateSelectedCount();refreshPointColorSwatches();state.calibration.points=readPoints();drawAll()}
 $('addPoint').onclick=()=>{$('pointsBody').appendChild(row({},$('pointsBody').children.length));refreshRangeControls();syncCalibrationPreview()};
 $('applyPointRange').onclick=()=>{const rows=[...$('pointsBody').querySelectorAll('tr')],a=Math.min(Number($('rangeStart').value),Number($('rangeEnd').value)),b=Math.max(Number($('rangeStart').value),Number($('rangeEnd').value));rows.forEach((tr,index)=>tr.querySelector('.point-selector').checked=index>=a&&index<=b);syncCalibrationPreview()};
 $('clearPointSelection').onclick=()=>{$('pointsBody').querySelectorAll('.point-selector').forEach(input=>input.checked=false);syncCalibrationPreview()};
-$('useForCalibration').onclick=()=>{const current=state.measurement?.summary?.steady_current_nA, concentration=$('knownConcentration').value;if(concentration===''){toast('请先填写已知浓度');return}$('pointsBody').appendChild(row({label:$('sampleName').value||state.measurement.run_id,concentration_um:concentration,current_nA:current}));document.querySelector('[data-view="calibrate"]').click();toast('已加入标定数据')};
+$('useForCalibration').onclick=()=>{const current=state.measurement?.summary?.steady_current_nA, concentration=$('knownConcentration').value;if(concentration===''){toast('请先填写已知浓度');return}$('pointsBody').appendChild(row({label:$('sampleName').value||state.measurement.run_id,concentration_um:concentration,current_nA:current}));refreshPointColorSwatches();document.querySelector('[data-view="calibrate"]').click();toast('已加入标定数据')};
 $('predictConcentration').onclick=async()=>{try{const result=await post('/api/predict',{});$('predictionResult').querySelector('strong').textContent=fmt(result.predicted_concentration_um,3);toast('浓度预测完成')}catch(e){errorBox('measureError',e)}};
 $('fitCalibration').onclick=async()=>{try{const points=readPoints(),selected=points.filter(point=>point.selected).map(point=>point.point_id);if(!selected.length){toast('请先选择一个标定点范围');return}const data=await post('/api/calibration/fit',{points,points_revision:state.calibration?.points_revision??null,selected_point_ids:selected,degree:Number($('fitDegree').value)});state.calibration=data;renderCalibration();renderWorkflow(await api('/api/workflow'));setSampleRole('test',true);toast('选中范围已生成并锁定为测试曲线')}catch(e){toast(diagnosticMessage(e))}};
 function modelCurrentAt(model, concentration){
@@ -1738,7 +1827,10 @@ function renderHiddenValidationPoints(){
 
 function renderValidation(points){
   const body=$('validationBody');body.replaceChildren();const rows=state.calibration?.model?(points||[]):[];$('validationEmpty').hidden=rows.length>0;
-  rows.forEach((point,index)=>{const tr=document.createElement('tr');tr.dataset.pointId=point.point_id||point.run_id||`validation-${index+1}`;const number=document.createElement('td');number.textContent=String(index+1);tr.appendChild(number);[['sample_name',point.sample_name||''],['concentration_um',point.concentration_um],['current_nA',point.current_nA]].forEach(([key,value])=>{const td=document.createElement('td'),input=document.createElement('input');input.dataset.validationKey=key;input.value=value??'';if(key!=='sample_name'){input.type='number';input.step='0.001';input.min=key==='concentration_um'?'0':''}input.addEventListener('input',()=>{state.validationDirty=true;$('validationEditBadge').textContent='未保存修改';$('validationEditBadge').className='live-badge warn';$('saveValidation').disabled=false;updateValidationSummary()});td.appendChild(input);tr.appendChild(td)});for(let i=0;i<7;i++){const td=document.createElement('td');td.dataset.validationDerived='true';tr.appendChild(td)}const action=document.createElement('td'),actions=document.createElement('div'),promote=document.createElement('button'),remove=document.createElement('button');actions.className='validation-row-actions';promote.className='text-button';promote.type='button';promote.textContent='添加为标定点';promote.title='将该测试点复制到候选标定点列表';promote.onclick=async()=>{try{state.calibration=await post('/api/calibration/promote-validation',{point_id:tr.dataset.pointId});renderCalibration();toast('已添加为候选标定点，请选择后重新拟合')}catch(e){toast(diagnosticMessage(e))}};remove.className='delete-point';remove.type='button';remove.textContent='隐藏';remove.title='从统计与图中隐藏该测试点（可随时恢复，原始测量文件保留）';remove.setAttribute('aria-label',`隐藏测试点 ${point.sample_name||index+1}`);remove.onclick=async()=>{try{remove.disabled=true;if(state.validationDirty)await persistValidationEdits();state.calibration=await post('/api/calibration/validation/delete',{point_id:tr.dataset.pointId});renderCalibration();toast('已隐藏，可在下方「已隐藏」中恢复')}catch(e){remove.disabled=false;toast(diagnosticMessage(e))}};actions.append(promote,remove);action.appendChild(actions);tr.appendChild(action);body.appendChild(tr);syncValidationRow(tr)});
+  // 🔴 test 族全量名单的持有者(reclaim=true)。注意用 points 而不是 rows:没有模型时
+  //    rows 是空的,但 drawAll 仍会按 points 画点,两边必须建在同一份名单上。
+  assignPointColorSlots('test',(points||[]).map((point,index)=>validationPointId(point,index)));
+  rows.forEach((point,index)=>{const tr=document.createElement('tr');tr.dataset.pointId=validationPointId(point,index);const number=document.createElement('td'),numberBox=document.createElement('span'),colorSwatch=document.createElement('i');const rowColor=pointColor('test',tr.dataset.pointId);tr.dataset.pointColor=rowColor;numberBox.className='point-number';colorSwatch.className='point-color-swatch diamond';colorSwatch.style.background=rowColor;numberBox.append(colorSwatch,document.createTextNode(String(index+1)));number.appendChild(numberBox);tr.appendChild(number);[['sample_name',point.sample_name||''],['concentration_um',point.concentration_um],['current_nA',point.current_nA]].forEach(([key,value])=>{const td=document.createElement('td'),input=document.createElement('input');input.dataset.validationKey=key;input.value=value??'';if(key!=='sample_name'){input.type='number';input.step='0.001';input.min=key==='concentration_um'?'0':''}input.addEventListener('input',()=>{state.validationDirty=true;$('validationEditBadge').textContent='未保存修改';$('validationEditBadge').className='live-badge warn';$('saveValidation').disabled=false;updateValidationSummary()});td.appendChild(input);tr.appendChild(td)});for(let i=0;i<7;i++){const td=document.createElement('td');td.dataset.validationDerived='true';tr.appendChild(td)}const action=document.createElement('td'),actions=document.createElement('div'),promote=document.createElement('button'),remove=document.createElement('button');actions.className='validation-row-actions';promote.className='text-button';promote.type='button';promote.textContent='添加为标定点';promote.title='将该测试点复制到候选标定点列表';promote.onclick=async()=>{try{state.calibration=await post('/api/calibration/promote-validation',{point_id:tr.dataset.pointId});renderCalibration();toast('已添加为候选标定点，请选择后重新拟合')}catch(e){toast(diagnosticMessage(e))}};remove.className='delete-point';remove.type='button';remove.textContent='隐藏';remove.title='从统计与图中隐藏该测试点（可随时恢复，原始测量文件保留）';remove.setAttribute('aria-label',`隐藏测试点 ${point.sample_name||index+1}`);remove.onclick=async()=>{try{remove.disabled=true;if(state.validationDirty)await persistValidationEdits();state.calibration=await post('/api/calibration/validation/delete',{point_id:tr.dataset.pointId});renderCalibration();toast('已隐藏，可在下方「已隐藏」中恢复')}catch(e){remove.disabled=false;toast(diagnosticMessage(e))}};actions.append(promote,remove);action.appendChild(actions);tr.appendChild(action);body.appendChild(tr);syncValidationRow(tr)});
   state.validationDirty=false;$('validationEditBadge').textContent='已保存';$('validationEditBadge').className='live-badge running';$('saveValidation').disabled=true;updateValidationSummary();
   renderHiddenValidationPoints();
 }

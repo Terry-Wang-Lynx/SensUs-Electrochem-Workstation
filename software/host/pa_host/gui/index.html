@@ -202,7 +202,7 @@
           <section class="panel calibration-panel">
             <div class="panel-head"><div><h2>当前测试曲线</h2><p id="calibrationStatus">先采集标定点，再选择范围</p></div></div>
             <div class="chart-wrap calibration-chart"><canvas id="calibrationChart"></canvas><div class="empty-chart" id="calibrationEmpty">添加数据后拟合曲线</div></div>
-            <div class="calibration-legend" aria-label="标定曲线图例"><span><i class="legend-swatch fit"></i>拟合曲线</span><label class="legend-toggle"><input id="showCalibrationPoints" type="checkbox" checked><span><i class="legend-swatch calibration"></i>标定点</span></label><label class="legend-toggle"><input id="showTestPoints" type="checkbox" checked><span><i class="legend-swatch validation"></i>测试点</span></label></div>
+            <div class="calibration-legend" aria-label="标定曲线图例"><span><i class="legend-swatch fit"></i>拟合曲线</span><label class="legend-toggle"><input id="showCalibrationPoints" type="checkbox" checked><span><i class="legend-swatch calibration"></i>标定点（冷色系，每点一色）</span></label><label class="legend-toggle"><input id="showTestPoints" type="checkbox" checked><span><i class="legend-swatch validation"></i>测试点（暖色系菱形，每点一色）</span></label></div>
             <div class="model-metrics"><div><span>R²</span><strong id="modelR2">--</strong></div><div><span>RMSE</span><strong id="modelRmse">--</strong></div><div><span>灵敏度</span><strong id="modelSlope">--</strong></div></div>
             <div class="model-path" id="modelPath">尚未生成测试曲线</div>
           </section>

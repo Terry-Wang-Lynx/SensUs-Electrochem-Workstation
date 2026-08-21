@@ -15,7 +15,20 @@ def _extract_js_function(source: str, name: str) -> str:
     start = source.index(f"function {name}(")
     if source[max(0, start - 6):start] == "async ":
         start -= 6
-    opening = source.index("{", start)
+    # 先跳过参数表再找函数体的 `{`:`function row(point={},index=0)` 那种默认值里就有一个
+    # `{`,直接 index("{") 会把它当函数体开头,depth 在参数表里就归零,摘出来的是半截签名
+    # (静默的:断言字符串永远匹配不上,读起来像"实现里没写这句")。
+    params = source.index("(", start)
+    depth = 0
+    for offset in range(params, len(source)):
+        if source[offset] == "(":
+            depth += 1
+        elif source[offset] == ")":
+            depth -= 1
+            if depth == 0:
+                params = offset
+                break
+    opening = source.index("{", params)
     depth = 0
     for offset in range(opening, len(source)):
         if source[offset] == "{":
@@ -1722,3 +1735,259 @@ def test_update_check_failure_is_visible_without_a_known_update() -> None:
     assert error_pos > visible.index("||", available_pos), (
         "error 仍被关在 available 的与条件里 —— 检查失败时不可见"
     )
+
+
+# ── 标定图逐点配色 ──────────────────────────────────────────────────────────────
+# 每个点一个颜色、两族两个色系、颜色与表格行严格对应。三条会静默毁掉这个特性的失效模式:
+#   ① 按 filter 后数组的下标取色 → 取消勾选/删点会让其余点整排换色;
+#   ② 色值在"画图"和"表格色块"两处各写一份 → 迟早分叉,色块指错行比没色块更糟;
+#   ③ 槽位用满后 `% palette.length` 循环复用 → 两个点同色,而人会确信自己找对了行。
+
+# 🔴 实际使用的调色板。过检记录见下面 test_calibration_point_palettes_pass_the_dataviz_gates
+_COOL_FAMILY = ["#0d7fae", "#1ab5a6", "#5b4289", "#8fa0f5", "#0e6936"]
+_WARM_FAMILY = ["#a8368e", "#ee9420", "#8f3a1c", "#ef79aa", "#8b7b16"]
+
+_POINT_COLOR_JS_NAMES = [
+    "assignPointColorSlots", "pointColorPalette", "pointColor",
+    "validationPointId", "refreshPointColorSwatches",
+]
+
+
+def _point_color_js_setup(app: str) -> str:
+    """把配色相关的模块级常量原样注入 node,测的就是 app.js 里的真值。"""
+    return "\n".join(
+        _extract_js_const(app, name) for name in (
+            "CALIBRATION_POINT_COLORS", "TEST_POINT_COLORS",
+            "POINT_COLOR_OVERFLOW", "CALIBRATION_CURVE_COLOR", "POINT_COLOR_SLOTS",
+        )
+    )
+
+
+_FAKE_POINTS_TABLE = """
+// refreshPointColorSwatches 只碰这几样东西,照它需要的形状造个假表格
+function fakeRow(pointId, selected){
+  const swatch={style:{}}, box={classes:new Set(),
+    classList:{toggle(name,on){on?box.classes.add(name):box.classes.delete(name)}}};
+  return {dataset:{pointId}, swatch, box, selector:{checked:selected},
+    querySelector(sel){return sel==='.point-color-swatch'?swatch
+      :sel==='.point-number'?box:sel==='.point-selector'?this.selector:null}};
+}
+let TABLE=[];
+const $=id=>({querySelectorAll:()=>TABLE});
+const render=rows=>{TABLE=rows;refreshPointColorSwatches();
+  return TABLE.map(tr=>[tr.dataset.pointId,tr.dataset.pointColor,tr.swatch.style.background,
+    [...tr.box.classes]])};
+"""
+
+
+def test_calibration_point_palettes_pass_the_dataviz_gates() -> None:
+    """两族调色板必须是过检值,并且两族不重叠、溢出灰不冒充第 6 个类别色。
+
+    2026-08-21 用 dataviz 的 scripts/validate_palette.js 实跑,记录在此(脚本是技能的
+    bundled 临时路径,会变,所以测试只钉 hex 与结论,不去调那个脚本):
+
+      两族合并 10 色,`--mode light --surface "#ffffff"` → **ALL CHECKS PASS**(exit 0)
+        Lightness band PASS · Chroma floor PASS
+        CVD separation PASS(worst adjacent #a8368e↔#0e6936 ΔE 12.2 deutan)
+        Normal-vision floor PASS(worst adjacent #1ab5a6↔#0d7fae ΔE 16.7)
+        Contrast vs surface WARN/relief:#1ab5a6 2.56 / #8fa0f5 2.47 / #ee9420 2.36 /
+          #ef79aa 2.63 —— relief 就是图正下方那两张带同色色块的表格
+      每族再单独跑 `--pairs all`(散点该用的口径,不是默认的相邻对)→ 两族都 ALL CHECKS PASS
+        冷族 worst all-pairs normal ΔE 16.7 / CVD 11.3;暖族 16.9 / 11.9(硬底线 15 / 6)
+
+    走过的弯路(别再试):单色系做明暗阶梯过不了(彩度掉到下限以下读起来像灰,且相邻步
+    normal ΔE 只有 8.5);从 dataviz 参考的 8 槽里挑 4 个暖色,怎么排都有一对相邻 ΔE<15
+    (实测 #eb6834↔#e34948 只有 7.1 / CVD 5.6)。族内 all-pairs 的天花板就是 5 色 ——
+    所以第 6 个点起走中性灰降级,不是"再挤一个颜色进来"。
+    """
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    cool = json.loads(_extract_js_const(app, "CALIBRATION_POINT_COLORS")
+                      .split("=", 1)[1].rstrip(";").replace("'", '"'))
+    warm = json.loads(_extract_js_const(app, "TEST_POINT_COLORS")
+                      .split("=", 1)[1].rstrip(";").replace("'", '"'))
+
+    assert cool == _COOL_FAMILY, "冷族色值变了 —— 必须重跑 validate_palette.js 并更新过检记录"
+    assert warm == _WARM_FAMILY, "暖族色值变了 —— 必须重跑 validate_palette.js 并更新过检记录"
+    assert not set(cool) & set(warm), "两族色值重叠,一个点的颜色就不能反推它属于哪张表了"
+
+    overflow = _extract_js_const(app, "POINT_COLOR_OVERFLOW").split("'")[1]
+    assert overflow not in cool and overflow not in warm, "溢出灰不能是任一族的类别色"
+    # 拟合曲线是模型不是数据类别:必须中性,不许落在暖族的色相弧上(原来的 #c77a18 就撞了)
+    curve = _extract_js_const(app, "CALIBRATION_CURVE_COLOR").split("'")[1]
+    assert curve not in cool and curve not in warm
+    red, green, blue = (int(curve[i:i + 2], 16) for i in (1, 3, 5))
+    assert max(red, green, blue) - min(red, green, blue) <= 24, f"拟合曲线 {curve} 不够中性"
+    assert "'#c77a18'" not in _extract_js_function(app, "drawAll"), "拟合曲线仍是暖色 #c77a18"
+
+    # AP 区域图那三个色是另一张图的,不许被这次改动带走
+    ap = _extract_js_function(app, "drawApScoreChart")
+    for kept in ("#28708c", "#c48720", "#b54455"):
+        assert kept in ap, f"drawApScoreChart 丢了 {kept}"
+
+
+def test_point_colour_never_recycles_a_slot_and_degrades_to_grey() -> None:
+    """槽位用满后落中性灰,**绝不**循环复用颜色。
+
+    `palette[i % palette.length]` 会让第 6 个点和第 1 个点同色 —— 人不会怀疑,
+    只会照着颜色去看错的那一行。灰色是"这个点没有专属色,去看 # 序号"的显式信号。
+    """
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    assert "%CALIBRATION_POINT_COLORS.length" not in app.replace(" ", "")
+    assert "%TEST_POINT_COLORS.length" not in app.replace(" ", "")
+
+    colours = _evaluate_chart_js(
+        _POINT_COLOR_JS_NAMES,
+        _point_color_js_setup(app) + _FAKE_POINTS_TABLE + """
+const ids=Array.from({length:8},(_,i)=>`p${i}`);
+assignPointColorSlots('calibration',ids);
+assignPointColorSlots('test',ids);
+""",
+        "[ids.map(id=>pointColor('calibration',id)),ids.map(id=>pointColor('test',id)),"
+        "POINT_COLOR_OVERFLOW]",
+    )
+    cool, warm, overflow = colours
+    assert cool[:5] == _COOL_FAMILY
+    assert warm[:5] == _WARM_FAMILY
+    assert cool[5:] == [overflow] * 3, "第 6 个点起必须是中性灰,不是回头用第 1 个颜色"
+    assert warm[5:] == [overflow] * 3
+    # 未登记的 id 也必须落灰,不能返回 undefined 让 canvas 画出黑点
+    assert _evaluate_chart_js(
+        _POINT_COLOR_JS_NAMES,
+        _point_color_js_setup(app) + _FAKE_POINTS_TABLE,
+        "pointColor('calibration','never-seen')",
+    ) == overflow
+
+
+def test_point_colour_survives_deselecting_and_deleting_other_points() -> None:
+    """🔴 稳定性:取消勾选或删掉一个点,**其余点的颜色一个都不许变**。
+
+    这是整个特性的命门。按 `points.filter(p=>p.selected)` 之后的下标取色,
+    取消勾选第 2 个点会让第 3、4、5 个点整排前移一格换色 —— 图上的点与表格行
+    从此对不上,而界面看起来完全正常。
+    """
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    baseline, after_deselect, after_delete, after_readd = _evaluate_chart_js(
+        _POINT_COLOR_JS_NAMES,
+        _point_color_js_setup(app) + _FAKE_POINTS_TABLE + """
+const rows=['a','b','c','d','e'].map(id=>fakeRow(id,true));
+const baseline=render(rows);
+rows[1].selector.checked=false;             // 取消勾选第 2 个点
+const afterDeselect=render(rows);
+const afterDelete=render(rows.filter(tr=>tr.dataset.pointId!=='b'));   // 删掉第 2 个点
+const afterReadd=render([...rows.filter(tr=>tr.dataset.pointId!=='b'),fakeRow('f',true)]);
+""",
+        "[baseline,afterDeselect,afterDelete,afterReadd]",
+    )
+
+    colour = {row[0]: row[1] for row in baseline}
+    assert [colour[k] for k in "abcde"] == _COOL_FAMILY
+
+    assert {row[0]: row[1] for row in after_deselect} == colour, "取消勾选换了别人的颜色"
+    # 取消勾选只改色块的明暗(该点不画进图里),不改颜色
+    assert [row[3] for row in after_deselect] == [[], ["is-unpicked"], [], [], []]
+
+    assert {row[0]: row[1] for row in after_delete} == {
+        k: colour[k] for k in "acde"
+    }, "删掉一个点换了其余点的颜色 —— 说明颜色绑到了下标而不是 point_id"
+
+    # 删掉的点把槽位还回来了:新点吃回那个槽位,而老点一个都没动
+    readd = {row[0]: row[1] for row in after_readd}
+    assert {k: readd[k] for k in "acde"} == {k: colour[k] for k in "acde"}
+    assert readd["f"] == colour["b"], "槽位没回收 —— 只剩 5 个点时第 5 个点却吃了溢出灰"
+
+
+def test_chart_point_colour_equals_its_table_row_swatch() -> None:
+    """同一个点:图上的颜色 == 表格行色块的颜色。
+
+    只靠一个来源保证 —— 两边都调 `pointColor(族, 稳定id)`。所以这里既钉行为
+    (色块 / dataset.pointColor / pointColor() 三者一致),也钉源码
+    (drawAll 不许自己写色值、不许按下标取)。
+    """
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    draw = _extract_js_function(app, "drawAll")
+
+    # 画图侧:颜色只能从 pointColor 取,键必须是稳定身份
+    assert "color:pointColor('calibration',point.point_id)" in draw
+    assert "color:pointColor('test',validationPointId(point,index))" in draw
+    for banned in ("#28708c", "#b54455"):
+        assert banned not in draw, f"drawAll 里又出现了内联点色 {banned}"
+    # 🔴 反例:`(c.points||[]).filter(p=>p.selected)` 之后再 map 取色就是那个 bug
+    assert ".filter(p=>p.selected)" not in draw
+    assert "assignPointColorSlots('calibration',calibrationPoints.map(point=>point.point_id)" in draw
+
+    # 表格侧:色块与 dataset.pointColor 都来自同一次 pointColor 调用
+    swatches = _extract_js_function(app, "refreshPointColorSwatches")
+    assert "pointColor('calibration',tr.dataset.pointId)" in swatches
+    assert swatches.count("pointColor(") == 1, "色块颜色只能取一次,免得两处分叉"
+
+    rendered = _evaluate_chart_js(
+        _POINT_COLOR_JS_NAMES,
+        _point_color_js_setup(app) + _FAKE_POINTS_TABLE + """
+const rows=['a','b','c'].map(id=>fakeRow(id,true));
+const table=render(rows);
+// 画图侧对同一个 point_id 的取色(drawAll 里就是这一句)
+const chart=rows.map(tr=>pointColor('calibration',tr.dataset.pointId));
+""",
+        "[table.map(r=>[r[1],r[2]]),chart]",
+    )
+    table, chart = rendered
+    assert [row[0] for row in table] == chart, "表格色块与图上取到的颜色不是同一个"
+    assert [row[1] for row in table] == chart, "写进 style.background 的不是同一个颜色"
+
+    # 两张表都要有色块,且形状区分族属(deutan 下粉↔青 ΔE 只有 4.1,族属不能只靠色相)
+    assert "colorSwatch.className='point-color-swatch'" in _extract_js_function(app, "row")
+    validation = _extract_js_function(app, "renderValidation")
+    assert "colorSwatch.className='point-color-swatch diamond'" in validation
+    assert "marker:'diamond'" in draw
+
+
+def test_calibration_legend_swatches_match_the_javascript_palettes() -> None:
+    """图例的两条渐变色块必须逐色对上 JS 里的调色板。
+
+    图例画的是"这一族有哪些颜色",一旦与 app.js 分叉,它就在骗人。
+    """
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    for selector, family in (("calibration", _COOL_FAMILY), ("validation", _WARM_FAMILY)):
+        rule = next(line for line in css.splitlines()
+                    if line.startswith(f".legend-swatch.{selector}{{"))
+        assert re.findall(r"#[0-9a-f]{6}", rule) == family, f"{selector} 图例与调色板分叉"
+    fit = next(line for line in css.splitlines() if line.startswith(".legend-swatch.fit{"))
+    assert _extract_js_const(app, "CALIBRATION_CURVE_COLOR").split("'")[1] in fit
+
+    # 色块本体:圆点 / 菱形 + 未勾选压暗
+    assert ".point-color-swatch{" in css
+    assert ".point-color-swatch.diamond{" in css and "rotate(45deg)" in css
+    assert ".point-number.is-unpicked .point-color-swatch{" in css
+
+
+def test_shared_drawchart_marker_field_is_opt_in() -> None:
+    """`marker` 必须是可选字段:不传就还是原来的圆点。
+
+    drawChart 是 itChart / dbgChart / 标定图共用的,给标定图加菱形不能顺手改掉
+    默认分支的调用参数 —— 那两张图的像素必须一个字节都不变。
+    """
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    chart = _extract_js_function(app, "drawChart")
+
+    assert "s.marker === 'diamond'" in chart
+    assert "else ctx.arc(cx, cy, radius, 0, Math.PI * 2);" in chart, (
+        "默认分支必须仍是同参数的 ctx.arc,否则 itChart 的圆点会变"
+    )
+    # pointRing 也必须是可选的:没传就一笔 stroke 都不许多画
+    assert "if (s.pointRing) {" in chart
+
+    # 只有标定图那两族 series 传 marker / pointRing;IT/CV/调试图的一个都不许带
+    draw = _extract_js_function(app, "drawAll")
+    assert draw.count("marker:") == 1, "marker 漏到了 IT/CV 的 series 上"
+    assert draw.count("pointRing:") == 2, "pointRing 只该给标定点与测试点两族"
+    debug = _extract_js_function(app, "drawDebug")
+    assert "marker:" not in debug and "pointRing:" not in debug
+
+    # 标定点先画、测试点后画 ⇒ 先画的那个必须更大,同浓度叠在一起时外圈才露得出来。
+    # 2026-08-21 实测(Playwright 数 canvas 像素):最挤的三点重叠处,被压在最下面的
+    # #8fa0f5 从 12px 提到 17px;11 个点色一个都没被完全吃掉。
+    cal_radius = float(re.search(r"pointRadius:([\d.]+),pointRing", draw).group(1))
+    test_radius = float(re.search(r"pointRadius:([\d.]+),marker:'diamond'", draw).group(1))
+    assert cal_radius > test_radius, "后画的测试点更大 ⇒ 同浓度的标定点会被整块吃掉"
