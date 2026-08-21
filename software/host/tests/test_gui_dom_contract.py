@@ -252,10 +252,8 @@ def test_it_quick_presets_cover_both_electrodes_at_both_potentials() -> None:
         "sens_period_code": 0, "target_rate_hz": 10, "fit_window_s": 20,
         "offset_mode": "20pct",
     }
-    oxidation = {
-        **shared, "initial_potential_v": 0.2, "potential_v": 0.2,
-        "working_electrode_v": 1.2, "duration_s": 180,
-    }
+    # 氧化的工作电位两种电极**不同**(微针 +0.4V / 丝网印刷 +0.2V);还原两者都是 -0.2V
+    oxidation = {**shared, "working_electrode_v": 1.2, "duration_s": 180}
     reduction = {
         **shared, "initial_potential_v": -0.2, "potential_v": -0.2,
         "working_electrode_v": 0.25, "duration_s": 120,
@@ -263,8 +261,10 @@ def test_it_quick_presets_cover_both_electrodes_at_both_potentials() -> None:
     needle = {"fsr_nA": 50, "offset_nA": 10}
     printed = {"fsr_nA": 1000, "offset_nA": 200}
     expected = {
-        "needle-ox": {**oxidation, **needle, "label": "微针 +0.2V"},
-        "printed-ox": {**oxidation, **printed, "label": "丝网印刷 +0.2V"},
+        "needle-ox": {**oxidation, **needle, "initial_potential_v": 0.4,
+                      "potential_v": 0.4, "label": "微针 +0.4V"},
+        "printed-ox": {**oxidation, **printed, "initial_potential_v": 0.2,
+                       "potential_v": 0.2, "label": "丝网印刷 +0.2V"},
         "needle-red": {**reduction, **needle, "label": "微针 -0.2V"},
         "printed-red": {**reduction, **printed, "label": "丝网印刷 -0.2V"},
     }
@@ -273,8 +273,8 @@ def test_it_quick_presets_cover_both_electrodes_at_both_potentials() -> None:
         assert evaluated[key]["settings"] == settings, key
         assert f'data-it-preset="{key}"' in html
         assert settings["label"] in html
-        # 🔴 同电位的两种电极只差量程。itPresetMatches 只比设置值、不记"点了哪个",
-        # 所以差异一旦被抹掉,同电位的两个按钮会一起高亮。
+        # 🔴 还原那一对(-0.2V)**只**靠量程区分。itPresetMatches 只比设置值、不记
+        # "点了哪个",所以量程差异一旦被抹掉,那两个按钮会一起高亮。
         assert evaluated[key]["lit"] == [key], key
         # 预设里的 offset_nA 必须与后端按 20% FSR 折算的值一致,否则表单与回读对不上
         ratio = OFFSET_OPTIONS[settings["offset_mode"]][1]
@@ -283,6 +283,46 @@ def test_it_quick_presets_cover_both_electrodes_at_both_potentials() -> None:
     preset_handler = _extract_js_function(app, "applyItPreset")
     assert "settingsChanged()" in preset_handler
     assert "/api/settings/apply" not in preset_handler
+
+
+def test_every_it_quick_preset_passes_the_backend_validator() -> None:
+    """四个预设必须能原样通过 `SettingsController.validate`。
+
+    预设是前端硬编码的字面量,而真正的约束在后端:RE = V_WE − E 必须落在
+    DAC 的 0.008–1.535 V、offset 必须小于满量程、拟合窗口不能超过时长。
+    改电位最容易踩的就是 RE 越界 —— 例如 +0.4V 配 V_WE 0.25V ⇒ RE = −0.15 V,
+    界面上看不出任何异常,点「应用条件」才报错。
+
+    这条同时把 offset_nA 交给后端算:断言前端字面量 == 后端按 20% FSR 折算的值。
+    """
+    from pa_host.gui_server import SettingsController
+
+    keys = ["needle-ox", "printed-ox", "needle-red", "printed-red"]
+    presets = _evaluate_chart_js(
+        ["itPresetSettings"],
+        f"const keys={json.dumps(keys)};",
+        "Object.fromEntries(keys.map(key=>[key,itPresetSettings(key)]))",
+    )
+
+    for key in keys:
+        preset = dict(presets[key])
+        preset.pop("label")
+        expected_offset = preset.pop("offset_nA")
+        settings = SettingsController.validate(preset)      # 越界会抛 ValueError
+        reference_electrode_v = (
+            settings["working_electrode_v"] - settings["potential_v"]
+        )
+        assert 0.008 <= reference_electrode_v <= 1.535, (
+            f"{key}: RE={reference_electrode_v:.3f} V 超出 DAC 范围"
+        )
+        assert settings["offset_nA"] == expected_offset, key
+        assert settings["offset_nA"] < settings["fsr_nA"], key
+        for field in ("potential_v", "working_electrode_v", "duration_s", "fsr_nA"):
+            assert settings[field] == preset[field], (key, field)
+
+    # 微针氧化是四个里 RE 最低的一档,顺手把它的实际值钉住(+0.4 配 V_WE 1.2 ⇒ 0.800)
+    needle_ox = presets["needle-ox"]
+    assert round(needle_ox["working_electrode_v"] - needle_ox["potential_v"], 3) == 0.8
 
 
 def test_it_quick_preset_populates_the_form_without_applying_hardware() -> None:
