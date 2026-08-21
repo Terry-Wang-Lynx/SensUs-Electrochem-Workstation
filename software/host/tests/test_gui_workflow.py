@@ -5281,6 +5281,146 @@ def test_history_curve_select_all_keeps_total_point_budget_bounded(tmp_path: Pat
     with pytest.raises(ValueError, match="最多叠加 80 条"):
         app.load_history_curves({"run_ids": [f"run-{index}" for index in range(81)]})
 
+def test_discovery_thread_survives_any_exception_type() -> None:
+    """🔴 设备发现线程的兜底必须是 `except Exception`,不能是类型清单。
+
+    2026-08-21 Windows 现场的事故形状:`subprocess.TimeoutExpired` 是
+    `SubprocessError` 的子类,既不是 OSError 也不是 RuntimeError/ValueError,于是
+    `_run_device_discovery()` 与 `_all_serial_port_infos()` 两层的类型清单**都漏**,
+    线程带着未处理异常死掉,`_start_device_discovery()` 每 25 秒把它拉起来再死一次
+    ⇒ `probing` 永远 true、USB 板永远 selectable:false、日志刷满 thread.unhandled。
+
+    这个线程还会调 OpenOCD / J-Link / pyserial,任何一处抛出不在清单里的异常都会
+    原样重演,所以守的是"任何异常都不许逃出去",而不是补一个类型进清单。
+    """
+    recorded: list[str] = []
+    exotic = subprocess.TimeoutExpired(cmd="powershell.exe", timeout=6.0)
+
+    with patch.object(gui_server, "APP",
+                      Mock(operation_lock=threading.RLock(),
+                           hardware_idle=Mock(return_value=True))), \
+            patch.object(gui_server, "JLINK_DRIVER_INSTALL_LOCK", threading.Lock()), \
+            patch.object(gui_server, "_discover_devices_with_probe",
+                         side_effect=exotic), \
+            patch.object(gui_server.DIAGNOSTICS, "exception",
+                         side_effect=lambda event, *a, **k: recorded.append(event) or ""), \
+            patch.object(gui_server.DIAGNOSTICS, "record",
+                         side_effect=lambda level, event, *a, **k: recorded.append(event) or ""):
+        gui_server.DEVICE_DISCOVERY_CANCEL.clear()
+        gui_server._run_device_discovery()          # 不抛就是通过
+
+    assert "device.discovery.unhandled" in recorded, recorded
+    # 线程必须把自己从全局槽位里摘掉,否则下一轮起不来
+    assert gui_server.DEVICE_DISCOVERY_THREAD is None
+
+
+def test_user_actions_preempt_the_background_device_discovery_round() -> None:
+    """用户操作必须先请后台设备发现让路,再等 operation_lock。
+
+    2026-08-21 Windows 现场(真板子)实测:`_run_device_discovery()` 在整轮探测期间
+    持有 operation_lock,于是
+      · /api/measurement/start 耗时 22531 ms,其中 started → device.selection.validated
+        占 20.8 s;同一个校验在 /api/devices/select 路径上只要 73 ms ⇒ 慢的是等锁;
+      · 「用选中点生成测试曲线」攒了 9 个 /api/calibration/fit,18.4~24.2 s 后
+        **在同一毫秒一起返回**,全部 409。
+
+    取消机制本来就齐(DEVICE_DISCOVERY_CANCEL 已穿进两个慢调用),缺的只是普通用户
+    操作也去 set 它 —— `_start_jlink_driver_task()` 早就这么做了。
+    """
+    order: list[str] = []
+
+    class ProbeLock:
+        def __enter__(self):
+            order.append(f"acquire(cancel={gui_server.DEVICE_DISCOVERY_CANCEL.is_set()})")
+            return self
+
+        def __exit__(self, *_args):
+            order.append("release")
+            return False
+
+    with patch.object(gui_server, "APP", Mock(operation_lock=ProbeLock())), \
+            patch.object(gui_server, "JLINK_DRIVER_INSTALL_LOCK", threading.Lock()):
+        gui_server.DEVICE_DISCOVERY_CANCEL.clear()
+        with gui_server._preempting_operation_lock() as waited_ms:
+            order.append(f"inside(cancel={gui_server.DEVICE_DISCOVERY_CANCEL.is_set()})")
+        assert isinstance(waited_ms, float)
+
+    # 抢锁时取消标志必须已经竖起来;拿到锁之后必须放下,否则发现轮再也跑不起来
+    assert order == [
+        "acquire(cancel=True)", "inside(cancel=False)", "release",
+    ], order
+    assert not gui_server.DEVICE_DISCOVERY_CANCEL.is_set()
+
+
+def test_preempting_lock_leaves_a_driver_preparation_suppression_alone() -> None:
+    """🔴 J-Link 驱动准备期间的取消标志不能被用户操作提前清掉。
+
+    `_start_jlink_driver_task()` 先 set 这个标志,靠它在整段(含 UAC 弹窗)期间压住
+    发现轮,直到 worker 收尾才 clear。若用户操作在中途把它清了,发现轮会在驱动安装
+    过程中复活 —— 那正是那段代码要避免的。
+    """
+    driver_lock = threading.Lock()
+    driver_lock.acquire()
+    try:
+        with patch.object(gui_server, "APP", Mock(operation_lock=threading.RLock())), \
+                patch.object(gui_server, "JLINK_DRIVER_INSTALL_LOCK", driver_lock):
+            gui_server.DEVICE_DISCOVERY_CANCEL.set()          # 模拟驱动任务已 set
+            with gui_server._preempting_operation_lock():
+                assert gui_server.DEVICE_DISCOVERY_CANCEL.is_set()
+            assert gui_server.DEVICE_DISCOVERY_CANCEL.is_set(), "不是本次 set 的,不该清"
+    finally:
+        driver_lock.release()
+        gui_server.DEVICE_DISCOVERY_CANCEL.clear()
+
+
+def test_user_facing_routes_use_the_preempting_lock() -> None:
+    """会卡住用户的那几条路由必须走抢占式取锁,不能是裸 operation_lock。"""
+    source = (
+        Path(gui_server.__file__).parent / "gui_server.py"
+    ).read_text(encoding="utf-8")
+    lines = source.splitlines()
+    for path in (
+        "/api/measurement/start", "/api/calibration/fit", "/api/settings/apply",
+        "/api/devices/select", "/api/schedule/start", "/api/debug/start",
+        "/api/workflow/config",
+    ):
+        index = next(
+            i for i, line in enumerate(lines) if f'self.path == "{path}"' in line
+        )
+        window = "\n".join(lines[index:index + 8])
+        assert "_preempting_operation_lock()" in window, f"{path} 没用抢占式取锁"
+        assert "with APP.operation_lock:" not in window, f"{path} 仍是裸锁"
+
+
+def test_rejected_posts_are_always_recorded(monkeypatch) -> None:
+    """🔴 被拒的 POST 必须留痕 —— 现场那 9 个 409 一条记录都没有。
+
+    `_send_json` 只在响应体自己没带 diagnostic_id 时才记 `api.request.error`,
+    所以"请求被拒"这个事实没有保证。拒因只存在于 HTTP 响应正文,客户端没抓就丢。
+    """
+    recorded: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        gui_server.DIAGNOSTICS, "record",
+        lambda level, event, message, **ctx: recorded.append((level, event, ctx)) or "",
+    )
+    handler = gui_server.RequestHandler.__new__(gui_server.RequestHandler)
+    handler.path = "/api/calibration/fit"
+    handler._response_status = 409
+
+    def boom() -> None:
+        handler._response_status = 409
+
+    handler._run_request("POST", boom)
+
+    events = [event for _level, event, _ctx in recorded]
+    assert "api.request.rejected" in events, events
+    assert "api.request.completed" not in events, "4xx 不该记成 completed"
+    rejected = next(ctx for _l, event, ctx in recorded if event == "api.request.rejected")
+    assert rejected["status"] == 409
+    assert rejected["path"] == "/api/calibration/fit"
+    assert isinstance(rejected["duration_ms"], float)
+
+
 def test_history_curve_payloads_carry_the_known_concentration(tmp_path: Path) -> None:
     """两个历史曲线接口都必须带浓度,且脏值一律落成 None。
 

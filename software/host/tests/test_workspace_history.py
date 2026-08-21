@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -12,6 +13,18 @@ import pytest
 
 from pa_host.gui_server import AppState
 from pa_host.workspace_history import WorkspaceHistory
+
+
+class _FakeWindowsPath(PureWindowsPath):
+    """在 macOS/Linux 上冒充"另一个盘上的工作区"。
+
+    _locator() 对入参只用到 resolve() 与 relative_to():纯路径已经有 relative_to
+    (跨 flavour 比较会正常抛 ValueError),只缺 resolve() —— 补上返回自身即可,
+    不必真去访问 D:\\,也不必在 CI 上拉一台 Windows。
+    """
+
+    def resolve(self) -> "_FakeWindowsPath":  # pragma: no cover - 单行替身
+        return self
 
 
 def _point(point_id: str, concentration: float, current: float) -> dict[str, object]:
@@ -61,6 +74,107 @@ def test_external_unix_workspace_uses_non_absolute_filesystem_locator() -> None:
         assert entry["location_anchor"] == expected_anchor
         assert '"path": "/' not in raw
         assert registry.resolve(entry["workspace_id"])[1] == workspace.resolve()
+
+
+def test_windows_workspace_on_another_drive_round_trips_via_absolute_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 🔴 Windows 独有缺陷:D: 盘既不在家目录/应用目录之下,也无法 relative_to("/"),
+    # 老实现直接抛"历史记录路径无法用相对定位保存"(接口层 400)。
+    with TemporaryDirectory() as tmp, monkeypatch.context() as env:
+        root = Path(tmp)
+        registry = WorkspaceHistory(root / "registry" / "history.json", root / "project")
+        env.setattr(os, "name", "nt")
+        workspace = _FakeWindowsPath(r"D:\data\ws")
+
+        locator = registry._locator(workspace)
+
+        assert locator["anchor"] == "absolute"
+        assert str(registry._path(locator)) == r"D:\data\ws"
+
+        # 落盘再读回:_read() 不能把绝对锚点条目当非法条目静默丢掉。
+        registry.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry.registry_path.write_text(
+            json.dumps({
+                "version": 1,
+                "entries": [{
+                    "workspace_id": "d-drive", "locator": locator,
+                    "label": "D 盘工作区",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        reloaded = registry._read()["entries"]
+        assert [item["locator"] for item in reloaded] == [locator]
+
+
+def test_relative_anchors_keep_priority_over_the_new_absolute_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 相对锚点是"应用/家目录整体搬动后仍能解析"的唯一依靠,绝对锚点只能垫底。
+    # 三个目录都只参与路径运算,不创建、不读写:注册表目录特意放在家目录之外,
+    # 否则 home 锚点会先命中,registry 锚点根本轮不到。
+    home = Path.home().resolve()
+    project = home / "sensus-project"
+    registry = WorkspaceHistory(
+        Path("/sensus-registry-fixture/history.json"), project
+    )
+
+    for name in ("posix", "nt"):
+        with monkeypatch.context() as env:
+            env.setattr(os, "name", name)
+            assert registry._locator(home / "ws-under-home") == {
+                "anchor": "home", "path": "ws-under-home",
+            }
+            assert registry._locator(project / "ws-under-project") == {
+                "anchor": "project", "path": "ws-under-project",
+            }
+            assert registry._locator(
+                registry.registry_dir / "ws-under-registry"
+            ) == {"anchor": "registry", "path": "ws-under-registry"}
+
+
+def test_legacy_registry_entries_of_every_anchor_remain_readable() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        project = root / "project"
+        registry_dir = root / "registry"
+        for existing in (project / "ws-p", registry_dir / "ws-r", root / "ws-f"):
+            existing.mkdir(parents=True)
+        legacy = {
+            "project": "ws-p",
+            "registry": "ws-r",
+            "filesystem": (root / "ws-f").relative_to(Path("/")).as_posix(),
+            # 家目录条目不落盘(不往用户真实家目录写东西),只验证它没被丢弃。
+            "home": "sensus-legacy-home/ws-h",
+        }
+        (registry_dir / "history.json").write_text(
+            json.dumps({
+                "version": 1,
+                "entries": [
+                    {"workspace_id": anchor, "label": anchor,
+                     "locator": {"anchor": anchor, "path": path}}
+                    for anchor, path in legacy.items()
+                ],
+            }),
+            encoding="utf-8",
+        )
+        registry = WorkspaceHistory(registry_dir / "history.json", project)
+
+        entries = {item["workspace_id"]: item for item in registry._read()["entries"]}
+        assert set(entries) == set(legacy)
+        assert registry._path(entries["project"]["locator"]) == project / "ws-p"
+        assert registry._path(entries["registry"]["locator"]) == registry_dir / "ws-r"
+        assert registry._path(entries["filesystem"]["locator"]) == root / "ws-f"
+        assert registry._path(entries["home"]["locator"]) == (
+            Path.home().resolve() / "sensus-legacy-home" / "ws-h"
+        )
+
+        listed = {item["workspace_id"]: item for item in registry.list()["entries"]}
+        assert set(listed) == set(legacy)
+        assert listed["project"]["status"] == "available"
+        assert listed["filesystem"]["status"] == "available"
+        assert listed["home"]["status"] == "missing"
 
 
 def test_import_summary_reads_existing_measurements_without_marker_write() -> None:

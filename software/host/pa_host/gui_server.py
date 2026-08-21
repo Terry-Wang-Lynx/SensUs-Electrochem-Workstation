@@ -11,6 +11,7 @@ parser and analysis pipeline.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import csv
 import hashlib
@@ -104,7 +105,7 @@ from .windows_jlink import (
     reports_probe_busy,
     resolve_helper as resolve_winusb_helper,
 )
-from .jlink_usb import discover_jlink_usb_devices
+from .jlink_usb import discover_jlink_usb_devices, set_diagnostics_sink
 
 _IS_WIN = sys.platform == "win32"
 
@@ -114,6 +115,14 @@ PROJECT_DIR = runtime.project_dir()
 STATE_DIR = runtime.state_dir()
 WINUSB_HELPER = resolve_winusb_helper(PROJECT_DIR)
 DIAGNOSTICS = DiagnosticStore(runtime.logs_dir())
+
+# 🔴 jlink_usb 在本模块下层(本模块 import 它),不能反过来 import DIAGNOSTICS,
+#    否则循环 import。它用可注入 sink,这里接上 —— 不接的话它的失败留痕只会
+#    走 logging 到 stderr,而 PyInstaller 的 windowed exe 没有 stderr,
+#    等于在真正出事的那台机器上看不见。
+set_diagnostics_sink(DIAGNOSTICS.record)
+
+
 FRONTEND_UPDATER = FrontendUpdater(
     PACKAGE_DIR / "gui", STATE_DIR, PROJECT_DIR
 )
@@ -150,6 +159,8 @@ SLOW_REQUEST_WARN_MS = 800.0
 # ⚠️ _refresh_live_analysis_locked 自身已有 LIVE_ANALYSIS_REFRESH_S 的节流,
 # 所以它**不是**每轮都做重活;是否存在锁饥饿尚未证实,这条告警就是为了下次能证实。
 LIVE_ANALYSIS_WARN_MS = 500.0
+# 等 operation_lock 超过这个时长就留痕 —— 用户能感知的卡顿几乎都是等锁
+LOCK_WAIT_WARN_MS = 500.0
 CLIENT_DIAGNOSTIC_MAX_LENGTH = 8_000
 CONFIG_GATE_GET_RETRY_S = 0.75
 CONFIG_GATE_LEGACY_PROBE_DELAY_S = 6.0
@@ -642,7 +653,8 @@ def _all_serial_port_infos() -> list[Any]:
     infos = _listed_serial_port_infos()
     try:
         native_jlinks = discover_jlink_usb_devices()
-    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError,
+            subprocess.SubprocessError) as exc:
         DIAGNOSTICS.record(
             "warning", "device.jlink.usb_discovery_failed",
             "Native J-Link USB discovery failed", error=str(exc),
@@ -2044,6 +2056,56 @@ def _start_jlink_driver_task(device_id: str) -> dict[str, Any]:
     return _jlink_driver_task_snapshot()
 
 
+@contextlib.contextmanager
+def _preempting_operation_lock() -> Any:
+    """抢占式获取 `operation_lock`:先请后台设备发现让路,再等锁。
+
+    🔴 为什么需要:`_run_device_discovery()` 在**整轮**探测期间持有 operation_lock,
+    而一轮 = spawn PowerShell 枚举 J-Link + 逐个 CDC 口发 GET 各等 2×1.5 s +
+    SMP 兄弟口探测,轻则数秒重则数十秒。凡是要这把锁的用户操作全部排在它后面。
+
+    2026-08-21 Windows 现场实测(真板子):
+      · 点「开始测量」→ /api/measurement/start 耗时 **22531 ms**,其中
+        started → device.selection.validated 占 **20.8 s**;而同一个校验在
+        /api/devices/select 与 /api/settings/apply 路径上只要 **72~73 ms**
+        ⇒ 慢的不是校验,是等锁。
+      · 点「用选中点生成测试曲线」→ 攒了 **9 个** /api/calibration/fit,
+        耗时 18.4~24.2 s,**在同一毫秒一起返回**(锁一放开全部冲出),最后全 409。
+        前端早已超时并显示「设备正在重新连接」——一句与病因无关的文案。
+
+    取消机制本来就齐:`DEVICE_DISCOVERY_CANCEL` 已穿进 `_discover_devices_with_probe()`
+    与 `_annotate_target_states()`,`cancelled` 时丢弃本轮结果并保留上一次缓存
+    (所以取消不会让设备列表变空)。`_start_jlink_driver_task()` 正是这么抢占的。
+    本函数只是让**普通用户操作**也享有同一待遇。
+
+    yield 出等锁毫秒数,调用方无需关心 —— 超阈值本函数自己留痕。
+    """
+    already_set = DEVICE_DISCOVERY_CANCEL.is_set()
+    if not already_set:
+        DEVICE_DISCOVERY_CANCEL.set()
+    waiting_since = time.monotonic()
+    # 🔴 必须保持 `with` 协议(不能改成 acquire/release):调用方与测试都依赖
+    #    operation_lock 的上下文管理器接口 —— test_queued_measurement_start_
+    #    rechecks_shutdown_inside_operation_lock 就是靠假锁的 __enter__ 来验证
+    #    "停机检查发生在锁内",换成 acquire() 它的探针就不再触发。
+    with APP.operation_lock:
+        wait_ms = round((time.monotonic() - waiting_since) * 1000, 1)
+        # 🔴 只有"是本次 set 的"且 J-Link 驱动准备没在跑时才清。驱动准备任务靠这个
+        #    标志在它整段(含 UAC)期间压住发现轮,被这里提前清掉会让发现轮在安装
+        #    中途复活,而那正是 `_start_jlink_driver_task` 要避免的。
+        if not already_set and not JLINK_DRIVER_INSTALL_LOCK.locked():
+            DEVICE_DISCOVERY_CANCEL.clear()
+        if wait_ms >= LOCK_WAIT_WARN_MS:
+            DIAGNOSTICS.record(
+                "warning", "api.lock_wait_slow",
+                "Waited too long for the operation lock",
+                wait_ms=wait_ms, threshold_ms=LOCK_WAIT_WARN_MS,
+                discovery_running=DEVICE_DISCOVERY_THREAD is not None,
+                driver_preparing=JLINK_DRIVER_INSTALL_LOCK.locked(),
+            )
+        yield wait_ms
+
+
 def _set_device_selection(device: dict[str, Any] | None) -> None:
     """Apply a manual device to the transport globals while the app is idle."""
     global HARDWARE_TRANSPORT, SERIAL_DATA_PORT, SERIAL_SMP_PORT, JLINK_SERIAL
@@ -2184,8 +2246,21 @@ def _run_device_discovery() -> None:
             if cancelled:
                 with DEVICE_DISCOVERY_LOCK:
                     devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 - 见下方红线
+        # 🔴 这里必须是 `except Exception`,不能是类型清单。
+        #    2026-08-21 Windows 现场:`subprocess.TimeoutExpired` 是
+        #    `SubprocessError` 的子类,既不是 OSError 也不是 RuntimeError/ValueError,
+        #    于是本行原来的 `(OSError, RuntimeError, ValueError)` 与
+        #    `_all_serial_port_infos()` 的清单**两层都漏**,线程带着未处理异常死掉,
+        #    而 `_start_device_discovery()` 每 25 秒把它再拉起来再死一次 ——
+        #    `probing` 永远 true、USB 板永远 selectable:false。
+        #    这个线程还会调 OpenOCD / J-Link / pyserial,任何一处再抛出一个不在
+        #    清单里的异常都会原样重演。宁可吞掉并留痕,也不要让它无限循环地死。
         error = str(exc)
+        DIAGNOSTICS.exception(
+            "device.discovery.unhandled",
+            "Device discovery raised an unexpected error", exc,
+        )
         # Preserve the last known list during a transient USB re-enumeration;
         # a short unplug/replug should not make the dialog lose the J-Link.
         with DEVICE_DISCOVERY_LOCK:
@@ -10452,6 +10527,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                     body_keys=self._request_body_keys,
                     duration_ms=duration_ms,
                 )
+            if method == "POST" and status >= 400:
+                # 🔴 `_send_json` 只在响应体自己没带 diagnostic_id 时才记
+                #    `api.request.error`,于是"请求被拒"并不保证留痕 ——
+                #    2026-08-21 现场那 9 个 18~24 s 的 409 一条记录都没有,
+                #    拒因只存在于 HTTP 响应正文里,客户端没抓就永久丢失。
+                #    这一条只带 path/status/耗时,不含正文,恒定记录。
+                DIAGNOSTICS.record(
+                    "warning", "api.request.rejected", "Control request rejected",
+                    method=method, path=path, status=status,
+                    request_id=self._request_id,
+                    body_keys=self._request_body_keys,
+                    duration_ms=duration_ms,
+                )
             if duration_ms >= SLOW_REQUEST_WARN_MS:
                 # GET 也记 —— 这是唯一能区分"后端慢"与"前端卡"的证据
                 DIAGNOSTICS.record(
@@ -10647,20 +10735,20 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = _release_hardware_for_shutdown()
                 shutdown_requested = True
             elif self.path == "/api/app-update/start":
-                with APP.operation_lock:
+                with _preempting_operation_lock():
                     _ensure_not_shutting_down()
                     if not APP.hardware_idle():
                         raise RuntimeError("请先停止测量、自动任务或硬件参数更新")
                     result = APP_UPDATER.start_download()
             elif self.path == "/api/app-update/apply":
-                with APP.operation_lock:
+                with _preempting_operation_lock():
                     _ensure_not_shutting_down()
                     if not APP.hardware_idle():
                         raise RuntimeError("请先停止测量、自动任务或硬件参数更新")
                     result = APP_UPDATER.begin_install()
                     shutdown_requested = True
             elif self.path == "/api/devices/select":
-                with APP.operation_lock:
+                with _preempting_operation_lock():
                     _ensure_not_shutting_down()
                     if not APP.hardware_idle():
                         raise RuntimeError("测量或自动任务运行期间不能切换设备")
@@ -10700,7 +10788,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     raise ValueError("请选择需要准备的 J-Link")
                 result = _start_jlink_driver_task(requested_id)
             elif self.path == "/api/measurement/start":
-                with APP.operation_lock:
+                with _preempting_operation_lock():
                     _ensure_not_shutting_down()
                     if APP.schedule.snapshot()["active"]:
                         raise RuntimeError("自动测量运行期间不能插入手动测量")
@@ -10719,7 +10807,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             # 复用 MeasurementController(它本来就是"一次 I-t 测量"这个抽象),
             # 只是打上 debug 标记并**不传 live_raw_path** ⇒ raw 留在 run_dir。
             elif self.path == "/api/debug/start":
-                with APP.operation_lock:
+                with _preempting_operation_lock():
                     _ensure_not_shutting_down()
                     result = APP.start_debug_run(payload)
             elif self.path == "/api/debug/stop":
@@ -10740,7 +10828,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/calibration/load":
                 result = APP.load_points(str(payload["path"]))
             elif self.path == "/api/calibration/fit":
-                result = APP.fit(payload)
+                # 🔴 `fit()` 内部自己取 operation_lock(与 measurement start 同一把,
+                #    见 fit() 的注释)。这里外层先抢占后台发现轮,否则用户点一次要
+                #    等一整轮探测跑完 —— 现场实测 18.4~24.2 s,且重复点击会攒成
+                #    一串请求在锁后面排队,锁一放开一起返回。
+                with _preempting_operation_lock():
+                    result = APP.fit(payload)
             elif self.path == "/api/calibration/validation":
                 result = APP.update_validation_points(payload)
             elif self.path == "/api/calibration/validation/restore":
@@ -10758,13 +10851,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/predict":
                 result = APP.predict(payload)
             elif self.path == "/api/schedule/start":
-                with APP.operation_lock:
+                with _preempting_operation_lock():
                     _ensure_not_shutting_down()
                     result = APP.start_schedule(payload)
             elif self.path == "/api/schedule/stop":
                 result = APP.schedule.stop()
             elif self.path == "/api/settings/apply":
-                with APP.operation_lock:
+                with _preempting_operation_lock():
                     _ensure_not_shutting_down()
                     if (APP.measurement.is_busy()
                             or APP.schedule.snapshot()["active"]):
@@ -10812,11 +10905,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     str(payload.get("initial_path") or "")
                 )
             elif self.path == "/api/workflow/config":
-                with APP.operation_lock:
+                with _preempting_operation_lock():
                     _ensure_not_shutting_down()
                     result = APP.configure_workflow(payload)
             elif self.path == "/api/workflow/reset-calibration":
-                with APP.operation_lock:
+                with _preempting_operation_lock():
                     _ensure_not_shutting_down()
                     result = APP.reset_calibration(payload)
             elif self.path == "/api/history/register":

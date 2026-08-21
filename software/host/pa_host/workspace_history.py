@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
@@ -18,6 +18,11 @@ MARKER_NAME = ".sensus-workspace.json"
 WORKSPACE_KIND = "workspace"
 BATCH_KIND = "batch"
 _KNOWN_KINDS = {WORKSPACE_KIND, BATCH_KIND}
+
+# 锚点分两类:相对锚点存"锚点 + 相对路径"(应用/家目录整体搬动后仍能解析,
+# 这是整套锚点机制存在的理由);绝对锚点存整条绝对路径,是最后一档兜底。
+_RELATIVE_ANCHORS = ("project", "home", "registry", "filesystem")
+ABSOLUTE_ANCHOR = "absolute"
 
 
 class WorkspaceHistory:
@@ -75,7 +80,7 @@ class WorkspaceHistory:
                 continue
             anchor = str(locator.get("anchor") or "")
             relative = str(locator.get("path") or "")
-            if anchor not in {"project", "home", "registry", "filesystem"} or not self._safe_relative(relative):
+            if not self._valid_locator(anchor, relative):
                 continue
             kind = str(item.get("kind") or WORKSPACE_KIND)
             if kind not in _KNOWN_KINDS:
@@ -116,6 +121,30 @@ class WorkspaceHistory:
         path = Path(value)
         return bool(value) and not path.is_absolute() and ".." not in path.parts
 
+    @staticmethod
+    def _safe_absolute(value: str) -> bool:
+        """绝对锚点的独立校验(_safe_relative 会直接拒掉绝对路径,不能复用)。
+
+        🔴 注册表可能是另一种平台写下的(Windows 写的 ``D:\\data\\ws`` 在 POSIX 上
+        被 PurePosixPath 当成单个文件名,既看不出绝对也看不出 ``..``),所以两种
+        flavour 都解析一遍:任一种认得出是绝对路径才收,任一种解析出 ``..`` 就拒。
+        绝对锚点没有"锚点根"可越界,校验保的是另两件事:
+        ① 不能是相对路径(否则解析时会悄悄拼到进程 cwd 后面,含义随工作目录漂移);
+        ② 不能含 ``..``(不给注册表里塞路径穿越片段的机会)。
+        """
+        if not value:
+            return False
+        parsed = (PurePosixPath(value), PureWindowsPath(value))
+        if not any(path.is_absolute() for path in parsed):
+            return False
+        return not any(".." in path.parts for path in parsed)
+
+    @classmethod
+    def _valid_locator(cls, anchor: str, path: str) -> bool:
+        if anchor == ABSOLUTE_ANCHOR:
+            return cls._safe_absolute(path)
+        return anchor in _RELATIVE_ANCHORS and cls._safe_relative(path)
+
     def _locator(self, workspace: Path) -> dict[str, str]:
         resolved = workspace.resolve()
         for anchor, root in (
@@ -129,19 +158,35 @@ class WorkspaceHistory:
             if relative.parts:
                 return {"anchor": anchor, "path": relative.as_posix()}
         if os.name != "nt":
+            # POSIX 只有一个文件系统根,任何绝对路径都能相对化到 "/",
+            # 于是这一档在 POSIX 上必然命中,绝对锚点实际只在 Windows 生效。
             try:
                 relative = resolved.relative_to(Path("/"))
                 if relative.parts:
                     return {"anchor": "filesystem", "path": relative.as_posix()}
             except ValueError:
                 pass
+        # 🔴 Windows 逃生口:Windows 每个盘/UNC 共享各自是一个根,``D:\ws``
+        # relative_to("/") 无意义,前面四档全落空 ⇒ 老实现直接抛错,导致"工作区
+        # 只能放家目录/应用目录以下",把工作区放 D: 盘的请求一律 400。
+        # 这里退化成存整条绝对路径:它确实不随目录搬动而跟随(跨盘路径本来也
+        # 没法跟着搬),但"能用且诚实"胜过"存不下"。放在最后一档 ⇒ 能相对化的
+        # 仍旧相对化,已有锚点优先级完全不变。
+        if resolved.is_absolute():
+            return {"anchor": ABSOLUTE_ANCHOR, "path": str(resolved)}
         raise ValueError("历史记录路径无法用相对定位保存")
 
     def _path(self, locator: dict[str, Any]) -> Path:
         anchor = str(locator.get("anchor") or "")
         relative = str(locator.get("path") or "")
-        if anchor not in {"project", "home", "registry", "filesystem"} or not self._safe_relative(relative):
+        if not self._valid_locator(anchor, relative):
             raise ValueError("历史记录路径无效")
+        if anchor == ABSOLUTE_ANCHOR:
+            # 🔴 不再 resolve():写入侧 _locator 已经 resolve 过,而在非原生平台上
+            # 对 "D:\\data\\ws" 调 resolve() 会把它当相对路径拼到 cwd 后面。
+            # 也没有 relative_to 越界检查可做——绝对锚点就是它自己的根,
+            # 越界语义不存在,安全性由 _safe_absolute 承担。
+            return Path(relative)
         root = {
             "project": self.project_dir, "home": self.home_dir,
             "registry": self.registry_dir,
