@@ -155,10 +155,17 @@ def test_legacy_registry_entries_of_every_anchor_remain_readable() -> None:
         legacy = {
             "project": "ws-p",
             "registry": "ws-r",
-            "filesystem": (root / "ws-f").relative_to(Path("/")).as_posix(),
             # 家目录条目不落盘(不往用户真实家目录写东西),只验证它没被丢弃。
             "home": "sensus-legacy-home/ws-h",
         }
+        # 🔴 `filesystem` 锚点**本质上是 POSIX 专有**的:它把绝对路径存成相对于 "/"
+        #    的路径,而 Windows 上带盘符的路径不在 "\" 之下 —— 生产代码的写入侧本来
+        #    就有 `if os.name != "nt"` 挡着,解析侧也不可能把 `\Users\...` 还原成
+        #    `C:\Users\...`。所以这一段只在 POSIX 上构造与断言。
+        #    (CI 的 Windows job 就是被这条测试自身的 `relative_to(Path("/"))` 拦下的:
+        #     ValueError: 'C:\\...\\ws-f' is not in the subpath of '\\')
+        if os.name != "nt":
+            legacy["filesystem"] = (root / "ws-f").relative_to(Path("/")).as_posix()
         (registry_dir / "history.json").write_text(
             json.dumps({
                 "version": 1,
@@ -176,7 +183,8 @@ def test_legacy_registry_entries_of_every_anchor_remain_readable() -> None:
         assert set(entries) == set(legacy)
         assert registry._path(entries["project"]["locator"]) == project / "ws-p"
         assert registry._path(entries["registry"]["locator"]) == registry_dir / "ws-r"
-        assert registry._path(entries["filesystem"]["locator"]) == root / "ws-f"
+        if os.name != "nt":
+            assert registry._path(entries["filesystem"]["locator"]) == root / "ws-f"
         assert registry._path(entries["home"]["locator"]) == (
             Path.home().resolve() / "sensus-legacy-home" / "ws-h"
         )
@@ -184,7 +192,8 @@ def test_legacy_registry_entries_of_every_anchor_remain_readable() -> None:
         listed = {item["workspace_id"]: item for item in registry.list()["entries"]}
         assert set(listed) == set(legacy)
         assert listed["project"]["status"] == "available"
-        assert listed["filesystem"]["status"] == "available"
+        if os.name != "nt":
+            assert listed["filesystem"]["status"] == "available"
         assert listed["home"]["status"] == "missing"
 
 
