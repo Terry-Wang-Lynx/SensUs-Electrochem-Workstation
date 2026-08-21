@@ -1,14 +1,18 @@
+import ast
 import hashlib
 import io
 import os
 import re
 import ssl
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from pa_host import app_update as app_update_module
 from pa_host.app_update import (
     AppUpdateError,
     AppUpdateManager,
@@ -301,3 +305,204 @@ def test_ssl_context_leaves_a_healthy_store_untouched() -> None:
                 side_effect=AssertionError("信任库正常时不应加载任何回落 CA"),
             ):
         assert _ssl_context() is healthy
+
+
+# 🔴 中文 Windows 上 locale 默认编码是 cp936(GBK),macOS 上是 UTF-8;两边都是
+# strict。`subprocess.run(..., text=True)` 不写 `encoding=` 时子进程输出就按这个
+# locale 编码 strict 解码 —— 工具吐出任何不合该编码的字节都会抛
+# UnicodeDecodeError,把一次正在进行的硬件操作/整包更新直接打断。
+# 下面两条测试是这一族缺陷的门禁:一条喂真字节走真解码路径,一条做 AST 静态扫描。
+
+_GBK_NOISE = "低压警告".encode("gb18030")
+"""GBK 编码的中文:字节以 0xB5 开头,不是合法 UTF-8 序列 ⇒ strict UTF-8 解码必抛。"""
+
+
+def test_macos_prepare_tolerates_non_utf8_tool_output(tmp_path: Path) -> None:
+    """🔴 hdiutil/ditto/codesign 吐出非 UTF-8 字节时,整包更新不许被解码异常打断。
+
+    这里不 mock 掉解码:替换的只有**命令本身**,生产代码给 ``subprocess.run``
+    的 kwargs 原样转发给真子进程,由真的 ``TextIOWrapper`` 去解码真的 GBK 字节。
+    撤掉 ``_prepare_archive`` 里任意一处的 ``encoding=`` / ``errors=``,
+    这条测试会以 ``UnicodeDecodeError`` 变红。
+    """
+
+    state_root = tmp_path / "state"
+    manager = AppUpdateManager(
+        "0.4.6", state_root, package_kind="macos-arm64",
+        target_path=tmp_path / "SensUs Workstation.app",
+    )
+    manager.root.mkdir(parents=True, exist_ok=True)
+    archive = tmp_path / "update.dmg"
+    archive.write_bytes(b"stand-in for the disk image")
+
+    real_run = subprocess.run
+    emitter = (
+        "import sys;"
+        f"sys.stdout.buffer.write({_GBK_NOISE!r});"
+        f"sys.stderr.buffer.write({_GBK_NOISE!r})"
+    )
+    seen: dict[str, dict[str, object]] = {}
+    decoded: list[str] = []
+
+    def fake_run(command: list[str], **kwargs: object):
+        tool = Path(str(command[0])).name
+        label = f"{tool} {command[1]}" if tool == "hdiutil" else tool
+        seen[label] = dict(kwargs)
+        if label == "hdiutil attach":
+            mount = Path(str(command[command.index("-mountpoint") + 1]))
+            (mount / "SensUs Workstation.app").mkdir(parents=True, exist_ok=True)
+        elif label == "ditto":
+            bundle = Path(str(command[2]))
+            (bundle / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+            (bundle / "Contents" / "MacOS" / "SensUsWorkstation").write_bytes(b"app")
+            backend = bundle / "Contents" / "Resources" / "backend" / "SensUsBackend"
+            backend.mkdir(parents=True, exist_ok=True)
+            (backend / "SensUsBackend").write_bytes(b"backend")
+        completed = real_run([sys.executable, "-c", emitter], **kwargs)
+        decoded.append(str(completed.stdout) + str(completed.stderr))
+        return completed
+
+    with patch("pa_host.app_update.subprocess.run", side_effect=fake_run):
+        staged = manager._prepare_archive(archive, "0.4.7")
+
+    assert staged == manager.root / "staged-0.4.7" / "SensUs Workstation.app"
+    # 四处调用点全部走到,缺一处就说明这条测试没覆盖到它。
+    assert set(seen) == {"hdiutil attach", "ditto", "hdiutil detach", "codesign"}
+    for label, kwargs in seen.items():
+        assert kwargs.get("encoding") == "utf-8", f"{label} 没把编码钉成 utf-8"
+        assert kwargs.get("errors") == "replace", f"{label} 没放宽 errors"
+    # 坏字节变成 U+FFFD,而不是抛异常;也不是按 locale 猜成了 "低压警告"。
+    assert decoded and all("\ufffd" in chunk for chunk in decoded)
+    assert all("低压警告" not in chunk for chunk in decoded)
+
+
+_LOCALE_DECODE_GUARDED_MODULES = (
+    "collect.py", "windows_jlink.py", "app_update.py", "jlink_usb.py",
+)
+
+
+def _subprocess_text_offenders(path: Path) -> list[str]:
+    """挑出一个模块里 ``text=True`` 却没写 ``encoding=``/``errors=`` 的 subprocess 调用。
+
+    ``windows_jlink.py`` 把公共 kwargs 提成 ``common = {...}`` 再 ``**common``
+    展开,只看字面 keyword 会漏,所以先把模块内的 dict 字面量 / ``dict(拷贝)`` /
+    下标赋值收成"名字 → 键集合"。已知局限:``**`` 后面跟无法静态求值的表达式
+    (如 ``**runtime.hidden_subprocess_kwargs()``)时按"没提供额外键"处理。
+    """
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    dict_keys: dict[str, set[str]] = {}
+
+    def literal_keys(node: ast.expr) -> set[str] | None:
+        if isinstance(node, ast.Dict):
+            keys: set[str] = set()
+            for key, value in zip(node.keys, node.values):
+                if key is None:  # {**other}
+                    inherited = literal_keys(value)
+                    if inherited is None:
+                        return None
+                    keys |= inherited
+                elif isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    keys.add(key.value)
+                else:
+                    return None
+            return keys
+        if isinstance(node, ast.Name):
+            return dict_keys.get(node.id)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "dict" and len(node.args) == 1
+                and not node.keywords):
+            return literal_keys(node.args[0])
+        return None
+
+    assignments = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)]
+    # 走三遍取不动点:`launcher_common = dict(common)` 这类链式拷贝的顺序
+    # 不由 ast.walk 保证。
+    for _ in range(3):
+        for node in assignments:
+            resolved = literal_keys(node.value)
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    if resolved is not None:
+                        dict_keys.setdefault(target.id, set()).update(resolved)
+                elif (isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)):
+                    dict_keys.setdefault(target.value.id, set()).add(
+                        target.slice.value
+                    )
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if not (isinstance(function, ast.Attribute)
+                and isinstance(function.value, ast.Name)
+                and function.value.id == "subprocess"
+                and function.attr in {
+                    "run", "Popen", "call", "check_call", "check_output",
+                }):
+            continue
+        explicit = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+        present = set(explicit)
+        for kw in node.keywords:
+            if kw.arg is None:
+                present |= literal_keys(kw.value) or set()
+        text_like = {"text", "universal_newlines"} & present
+
+        def enables_text(key: str) -> bool:
+            value = explicit.get(key)
+            if isinstance(value, ast.Constant):
+                return value.value is True
+            return True  # 变量/表达式/来自 ** 展开 → 保守当成开了文本模式
+
+        if not any(enables_text(key) for key in text_like):
+            continue
+        missing = [key for key in ("encoding", "errors") if key not in present]
+        if missing:
+            offenders.append(
+                f"{path.name}:{node.lineno} subprocess.{function.attr} "
+                f"开了文本模式但缺 {'/'.join(missing)}="
+            )
+    return offenders
+
+
+def test_hardware_subprocess_calls_never_decode_with_the_locale_encoding() -> None:
+    """机器门禁:这四个模块里任何 subprocess 文本模式调用都必须自带 encoding/errors。
+
+    🔴 作用域只限这四个模块(硬件操作 + 自动更新链路),不扫全包 —— 其余文件由
+    各自的测试负责,在这里扫会把别处的改动误报到这条断言上。
+    """
+
+    package = Path(app_update_module.__file__).resolve().parent
+    offenders: list[str] = []
+    for module in _LOCALE_DECODE_GUARDED_MODULES:
+        offenders += _subprocess_text_offenders(package / module)
+    assert offenders == []
+
+
+def test_the_subprocess_text_gate_actually_catches_a_missing_encoding(
+    tmp_path: Path,
+) -> None:
+    """门禁自检:上面那条断言恒为真才是最坏情况,这里证明它抓得住缺陷。"""
+
+    sample = tmp_path / "sample.py"
+    sample.write_text(
+        "import subprocess\n"
+        "common = {'capture_output': True, 'text': True}\n"
+        "fixed = {**common, 'encoding': 'utf-8', 'errors': 'replace'}\n"
+        "subprocess.run(['a'], text=True)\n"
+        "subprocess.run(['b'], **common)\n"
+        "subprocess.run(['c'], universal_newlines=True)\n"
+        "subprocess.run(['d'], **fixed)\n"
+        "subprocess.run(['e'], text=True, encoding='utf-8', errors='replace')\n"
+        "subprocess.run(['f'], capture_output=True)\n"
+        "subprocess.run(['g'], text=False)\n",
+        encoding="utf-8",
+    )
+
+    offenders = _subprocess_text_offenders(sample)
+
+    assert [line.split(":")[1].split(" ")[0] for line in offenders] == ["4", "5", "6"]

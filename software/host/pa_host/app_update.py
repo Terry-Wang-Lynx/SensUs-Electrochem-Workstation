@@ -429,11 +429,28 @@ class AppUpdateManager:
             raise AppUpdateError("当前平台不支持准备整包更新")
         mount = Path(tempfile.mkdtemp(prefix="mount-", dir=self.root))
         app_destination = destination / "SensUs Workstation.app"
+        # 🔴 下面四处 subprocess.run 必须显式写 encoding/errors。text=True 而不给
+        # encoding 时,Python 用 locale.getpreferredencoding() 解码,且是 strict:
+        #   - 中文 Windows 上那是 cp936(GBK),任何非 GBK 字节直接抛
+        #     UnicodeDecodeError,把调用方打断;
+        #   - macOS 默认 UTF-8,但 hdiutil / ditto / codesign 的诊断行里会带上
+        #     DMG 卷名与包内文件名,DMG 里完全可能存在不是合法 UTF-8 的文件名
+        #     (从别的文件系统拷进去的),strict 解码同样会抛。
+        # 编码选 utf-8:三者都是 macOS 系统工具,输出走的是系统 UTF-8 约定
+        # (macOS 全链路 UTF-8,没有 PowerShell 那种 [Console]::OutputEncoding
+        # 需要对齐的情况)。
+        # errors 选 replace:这四处的 stdout/stderr **只**当诊断文本用 ——
+        # attach/ditto/codesign 靠 check=True 的退出码判成败,输出只在
+        # CalledProcessError 里被拼进错误消息;detach 的返回值整个丢弃。
+        # 没有任何一处会被解析成结构化数据(没有 JSON / 版本号 / 路径提取),
+        # 所以坏字节变成 U+FFFD 最多让错误消息里多几个乱码字符,
+        # 绝不该因此打断一次正在进行的整包更新。
         try:
             subprocess.run(
                 ["/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse",
                  "-mountpoint", str(mount), str(archive)],
-                check=True, capture_output=True, text=True, timeout=60,
+                check=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=60,
             )
             source = mount / "SensUs Workstation.app"
             if not source.is_dir():
@@ -441,12 +458,14 @@ class AppUpdateManager:
             destination.mkdir(parents=True)
             subprocess.run(
                 ["/usr/bin/ditto", str(source), str(app_destination)],
-                check=True, capture_output=True, text=True, timeout=180,
+                check=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=180,
             )
         finally:
             subprocess.run(
                 ["/usr/bin/hdiutil", "detach", str(mount), "-force"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30,
             )
             shutil.rmtree(mount, ignore_errors=True)
         if not (
@@ -455,9 +474,11 @@ class AppUpdateManager:
                  / "SensUsBackend" / "SensUsBackend").is_file()
         ):
             raise AppUpdateError("macOS 更新包内容不完整")
+        # 同上:codesign 的判定来自 check=True 的退出码,输出只进错误消息。
         subprocess.run(
             ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app_destination)],
-            check=True, capture_output=True, text=True, timeout=60,
+            check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60,
         )
         return app_destination
 
