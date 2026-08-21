@@ -970,6 +970,13 @@ def find_rtt_address(elf: Path) -> int:
         ]
         for metadata in metadata_candidates:
             try:
+                # ❌ 故意**不**容错读:firmware.json 是我们自己的构建/发布产物
+                #    (随包 prebuilt 元数据),不是用户数据 —— 内容只有 rtt_address
+                #    这类 ASCII 值,永远不会有中文,也永远不会经过用户的 locale。
+                #    它解不开只有一个含义:随包文件被损坏/被截断,那正该立刻暴露成
+                #    "找不到 RTT 地址",而不是被 gb18030 静默解成乱码再报一个
+                #    风马牛不相及的 KeyError。
+                #    (判据见 textio.py 模块 docstring 末段:随包资源保持严格 UTF-8。)
                 payload = json.loads(metadata.read_text(encoding="utf-8"))
                 value = payload["rtt_address"]
                 return int(value, 0) if isinstance(value, str) else int(value)
@@ -1610,6 +1617,15 @@ def read_serial_lines(port: str, baudrate: int = 115200,
                 last_cmd_poll = now
                 try:
                     if cmd_file.exists():
+                        # ❌ 故意**不**容错读:命令文件是上位机自己刚写出来的进程间
+                        #    管道,不是用户数据。内容只能是固件命令,而
+                        #    `_encode_firmware_command` 本来就拒收非 ASCII ⇒ 合法内容
+                        #    必然是 ASCII。这里读出非 UTF-8 字节,说明有别的东西在往
+                        #    这个文件里写(或文件被写坏),该立刻炸给下面那个 handler
+                        #    看,而不是靠 gb18030 解成乱码命令再发给固件。
+                        #    ⚠️ 上面 RTT 分支(_split_complete_lines 之前)那处历史上带
+                        #    errors="replace",两者不一致是既有状态,本轮不动它:
+                        #    改成严格会给 RTT 路径引入新的抛出点。
                         with cmd_file.open("r", encoding="utf-8") as fh:
                             fh.seek(cmd_pos)
                             fresh = fh.read()

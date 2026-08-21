@@ -12,6 +12,8 @@ import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from .textio import is_legacy_encoding, read_csv_lines, read_json_tolerant
+
 
 REGISTRY_VERSION = 1
 MARKER_NAME = ".sensus-workspace.json"
@@ -23,6 +25,21 @@ _KNOWN_KINDS = {WORKSPACE_KIND, BATCH_KIND}
 # 这是整套锚点机制存在的理由);绝对锚点存整条绝对路径,是最后一档兜底。
 _RELATIVE_ANCHORS = ("project", "home", "registry", "filesystem")
 ABSOLUTE_ANCHOR = "absolute"
+
+#: 现行写入编码。读取端能吃下旧编码(见 textio.py),但必须如实说出读到的是哪一种。
+CURRENT_ENCODING = "utf-8"
+
+
+def legacy_encoding_notice(encoding: str) -> str:
+    """旧编码的用户可见提示 —— 这是**提示**不是错误:数据已正确读入,工作区可用。
+
+    🔴 措辞与 `gui_server.AppState._load_workspace` 末尾那句保持一致:同一件事在
+    "当前工作区"和"历史列表"两处说法不同,用户会以为是两个问题。
+    """
+    return (
+        f"本批次记录是旧版本以 {encoding} 编码写下的，"
+        "已按该编码正确读入；建议重新导出一份，以免其它工具误读"
+    )
 
 
 class WorkspaceHistory:
@@ -62,7 +79,11 @@ class WorkspaceHistory:
         if not self.registry_path.exists():
             return self._empty()
         try:
-            raw = json.loads(self.registry_path.read_text(encoding="utf-8"))
+            # ✅ 用户数据:注册表存的是**工作区路径 + 用户起的批次 label**,中文路径在
+            #    旧版本(漏写 encoding)的中文 Windows 上按 cp936 落盘。严格 utf-8 读会
+            #    掉进下面这个 handler ⇒ "历史注册表已损坏" ⇒ 用户**整份历史列表清空**,
+            #    而文件其实完好无损,只是编码是旧的。
+            raw, encoding = read_json_tolerant(self.registry_path)
         except (OSError, json.JSONDecodeError, UnicodeError) as exc:
             return self._empty(f"历史注册表已损坏：{exc}")
         if isinstance(raw, list):
@@ -100,13 +121,23 @@ class WorkspaceHistory:
                 "kind": kind,
                 "workspace_root_id": workspace_root_id,
             })
+        registry_error = (
+            "" if raw.get("version") in (None, 0, REGISTRY_VERSION)
+            else f"已忽略不支持的注册表版本 {raw.get('version')}"
+        )
+        if not registry_error and is_legacy_encoding(encoding):
+            # 🔴 旧编码不静默:前端把 registry_error 当提示条显示(app.js 的
+            #    workspaceHistoryError)。这里措辞是提示而非"损坏",因为注册表可用;
+            #    而且下一次写注册表(register/favorite/remove/重定位)会被
+            #    _atomic_json 以 UTF-8 整份重写 ⇒ 注册表这一份是自动痊愈的。
+            registry_error = (
+                f"历史注册表是旧版本以 {encoding} 编码写下的，已正确读入；"
+                "下次写入历史时会自动转为 UTF-8"
+            )
         return {
             "version": REGISTRY_VERSION,
             "entries": entries,
-            "registry_error": (
-                "" if raw.get("version") in (None, 0, REGISTRY_VERSION)
-                else f"已忽略不支持的注册表版本 {raw.get('version')}"
-            ),
+            "registry_error": registry_error,
         }
 
     @staticmethod
@@ -212,7 +243,11 @@ class WorkspaceHistory:
         """Read the directory marker without requiring a registry entry."""
         marker = workspace / MARKER_NAME
         try:
-            payload = json.loads(marker.read_text(encoding="utf-8"))
+            # ✅ 用户数据:marker 存着用户起的批次 label(中文)。读不出来的后果比
+            #    报错更坏 —— marker_info 返回 {} ⇒ _marker_id 为 None ⇒ register 认不出
+            #    这是同一个工作区,另发一个 workspace_id,历史列表出现重复条目、
+            #    目录搬动后的重定位(_relocate)也一并失效。
+            payload, _encoding = read_json_tolerant(marker)
             if not isinstance(payload, dict):
                 return {}
             workspace_id = str(payload.get("workspace_id") or "")
@@ -286,8 +321,26 @@ class WorkspaceHistory:
 
     @staticmethod
     def _health(workspace: Path) -> tuple[str, str]:
+        """🔴 二元返回**必须保持**:`gui_server.import_history` 按 ``status, detail =``
+        解包,那个文件已经提交,不能因为这里多了编码信息就改它的调用假设。
+        需要编码的内部调用走 `_health_detailed`。
+        """
+        status, detail, _encoding = WorkspaceHistory._health_detailed(workspace)
+        return status, detail
+
+    @staticmethod
+    def _health_detailed(workspace: Path) -> tuple[str, str, str]:
+        """返回 ``(status, detail, encoding)``,encoding 是读这批文件真正用到的编码。
+
+        🔴 旧编码**不改 status**:工作区照常 "available",只是把 detail 换成提示。
+        这一整套读全是**用户数据**(用户自己的批次目录),旧版本漏写 encoding 时中文
+        样品名/标签按 cp936 落盘,严格 utf-8 读会把一个完全可用的工作区标成
+        "corrupt" —— 用户看到的是"工作区坏了"。
+        """
         if not workspace.is_dir():
-            return "missing", "工作区目录不存在"
+            return "missing", "工作区目录不存在", CURRENT_ENCODING
+        # 任意一份文件读出旧编码,整个工作区就该提示用户重新导出。
+        legacy_encodings: list[str] = []
         json_files = (
             "calibration-model.json", "calibration-settings.json",
             "calibration-plateau.json", "calibration-filter.json",
@@ -299,30 +352,39 @@ class WorkspaceHistory:
             if not path.exists():
                 continue
             try:
-                if not isinstance(json.loads(path.read_text(encoding="utf-8")), dict):
+                # ✅ 用户数据 → 容错读。
+                payload, encoding = read_json_tolerant(path)
+                if not isinstance(payload, dict):
                     raise ValueError("JSON 顶层不是对象")
             except (OSError, ValueError, json.JSONDecodeError, UnicodeError) as exc:
-                return "corrupt", f"{name} 无法读取：{exc}"
+                return "corrupt", f"{name} 无法读取：{exc}", CURRENT_ENCODING
+            if is_legacy_encoding(encoding):
+                legacy_encodings.append(encoding)
         csv_schemas = {
             "calibration-points.csv": {"concentration_um", "current_nA"},
             "measurement-index.csv": {"run_id", "state"},
         }
-    # 🔴 这三处读工作区 CSV 一律带 errors="replace":它们的 except 本来就拦得住
-    #    UnicodeError(不会崩),但后果是把一个只有几个坏字节的工作区标成 "corrupt"
-    #    或把记录读空 —— 用户看到的是"工作区坏了",而它其实完全可用。
-    #    坏字节的来源见 filtering.py/cv.py 的编码说明(中文 Windows 的 cp936 落盘)。
         for name, required in csv_schemas.items():
             path = workspace / name
             if not path.exists():
                 continue
             try:
-                with path.open(newline="", encoding="utf-8", errors="replace") as handle:
-                    fields = set(csv.DictReader(handle).fieldnames or ())
+                # 🔴 上一轮这里是 errors="replace":确实不崩了,可代价是中文被烧成
+                #    U+FFFD。本函数只看列名(ASCII)所以 schema 判定没受影响,但同一份
+                #    index.csv 在 summarize() 里要取中文 latest_sample_name ⇒ 一律升级
+                #    成 read_csv_lines(gb18030 回退把中文**正确还原**)。
+                lines, encoding = read_csv_lines(path)
+                fields = set(csv.DictReader(lines).fieldnames or ())
                 if not required.issubset(fields):
-                    return "corrupt", f"{name} 缺少必需列"
+                    return "corrupt", f"{name} 缺少必需列", CURRENT_ENCODING
             except (OSError, UnicodeError, csv.Error) as exc:
-                return "corrupt", f"{name} 无法读取：{exc}"
-        return "available", ""
+                return "corrupt", f"{name} 无法读取：{exc}", CURRENT_ENCODING
+            if is_legacy_encoding(encoding):
+                legacy_encodings.append(encoding)
+        if legacy_encodings:
+            encoding = legacy_encodings[0]
+            return "available", legacy_encoding_notice(encoding), encoding
+        return "available", "", CURRENT_ENCODING
 
     @staticmethod
     def summarize(workspace: Path) -> dict[str, Any]:
@@ -333,19 +395,21 @@ class WorkspaceHistory:
         points_path = workspace / "calibration-points.csv"
         if points_path.exists():
             try:
-                with points_path.open(newline="", encoding="utf-8", errors="replace") as handle:
-                    point_count = sum(
-                        1 for row in csv.DictReader(handle)
-                        if row.get("concentration_um") not in (None, "")
-                        and row.get("current_nA") not in (None, "")
-                    )
+                # ✅ 用户数据(标定点 CSV)。这里只数行数,但与 index.csv 用同一套回退,
+                #    免得同一个工作区两份 CSV 一份能读、一份读空。
+                point_count = sum(
+                    1 for row in csv.DictReader(read_csv_lines(points_path)[0])
+                    if row.get("concentration_um") not in (None, "")
+                    and row.get("current_nA") not in (None, "")
+                )
             except (OSError, UnicodeError, csv.Error):
                 point_count = 0
 
         selection_path = workspace / "calibration-selection.json"
         if selection_path.exists():
             try:
-                selection = json.loads(selection_path.read_text(encoding="utf-8"))
+                # ✅ 用户数据(工作区里的选点状态)。
+                selection = read_json_tolerant(selection_path)[0]
                 selected = selection.get("selected_point_ids", [])
                 selected_count = len(selected) if isinstance(selected, list) else 0
             except (OSError, UnicodeError, TypeError, json.JSONDecodeError):
@@ -355,15 +419,21 @@ class WorkspaceHistory:
         index_path = workspace / "measurement-index.csv"
         if index_path.exists():
             try:
-                with index_path.open(newline="", encoding="utf-8", errors="replace") as handle:
-                    records = [dict(row) for row in csv.DictReader(handle)]
+                # 🔴 这一处最要紧:summarize 的产物直接进历史列表(latest_sample_name
+                #    就是中文样品名)。errors="replace" 能加载但会把它显示成
+                #    "�����" —— 加载得上却看不懂,等于没修。gb18030 回退才能还原。
+                records = [
+                    dict(row) for row in csv.DictReader(read_csv_lines(index_path)[0])
+                ]
             except (OSError, UnicodeError, csv.Error):
                 records = []
         if not records:
             # Older exports may contain summaries without the workspace index.
             for summary_path in sorted(workspace.glob("*-summary.json")):
                 try:
-                    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+                    # ✅ 用户数据:更老的导出没有 index.csv,只有一串 *-summary.json,
+                    #    里面同样带中文 sample_name —— 恰恰是最可能撞旧编码的一批。
+                    payload = read_json_tolerant(summary_path)[0]
                 except (OSError, UnicodeError, TypeError, json.JSONDecodeError):
                     continue
                 if not isinstance(payload, dict):
@@ -393,7 +463,8 @@ class WorkspaceHistory:
         model_path = workspace / "calibration-model.json"
         if model_path.exists():
             try:
-                model = json.loads(model_path.read_text(encoding="utf-8"))
+                # ✅ 用户数据(工作区里的标定模型)。
+                model = read_json_tolerant(model_path)[0]
                 raw_r2 = model.get("r2") if isinstance(model, dict) else None
                 model_r2 = float(raw_r2) if raw_r2 is not None else None
             except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
@@ -406,7 +477,8 @@ class WorkspaceHistory:
             if not settings_path.exists():
                 continue
             try:
-                payload = json.loads(settings_path.read_text(encoding="utf-8"))
+                # ✅ 用户数据(工作区状态/标定设置)。
+                payload = read_json_tolerant(settings_path)[0]
                 candidate = payload.get("settings", payload) if isinstance(payload, dict) else {}
                 if isinstance(candidate, dict):
                     settings = candidate
@@ -538,8 +610,8 @@ class WorkspaceHistory:
                 relocated = relocated or entry["locator"] != old_locator
                 if workspace is None:
                     workspace = self._path(entry["locator"])
-                status, detail = self._health(workspace)
-                public = self._public(entry, workspace, status, detail)
+                status, detail, encoding = self._health_detailed(workspace)
+                public = self._public(entry, workspace, status, detail, encoding)
                 public["current"] = bool(current is not None and workspace == current)
                 entries.append(public)
             if relocated:
@@ -588,8 +660,8 @@ class WorkspaceHistory:
                 "version": REGISTRY_VERSION, "entries": data["entries"],
             })
             workspace = self._relocate(entry) or self._path(entry["locator"])
-            status, detail = self._health(workspace)
-            return self._public(entry, workspace, status, detail)
+            status, detail, encoding = self._health_detailed(workspace)
+            return self._public(entry, workspace, status, detail, encoding)
 
     def remove(self, workspace_id: str) -> None:
         with self.lock:
@@ -607,7 +679,11 @@ class WorkspaceHistory:
     @staticmethod
     def _public(
         entry: dict[str, Any], workspace: Path, status: str, detail: str,
+        encoding: str = CURRENT_ENCODING,
     ) -> dict[str, Any]:
+        """🔴 `encoding` 是**新增可选参数 + 新增可选键**:已有键的语义一个都没动,
+        默认值让 register() 那种"我们刚写完、必然是 UTF-8"的调用无需改动。
+        """
         locator = entry["locator"]
         return {
             "workspace_id": entry["workspace_id"],
@@ -623,5 +699,8 @@ class WorkspaceHistory:
             "favorite": bool(entry["favorite"]),
             "status": status,
             "status_detail": detail,
+            # 新增可选键:这份工作区实际读出来的编码(旧编码时前端可据此单独提示,
+            # 不看也无妨 —— 提示文本已经拼进 status_detail,而它前端已在显示)。
+            "encoding": encoding,
             "summary": dict(entry.get("summary") or {}),
         }

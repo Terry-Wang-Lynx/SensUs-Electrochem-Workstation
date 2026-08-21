@@ -11,8 +11,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import math
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pa_host.analyze import (  # noqa: E402
     analyze_current,
+    load_csv,
     estimate_psd,
     overlapping_allan_dev,
 )
@@ -230,3 +234,51 @@ def _run_all() -> int:
 if __name__ == "__main__":
     print("=== 上位机分析栈单测 ===")
     raise SystemExit(_run_all())
+
+
+def test_legacy_gbk_run_csv_loads_with_chinese_intact() -> None:
+    """旧版本写的 run CSV(中文注释头)必须能读,且中文正确还原。
+
+    现场:旧版本在中文 Windows 上把带中文的注释头按 cp936 落盘;严格 utf-8 读会在
+    那串中文上抛,而用户已积攒一批这样的文件,不能要求他们转换。
+    🔴 用 gb18030 回退而不是 errors="replace",决定的是"中文还能不能看" ——
+    实测少了那一档,`左旋多巴` 会变成一串 U+FFFD。
+
+    ⚠️ 本文件设计成无 pytest 也能跑,所以不用 capsys / pytest.approx。
+    """
+    with tempfile.TemporaryDirectory() as raw_dir:
+        csv_path = Path(raw_dir) / "旧数据.csv"
+        csv_path.write_bytes((
+            "# pA-Converter V5.1 实时采集 —— 左旋多巴标定\n"
+            "host_unix_s,seq,dev_ms,counts,fa_fw\n"
+            "1787320483.774,0,668874,7176,-18994141\n"
+            "1787320483.897,1,668997,7180,-18872070\n"
+            "1787320484.020,2,669120,7175,-19000000\n"
+        ).encode("gb18030"))
+
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            values, elapsed = load_csv(csv_path)
+
+        assert len(values) == 3 and len(elapsed) == 3
+        # fa_fw 是 fA,load_csv 返回 pA(/1000);-18994141 fA = -18994.141 pA
+        assert abs(values[0] - (-18994.141)) < 1e-3
+        assert abs(elapsed[0]) < 1e-9 and elapsed[2] > 0
+        assert "gb18030" in captured.getvalue()      # 旧编码必须有可见提示
+
+
+def test_clean_utf8_run_csv_is_not_flagged() -> None:
+    """反面样本:干净 UTF-8 不许被提示成旧编码,否则提示会变成噪声。"""
+    with tempfile.TemporaryDirectory() as raw_dir:
+        csv_path = Path(raw_dir) / "新数据.csv"
+        csv_path.write_text(
+            "# 左旋多巴\nhost_unix_s,seq,dev_ms,counts,fa_fw\n"
+            "1787320483.774,0,668874,7176,-18994141\n"
+            "1787320483.897,1,668997,7180,-18872070\n"
+            "1787320484.020,2,669120,7175,-19000000\n",
+            encoding="utf-8",
+        )
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            load_csv(csv_path)
+        assert "gb18030" not in captured.getvalue()

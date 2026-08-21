@@ -27,6 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .textio import is_legacy_encoding, read_csv_lines
+
 try:
     from scipy import signal as _scipy_signal
 except ImportError:  # pragma: no cover - 环境退化路径
@@ -302,21 +304,33 @@ def load_csv(path: Path, use_host_clock: bool = True,
     """
     ts: list[float] = []
     vals: list[float] = []
-    with path.open(newline="", encoding="utf-8") as fh:
-        # 跳过 '#' 注释行(synth.py 会写 SYNTHETIC 标记;真实记录也可能带表头注释),
-        # 否则 DictReader 会把注释当成表头。
-        rows = (ln for ln in fh if not ln.lstrip().startswith("#"))
-        for row in csv.DictReader(rows):
-            ts.append(
-                float(row["seq"]) * seq_period_ms / 1000.0 if seq_period_ms
-                else float(row["host_unix_s"]) if use_host_clock
-                else float(row["dev_ms"]) / 1000.0
-            )
-            if fsr_pa is not None and offset_pa is not None:
-                counts = float(row["counts"])
-                vals.append(offset_pa - counts * fsr_pa / 65536.0)
-            else:
-                vals.append(float(row["fa_fw"]) / 1000.0)
+    # ✅ 用户数据:collect.py 落在用户目录里的 run CSV。数据列全是数字,但 '#' 注释行
+    #    里带样品名/批次名(中文),旧版本在中文 Windows 上按 cp936 落盘 ⇒ 严格 utf-8
+    #    读会 UnicodeDecodeError,一整段实测数据就分析不出来了。
+    lines, encoding = read_csv_lines(path)
+    if is_legacy_encoding(encoding):
+        # 🔴 旧编码不静默。analyze 是"命令行 + 库"两用,没有 GUI 字段可挂提示,
+        #    唯一的用户可见通道就是 stderr;静默容错等于让人永远不知道自己手里
+        #    的数据是旧编码写的。写 stderr 不污染 stdout(可能在被管道消费)。
+        print(
+            f"[analyze] ⚠️ {path} 是旧版本以 {encoding} 编码写下的，"
+            "已按该编码正确读入；建议重新导出一份",
+            file=sys.stderr,
+        )
+    # 跳过 '#' 注释行(synth.py 会写 SYNTHETIC 标记;真实记录也可能带表头注释),
+    # 否则 DictReader 会把注释当成表头。
+    rows = (ln for ln in lines if not ln.lstrip().startswith("#"))
+    for row in csv.DictReader(rows):
+        ts.append(
+            float(row["seq"]) * seq_period_ms / 1000.0 if seq_period_ms
+            else float(row["host_unix_s"]) if use_host_clock
+            else float(row["dev_ms"]) / 1000.0
+        )
+        if fsr_pa is not None and offset_pa is not None:
+            counts = float(row["counts"])
+            vals.append(offset_pa - counts * fsr_pa / 65536.0)
+        else:
+            vals.append(float(row["fa_fw"]) / 1000.0)
     t = np.asarray(ts, dtype=float)
     return np.asarray(vals, dtype=float), t - t[0]
 

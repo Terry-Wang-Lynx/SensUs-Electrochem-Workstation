@@ -28,6 +28,7 @@ from typing import Iterable, Sequence
 import numpy as np
 
 from .filtering import apply_filter
+from .textio import read_csv_lines, read_text_tolerant
 
 
 DEFAULT_WINDOW_S = 20.0
@@ -700,13 +701,10 @@ def evaluate_platform(
     )
 
 
-def _read_csv_lines(path: Path) -> list[str]:
-    """Read current UTF-8 CSVs while retaining legacy Windows GBK files."""
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        text = path.read_text(encoding="gb18030")
-    return text.splitlines()
+# 🔴 原先这里有个本地 `_read_csv_lines`:只有两级回退(缺 errors="replace" 兜底 ⇒
+#    既非 UTF-8 也非 GBK 系的文件仍会抛),而且不返回真正用到的编码 ⇒ 调用方无法
+#    提示用户"这份是旧编码"。已删除,统一走 `textio.read_csv_lines`
+#    (filtering.py 里那份同源副本本轮不动,见交接说明)。
 
 
 def _load_run_csv_with_quality(
@@ -719,8 +717,9 @@ def _load_run_csv_with_quality(
     """
 
     path = Path(path)
+    # ✅ 用户数据:run CSV 落在用户自己的批次目录里。
     rows = list(csv.DictReader(
-        line for line in _read_csv_lines(path) if not line.startswith("#")
+        line for line in read_csv_lines(path)[0] if not line.startswith("#")
     ))
     if not rows:
         raise ValueError(f"run CSV has no data rows: {path}")
@@ -901,8 +900,9 @@ def summarize_run(path: str | Path, window_s: float = DEFAULT_WINDOW_S,
 
 def load_calibration_points(path: str | Path) -> list[CalibrationPoint]:
     path = Path(path)
+    # ✅ 用户数据:标定点 CSV,注释行/标签列可能带中文样品名。
     reader = csv.DictReader(
-        line for line in _read_csv_lines(path) if not line.startswith("#")
+        line for line in read_csv_lines(path)[0] if not line.startswith("#")
     )
     if reader.fieldnames is None:
         raise ValueError("calibration CSV has no header")
@@ -1005,8 +1005,14 @@ def save_model(model: CalibrationModel, path: str | Path) -> None:
 
 
 def load_model(path: str | Path) -> CalibrationModel:
+    # ✅ 用户数据:calibration-model.json 就在用户的工作区目录里,`_load_workspace()`
+    #    加载工作区时会读它(gui_server 的 paths["model"])。
+    # 🔴 这一处的失败样子特别隐蔽:UnicodeDecodeError 是 ValueError 的子类,而调用方
+    #    的 handler 恰好写着 `except (OSError, ValueError, json.JSONDecodeError)` ⇒
+    #    不报错、不崩,只是把 self.model 置 None ——用户**悄无声息地丢掉整条标定曲线**,
+    #    还以为是自己没拟合过。
     return CalibrationModel.from_json(
-        json.loads(Path(path).read_text(encoding="utf-8"))
+        json.loads(read_text_tolerant(Path(path))[0])
     )
 
 

@@ -155,3 +155,34 @@ def test_serial_armed_recovers_start_marker_glued_to_config_line(
     lines.close()
 
     assert instances[0].writes == [b"GET\nSTATUS\n", b"START\n"]
+
+
+def test_packaged_and_ipc_reads_stay_strict_utf8() -> None:
+    """🔴 这两处**故意**保持严格 UTF-8,不许被顺手"一起容错掉"。
+
+    分类原则(见 pa_host/textio.py 模块 docstring):容错只给**用户数据**。
+    · `firmware.json` 是随包构建产物,内容只有 rtt_address 这类 ASCII,
+      永不经过用户 locale ⇒ 解不开只意味着随包文件坏了,该立刻暴露成
+      "找不到 RTT 地址",而不是被 gb18030 静默解成乱码再报个 KeyError。
+    · 命令文件是上位机自己刚写的进程间管道,`_encode_firmware_command`
+      本来就拒收非 ASCII ⇒ 读出非 UTF-8 说明有别的东西在写它。
+
+    容错掩盖这两处 = 把"文件坏了"变成"行为诡异",排查成本高得多。
+    """
+    import ast
+
+    source = (Path(collect.__file__)).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    tolerant = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = (node.func.attr if isinstance(node.func, ast.Attribute)
+                else getattr(node.func, "id", ""))
+        if name in {"read_text_tolerant", "read_csv_lines", "read_json_tolerant"}:
+            tolerant.append(node.lineno)
+
+    assert tolerant == [], (
+        f"collect.py 出现了容错读(行 {tolerant})。若确实是用户数据请更新本测试的"
+        "判据说明;若是随包资源/内部管道,请改回严格 UTF-8。"
+    )

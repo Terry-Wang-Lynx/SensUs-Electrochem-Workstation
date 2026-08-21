@@ -92,6 +92,17 @@ def test_windows_workspace_on_another_drive_round_trips_via_absolute_anchor(
         assert locator["anchor"] == "absolute"
         assert str(registry._path(locator)) == r"D:\data\ws"
 
+        # 🔴 到这里 os.name 的伪装必须撤掉,而且不是为了让测试变松:
+        #    `_read()`/`_valid_locator()`/`_safe_absolute()` 一个都不看 os.name
+        #    (它们用 PurePosixPath+PureWindowsPath 两种 flavour 各解析一遍),
+        #    所以下面这段断言与 os.name 无关。但 os.name 是**进程级全局量**:
+        #    `pathlib.Path(x)` 会照它挑 flavour,伪装成 nt 时 Path("/var/...") 变成
+        #    WindowsPath 并把分隔符改写成 "\var\..." ⇒ 在 macOS 上读真实临时文件
+        #    直接 FileNotFoundError。这是伪装带来的假象,真 Windows 上 Path 本来就是
+        #    WindowsPath、重新包一次是空操作。断言一条没减,只是把伪装收回到真正
+        #    需要它的 `_locator()` 那两行。
+        env.undo()
+
         # 落盘再读回:_read() 不能把绝对锚点条目当非法条目静默丢掉。
         registry.registry_path.parent.mkdir(parents=True, exist_ok=True)
         registry.registry_path.write_text(
@@ -461,3 +472,211 @@ def test_history_discovers_matching_batch_directories_copied_into_workspace() ->
         )
         assert discovered["status"] == "available"
         assert discovered["workspace_root_id"] == root_id
+
+
+# ==========================================================================
+# 旧编码(中文 Windows 的 cp936/GBK)落盘的历史记录必须还能读
+#
+# 现场(2026-08-21,同事的中文 Windows):写盘当时一切正常,**重启后**加载带中文的
+# 批次历史报 `'utf-8' codec can't decode bytes in position 320-321`。
+# "重启才坏"是因为同一会话里 records 一直在内存里、文件从没被读回来过;重启后才
+# 第一次真的去读 —— 那些文件是**旧版本**写的(漏写 encoding,中文按 cp936 落盘)。
+# 写入端现已全部锁 UTF-8,但旧文件还在用户磁盘上、量很大 ⇒ 只能在读取端修,
+# 且不能要求用户转换文件。
+# ==========================================================================
+
+_LEGACY_INDEX_CSV = (
+    "finished_at,run_id,sample_name,sample_role,known_concentration_um,"
+    "steady_current_nA,state,data_path\n"
+    "1787000000,it_1,左旋多巴 6.25µM,calibration,6.25,-18.9,completed,"
+    "数据/左旋多巴-6.25.csv\n"
+    "1787000600,it_2,空白对照,calibration,0,-2.1,completed,数据/空白.csv\n"
+)
+_LEGACY_POINTS_CSV = (
+    "point_id,label,concentration_um,current_nA\n"
+    "p1,左旋多巴 6.25µM,6.25,-18.9\n"
+    "p2,空白对照,0,-2.1\n"
+)
+
+
+def _legacy_workspace(root: Path, *, encoding: str) -> Path:
+    """造一份"旧版本写下的"批次目录:目录名中文,内容按 `encoding` 落盘。"""
+    workspace = root / "左旋多巴 第一批"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "measurement-index.csv").write_bytes(
+        _LEGACY_INDEX_CSV.encode(encoding)
+    )
+    (workspace / "calibration-points.csv").write_bytes(
+        _LEGACY_POINTS_CSV.encode(encoding)
+    )
+    # 工作区里的 JSON 同样会带中文(样品名/标签),旧版本一样按 locale 落盘。
+    (workspace / "calibration-settings.json").write_bytes(
+        json.dumps({"settings": {"method": "it", "sample_name": "左旋多巴 6.25µM"}},
+                   ensure_ascii=False).encode(encoding)
+    )
+    return workspace
+
+
+def _legacy_registry_bytes(encoding: str) -> bytes:
+    payload = {
+        "version": 1,
+        "entries": [{
+            "workspace_id": "legacy-batch",
+            "locator": {"anchor": "project", "path": "左旋多巴 第一批"},
+            "label": "左旋多巴 第一批",
+            "created_at": 1787000000.0,
+            "updated_at": 1787000600.0,
+            "favorite": False,
+            "summary": {},
+        }],
+    }
+    # ensure_ascii=False 是关键:中文必须真的以该编码的**字节**存在文件里,
+    # 否则 json.dumps 会转义成 \uXXXX,整个文件退化成 ASCII,测不出编码问题。
+    return json.dumps(payload, ensure_ascii=False).encode(encoding)
+
+
+def test_legacy_gbk_history_loads_with_chinese_intact_and_a_notice() -> None:
+    """🔴 旧 GBK 编码的注册表 + 批次目录要能加载,中文要**正确还原**并给出提示。
+
+    正确还原是这条测试的重点,不是"能不能加载":上一轮这几处 CSV 读被加过
+    `errors="replace"`,加载确实不再报错,但历史列表里的中文样品名会显示成
+    `'������� 6.25�0�8M'` —— 加载得上却看不懂,等于没修。
+    """
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        workspace = _legacy_workspace(root, encoding="gb18030")
+        (root / "history.json").write_bytes(_legacy_registry_bytes("gb18030"))
+        registry = WorkspaceHistory(root / "history.json", root)
+
+        listed = registry.list()
+        entry = listed["entries"][0]
+
+        # ① 条目没被"注册表已损坏"整份丢掉,中文标签正确还原
+        assert entry["workspace_id"] == "legacy-batch"
+        assert entry["label"] == "左旋多巴 第一批"
+        assert "�" not in entry["label"]
+        # ② 旧编码不是错误:工作区照常可用
+        assert entry["status"] == "available"
+        # ③ 用户可见提示,两条通道都给到:已有的 status_detail(前端已在显示)
+        #    + 新增可选键 encoding
+        assert "旧版本" in entry["status_detail"]
+        assert "重新导出" in entry["status_detail"]
+        assert entry["encoding"] == "gb18030"
+        # ④ 注册表自身的旧编码也要说出来(前端把 registry_error 当提示条显示)
+        assert "历史注册表" in listed["registry_error"]
+        assert "gb18030" in listed["registry_error"]
+
+        # ⑤ 摘要里的中文样品名必须正确还原 —— 它直接显示在历史列表上
+        summary = WorkspaceHistory.summarize(workspace)
+        assert summary["latest_sample_name"] == "空白对照"
+        assert summary["records_count"] == 2
+        assert summary["points_count"] == 2
+        assert summary["method"] == "it"
+
+        # ⑥ _health 的二元返回必须保住:gui_server.import_history 这样解包
+        status, detail = WorkspaceHistory._health(workspace)
+        assert status == "available"
+        assert "旧版本" in detail
+
+
+def test_clean_utf8_history_is_not_flagged_as_legacy() -> None:
+    """反面样本:干净 UTF-8 不许被误报旧编码,否则提示变噪声、用户学会忽略它。"""
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        workspace = _legacy_workspace(root, encoding="utf-8")
+        (root / "history.json").write_bytes(_legacy_registry_bytes("utf-8"))
+        registry = WorkspaceHistory(root / "history.json", root)
+
+        listed = registry.list()
+        entry = listed["entries"][0]
+
+        assert entry["label"] == "左旋多巴 第一批"
+        assert entry["status"] == "available"
+        assert entry["status_detail"] == "", entry["status_detail"]
+        assert entry["encoding"] == "utf-8"
+        assert listed["registry_error"] == "", listed["registry_error"]
+        assert WorkspaceHistory.summarize(workspace)["latest_sample_name"] == "空白对照"
+
+
+# ==========================================================================
+# 机器门禁:用户数据的读不许再是严格 utf-8
+# ==========================================================================
+
+#: 🔴 作用域只限本轮改的这四个文件。别扩到全包 —— 随包资源(index.html /
+#   styles.css / prebuilt 元数据)本来就该保持严格 UTF-8,扫全包会把它们全报成
+#   违规,门禁立刻变成噪声。
+_GATED_MODULES = ("workspace_history.py", "analyze.py", "it.py", "collect.py")
+
+#: 明示豁免:这两处读的是**我们自己刚产出的文件**,不是用户数据。
+#  坏了该立刻暴露,不该被编码容错掩盖(判据见 textio.py 模块 docstring 末段)。
+_STRICT_READS_ON_PURPOSE = {
+    # 随包 prebuilt firmware.json:构建产物,内容只有 rtt_address 这类 ASCII
+    ("collect.py", "find_rtt_address"),
+    # 上位机自己写的命令文件:_encode_firmware_command 本就拒收非 ASCII
+    ("collect.py", "read_serial_lines"),
+}
+
+
+def _strict_reads(module_path: Path) -> set[tuple[str, str]]:
+    """扫出"以严格编码读文件"的调用,返回 {(文件名, 所在函数名)}。
+
+    判定:`.read_text(...)` 或读模式的 `.open(...)`,且**没带** `errors=`
+    (带 errors= 至少不会因为一个坏字节把整个工作区弄没)。写模式一律跳过 ——
+    写入端锁 UTF-8 是对的,本门禁管的是读取端。
+    """
+    import ast
+
+    tree = ast.parse(module_path.read_text(encoding="utf-8"))
+    enclosing: dict[ast.AST, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.walk(node):
+                # 嵌套函数:外层先写、内层后写 ⇒ 最终留下最内层的名字
+                enclosing[child] = node.name
+    found: set[tuple[str, str]] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr not in ("read_text", "open"):
+            continue
+        keywords = {kw.arg for kw in node.keywords}
+        if "errors" in keywords:
+            continue
+        if node.func.attr == "open":
+            mode = ""
+            if node.args and isinstance(node.args[0], ast.Constant):
+                mode = str(node.args[0].value)
+            for kw in node.keywords:
+                if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                    mode = str(kw.value.value)
+            if any(flag in mode for flag in ("w", "a", "x", "+")):
+                continue
+        found.add((module_path.name, enclosing.get(node, "<module>")))
+    return found
+
+
+def test_user_data_reads_no_longer_use_strict_utf8() -> None:
+    """门禁:这四个文件里读用户数据的地方不许再是严格 utf-8。
+
+    为什么要机器扫而不是靠人复核:这次的报错文本
+    (`'utf-8' codec can't decode bytes in position 320-321`)**分辨不出是哪个文件**
+    —— 抛它的 handler 同时包着一整批读。漏掉任何一处,现场就重演同一句报错,
+    而我们会以为已经修好了。
+    """
+    package = Path(__file__).resolve().parents[1] / "pa_host"
+    strict: set[tuple[str, str]] = set()
+    for name in _GATED_MODULES:
+        strict |= _strict_reads(package / name)
+
+    assert strict == _STRICT_READS_ON_PURPOSE, (
+        f"新增/遗漏的严格读:多出 {strict - _STRICT_READS_ON_PURPOSE}、"
+        f"少了 {_STRICT_READS_ON_PURPOSE - strict}"
+    )
+
+    # 读取端确实走了共用模块,而不是又各写一份三级回退
+    for name in ("workspace_history.py", "analyze.py", "it.py"):
+        source = (package / name).read_text(encoding="utf-8")
+        assert "from .textio import" in source, name
+    # it.py 里那份只有两级回退、且不返回编码名的重复实现必须已经删掉
+    # (查 `def `,不查裸名字 —— 删除说明里还引用着这个名字)
+    assert "def _read_csv_lines" not in (package / "it.py").read_text(encoding="utf-8")
