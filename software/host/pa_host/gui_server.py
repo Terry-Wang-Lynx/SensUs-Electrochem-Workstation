@@ -8120,11 +8120,21 @@ class AppState:
                     ]
             if paths["index"].exists():
                 try:
+                    # 🔴 `errors="replace"` + 宽 except 都是必须的,而且这是本文件里
+                    #    唯一漏掉的一处 —— 上面 100 行 paths["points"] 的读法就是对的。
+                    #    2026-08-21 现场:同事的 measurement-index.csv 含 GBK 字节
+                    #    (中文 Windows 上 filtering/cv 曾按 cp936 落盘),
+                    #    `UnicodeDecodeError` 是 **ValueError** 的子类,`except OSError`
+                    #    拦不住它 ⇒ 异常冲出 `_load_workspace()`,一路飙到构造函数的
+                    #    `except (OSError, ValueError, ...)`,于是**整个工作区**被判
+                    #    不可用:「已保存的工作区当前不可用：'utf-8' codec can't decode
+                    #    bytes in position 320-321: invalid continuation byte」。
+                    #    一个坏字节不该让人丢掉整批标定数据 —— 宁可少数字符变 U+FFFD。
                     with paths["index"].open(
-                        newline="", encoding="utf-8"
+                        newline="", encoding="utf-8", errors="replace"
                     ) as handle:
                         self.records = list(csv.DictReader(handle))
-                except OSError:
+                except (OSError, ValueError, csv.Error):
                     self.records = []
             if paths["drift"].exists():
                 try:

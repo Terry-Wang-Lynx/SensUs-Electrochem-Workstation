@@ -9,11 +9,48 @@ saved analysis uses the same transfer function the operator saw during a run.
 from __future__ import annotations
 
 import csv
+import json
 import math
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+
+
+def read_csv_lines(path: str | Path) -> tuple[list[str], str]:
+    """读取 CSV 文本行,并如实返回真正用于解码的编码名。
+
+    🔴 中文 Windows 的 locale 默认编码是 cp936(GBK)。历史版本这里漏写了
+    ``encoding=`` ⇒ 带中文的注释行以 GBK 落盘,而这些文件现在还躺在现场
+    的磁盘上。所以光把写入端锁成 UTF-8 救不了他们,读取端必须容错:
+
+    1. 先按 UTF-8 读(``utf-8-sig`` 顺手吃掉 Excel 往复后留下的 BOM);
+    2. ``UnicodeDecodeError`` 时退回 ``gb18030`` —— 能把中文**正确**还原,
+       比 ``errors="replace"`` 直接把中文烧成 U+FFFD 好得多;
+    3. 两者都不成才用 ``errors="replace"`` 兜底。
+
+    目标是让一个被污染的工作区变成"能用但有警告",而不是整个工作区
+    直接不可用(现场实例:`已保存的工作区当前不可用:'utf-8' codec ...`)。
+
+    与 ``it.py::_read_csv_lines`` 是同一套回退策略;本次改动被限制在
+    filtering/cv 两个模块内,未做合并。
+    """
+
+    path = Path(path)
+    try:
+        return path.read_text(encoding="utf-8-sig").splitlines(), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    try:
+        return path.read_text(encoding="gb18030").splitlines(), "gb18030"
+    except UnicodeDecodeError:
+        pass
+    # gb18030 覆盖面极广,走到这里说明文件既不是 UTF-8 也不是 GBK 系;
+    # 这时宁可让几个字符变成 U+FFFD,也不能让整个工作区打不开。
+    return (
+        path.read_text(encoding="utf-8", errors="replace").splitlines(),
+        "utf-8/replace",
+    )
 
 
 FILTER_DEFAULTS: dict[str, Any] = {
@@ -223,10 +260,10 @@ def write_filtered_csv(
     output = Path(output)
     if source.resolve() == output.resolve():
         raise ValueError("滤波输出必须是新文件，不能覆盖原始采集文件")
-    rows: list[dict[str, str]] = []
-    with source.open(newline="") as handle:
-        for row in csv.DictReader(line for line in handle if not line.startswith("#")):
-            rows.append(row)
+    lines, source_encoding = read_csv_lines(source)
+    rows: list[dict[str, str]] = list(
+        csv.DictReader(line for line in lines if not line.startswith("#"))
+    )
     if not rows:
         raise ValueError(f"run CSV has no data rows: {source}")
     time_s = np.asarray([float(row.get("time_s", row.get("dev_ms", 0)))
@@ -243,10 +280,25 @@ def write_filtered_csv(
         for row, sat, ovf in zip(rows, raw_sat, raw_ovf)
     ]) & np.isfinite(time_s) & np.isfinite(current)
     filtered, meta = apply_filter(time_s, current, valid, config)
+    # 解码用的编码是可复现性的一部分,一律记进 meta;不是 UTF-8 时还要把
+    # 警告顶到 note 里,否则操作员看不出这份数据来自一个被污染的文件。
+    meta["source_encoding"] = source_encoding
+    if source_encoding != "utf-8":
+        warning = f"源文件不是 UTF-8，已按 {source_encoding} 回退解码，建议重新导出"
+        meta["note"] = f"{meta['note']} · {warning}" if meta["note"] else warning
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="") as handle:
+    # 🔴 必须显式 encoding="utf-8"。meta["note"] 带中文(如"低通截止频率已限制
+    #    为奈奎斯特频率的 90%"),漏写 encoding 时中文 Windows 会按 cp936(GBK)
+    #    落盘,之后任何按 UTF-8 读这个文件的代码都在那串中文上抛
+    #    UnicodeDecodeError。macOS 默认 UTF-8 所以本地永远测不出来。
+    with output.open("w", newline="", encoding="utf-8") as handle:
         handle.write("# Host-side filtered view; raw source is preserved\n")
-        handle.write(f"# filter: {meta}\n")
+        # 原来直接把 dict 的 repr 塞进注释行(中文 + 单引号混在一起,既难解析
+        # 也难排错)。改用 JSON:ensure_ascii=False 保持中文可读(文件编码已锁
+        # UTF-8),default=str 兜住将来可能漏进 meta 的 numpy 标量。
+        handle.write(
+            f"# filter: {json.dumps(meta, ensure_ascii=False, default=str)}\n"
+        )
         writer = csv.writer(handle)
         writer.writerow([
             "time_s", "current_nA", "valid", "sat", "ovf", "raw_current_nA",

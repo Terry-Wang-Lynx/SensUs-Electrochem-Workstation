@@ -5281,6 +5281,46 @@ def test_history_curve_select_all_keeps_total_point_budget_bounded(tmp_path: Pat
     with pytest.raises(ValueError, match="最多叠加 80 条"):
         app.load_history_curves({"run_ids": [f"run-{index}" for index in range(81)]})
 
+def test_gbk_polluted_measurement_index_does_not_kill_the_workspace(
+    tmp_path: Path,
+) -> None:
+    """🔴 一个坏字节不该让人丢掉整批标定数据。
+
+    2026-08-21 现场(同事的中文 Windows):
+        已保存的工作区当前不可用：'utf-8' codec can't decode bytes in
+        position 320-321: invalid continuation byte
+
+    根因链:filtering.py/cv.py 曾在中文 Windows 上按 cp936 落盘(见那两个文件),
+    于是工作区里的 CSV 含 GBK 字节;而 `_load_workspace()` 读 measurement-index.csv
+    时是 strict utf-8 且只 `except OSError` —— 而 `UnicodeDecodeError` 是
+    **ValueError** 的子类,拦不住 ⇒ 异常冲出 `_load_workspace()`,一路到构造函数,
+    整个工作区被判不可用。
+
+    ⚠️ 与今天另外两处是**同一个形状**:异常类型不在 except 清单里。
+    """
+    workspace = tmp_path / "batch"
+    workspace.mkdir()
+    index = workspace / "measurement-index.csv"
+    # 表头 ASCII、数据行含 GBK 编码的中文样品名 —— 正是现场那种文件
+    index.write_bytes(
+        b"finished_at,run_id,sample_name,sample_role,known_concentration_um,"
+        b"steady_current_nA,predicted_concentration_um,state,data_path,raw_path\n"
+        + "1787000000,it_1,低浓度样品,calibration,6.25,-18.9,,completed,a.csv,b.csv\n"
+        .encode("gb18030")
+    )
+
+    app = AppState()
+    app.save_dir = workspace
+    app.workspace_root = tmp_path
+    app._load_workspace(create=False)          # 不抛就是通过
+
+    assert app.workspace_available, app.workspace_error
+    assert len(app.records) == 1, app.records
+    # 坏字节退化成替换字符,但**这一行数据仍然在**(数值列都是 ASCII,完好)
+    assert app.records[0]["run_id"] == "it_1"
+    assert app.records[0]["known_concentration_um"] == "6.25"
+
+
 def test_discovery_thread_survives_any_exception_type() -> None:
     """🔴 设备发现线程的兜底必须是 `except Exception`,不能是类型清单。
 

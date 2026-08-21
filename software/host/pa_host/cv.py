@@ -10,6 +10,8 @@ from typing import Any
 
 import numpy as np
 
+from .filtering import read_csv_lines
+
 
 @dataclass(frozen=True)
 class CVSummary:
@@ -29,14 +31,22 @@ class CVSummary:
     warnings: tuple[str, ...]
 
 
-def load_cv_run(path: str | Path) -> dict[str, np.ndarray]:
+def load_cv_run(path: str | Path) -> dict[str, Any]:
+    """载入 CV 原始 CSV。
+
+    🔴 返回值除了各条曲线数组,还带一个 ``source_encoding`` 字符串:现场存在
+    中文 Windows 用 cp936(GBK)落盘的历史文件,``read_csv_lines`` 会把它们
+    读回来而不是抛 ``UnicodeDecodeError``,但必须把这件事如实传下去,由
+    ``summarize_cv`` 转成用户能看到的警告。数组消费者一律按名字取键,多这个
+    标量键不影响它们。
+    """
+
     path = Path(path)
-    rows: list[dict[str, str]] = []
-    with path.open(newline="") as handle:
-        reader = csv.DictReader(line for line in handle if not line.startswith("#"))
-        if reader.fieldnames is None or "potential_mv" not in reader.fieldnames:
-            raise ValueError("文件不包含 CV 电位列")
-        rows = list(reader)
+    lines, source_encoding = read_csv_lines(path)
+    reader = csv.DictReader(line for line in lines if not line.startswith("#"))
+    if reader.fieldnames is None or "potential_mv" not in reader.fieldnames:
+        raise ValueError("文件不包含 CV 电位列")
+    rows: list[dict[str, str]] = list(reader)
     if not rows:
         empty = np.array([], dtype=float)
         return {
@@ -46,6 +56,7 @@ def load_cv_run(path: str | Path) -> dict[str, np.ndarray]:
             "cycle": np.array([], dtype=int),
             "direction": np.array([], dtype=int),
             "valid": np.array([], dtype=bool),
+            "source_encoding": source_encoding,
         }
     dev_ms = np.array([float(row["dev_ms"]) for row in rows], dtype=float)
     potential = np.array([float(row["potential_mv"]) / 1000 for row in rows])
@@ -63,6 +74,7 @@ def load_cv_run(path: str | Path) -> dict[str, np.ndarray]:
         "cycle": cycle,
         "direction": direction,
         "valid": valid,
+        "source_encoding": source_encoding,
     }
 
 
@@ -71,6 +83,12 @@ def summarize_cv(path: str | Path, settings: dict[str, Any]) -> CVSummary:
     valid = data["valid"]
     cycles_observed = int(data["cycle"].max()) if len(data["cycle"]) else 0
     warnings: list[str] = []
+    # 编码回退放在第一条:它会让人怀疑整份文件,先说清楚再说饱和点。
+    source_encoding = str(data.get("source_encoding") or "utf-8")
+    if source_encoding != "utf-8":
+        warnings.append(
+            f"原始文件不是 UTF-8，已按 {source_encoding} 回退解码，建议重新导出"
+        )
     saturated = int((~valid).sum())
     if saturated:
         warnings.append(f"{saturated} 个点饱和或 FIFO 溢出")
@@ -110,7 +128,10 @@ def export_cv_csv(raw_path: str | Path, output_path: str | Path,
     data = load_cv_run(raw_path)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="") as handle:
+    # 🔴 显式 encoding="utf-8"。目前导出内容全是 ASCII,但中文 Windows 的
+    #    locale 默认是 cp936,一旦将来往表头/参数行加中文,漏写 encoding 就会
+    #    重演"GBK 落盘、UTF-8 读不回来"那条故障链。
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
         handle.write("SensUs Electrochemistry Workstation\n")
         handle.write("Cyclic Voltammetry\n")
         handle.write(f"Init E (V) = {settings['cv_low_v']:.3f}\n")

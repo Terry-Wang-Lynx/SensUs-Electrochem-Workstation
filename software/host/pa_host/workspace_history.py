@@ -307,12 +307,16 @@ class WorkspaceHistory:
             "calibration-points.csv": {"concentration_um", "current_nA"},
             "measurement-index.csv": {"run_id", "state"},
         }
+    # 🔴 这三处读工作区 CSV 一律带 errors="replace":它们的 except 本来就拦得住
+    #    UnicodeError(不会崩),但后果是把一个只有几个坏字节的工作区标成 "corrupt"
+    #    或把记录读空 —— 用户看到的是"工作区坏了",而它其实完全可用。
+    #    坏字节的来源见 filtering.py/cv.py 的编码说明(中文 Windows 的 cp936 落盘)。
         for name, required in csv_schemas.items():
             path = workspace / name
             if not path.exists():
                 continue
             try:
-                with path.open(newline="", encoding="utf-8") as handle:
+                with path.open(newline="", encoding="utf-8", errors="replace") as handle:
                     fields = set(csv.DictReader(handle).fieldnames or ())
                 if not required.issubset(fields):
                     return "corrupt", f"{name} 缺少必需列"
@@ -329,7 +333,7 @@ class WorkspaceHistory:
         points_path = workspace / "calibration-points.csv"
         if points_path.exists():
             try:
-                with points_path.open(newline="", encoding="utf-8") as handle:
+                with points_path.open(newline="", encoding="utf-8", errors="replace") as handle:
                     point_count = sum(
                         1 for row in csv.DictReader(handle)
                         if row.get("concentration_um") not in (None, "")
@@ -351,7 +355,7 @@ class WorkspaceHistory:
         index_path = workspace / "measurement-index.csv"
         if index_path.exists():
             try:
-                with index_path.open(newline="", encoding="utf-8") as handle:
+                with index_path.open(newline="", encoding="utf-8", errors="replace") as handle:
                     records = [dict(row) for row in csv.DictReader(handle)]
             except (OSError, UnicodeError, csv.Error):
                 records = []
