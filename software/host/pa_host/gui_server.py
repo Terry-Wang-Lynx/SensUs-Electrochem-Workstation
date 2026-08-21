@@ -106,6 +106,7 @@ from .windows_jlink import (
     resolve_helper as resolve_winusb_helper,
 )
 from .jlink_usb import discover_jlink_usb_devices, set_diagnostics_sink
+from .textio import read_csv_lines, read_text_tolerant
 
 _IS_WIN = sys.platform == "win32"
 
@@ -453,7 +454,7 @@ NCS_VENV_ACTIVATE = Path(_configured_activate).expanduser() if (
 
 def _firmware_source() -> str:
     try:
-        payload = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        payload = json.loads(read_text_tolerant(SETTINGS_PATH)[0])
         source = str(payload.get("firmware_source") or "")
         return source if source in {"build", "prebuilt"} else ""
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -2732,7 +2733,7 @@ class FilterController:
         self.settings = dict(FILTER_DEFAULTS)
         if FILTER_SETTINGS_PATH.exists():
             try:
-                loaded = json.loads(FILTER_SETTINGS_PATH.read_text(encoding="utf-8"))
+                loaded = json.loads(read_text_tolerant(FILTER_SETTINGS_PATH)[0])
                 self.settings = validate_filter_config(
                     loaded.get("settings", loaded) if isinstance(loaded, dict) else {}
                 )
@@ -2774,7 +2775,7 @@ class PlateauController:
         self.settings = PlateauConfig.validate(None)
         if PLATEAU_SETTINGS_PATH.exists():
             try:
-                loaded = json.loads(PLATEAU_SETTINGS_PATH.read_text(encoding="utf-8"))
+                loaded = json.loads(read_text_tolerant(PLATEAU_SETTINGS_PATH)[0])
                 raw = loaded.get("settings", loaded) if isinstance(loaded, dict) else {}
                 self.settings = PlateauConfig.validate(raw)
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -2854,7 +2855,7 @@ class SettingsController:
         self._saved_firmware_source = "build"
         if SETTINGS_PATH.exists():
             try:
-                saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                saved = json.loads(read_text_tolerant(SETTINGS_PATH)[0])
                 if not isinstance(saved, dict):
                     raise ValueError("settings file must contain an object")
                 saved_settings = saved.get("settings", saved)
@@ -7718,6 +7719,9 @@ class AppState:
         self.workspace_root: Path | None = None
         self.workspace_available = False
         self.workspace_error = ""
+        # 工作区索引实际用的编码。旧版本(漏写 encoding)在中文 Windows 上会把中文
+        # 样品名按 cp936 落盘;现在能正确读回,但要让用户知道该重新导出。
+        self.workspace_encoding = "utf-8"
         self.model: CalibrationModel | None = None
         self.model_path: Path | None = None
         self.model_settings: dict[str, Any] | None = None
@@ -7741,7 +7745,7 @@ class AppState:
         self.latest_workflow_result: dict[str, Any] | None = None
         if WORKFLOW_PATH.exists():
             try:
-                saved = json.loads(WORKFLOW_PATH.read_text(encoding="utf-8"))
+                saved = json.loads(read_text_tolerant(WORKFLOW_PATH)[0])
                 raw_save_dir = str(saved.get("save_dir") or "").strip()
                 if not raw_save_dir:
                     raise ValueError("已保存的工作区路径为空")
@@ -7990,6 +7994,9 @@ class AppState:
             self.workspace_root = self._workspace_root_for(save_dir)
         self.workspace_available = True
         self.workspace_error = ""
+        # 🔴 必须复位:否则切换工作区时,上一个工作区的旧编码标记会留在这里,
+        #    让一个干净的新批次也被提示"是旧编码写的"。
+        self.workspace_encoding = "utf-8"
         paths = self._workspace_paths()
         with self.lock:
             self.points = []
@@ -8038,7 +8045,7 @@ class AppState:
             if paths["settings"].exists():
                 try:
                     saved_calibration_settings = json.loads(
-                        paths["settings"].read_text(encoding="utf-8")
+                        read_text_tolerant(paths["settings"])[0]
                     )
                     # Before these controls existed, firmware always stepped from 0 V
                     # immediately. Preserve that historical protocol instead of
@@ -8056,7 +8063,7 @@ class AppState:
             ):
                 try:
                     saved_plateau = json.loads(
-                        paths["plateau"].read_text(encoding="utf-8")
+                        read_text_tolerant(paths["plateau"])[0]
                     )
                     raw_plateau = (
                         saved_plateau.get("settings", saved_plateau)
@@ -8068,7 +8075,7 @@ class AppState:
             if paths["filter"].exists():
                 try:
                     saved_filter = json.loads(
-                        paths["filter"].read_text(encoding="utf-8")
+                        read_text_tolerant(paths["filter"])[0]
                     )
                     self.calibration_filter = validate_filter_config(
                         saved_filter.get("settings", saved_filter)
@@ -8091,7 +8098,7 @@ class AppState:
                 if paths["selection"].exists():
                     try:
                         selection = json.loads(
-                            paths["selection"].read_text(encoding="utf-8")
+                            read_text_tolerant(paths["selection"])[0]
                         )
                         known_ids = {record["point_id"] for record in self.point_records}
                         self.selected_point_ids = [
@@ -8130,16 +8137,17 @@ class AppState:
                     #    不可用:「已保存的工作区当前不可用：'utf-8' codec can't decode
                     #    bytes in position 320-321: invalid continuation byte」。
                     #    一个坏字节不该让人丢掉整批标定数据 —— 宁可少数字符变 U+FFFD。
-                    with paths["index"].open(
-                        newline="", encoding="utf-8", errors="replace"
-                    ) as handle:
-                        self.records = list(csv.DictReader(handle))
+                    # 旧编码用 gb18030 **正确还原**中文,而不是 errors="replace"
+                    # 把中文烧成一串 U+FFFD —— 用户的中文样品名必须能看。
+                    index_lines, index_encoding = read_csv_lines(paths["index"])
+                    self.records = list(csv.DictReader(index_lines))
+                    self.workspace_encoding = index_encoding
                 except (OSError, ValueError, csv.Error):
                     self.records = []
             if paths["drift"].exists():
                 try:
                     saved_drift = json.loads(
-                        paths["drift"].read_text(encoding="utf-8")
+                        read_text_tolerant(paths["drift"])[0]
                     )
                     if isinstance(saved_drift, dict):
                         self.drift = {**self._empty_drift(), **saved_drift}
@@ -8148,7 +8156,7 @@ class AppState:
             if paths["validation"].exists():
                 try:
                     saved_validation = json.loads(
-                        paths["validation"].read_text(encoding="utf-8")
+                        read_text_tolerant(paths["validation"])[0]
                     )
                     raw_points = (saved_validation.get("points", saved_validation)
                                   if isinstance(saved_validation, dict) else {})
@@ -8177,7 +8185,7 @@ class AppState:
 
             if paths["runtime"].exists():
                 try:
-                    runtime = json.loads(paths["runtime"].read_text(encoding="utf-8"))
+                    runtime = json.loads(read_text_tolerant(paths["runtime"])[0])
                     if not isinstance(runtime, dict):
                         raise ValueError("workspace state must be an object")
                     self.workspace_runtime_settings = SettingsController.validate(
@@ -8193,6 +8201,17 @@ class AppState:
                     self.workspace_runtime_settings = None
                     self.workspace_runtime_filter = None
                     self.workspace_runtime_plateau = None
+        # 🔴 旧编码**不是错误**:工作区可用,数据也已按正确编码读回,只是要让用户
+        #    知道该重新导出。复用 workspace_error 是因为前端已经在显示它
+        #    (见 _WORKSPACE_STATE_FIELDS),不必新增字段;而静默容错等于让人
+        #    永远不知道自己手里的数据是旧编码。放在函数末尾:此时所有读都已完成。
+        if self.workspace_available and not self.workspace_error:
+            from .textio import is_legacy_encoding
+            if is_legacy_encoding(self.workspace_encoding):
+                self.workspace_error = (
+                    f"本批次记录是旧版本以 {self.workspace_encoding} 编码写下的，"
+                    "已按该编码正确读入；建议重新导出一份，以免其它工具误读"
+                )
 
     _WORKSPACE_STATE_FIELDS = (
         "save_dir", "workspace_root", "workspace_available", "workspace_error",
@@ -9090,13 +9109,15 @@ class AppState:
         """Add new index columns without corrupting rows written by older releases."""
         if not path.exists() or path.stat().st_size == 0:
             return list(required_fields), False
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            existing_fields = list(reader.fieldnames or [])
-            missing = [field for field in required_fields if field not in existing_fields]
-            if not missing:
-                return existing_fields, False
-            rows = list(reader)
+        # 🔴 本函数 docstring 就写着"不要弄坏旧版本写的行" —— 那首先得能**读**
+        #    旧版本写的行:旧版若干处漏写 encoding,中文样品名按 cp936 落盘。
+        lines, _ = read_csv_lines(path)
+        reader = csv.DictReader(lines)
+        existing_fields = list(reader.fieldnames or [])
+        missing = [field for field in required_fields if field not in existing_fields]
+        if not missing:
+            return existing_fields, False
+        rows = list(reader)
 
         migrated_fields = [*existing_fields, *missing]
         temporary_path: Path | None = None
@@ -9132,8 +9153,7 @@ class AppState:
         ]
         fields, migrated = self._ensure_measurement_index_schema(path, required_fields)
         if migrated:
-            with path.open(newline="", encoding="utf-8") as handle:
-                self.records = list(csv.DictReader(handle))
+            self.records = list(csv.DictReader(read_csv_lines(path)[0]))
         row = {key: result.get(key, "") for key in fields}
         measurement_settings = result.get("measurement_settings")
         row["measurement_settings_json"] = (

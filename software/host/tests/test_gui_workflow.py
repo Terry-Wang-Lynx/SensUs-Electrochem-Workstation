@@ -5281,6 +5281,79 @@ def test_history_curve_select_all_keeps_total_point_budget_bounded(tmp_path: Pat
     with pytest.raises(ValueError, match="最多叠加 80 条"):
         app.load_history_curves({"run_ids": [f"run-{index}" for index in range(81)]})
 
+def test_legacy_gbk_workspace_loads_with_chinese_intact_and_a_notice(
+    tmp_path: Path,
+) -> None:
+    """🔴 旧版本写的中文记录必须能加载,而且中文要**正确还原**。
+
+    现场(同事的中文 Windows)的关键细节:
+        「用 GUI + 落盘,即使文件名和数据点名称带中文都没问题;
+          **重启电脑后**,加载带中文的批次历史就报
+          'utf-8' codec can't decode bytes in position 320-321」
+
+    "重启才坏"不是操作系统状态变了 —— 同一次会话里 `self.records` 一直在内存里
+    (`_append_record` 写盘的同时也 append 到内存),GUI 显示的历史来自内存,
+    **文件从来没被读回来过**;重启后 `_load_workspace()` 才第一次真的去读。
+    ⇒ 所以这条测试必须走 `_load_workspace()`,而不是只测解码函数。
+
+    用户已经积攒了一批旧编码数据,所以**不能要求他们转换文件**:
+    回退到 gb18030 要把中文**正确还原**,不是 errors="replace" 烧成 U+FFFD。
+    """
+    workspace = tmp_path / "旧批次"
+    workspace.mkdir()
+    header = (
+        "finished_at,run_id,sample_name,sample_role,known_concentration_um,"
+        "steady_current_nA,predicted_concentration_um,state,data_path,raw_path\n"
+    )
+    rows = (
+        "1787000000,it_1,左旋多巴 6.25µM,calibration,6.25,-18.9,,completed,"
+        "数据/左旋多巴-6.25.csv,原始/左旋多巴-6.25.csv\n"
+        "1787000600,it_2,空白对照,calibration,0,-2.1,,completed,"
+        "数据/空白.csv,原始/空白.csv\n"
+    )
+    # 🔴 关键:整份文件按 GBK 落盘 —— 这就是旧版本在中文 Windows 上产出的样子
+    (workspace / "measurement-index.csv").write_bytes(
+        (header + rows).encode("gb18030")
+    )
+
+    app = AppState()
+    app.save_dir = workspace
+    app.workspace_root = tmp_path
+    app._load_workspace(create=False)          # 不抛就是通过
+
+    assert app.workspace_available
+    assert len(app.records) == 2, app.records
+    # 中文**正确还原**,不是替换字符
+    assert app.records[0]["sample_name"] == "左旋多巴 6.25µM"
+    assert app.records[1]["sample_name"] == "空白对照"
+    assert "\ufffd" not in app.records[0]["sample_name"]
+    # 中文路径也要还原(旧版本连 data_path 都是 GBK)
+    assert app.records[0]["data_path"] == "数据/左旋多巴-6.25.csv"
+    # 用户可见提示:能用,但要知道该重新导出
+    assert app.workspace_encoding == "gb18030"
+    assert "旧版本" in app.workspace_error and "重新导出" in app.workspace_error
+
+
+def test_clean_utf8_workspace_is_not_flagged_as_legacy(tmp_path: Path) -> None:
+    """反面样本:干净的 UTF-8 工作区不许被误报旧编码(否则提示会变成噪声)。"""
+    workspace = tmp_path / "新批次"
+    workspace.mkdir()
+    (workspace / "measurement-index.csv").write_text(
+        "finished_at,run_id,sample_name,sample_role,known_concentration_um,"
+        "steady_current_nA,predicted_concentration_um,state,data_path,raw_path\n"
+        "1787000000,it_1,左旋多巴,calibration,6.25,-18.9,,completed,a.csv,b.csv\n",
+        encoding="utf-8",
+    )
+    app = AppState()
+    app.save_dir = workspace
+    app.workspace_root = tmp_path
+    app._load_workspace(create=False)
+
+    assert app.records[0]["sample_name"] == "左旋多巴"
+    assert app.workspace_encoding in ("utf-8", "utf-8-sig")
+    assert app.workspace_error == "", app.workspace_error
+
+
 def test_gbk_polluted_measurement_index_does_not_kill_the_workspace(
     tmp_path: Path,
 ) -> None:
