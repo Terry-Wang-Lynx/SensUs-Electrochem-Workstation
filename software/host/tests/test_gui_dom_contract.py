@@ -27,6 +27,17 @@ def _extract_js_function(source: str, name: str) -> str:
     raise AssertionError(f"Unterminated JavaScript function: {name}")
 
 
+def _extract_js_const(source: str, name: str) -> str:
+    """取出 `const NAME=...;` 整行,原样注入 node 脚本。
+
+    `_evaluate_chart_js` 只会摘函数,而被测函数常引用模块级常量(调色板、角色表)。
+    照抄源码里的那一行,测试用到的就是**真值**,不是复制一份会跟着漂的字面量。
+    """
+    match = re.search(rf"^const {name}=.*$", source, re.MULTILINE)
+    assert match, f"app.js 里找不到 const {name}"
+    return match.group(0)
+
+
 def _evaluate_chart_js(names: list[str], setup: str, result: str) -> object:
     return _evaluate_gui_js("app.js", names, setup, result)
 
@@ -1544,6 +1555,114 @@ def test_checkbox_reset_has_zero_specificity_and_precedes_component_rules() -> N
     # 组件侧刻意设定的尺寸必须仍然存在(否则复选框会退回浏览器默认大小)
     for component in ('.point-selector{width:16px', '.checkbox-row input{width:16px'):
         assert component in css, f"{component} 被删了 —— 复位规则不负责恢复这些尺寸"
+
+
+def test_history_curve_entries_carry_the_concentration_and_the_sample_name() -> None:
+    """历史曲线条目必须同时给出样品名与浓度。
+
+    2026-08-21 现场反馈:「历史曲线只有编号没有浓度」+「显示一下样品名称」。
+    根因是样品名在实测里就是流水编号(归档索引里是 1/2/3/4),而浓度存在
+    `known_concentration_um` 里却从没进过这个列表的 payload —— 于是同一批次
+    四个标定点在界面上长得一模一样,只能靠时间戳分辨。
+    """
+    html = (GUI_DIR / "index.html").read_text(encoding="utf-8")
+    css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+    rows = [
+        {"sample_name": "1", "sample_role": "calibration",
+         "known_concentration_um": 6.25, "finished_at": 0},
+        {"sample_name": "3", "sample_role": "calibration",
+         "known_concentration_um": 25.0, "finished_at": 0},
+        {"sample_name": "未知样品 01", "sample_role": "test",
+         "known_concentration_um": None, "finished_at": 0},
+        {"sample_name": "", "run_id": "it_1", "sample_role": "cv",
+         "known_concentration_um": "", "finished_at": 0},
+        {"sample_name": "脏值", "sample_role": "test",
+         "known_concentration_um": "abc", "finished_at": 0},
+    ]
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    evaluated = _evaluate_chart_js(
+        ["historyTimestamp", "concentrationLabel", "historyCurveTitle",
+         "historyCurveDetail"],
+        f"{_extract_js_const(app, 'HISTORY_CURVE_ROLES')}\nconst rows={json.dumps(rows)};",
+        "rows.map(r=>[historyCurveTitle(r),historyCurveDetail(r).split(' · ')[0]])",
+    )
+
+    assert evaluated == [
+        ["1 · 6.25 µM", "标定"],
+        ["3 · 25 µM", "标定"],          # 25.0 不能显示成 "25.0 µM"
+        ["未知样品 01", "测试"],          # 无浓度时只留名字,不留一个空的 " · "
+        ["it_1", "CV"],                 # 名字为空才回落到 run_id
+        ["脏值", "测试"],                # 脏值不能变成 "NaN µM"
+    ]
+    assert 'id="historyCurveLegend"' in html
+    # 两行版式:标题(名+浓度)与副行(角色+时间)分开,否则一格 232px 装不下会重新挤在一起
+    assert ".history-curve-option>span{display:grid" in css
+    assert ".history-curve-option small{" in css
+
+
+def test_history_curve_legend_rules_outrank_the_generic_chart_legend_rules() -> None:
+    """图例规则必须带 `.chart-legend` 前缀,否则完全不生效。
+
+    同文件里 `.chart-legend span{display:flex}` 与 `.chart-legend i{width:6px...}`
+    都是 (0,1,1),裸类名 `.history-curve-legend` 只有 (0,1,0) —— **与顺序无关**地输。
+    实测踩过:第一版写成裸类名,`display:contents` 被 `display:flex` 盖掉,
+    整组图例被塞进一个 flex 项里。
+    """
+    css = (GUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert ".chart-legend .history-curve-legend{display:contents}" in css
+    assert ".chart-legend .history-curve-swatch{" in css
+    for bare in re.finditer(r"(?<!\.chart-legend )\.history-curve-(legend|swatch)\{", css):
+        raise AssertionError(f"图例规则缺 .chart-legend 前缀,赢不过 (0,1,1):{bare.group(0)}")
+    # 叠加曲线可以选到 80 条,图例必须能换行并靠右收,否则会向左溢出画布
+    legend_rule = css[css.index(".chart-legend{"):css.index(".chart-legend{") + 260]
+    assert "flex-wrap:wrap" in legend_rule and "justify-content:flex-end" in legend_rule
+    assert "max-width:calc(100% - 56px)" in legend_rule
+
+
+def test_overlaid_history_curves_share_one_palette_with_their_legend() -> None:
+    """线的颜色与图例色块必须取同一个数组同一个下标。
+
+    图例指错曲线比没有图例更糟,而这在实现上只需要有人在 drawAll 里复制一份
+    调色板字面量就会发生。同理,叠加集合只能算一次:两处各自 filter 会在
+    "method 是 cv 但这一轮没有电位数据" 时选到不同的集合。
+    """
+    app = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    draw = _extract_js_function(app, "drawAll")
+    legend = _extract_js_function(app, "renderHistoryCurveLegend")
+
+    assert "const HISTORY_CURVE_COLORS=[" in app
+    assert "'#8b6f5a'" not in draw, "drawAll 里又出现了内联调色板字面量"
+    pick = "HISTORY_CURVE_COLORS[index%HISTORY_CURVE_COLORS.length]"
+    assert draw.count(pick) == 2, "IT/CV 两支都必须用共享调色板"
+    assert pick in legend
+    assert draw.count("state.historyCurves.filter(") == 1, "叠加集合只能算一次"
+    assert "renderHistoryCurveLegend(overlays)" in draw
+
+    # 调色板 6 色,第 7 条起会撞色 ⇒ 图例最多列 6 条,多出来的只报条数、不给色块
+    palette = json.loads(
+        _extract_js_const(app, "HISTORY_CURVE_COLORS")
+        .split("=", 1)[1].rstrip(";").replace("'", '"')
+    )
+    rendered = _evaluate_chart_js(
+        ["concentrationLabel", "historyCurveTitle", "renderHistoryCurveLegend"],
+        _extract_js_const(app, "HISTORY_CURVE_COLORS") + """
+const box={children:[],replaceChildren(){this.children=[]},appendChild(n){this.children.push(n)}};
+const $=()=>box;
+const document={createElement:()=>({className:'',style:{},parts:[],
+  append(...n){this.parts.push(...n)},set textContent(v){this.parts.push(v)}}),
+  createTextNode:value=>value};
+renderHistoryCurveLegend(Array.from({length:9},(_,i)=>({sample_name:`s${i}`,known_concentration_um:i})));
+""",
+        "box.children.map(c=>c.parts.map(p=>typeof p==='string'?p:p.style.background))",
+    )
+
+    assert len(rendered) == len(palette) + 1, "每色一个色块 + 1 条溢出计数"
+    assert rendered[0] == [palette[0], "s0 · 0 µM"]
+    assert rendered[len(palette) - 1] == [
+        palette[-1], f"s{len(palette) - 1} · {len(palette) - 1} µM",
+    ]
+    assert rendered[-1] == [f"+{9 - len(palette)} 条"]
 
 
 def test_update_check_failure_is_visible_without_a_known_update() -> None:

@@ -47,7 +47,7 @@
         <div class="workspace-grid">
           <section class="panel chart-panel">
             <div class="panel-head"><div><h2 id="chartTitle">I-T 计时电流曲线</h2><p id="measureMessage">等待开始测量</p></div><div class="chart-actions"><div class="live-current" id="liveCurrentBox"><span>实时电流</span><strong id="liveCurrent">--</strong><small id="liveCurrentUnit">nA</small><em id="liveCurrentTime">尚无数据</em></div><button class="secondary" id="toggleHistoryCurves" type="button">历史曲线</button><div class="segmented" id="chartWindow"><button class="active" data-window="300">300 s</button><button data-window="20">20 s</button><button data-window="5">5 s</button></div><div class="live-badge" id="liveBadge">待机</div></div></div>
-            <div class="chart-wrap"><canvas id="itChart" aria-label="IT 电流时间曲线"></canvas><div class="chart-legend"><span><i class="valid-point"></i>有效点</span><span><i class="invalid-point"></i>异常点</span></div><div class="empty-chart" id="chartEmpty">开始测量后显示实时电流</div></div>
+            <div class="chart-wrap"><canvas id="itChart" aria-label="IT 电流时间曲线"></canvas><div class="chart-legend"><span><i class="valid-point"></i>有效点</span><span><i class="invalid-point"></i>异常点</span><span class="history-curve-legend" id="historyCurveLegend"></span></div><div class="empty-chart" id="chartEmpty">开始测量后显示实时电流</div></div>
             <div class="metric-strip">
               <div><span id="metricPrimaryLabel">稳态电流</span><strong id="steadyCurrent">--</strong><small id="metricPrimaryUnit">nA</small><em class="metric-note" id="metricPrimaryNote">等待测量</em></div>
               <div><span id="metricSecondaryLabel">噪声水平</span><strong id="steadySd">--</strong><small id="metricSecondaryUnit">nA</small><em class="metric-note" id="metricSecondaryNote">等待测量</em></div>

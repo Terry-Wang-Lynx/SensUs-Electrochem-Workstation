@@ -584,6 +584,22 @@ OFFSET_OPTIONS = {
 SENS_PERIOD_MS = {0: 124, 1: 242, 2: 476, 3: 945, 4: 1882, 5: 3757}
 
 
+def _finite_float_or_none(value: object) -> float | None:
+    """把记录里的数值字段折成 float 或 None。
+
+    `self.records` 直接来自 `csv.DictReader`,所以浓度这类字段是**字符串**,
+    未填时是空串;老索引里还可能完全没有这一列。JSON 里必须落成 null 而不是
+    ""/NaN —— 前端用 Number.isFinite 判断要不要显示,NaN 会被显示成 "NaN µM"。
+    """
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
 def _port_accepts_connections(port: int) -> bool:
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.2):
@@ -8629,6 +8645,11 @@ class AppState:
                     "sample_name": str(record.get("sample_name") or "未命名样品"),
                     "sample_role": str(record.get("sample_role") or ""),
                     "finished_at": record.get("finished_at"),
+                    # 浓度是这个列表里唯一能区分同一批次各点的量:样品名常被填成
+                    # 流水编号(实测索引里就是 1/2/3/4),不带浓度等于没有信息。
+                    "known_concentration_um": _finite_float_or_none(
+                        record.get("known_concentration_um")
+                    ),
                     "steady_current_nA": record.get("steady_current_nA"),
                     "measurement_settings_json": record.get("measurement_settings_json", ""),
                 })
@@ -8664,6 +8685,9 @@ class AppState:
                     "sample_name": str(record.get("sample_name") or run_id),
                     "sample_role": str(record.get("sample_role") or ""),
                     "finished_at": record.get("finished_at"),
+                    "known_concentration_um": _finite_float_or_none(
+                        record.get("known_concentration_um")
+                    ),
                     **curve,
                 })
         return {"curves": curves}

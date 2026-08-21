@@ -5281,6 +5281,52 @@ def test_history_curve_select_all_keeps_total_point_budget_bounded(tmp_path: Pat
     with pytest.raises(ValueError, match="最多叠加 80 条"):
         app.load_history_curves({"run_ids": [f"run-{index}" for index in range(81)]})
 
+def test_history_curve_payloads_carry_the_known_concentration(tmp_path: Path) -> None:
+    """两个历史曲线接口都必须带浓度,且脏值一律落成 None。
+
+    2026-08-21 现场反馈:「历史曲线只有编号没有浓度」。样品名在实测里就是流水编号
+    (归档索引 `docs/归档/measurement-index.csv` 里是 1/2/3/4),浓度存在
+    `known_concentration_um` 却从没进过 payload。
+
+    🔴 `self.records` 直接来自 `csv.DictReader`,所以这一列是**字符串**:未填是空串,
+    老索引可能整列缺失,手改过的文件可能是脏值。JSON 里必须是 null 而不是 ""/NaN ——
+    前端用 Number.isFinite 判断要不要显示,NaN 会被渲染成 "NaN µM"。
+    """
+    app = AppState()
+    app.save_dir = tmp_path / "concentration"
+    app._load_workspace()
+    app.records = [
+        {"run_id": "a", "state": "completed", "data_path": "a.csv", "sample_name": "1",
+         "sample_role": "calibration", "finished_at": "1785000000",
+         "known_concentration_um": "6.25"},
+        {"run_id": "b", "state": "completed", "data_path": "b.csv", "sample_name": "2",
+         "sample_role": "test", "finished_at": "1785000600",
+         "known_concentration_um": ""},
+        {"run_id": "c", "state": "completed", "data_path": "c.csv", "sample_name": "3",
+         "sample_role": "test", "finished_at": "1785001200",
+         "known_concentration_um": "abc"},
+        {"run_id": "d", "state": "completed", "data_path": "d.csv", "sample_name": "4",
+         "sample_role": "test", "finished_at": "1785001800"},          # 老索引缺这一列
+    ]
+
+    catalog = {
+        curve["run_id"]: curve["known_concentration_um"]
+        for curve in app.history_curves_snapshot()["curves"]
+    }
+    assert catalog == {"a": 6.25, "b": None, "c": None, "d": None}
+
+    with patch.object(app, "_curve_from_record", return_value={
+        "method": "it", "time_s": [0.0], "current_nA": [1.0], "valid": [True],
+    }):
+        loaded = app.load_history_curves({"run_ids": ["a", "b"]})
+
+    # 图上的图例也要用浓度,所以 load 接口同样必须带
+    assert [
+        (curve["sample_name"], curve["known_concentration_um"])
+        for curve in loaded["curves"]
+    ] == [("1", 6.25), ("2", None)]
+
+
 def test_is_busy_does_not_block_on_the_state_lock() -> None:
     """`is_busy()` 必须能在 self.lock 被别人持有时立刻返回。
 

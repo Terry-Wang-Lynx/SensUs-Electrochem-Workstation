@@ -593,9 +593,36 @@ async function openWorkspaceHistory(entry){
 $('historyFavoritesOnly').addEventListener('change',()=>renderWorkspaceHistory());
 $('refreshWorkspaceHistory').addEventListener('click',()=>void refreshWorkspaceHistory());
 
-function historyCurveLabel(curve){
-  const at=historyTimestamp(curve.finished_at),role={calibration:'标定',test:'测试',stabilization:'稳定化',cv:'CV'}[curve.sample_role]||curve.sample_role||'测量';
-  return `${curve.sample_name||curve.run_id} · ${role} · ${at}`;
+// 叠加曲线的配色。🔴 图上的线、列表/图例的色块必须取同一个数组同一个下标,
+// 否则图例会指错曲线 —— 那比没有图例更糟。调色板只有 6 色,第 7 条起会撞色,
+// 所以图例最多列 6 条,多出来的只报条数、不给色块。
+const HISTORY_CURVE_COLORS=['#8b6f5a','#766f9b','#5b8792','#9a6d7e','#6e8b65','#a7844c'];
+const HISTORY_CURVE_ROLES={calibration:'标定',test:'测试',stabilization:'稳定化',cv:'CV'};
+function concentrationLabel(value){
+  const numeric=Number(value);
+  // 后端把缺失折成 null;这里还要挡住 ''/undefined/NaN,否则会显示成 "NaN µM"
+  return value===null||value===undefined||value===''||!Number.isFinite(numeric)?'':`${numeric} µM`;
+}
+// 样品名在实测里常被填成流水编号(1/2/3/4),所以浓度必须一起显示,否则这个列表
+// 分不出同一批次的各个点。
+function historyCurveTitle(curve){
+  const name=curve.sample_name||curve.run_id,concentration=concentrationLabel(curve.known_concentration_um);
+  return concentration?`${name} · ${concentration}`:name;
+}
+function historyCurveDetail(curve){
+  const role=HISTORY_CURVE_ROLES[curve.sample_role]||curve.sample_role||'测量';
+  return `${role} · ${historyTimestamp(curve.finished_at)}`;
+}
+function renderHistoryCurveLegend(overlays){
+  const box=$('historyCurveLegend');if(!box)return;
+  box.replaceChildren();
+  overlays.slice(0,HISTORY_CURVE_COLORS.length).forEach((curve,index)=>{
+    const item=document.createElement('span'),swatch=document.createElement('i');
+    swatch.className='history-curve-swatch';swatch.style.background=HISTORY_CURVE_COLORS[index%HISTORY_CURVE_COLORS.length];
+    item.append(swatch,document.createTextNode(historyCurveTitle(curve)));box.appendChild(item);
+  });
+  const hidden=overlays.length-HISTORY_CURVE_COLORS.length;
+  if(hidden>0){const more=document.createElement('span');more.textContent=`+${hidden} 条`;box.appendChild(more)}
 }
 function syncHistoryCurveSelectAll(){
   const toggle=$('selectAllHistoryCurves'),inputs=[...$('historyCurveList').querySelectorAll('input[type="checkbox"]')],selected=inputs.filter(input=>input.checked).length;
@@ -606,8 +633,11 @@ function renderHistoryCurves(){
   if(!state.historyCurveCatalog.length){const empty=document.createElement('span');empty.textContent='当前批次还没有可叠加的已完成曲线';list.appendChild(empty);syncHistoryCurveSelectAll();return}
   state.historyCurveCatalog.forEach(curve=>{
     const label=document.createElement('label'),input=document.createElement('input'),text=document.createElement('span');
+    const title=document.createElement('strong'),detail=document.createElement('small');
     label.className='history-curve-option';input.type='checkbox';input.value=curve.run_id;input.checked=state.historyCurveIds.includes(curve.run_id);
-    input.addEventListener('change',()=>void selectHistoryCurves());text.textContent=historyCurveLabel(curve);label.append(input,text);list.appendChild(label);
+    input.addEventListener('change',()=>void selectHistoryCurves());
+    title.textContent=historyCurveTitle(curve);detail.textContent=historyCurveDetail(curve);
+    text.append(title,detail);label.append(input,text);list.appendChild(label);
   });
   syncHistoryCurveSelectAll();
 }
@@ -868,12 +898,17 @@ function drawAll(){
   const d=(!state.measurement?.busy&&!live.current_nA?.length&&preview)?preview:live;
   const current = d.current_nA || [], allSeries=[];
   const filtered = filterValues(d.time_s || current.map((_,i)=>i), current, d.valid).values;
-  if(state.method==='cv' && d.potential_v){
+  // 叠加集合在这里算一次,下面画线与图例共用 —— 两处各自 filter 会在
+  // "method 是 cv 但这一轮没有电位数据"时选到不同的集合,图例就会指错曲线。
+  const cvMode=Boolean(state.method==='cv' && d.potential_v);
+  const overlays=state.historyCurves.filter(curve=>curve.method===(cvMode?'cv':'it'));
+  renderHistoryCurveLegend(overlays);
+  if(cvMode){
     const maxCycle=Math.max(0,...(d.cycle||[]));
     const keep=state.chartWindowS===null?Infinity:state.chartWindowS;
     const firstCycle=Math.max(1,maxCycle-keep+1);
-    state.historyCurves.filter(curve=>curve.method==='cv').forEach((curve,index)=>{
-      const color=['#8b6f5a','#766f9b','#5b8792','#9a6d7e','#6e8b65','#a7844c'][index%6],values=filterValues(curve.time_s||curve.potential_v,curve.current_nA||[],curve.valid).values;
+    overlays.forEach((curve,index)=>{
+      const color=HISTORY_CURVE_COLORS[index%HISTORY_CURVE_COLORS.length],values=filterValues(curve.time_s||curve.potential_v,curve.current_nA||[],curve.valid).values;
       const cycles=[...new Set(curve.cycle||[])];cycles.forEach(cycle=>{const points=[];(curve.potential_v||[]).forEach((potential,i)=>{if(curve.cycle?.[i]===cycle&&curve.valid?.[i]!==false)points.push([potential,Number(values[i])/1000])});if(points.length)allSeries.push({points,color,width:.8,alpha:.72})});
     });
     for(let cycle=firstCycle;cycle<=maxCycle;cycle++){
@@ -896,8 +931,8 @@ function drawAll(){
     const duration=Number(state.measurement?.settings?.duration_s||state.settings?.settings?.duration_s||180),adaptive=Boolean(state.measurement?.settings?.adaptive_stop??state.settings?.settings?.adaptive_stop),latest=rawPoints.at(-1)?.[0]||0;
     if(state.chartWindowFixed){while(latest>state.chartWindowS)state.chartWindowS+=100}
     const xmin=state.chartWindowFixed?0:Math.max(0,latest-state.chartWindowS),xmax=state.chartWindowFixed?Math.max(300,state.chartWindowS):Math.max(state.chartWindowS,latest),visible=points=>points.filter(point=>point[0]>=xmin&&point[0]<=xmax);
-    state.historyCurves.filter(curve=>curve.method==='it').forEach((curve,index)=>{
-      const values=filterValues(curve.time_s||[],curve.current_nA||[],curve.valid).values,color=['#8b6f5a','#766f9b','#5b8792','#9a6d7e','#6e8b65','#a7844c'][index%6];
+    overlays.forEach((curve,index)=>{
+      const values=filterValues(curve.time_s||[],curve.current_nA||[],curve.valid).values,color=HISTORY_CURVE_COLORS[index%HISTORY_CURVE_COLORS.length];
       const points=(curve.time_s||[]).map((time,i)=>[time,values[i]]).filter(point=>point[0]>=xmin&&point[0]<=xmax);if(points.length)allSeries.push({points,color,width:1.05,alpha:.75});
     });
     if(state.showRaw)allSeries.push({points:visible(rawPoints),color:'#b8c0c2',width:.55},
