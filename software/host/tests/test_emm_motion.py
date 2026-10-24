@@ -135,7 +135,7 @@ class FakeSerial:
         self.closed = True
 
 
-def make_bus(*, move_timeout_s=0.4, **kwargs):
+def make_bus(*, move_timeout_s=None, **kwargs):
     opened = []
 
     def factory(**options):
@@ -144,7 +144,7 @@ def make_bus(*, move_timeout_s=0.4, **kwargs):
         return serial
 
     bus = SharedEmmBus("fake-rs485", 115200, copy.deepcopy(AXES),
-                       serial_factory=factory, transaction_timeout_s=0.02,
+                       serial_factory=factory,
                        move_timeout_s=move_timeout_s, **kwargs)
     bus._command_gap_s = 0
     return bus, opened
@@ -256,9 +256,17 @@ def test_reference_cannot_be_confirmed_while_an_axis_is_moving():
     assert not bus.snapshot()["referenced"]
 
 
-def test_arrival_accepts_observed_encoder_error_within_drive_position_window():
+@pytest.mark.parametrize("host_preemption", [0, 0.55])
+def test_arrival_accepts_observed_encoder_error_within_drive_position_window(host_preemption, monkeypatch):
     bus, serial = ready_bus()
-    serial.on_move = lambda: serial.positions.update({1: serial.positions[1] + 26})
+    clock = MotionTestClock()
+    clock.attach(monkeypatch, serial)
+
+    def complete_move():
+        clock.sleep(host_preemption)
+        serial.positions[1] += 26
+
+    serial.on_move = complete_move
     result = bus.move_to("X", 0.5, 0.5)
     assert result["position"]["X"] == pytest.approx(0.50079345703125)
     assert result["axes"]["X"]["arrival_tolerance_mm"] == pytest.approx(2 * 0.8 / 360)

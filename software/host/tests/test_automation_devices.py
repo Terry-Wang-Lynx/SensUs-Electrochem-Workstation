@@ -9,7 +9,7 @@ import pytest
 
 from pa_host.automation import AutomationController, default_experiment
 from pa_host.emm_motion import SharedEmmBus
-from test_emm_motion import FakeSerial
+from test_emm_motion import FakeSerial, MotionTestClock
 
 
 def connected_controller(tmp_path, interval=0):
@@ -19,8 +19,7 @@ def connected_controller(tmp_path, interval=0):
         serial = FakeSerial(timeout=0.05, write_timeout=0.05)
         serial.statuses = {1: 3, 2: 3}
         opened.append(serial)
-        return SharedEmmBus(port, baud, axes, serial_factory=lambda **kwargs: serial,
-                            transaction_timeout_s=0.05, **options)
+        return SharedEmmBus(port, baud, axes, serial_factory=lambda **kwargs: serial, **options)
 
     controller = AutomationController(tmp_path / "state", tmp_path / "runs", tmp_path,
                                       motion_factory=factory, motion_feedback_interval_s=interval)
@@ -87,8 +86,20 @@ def test_explicit_refresh_is_only_six_reads_and_preserves_profiles_and_hand_moti
         controller.disconnect_motion()
 
 
-def test_feedback_age_uses_monotonic_clock_and_cached_staleness(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ack_delay", [0, 0.06])
+def test_feedback_age_uses_monotonic_clock_and_cached_staleness(tmp_path, monkeypatch, ack_delay):
     controller, opened, _ = connected_controller(tmp_path)
+    clock = MotionTestClock()
+    clock.attach(monkeypatch, opened[0])
+    original_write = opened[0].write
+
+    def write(frame):
+        result = original_write(frame)
+        if frame[1] == 0xFE:
+            clock.sleep(ack_delay)
+        return result
+
+    monkeypatch.setattr(opened[0], "write", write)
     try:
         recorded = controller.snapshot()["motion"]["axes"]["X"]["updated_monotonic"]
         opened[0].writes.clear()
