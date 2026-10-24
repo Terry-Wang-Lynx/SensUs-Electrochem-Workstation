@@ -3,6 +3,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from node_test_utils import run_node
 from PIL import Image
 
 from pa_host.gui_server import OFFSET_OPTIONS
@@ -28,7 +29,7 @@ const requestAnimationFrame=()=>{};
 callbacks.throughput();const hidden=nodes.firmwareNote.hidden;
 callbacks.measure();console.log(JSON.stringify({hidden,restored:!nodes.firmwareNote.hidden}));
 """
-    completed = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    completed = run_node(script, check=True, capture_output=True, text=True)
     assert json.loads(completed.stdout) == {"hidden": True, "restored": True}
 
 
@@ -82,9 +83,7 @@ def _evaluate_gui_js(
     source = (GUI_DIR / file_name).read_text(encoding="utf-8")
     functions = "\n".join(_extract_js_function(source, name) for name in names)
     script = f"{functions}\n{setup}\nconsole.log(JSON.stringify({result}));"
-    completed = subprocess.run(
-        ["node", "-e", script], check=True, capture_output=True, text=True,
-    )
+    completed = run_node(script, check=True, capture_output=True, text=True)
     return json.loads(completed.stdout)
 
 
@@ -449,9 +448,7 @@ const renderSettings=data=>renders.push(data);
   console.log(JSON.stringify({{initialDelay,afterStale,retryDelay,appliedDraft,pollSequence:state.settingsPollSequence}}));
 }})().catch(error=>{{console.error(error);process.exit(1)}});
 """
-    completed = subprocess.run(
-        ["node", "-e", script], check=True, capture_output=True, text=True,
-    )
+    completed = run_node(script, check=True, capture_output=True, text=True)
 
     assert json.loads(completed.stdout) == {
         "initialDelay": 250,
@@ -495,9 +492,7 @@ const clearSettingsError=()=>{{clears+=1}};
   }}));
 }})().catch(error=>{{console.error(error);process.exit(1)}});
 """
-    completed = subprocess.run(
-        ["node", "-e", script], check=True, capture_output=True, text=True,
-    )
+    completed = run_node(script, check=True, capture_output=True, text=True)
 
     assert json.loads(completed.stdout) == {
         "resumed": {"active": True, "sequence": 1, "delay": 250},
@@ -931,9 +926,7 @@ const whileSwitching=input.value;
 syncWorkspacePathInput({{workspace_root:'/confirmed'}},true);
 console.log(JSON.stringify({{whileFocused,afterBlur,whileSwitching,forced:input.value}}));
 """
-    completed = subprocess.run(
-        ["node", "-e", script], check=True, capture_output=True, text=True,
-    )
+    completed = run_node(script, check=True, capture_output=True, text=True)
     assert json.loads(completed.stdout) == {
         "whileFocused": "/draft",
         "afterBlur": "/server",
@@ -965,9 +958,7 @@ const api=async(path,options)=>{{requests.push({{path,options}});return {{select
   console.log(JSON.stringify({{message,nativeResult,fallbackResult,requests}}));
 }})().catch(error=>{{console.error(error);process.exit(1)}});
 """
-    completed = subprocess.run(
-        ["node", "-e", script], check=True, capture_output=True, text=True,
-    )
+    completed = run_node(script, check=True, capture_output=True, text=True)
     result = json.loads(completed.stdout)
     assert result["message"]["action"] == "browseWorkspace"
     assert result["message"]["initial_path"] == "/initial"
@@ -1011,9 +1002,7 @@ const errorBox=(id,error)=>errors.push(String(error));
   console.log(JSON.stringify({{cancelled,restoredAfterCancel,switched,duplicate,requests,toasts,errors,finalPath:nodes.saveDirectory.value}}));
 }})().catch(error=>{{console.error(error);process.exit(1)}});
 """
-    completed = subprocess.run(
-        ["node", "-e", script], check=True, capture_output=True, text=True,
-    )
+    completed = run_node(script, check=True, capture_output=True, text=True)
     result = json.loads(completed.stdout)
 
     assert result == {
@@ -1489,9 +1478,7 @@ scheduleMeasurementDraw({{...second,state:'completed'}});
 const completed={{frames:frames.length,draws}};
 console.log(JSON.stringify({{queued,unchanged,completed}}));
 """
-    completed = subprocess.run(
-        ["node", "-e", script], check=True, capture_output=True, text=True,
-    )
+    completed = run_node(script, check=True, capture_output=True, text=True)
 
     assert json.loads(completed.stdout) == {
         "queued": {"frames": 1, "draws": 0},

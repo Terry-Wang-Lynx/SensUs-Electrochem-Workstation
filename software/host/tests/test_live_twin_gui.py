@@ -1,7 +1,7 @@
 import json
 import re
-import subprocess
 
+from node_test_utils import run_node
 import pytest
 
 from test_absolute_limits_gui import LIMITS_BOOTSTRAP
@@ -112,9 +112,7 @@ const state={exiting:false};let highThroughputDevicesPending=false;const paths=[
 const api=async path=>{paths.push(path);if(fail)throw new Error('offline');return {motion:{connected:true},boards:{},limits:{}};};
 (async()=>{await refreshHighThroughputDevices();const connected=window.PAHighThroughputDevices;fail=true;await refreshHighThroughputDevices();console.log(JSON.stringify({paths,connected,failed:window.PAHighThroughputDevices,propagated:window.HighThroughput.last}));})();
 """
-    completed = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, check=True,
-    )
+    completed = run_node(script, capture_output=True, text=True, check=True)
     result = json.loads(completed.stdout)
     assert result["paths"] == ["/api/automation/v1/devices"] * 2
     assert result["connected"]["available"]

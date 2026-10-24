@@ -1,7 +1,7 @@
 import json
-import subprocess
 from pathlib import Path
 
+from node_test_utils import run_node
 
 GUI = Path(__file__).parents[1] / "pa_host" / "gui"
 
@@ -9,10 +9,7 @@ GUI = Path(__file__).parents[1] / "pa_host" / "gui"
 def evaluate(script):
     if not (GUI / "high_throughput.js").exists():
         raise AssertionError("Automation editor is not implemented")
-    completed = subprocess.run(
-        ["node", "-e", f"const ui = require({json.dumps(str(GUI / 'high_throughput.js'))});\n{script}"],
-        capture_output=True, text=True, check=True,
-    )
+    completed = run_node(f"const ui = require({json.dumps(str(GUI / 'high_throughput.js'))});\n{script}", capture_output=True, text=True, check=True)
     return json.loads(completed.stdout)
 
 
@@ -49,10 +46,7 @@ const input=(id,value)=>{const field=elements.get(id);field.value=String(value);
 const click=async id=>{elements.get(id).dispatchEvent(new Event('click'));await tick();};
 """
     source = source if source is not None else (GUI / "high_throughput.js").read_text()
-    completed = subprocess.run(
-        ["node", "-e", GUIDED_DOCUMENT + bootstrap + before_source + f"\nconst browserModule={{exports:{{}}}};new Function('module',{json.dumps(source)})(browserModule);const ui=browserModule.exports;\n" + script],
-        capture_output=True, text=True,
-    )
+    completed = run_node(GUIDED_DOCUMENT + bootstrap + before_source + f"\nconst browserModule={{exports:{{}}}};new Function('module',{json.dumps(source)})(browserModule);const ui=browserModule.exports;\n" + script, capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr
     return json.loads(completed.stdout)
 
@@ -192,15 +186,14 @@ console.log(JSON.stringify([
  scene.previewTarget({{op:'wait',resolved_params:{{seconds:2}}}}, defaults, {{x:-74,z:-6}})
 ]));
 """
-    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+    result = run_node(script, capture_output=True, text=True, check=True)
     assert json.loads(result.stdout) == [{"x": -74, "z": 0}, {"x": -74, "z": -6}, {"x": -74, "z": -6}]
 
 
 def test_scene_builds_pickable_96_well_plate_and_preserves_both_cad_boards():
     if not (GUI / "high_throughput_3d.js").exists():
         raise AssertionError("Interactive apparatus scene is not implemented")
-    completed = subprocess.run(
-        ["node", "-e", f"""
+    completed = run_node(f"""
 const scene = require({json.dumps(str(GUI / 'high_throughput_3d.js'))});
 const three = require({json.dumps(str(GUI / 'three.min.js'))});
 const geometry = require({json.dumps(str(GUI / 'ht-geometry.json'))});
@@ -212,8 +205,7 @@ console.log(JSON.stringify({{
  wells:assembly.wells.length,boards:assembly.boards.map(board=>board.userData.cadMeshCount),
  finite:[bounds.min.x,bounds.min.y,bounds.min.z,bounds.max.x,bounds.max.y,bounds.max.z].every(Number.isFinite),
 }}));
-"""], capture_output=True, text=True, check=True,
-    )
+""", capture_output=True, text=True, check=True)
     result = json.loads(completed.stdout)
     assert result["columns"] == list(range(1, 13))
     assert result["wells"] == 96
@@ -222,16 +214,14 @@ console.log(JSON.stringify({{
 
 
 def evaluate_apparatus(script):
-    completed = subprocess.run(
-        ["node", "-e", f"""
+    completed = run_node(f"""
 const scene = require({json.dumps(str(GUI / 'high_throughput_3d.js'))});
 const three = require({json.dumps(str(GUI / 'three.min.js'))});
 const boards = require({json.dumps(str(GUI / 'ht-geometry.json'))});
 const cad = require({json.dumps(str(GUI / 'ht-apparatus.json'))});
 const assembly = scene.buildApparatus(three,boards,cad);
 {script}
-"""], capture_output=True, text=True, check=True,
-    )
+""", capture_output=True, text=True, check=True)
     return json.loads(completed.stdout)
 
 

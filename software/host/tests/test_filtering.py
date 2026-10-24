@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from node_test_utils import run_node
+
 import numpy as np
 import pytest
 
@@ -197,9 +199,7 @@ const result = filterValues(
 );
 console.log(JSON.stringify(result));
 """
-    completed = subprocess.run(
-        ["node", "-e", script], check=True, capture_output=True, text=True,
-    )
+    completed = run_node(script, check=True, capture_output=True, text=True)
     result = json.loads(completed.stdout)
     return np.asarray(result["values"], dtype=float), result["meta"]
 

@@ -17,6 +17,7 @@
 | 多轮/折返顺序或记录复用、暂停/START前假进度 | 有限有序路径、完整访问状态机、独立轮次/访问身份和运行快照进度；`test_guided_routes.py`、`test_route_runtime.py`、`test_experiment_progress.py` |
 | 仅全量测试中的两项键盘测试失败 | 已退役5ms假设改为现行20ms安全断言；日志单例测试在独立进程验证，未改变生产日志目录；`test_emm_command_spacing.py`、`test_keyboard_trace.py` |
 | 冻结包与开发机PSD后端不同 | 便携包显式包含同版SciPy、锁定运行/验证依赖；`test_release_reproducibility.py`及冻结包测试 |
+| 云端/Windows运行网页回归时命令行过长 | JavaScript测试通过UTF-8标准输入执行，不将整份网页脚本塞入命令行参数；保留全部DOM行为断言；`test_node_test_utils.py` |
 
 ## 尚未解决或不能据软件保证的事项
 

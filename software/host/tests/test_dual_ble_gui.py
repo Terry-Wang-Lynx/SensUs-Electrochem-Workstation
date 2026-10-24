@@ -1,6 +1,6 @@
 import json
-import subprocess
 
+from node_test_utils import run_node
 from test_automation_gui import evaluate_browser
 from test_gui_ble import GUI_DIR, _evaluate_gui_js, _extract_js_function
 
@@ -211,7 +211,7 @@ const $=()=>errors;const diagnosticMessage=error=>error.message;const renderDevi
 (async()=>{await setBleDeviceConnection('rear-uuid',true);await setBleDeviceConnection('rear-uuid',false);
 console.log(JSON.stringify({requests,rendered,action:state.bleAction}));})();
 """
-    completed = subprocess.run(["node", "-e", script], text=True, capture_output=True, check=True)
+    completed = run_node(script, text=True, capture_output=True, check=True)
     result = json.loads(completed.stdout)
     assert result["requests"] == [
         {"path": "/api/devices/ble/connect", "body": {"address": "rear-uuid"}},
@@ -229,6 +229,6 @@ const $=()=>notice;const diagnosticMessage=error=>error.message;
 const renderDeviceList=()=>{},renderBleControls=()=>{},refreshDevices=async()=>{};
 (async()=>{await setBleDeviceConnection('rear-uuid',true);console.log(JSON.stringify({error:state.bleConnectionError,notice:notice.textContent}));})();
 """
-    completed = subprocess.run(["node", "-e", script], text=True, capture_output=True, check=True)
+    completed = run_node(script, text=True, capture_output=True, check=True)
     result = json.loads(completed.stdout)
     assert result == {"error": "Board verification failed", "notice": "Board verification failed"}

@@ -1,8 +1,8 @@
 import json
 import re
-import subprocess
 from pathlib import Path
 
+from node_test_utils import run_node
 import pytest
 
 GUI_DIR = Path(__file__).parents[1] / "pa_host" / "gui"
@@ -38,7 +38,7 @@ def _evaluate_gui_js(file_name, names, setup, result):
     source = (GUI_DIR / file_name).read_text(encoding="utf-8")
     functions = "\n".join(_extract_js_function(source, name) for name in names)
     script = f"{functions}\n{setup}\nconsole.log(JSON.stringify({result}));"
-    completed = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    completed = run_node(script, check=True, capture_output=True, text=True)
     return json.loads(completed.stdout)
 
 
@@ -273,7 +273,7 @@ const api=async(path,options)=>{calls.push([path,options.method]);return path.en
 (async()=>{await scanBleDevices();await stopBleDevice();const failed=nodes.deviceDialogBusy.textContent;
 confirmed=true;await stopBleDevice();console.log(JSON.stringify({calls,messages,failed}));})().catch(error=>{console.error(error);process.exit(1)});
 """
-    completed = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    completed = run_node(script, check=True, capture_output=True, text=True)
     result = json.loads(completed.stdout)
     assert result["calls"] == [["/api/devices/ble/scan", "POST"], ["/api/devices/ble/stop", "POST"], ["/api/devices/ble/stop", "POST"]]
     assert "确认" in result["failed"]

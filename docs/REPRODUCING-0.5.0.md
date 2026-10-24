@@ -46,6 +46,8 @@ make firmware-test CC="$(brew --prefix llvm)/bin/clang"
 Windows 源码复现使用同样的 Python 3.12.10 和 Node 22：
 
 ```powershell
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 python -m venv .venv
 .venv\Scripts\python -m pip install --require-hashes -r packaging/source-test.lock
 .venv\Scripts\python -m pip install --no-deps --no-build-isolation -e .
