@@ -1,5 +1,6 @@
 """Bounded asynchronous keyboard/motor timeline; never writes on control threads."""
 
+import atexit
 import copy
 import json
 import logging.handlers
@@ -13,14 +14,33 @@ _queue = queue.Queue(maxsize=4096)
 _path = None
 _dropped = 0
 _error = None
+_worker = None
+_closed = False
+_lifecycle_lock = threading.Lock()
 
 
 def configure(directory):
-    global _path
+    global _path, _worker
     if _path is not None:
         return
     _path = Path(directory) / "keyboard-events.jsonl"
-    threading.Thread(target=_write, name="keyboard-trace-writer", daemon=True).start()
+    _worker = threading.Thread(target=_write, name="keyboard-trace-writer", daemon=True)
+    _worker.start()
+    atexit.register(close)
+
+
+def close():
+    global _closed
+    send_sentinel = False
+    with _lifecycle_lock:
+        if _worker is None:
+            return
+        if not _closed:
+            _closed = True
+            send_sentinel = True
+    if send_sentinel:
+        _queue.put(None)
+    _worker.join()
 
 
 def emit(event):
@@ -29,10 +49,13 @@ def emit(event):
         return
     record = {"host_unix_s": time.time(), "host_monotonic_s": time.monotonic(),
               "dropped_total": _dropped, **copy.deepcopy(event)}
-    try:
-        _queue.put_nowait(record)
-    except queue.Full:
-        _dropped += 1
+    with _lifecycle_lock:
+        if _closed:
+            return
+        try:
+            _queue.put_nowait(record)
+        except queue.Full:
+            _dropped += 1
 
 
 def status():
@@ -46,6 +69,13 @@ def _write():
     while True:
         record = _queue.get()
         try:
+            if record is None:
+                try:
+                    if handler is not None:
+                        handler.close()
+                except Exception as error:
+                    _error = str(error)
+                return
             if handler is None:
                 _path.parent.mkdir(parents=True, exist_ok=True)
                 handler = logging.handlers.RotatingFileHandler(_path, maxBytes=10 * 1024 * 1024,

@@ -1,10 +1,12 @@
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from pa_host.emm_motion import MotionError
-from test_powered_manual_driver import powered_bus
+from pa_host.emm_motion import MotionError, SharedEmmBus
+from test_emm_motion import AXES
+from test_powered_manual_driver import PoweredManualSerial, powered_bus
 
 
 def spaced_bus(monkeypatch):
@@ -76,10 +78,20 @@ def test_elapsed_gap_adds_no_wait_and_closed_port_discards_old_pacing(monkeypatc
     assert bus._last_exchange_monotonic is None
 
 
-def test_real_default_spacing_supports_two_axis_stationary_confirmation():
-    bus, serial, events = powered_bus(enabled=True)
-    bus._command_gap_s = 0.02
-    bus._timeout = 0.05
+@pytest.mark.parametrize("transaction_latency", [0, 0.03])
+def test_real_default_spacing_supports_two_axis_stationary_confirmation(transaction_latency):
+    serial = PoweredManualSerial(timeout=0.2, write_timeout=0.2)
+    serial.statuses = {1: 3, 2: 3}
+    bus = SharedEmmBus("fake-default-cadence", 115200, AXES, serial_factory=lambda **options: serial)
+    assert bus._command_gap_s == 0.02 and bus._timeout == 1.0
+    bus.connect()
+    original_write = serial.write
+
+    def write(frame):
+        time.sleep(transaction_latency)
+        return original_write(frame)
+
+    serial.write = write
     assert set(bus._stationary_states(enabled=True)) == {"X", "Z"}
 
 

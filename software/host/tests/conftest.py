@@ -17,3 +17,9 @@ os.environ["SENSUS_MEASUREMENTS_DIR"] = str(_TEST_ROOT / "measurements")
 # attached to the developer machine. Transport-specific tests override the
 # module globals explicitly.
 os.environ["SENSUS_TRANSPORT"] = "rtt"
+
+
+def pytest_sessionfinish(session, exitstatus):
+    from pa_host import keyboard_trace
+
+    keyboard_trace.close()

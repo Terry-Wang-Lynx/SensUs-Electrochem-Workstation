@@ -1,12 +1,27 @@
 import copy
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from pa_host.emm_motion import MotionError, SharedEmmBus
 from test_emm_motion import AXES
 from test_powered_manual_driver import PoweredManualSerial
+
+
+class WireClock:
+    def __init__(self):
+        self.now = 100.0
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return 1700000000 + self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
 
 
 class FastSerial(PoweredManualSerial):
@@ -286,14 +301,15 @@ def test_invalid_fast_hold_never_writes_a_motion_command(speed, maximum, distanc
 
 
 class SlewingSerial(FastSerial):
-    def __init__(self, **options):
+    def __init__(self, *, clock=None, **options):
         super().__init__(**options)
+        self.clock = time if clock is None else clock
         self.goals = {}
-        self.updated = time.monotonic()
+        self.updated = self.clock.monotonic()
         self.stop_positions = []
 
     def write(self, frame):
-        now = time.monotonic()
+        now = self.clock.monotonic()
         for address, goal in self.goals.items():
             before = self.positions[address]
             distance = goal - before
@@ -358,12 +374,23 @@ def test_fast_hold_quiesces_active_motor_before_querying_the_shared_bus_peer(axi
     assert stop_index < peer_index
 
 
-def test_rolling_fast_targets_keep_a_noninstant_drive_moving_at_production_wire_cadence():
-    serial = SlewingSerial(timeout=0.2, write_timeout=0.2)
+def test_rolling_fast_targets_keep_a_noninstant_drive_moving_at_production_wire_cadence(monkeypatch):
+    clock = WireClock()
+    monkeypatch.setattr("pa_host.emm_motion.time", clock)
+    monkeypatch.setattr("pa_host.keyboard_fast_jog.time", clock)
+    host_clock = WireClock()
+
+    def descheduled_host_time():
+        host_clock.sleep(0.5)
+        return host_clock.monotonic()
+
+    monkeypatch.setattr(__name__ + ".time", SimpleNamespace(monotonic=descheduled_host_time))
+    serial = SlewingSerial(clock=clock, timeout=0.2, write_timeout=0.2)
     axes = copy.deepcopy(AXES)
     for axis in axes.values():
         axis["max_speed_mm_s"] = 20
     bus = SharedEmmBus("fake-slewing-jog", 115200, axes, serial_factory=lambda **options: serial)
+    assert bus._command_gap_s == 0.02
     bus.connect()
     bus.begin_keyboard_alignment(confirmed=True)
     start_count = serial.positions[1]

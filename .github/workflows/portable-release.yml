@@ -61,6 +61,9 @@ jobs:
           python -m pip install --require-hashes -r packaging/source-test.lock
           python -m pip install --no-deps --no-build-isolation -e .
       - name: Run host tests
+        timeout-minutes: 45
+        env:
+          PYTEST_ADDOPTS: "-vv -o faulthandler_timeout=90"
         run: make test VENV_PYTHON=python
       - name: Install pinned OpenOCD build prerequisite
         run: brew install pkgconf
@@ -168,7 +171,9 @@ jobs:
           python -m pip install --require-hashes -r packaging/source-test.lock
           python -m pip install --no-deps --no-build-isolation -e .
       - name: Run host tests
+        timeout-minutes: 45
         env:
+          PYTEST_ADDOPTS: "-vv -o faulthandler_timeout=90"
           PYTHONUTF8: "1"
           PYTHONIOENCODING: utf-8
           SENSUS_TRANSPORT: rtt

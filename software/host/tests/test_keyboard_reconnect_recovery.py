@@ -7,18 +7,36 @@ from pa_host.guided_automation import GuidedAutomation
 from test_guided_integration import guided_app
 from test_keyboard_alignment_integration import dispatch
 from test_powered_manual_driver import PoweredManualSerial
+from test_keyboard_fast_jog import WireClock
 
 
 @pytest.mark.parametrize("stop_fails", [False, True])
-def test_blocked_old_session_rechecks_stop_on_new_connection_before_restart(guided_app, tmp_path, stop_fails):
+@pytest.mark.parametrize("transaction_latency", [0, 0.03])
+def test_blocked_old_session_rechecks_stop_on_new_connection_before_restart(guided_app, tmp_path, stop_fails,
+                                                                         monkeypatch, transaction_latency):
     serials = []
+    clock = WireClock()
+    monkeypatch.setattr("pa_host.emm_motion.time", clock)
 
     def factory(port, baud, axes, **options):
         serial = PoweredManualSerial(timeout=0.2, write_timeout=0.2)
         serial.statuses = {1: 3, 2: 3}
+        original_write = serial.write
+        original_read = serial.read
+
+        def write(frame):
+            clock.sleep(transaction_latency)
+            return original_write(frame)
+
+        def read(count):
+            clock.sleep(0.001)
+            return original_read(count)
+
+        serial.write = write
+        serial.read = read
         serials.append(serial)
         return SharedEmmBus(port, baud, axes, serial_factory=lambda **settings: serial,
-                            transaction_timeout_s=0.05, **options)
+                            **options)
 
     controller = AutomationController(tmp_path / "automation", tmp_path / "runs", tmp_path,
                                       motion_factory=factory, motion_feedback_interval_s=0.05)

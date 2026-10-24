@@ -320,7 +320,8 @@ def test_authorization_fault_stops_axes_before_waiting_for_collectors(tmp_path):
     assert result["error"]["code"] == "absolute_limits_required"
 
 
-def test_limit_monitor_continues_through_guided_ble_recovery(tmp_path):
+@pytest.mark.parametrize("collector_start_delay", [0, 0.35])
+def test_limit_monitor_continues_through_guided_ble_recovery(tmp_path, collector_start_delay):
     stopped_boards = []
     controller, document, serial, _drivers = controller_fixture(
         tmp_path, board_stop=lambda address: stopped_boards.append(address) or {"stop_confirmed": False})
@@ -330,11 +331,30 @@ def test_limit_monitor_continues_through_guided_ble_recovery(tmp_path):
     document["defaults"]["settle_s"] = 0
     document["program"] += [{"op": "dwell", "seconds": 0.5, "acquire": ["A", "E"]},
                             {"op": "withdraw"}, {"op": "move_to_column", "column": 2}]
-    controller._process_factory = GuidedFactory(time, loss_at=time.monotonic() + 0.25, unavailable="AB")
+    collectors = GuidedFactory(time, loss_at=float("inf"), unavailable="AB")
+
+    def spawn(command, **options):
+        if not collectors.children:
+            time.sleep(collector_start_delay)
+        child = collectors(command, **options)
+        original_poll = child.poll
+
+        def poll():
+            result = original_poll()
+            if (collectors.loss_at == float("inf") and len(collectors.children) == 2
+                    and all(collector.started for collector in collectors.children)):
+                collectors.loss_at = time.monotonic() + 0.05
+            return result
+
+        child.poll = poll
+        return child
+
+    controller._process_factory = spawn
     controller.start(document, "live", compile_experiment(document)["plan_hash"], "ble-recovery")
     try:
         result = wait_state(controller, "waiting_recovery")
         assert result["state"] == "waiting_recovery", result
+        assert len(collectors.children) >= 2 and all(collector.started for collector in collectors.children[:2])
         serial.positions[1] = 6000001
         result = wait_state(controller, "error")
         assert result["error"]["code"] == "stop_unconfirmed"

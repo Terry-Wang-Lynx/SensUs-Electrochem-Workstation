@@ -145,7 +145,7 @@ class SharedEmmBus:
                        "referenced": False, "enabled": False, "enable_confirmed": False,
                        "position_mm": None, "speed_mm_s": None, "status": None,
                        "raw_count": None, "reference_count": None, "telemetry_valid": False,
-                       "updated_monotonic": None, "config": None, "firmware_version": None,
+                       "updated_monotonic": None, "telemetry_sequence": 0, "config": None, "firmware_version": None,
                        "hardware_version": None, "power_flag_baseline": None}
                 for name, config in self.axes.items()}
 
@@ -401,6 +401,7 @@ class SharedEmmBus:
             state.update(raw_count=raw_count, speed_mm_s=direction * rpm * config["lead_mm"] / 60,
                          speed_rpm=rpm, status=status, enabled=bool(status & 1),
                          telemetry_valid=True, updated_monotonic=sample_start,
+                         telemetry_sequence=state["telemetry_sequence"] + 1,
                          power_flag_baseline=status & 0x80, **extra)
             trace = getattr(self, "_keyboard_trace_context", None)
             if (trace and trace.get("axis") == axis and trace.get("command_sent")
@@ -1267,7 +1268,8 @@ class SharedEmmBus:
     def _keyboard_jog_pair(self, previous, state):
         return (self._keyboard_jog_ready(previous) and self._keyboard_jog_ready(state)
                 and state["input_target_count"] == previous["input_target_count"]
-                and 0 < state["updated_monotonic"] - previous["updated_monotonic"] <= 2
+                and state["telemetry_sequence"] > previous["telemetry_sequence"]
+                and 0 <= state["updated_monotonic"] - previous["updated_monotonic"] <= 2
                 and abs(state["raw_count"] - previous["raw_count"]) <= self._keyboard_jog_counts(state))
 
     def _keyboard_held_matches(self, initial, state):

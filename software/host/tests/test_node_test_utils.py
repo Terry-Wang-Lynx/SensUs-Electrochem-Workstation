@@ -10,6 +10,7 @@ def test_large_unicode_script_uses_stdin_below_platform_argument_limits(monkeypa
     def bounded_run(command, **options):
         assert sum(len(argument.encode("utf-8")) + 1 for argument in command) < 32768
         assert command == ["node", "-"]
+        assert options.get("timeout") == 30
         assert len(options["input"].encode("utf-8")) > 163840
         observed.append(command)
         return original_run(command, **options)

@@ -28,3 +28,10 @@ def test_source_verification_dependencies_are_locked_with_hashes():
     content = lock.read_text(encoding="utf-8")
     assert "pytest==" in content and "scipy==" in content
     assert "--hash=sha256:" in content
+
+
+def test_ci_host_tests_are_bounded_and_dump_stalled_threads():
+    for name, count in (("ci.yml", 1), ("portable-release.yml", 2)):
+        workflow = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+        assert workflow.count('PYTEST_ADDOPTS: "-vv -o faulthandler_timeout=90"') == count
+        assert workflow.count("timeout-minutes: 45") == count

@@ -2,6 +2,7 @@ import pytest
 
 from pa_host.emm_motion import MotionError
 from test_keyboard_post_stop_settling import stopped_tail_bus
+from test_keyboard_fast_jog import WireClock
 
 
 def test_keyboard_handoff_does_not_wait_for_single_count_precision():
@@ -17,8 +18,19 @@ def test_keyboard_handoff_does_not_wait_for_single_count_precision():
     assert not bus.snapshot()["faulted"]
 
 
-def test_global_stop_keeps_single_count_confirmation_even_with_keyboard_session():
+@pytest.mark.parametrize("transaction_latency", [0, 0.04])
+def test_global_stop_keeps_single_count_confirmation_even_with_keyboard_session(monkeypatch, transaction_latency):
     bus, serial, cancellation, tail = stopped_tail_bus(offsets=(139, 107, 77, 55, 25, 13, 13, 5, 5))
+    bus._timeout = 1.0
+    clock = WireClock()
+    monkeypatch.setattr("pa_host.emm_motion.time", clock)
+    original_write = serial.write
+
+    def write(frame):
+        clock.sleep(transaction_latency)
+        return original_write(frame)
+
+    serial.write = write
     result = bus.stop_all()
     assert result["stop_confirmed"]
     assert len(tail["samples"]) == 7

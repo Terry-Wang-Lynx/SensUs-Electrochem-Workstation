@@ -21,6 +21,9 @@ jobs:
           python -m pip install --require-hashes -r packaging/source-test.lock
           python -m pip install --no-deps --no-build-isolation -e .
       - name: Test Python and browser code
+        timeout-minutes: 45
+        env:
+          PYTEST_ADDOPTS: "-vv -o faulthandler_timeout=90"
         run: make test VENV_PYTHON=python
       - name: Test portable firmware logic
         run: make firmware-test
