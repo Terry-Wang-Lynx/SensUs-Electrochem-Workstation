@@ -70,10 +70,15 @@ def test_legacy_still_rejects_nullable_concentration_negative_pitch_and_guided_f
 
 def wait_terminal(controller):
     deadline = time.monotonic() + 3
-    while controller._thread.is_alive() and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        worker = controller._thread
+        state = controller.snapshot()
+        if (state["state"] in {"completed", "stopped", "error"}
+                and worker is not None and worker.ident is not None
+                and not worker.is_alive() and worker is controller._thread):
+            return state
         time.sleep(0.002)
-    assert not controller._thread.is_alive(), controller.snapshot()
-    return controller.snapshot()
+    raise AssertionError(controller.snapshot())
 
 
 def test_guided_synthetic_windows_keep_raw_samples_without_inventing_concentration(tmp_path):
