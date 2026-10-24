@@ -1,19 +1,27 @@
 # SensUs Electrochemistry Workstation
 
-SensUs 是一套基于 MAX30131 与 nRF52833 的三电极电化学工作站软件。本仓库独立包含 Zephyr 固件、RTT/USB 采集链路，以及面向实验人员的本地交互界面。
+SensUs 是一套基于 MAX30131/MAX30134 与 nRF52833 的三电极电化学工作站软件。本仓库独立包含 Zephyr 固件、RTT/USB/BLE 采集链路，以及面向实验人员的本地交互界面。
 
 ## 当前交接基线
 
-- 当前发布版：`v0.4.12`，下载入口：[GitHub Releases](https://github.com/Terry-Wang-Lynx/SensUs-Electrochem-Workstation/releases/latest)
+- 当前版本：`0.5.0` 预览版，新增 V5.2 四路蓝牙、双板八电极高通量模板、键盘四点对位与编码器反馈模型。[版本说明与验收边界](docs/RELEASE_NOTES.md)，安装包见 [v0.5.0 Release](https://github.com/Terry-Wang-Lynx/SensUs-Electrochem-Workstation/releases/tag/v0.5.0)，原稳定更新通道不变。
 - 完整维护说明：[docs/HANDOFF.md](docs/HANDOFF.md)
+- 从干净克隆运行、构建和验收：[复现指南](docs/REPRODUCING-0.5.0.md)。已知故障的回归映射和未验收边界：[问题清单](docs/KNOWN-ISSUES-0.5.0.md)。不承诺零缺陷或跨硬件逐样本完全相同。
+- [键盘四点标定](docs/KEYBOARD-ALIGNMENT.md)：每次开机显式进入、保持锁轴，不再手拧。读取物理第1/12列X、工作Z、安全Z；默认0.5mm/s，可明确确认并调至20mm/s硬上限，松键/失焦/过期停止。独立机械四边界仅作历史可选功能，不是普通页前提。
+- [高通量实验](docs/GUIDED-ROUTES.md)：一次性、重复N轮和自定义有序路径（可折返/重复访问），默认参数可覆盖；顶部全程进度、轮次和剩余时间。双板A–H、共享RS485双轴及[Agent接口](docs/AUTOMATION-API-v1.md)均包含在源码中。
+- 3D 模型按保存的 Fusion 整机修正为“X 移动孔板，Z 背架固定”，来源与再生成方法见[模型来源](docs/AUTOMATION-MODEL-SOURCES.md)。
+- 逐列时长明确显示、八电极采样参数共用、双板绑定、剩余窗口续采、列末安全暂停；[端点保守靠近](docs/ENDPOINT-APPROACH.md)保持原目标/容差，最后小段低速，不影响键盘速度。原约199mm快速横移的修正后全行程仍未实物复验。
+- 设备反馈失效时明确显示位置未知；CAD配准仍含名义假设，不代表机械精度或碰撞签核。旧手拧/松轴/四边界方案的记录仅是历史，不覆盖当前键盘四点流程。
+- RS485 联调：X=1、Z=2；正面方向0对应X左/Z下。10月22日的20mm观察终点已被用户后续手工对位取代，不可再当当前位置。[2026-10-22历史联调记录](docs/RS485-BRINGUP-2026-10-22.md)
 - 固件与数据链路入口：[software/README.md](software/README.md)
-- 日常连接：板 1/V4 使用 J-Link + RTT；板 2/V5.1 使用 USB DATA + SMP
-- 源码范围：本仓库包含上位机、V4/V5.1 固件、板定义、测试、打包脚本和随包固件；PCB、仿真和硬件设计真值位于独立的 [pA-Converter 仓库](https://github.com/clateral912/pA-Converter)（私有，需另行授予接手人访问权限）
+- 日常连接：板 1/V4 使用 J-Link + RTT；板 2/V5.1 使用 USB DATA + SMP；V5.2使用Bluetooth NUS（`pA-V5.2`，需预装V5.2固件）
+- 源码范围：完整上位机、网页/3D派生网格、V4/V5.1固件与镜像、测试及打包工具均在本仓库。V5.2板端固件/协议源、PCB和原始机械STEP位于独立工程，运行网页不依赖那些目录；实际接板需预烧录 `v52-0.1` 并另行取得[硬件仓库](https://github.com/clateral912/pA-Converter)访问权，不自动烧录V5.2。
 
 给实验人员使用时，直接下载 Release 中的自包含分发包：Windows 10/11 x64 使用 ZIP，Apple Silicon + macOS 14 及以上使用 DMG。正常测量、修改 I-T/CV 条件和升级已经初始化的 V5.1 板卡不需要安装 Python、NCS、Zephyr、OpenOCD 或 SEGGER 工具。
 
 界面已经打通以下流程：
 
+- V5.2蓝牙扫描、协议验证、四路同时显示/保存和温压监测；选择一路进行现有分析/标定，板型/通道之间不混用标定
 - 恒电位 I-T 实时采集，每一个原生点即时显示并追加保存
 - 循环伏安 CV：电位上下限、扫描速度、循环圈数与扫描前静置时间可配置
 - CV 波形以 1 mV 步进；标准图横轴为电位、纵轴为电流，每个原生点实时显示并保存
@@ -25,6 +33,8 @@ SensUs 是一套基于 MAX30131 与 nRF52833 的三电极电化学工作站软�
 - 主机侧软件滤波：1--4 阶软件低通，支持自动/手动截止频率，以及仅显示或参与稳态分析/标定
 
 ## 一键启动
+
+V5.2入口：“选择设备”→“扫描蓝牙”→“连接并验证”。仅支持恒电位I-t，CV/EIS/旧硬件DEBUG/OTA不开放；断线不等于板端停机，重连后可明确发送STOP。四路原始文件不重采样，分析导出保留既有重采样流程。详情见[蓝牙使用说明](docs/V0.5.0-V52-BLE.md)。
 
 ### macOS
 
@@ -162,6 +172,14 @@ CV 不进入 I-T 标定/浓度预测链。扫描结束后会生成原始 CSV、�
 这项审计能确认数字控制状态，但不能替代示波器对实际 `WE-RE` 模拟电压的直接测量。45 µM 历史数据的专门排查见 [docs/45uM-current-transition-analysis.md](docs/45uM-current-transition-analysis.md)。
 
 ## 测试与打包
+
+从干净克隆重现发布环境，请先安装 Python 3.12.10、Node.js 22；Mac DMG 还需 Apple Silicon/macOS14+、Xcode Command Line Tools 与 `pkg-config`。完整步骤见[复现指南](docs/REPRODUCING-0.5.0.md)。
+
+```bash
+make install-locked PYTHON=/absolute/path/to/python3.12
+make test
+make dmg PYTHON=/absolute/path/to/python3.12
+```
 
 ```bash
 make test

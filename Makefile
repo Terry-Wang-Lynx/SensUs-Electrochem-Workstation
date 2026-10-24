@@ -18,11 +18,12 @@ else
 	NULL := /dev/null
 endif
 
-.PHONY: install run app portable-macos dmg runtime-firmware test firmware-test package clean-package clean help
+.PHONY: install install-locked run app portable-macos dmg runtime-firmware test firmware-test package clean-package clean help
 
 help:
 	@echo SensUs Electrochem Workstation build targets:
 	@echo   make install          Create venv and install dependencies
+	@echo   make install-locked   Install the verified Python 3.12.10 source environment
 	@echo   make run              Start the GUI server (browser interface)
 	@echo   make app              Build macOS native app (macOS only)
 	@echo   make portable-macos   Build self-contained macOS arm64 app
@@ -36,6 +37,12 @@ help:
 install:
 	$(PYTHON) -m venv $(VENV)
 	$(VENV_PIP) install -e ".[dev,analysis]"
+
+install-locked:
+	$(PYTHON) -c "import platform; assert platform.python_version() == '3.12.10', 'Use Python 3.12.10 for the locked release environment'"
+	$(PYTHON) -m venv $(VENV)
+	$(VENV_PIP) install --require-hashes -r packaging/source-test.lock
+	$(VENV_PIP) install --no-deps --no-build-isolation -e .
 
 run:
 ifeq ($(OS),Windows_NT)
@@ -74,6 +81,8 @@ test:
 	$(VENV_PYTHON) -m compileall -q software/host/pa_host
 	node --check software/host/pa_host/gui/app.js
 	node --check software/host/pa_host/gui/compact.js
+	node --check software/host/pa_host/gui/high_throughput.js
+	node --check software/host/pa_host/gui/high_throughput_3d.js
 
 firmware-test:
 	$(MAKE) -C software/firmware/tests clean all

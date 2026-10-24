@@ -458,8 +458,25 @@ def _windows_app() -> int:
 def main(argv: list[str] | None = None) -> int:
     _prepare_standard_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"gui", "it-tool", "collect", "smpmgr"}
+    commands = {"gui", "it-tool", "collect", "collect-ble", "analyze", "verify-runtime", "smpmgr"}
     command = argv.pop(0) if argv and argv[0] in commands else ""
+    if command == "verify-runtime":
+        from importlib.metadata import version
+        import numpy
+        import scipy
+        import bleak
+        from pa_host import __version__, analyze, v52_ble
+        from pa_host.motion_approach import endpoint_phases
+
+        if argv:
+            raise ValueError("verify-runtime accepts no arguments")
+        del bleak
+        available = callable(getattr(analyze._scipy_signal, "welch", None))
+        print(json.dumps({"version": __version__, "numpy": numpy.__version__,
+                          "scipy": scipy.__version__, "bleak": version("bleak"),
+                          "scipy_welch": available, "protocol": v52_ble.PROTOCOL,
+                          "endpoint_phases": endpoint_phases(0, 10, 2, (0, 10), 0.001, 0.005)}))
+        return 0 if available else 1
     if not command and sys.platform == "win32" and not os.environ.get("SENSUS_PORTABLE_CHILD"):
         mutex = _acquire_windows_single_instance()
         if mutex is None:
@@ -493,8 +510,12 @@ def main(argv: list[str] | None = None) -> int:
         from pa_host.gui_server import main as target
     elif command == "it-tool":
         from pa_host.it_tool import main as target
+    elif command == "collect-ble":
+        from pa_host.collect_ble import main as target
     elif command == "collect":
         from pa_host.collect import main as target
+    elif command == "analyze":
+        from pa_host.analyze import main as target
     else:
         from smpmgr.main import app
 

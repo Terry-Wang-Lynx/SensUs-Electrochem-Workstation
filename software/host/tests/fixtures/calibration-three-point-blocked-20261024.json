@@ -1,0 +1,798 @@
+{
+  "guided": {
+    "document": {
+      "schema_version": "guided-1.0",
+      "name": "Template 1",
+      "output_dir": "",
+      "bindings": {
+        "boards": {
+          "A": {
+            "address": "",
+            "settings": {}
+          },
+          "B": {
+            "address": "",
+            "settings": {}
+          }
+        },
+        "motion": {
+          "port": "/dev/fixture-rs485",
+          "baud": 115200,
+          "axes": {
+            "X": {
+              "address": 1,
+              "lead_mm": 2,
+              "travel_mm": 150,
+              "positive_direction": 0,
+              "max_speed_mm_s": 20
+            },
+            "Z": {
+              "address": 2,
+              "lead_mm": 2,
+              "travel_mm": 50,
+              "positive_direction": 0,
+              "max_speed_mm_s": 20
+            }
+          }
+        }
+      },
+      "safety": {
+        "motion_policy_confirmed": false,
+        "electrical_policy_confirmed": false
+      },
+      "defaults": {
+        "descend_speed_mm_s": 0.5,
+        "ascend_speed_mm_s": 1,
+        "translate_speed_mm_s": 2,
+        "dwell_s": 180,
+        "settle_s": 2
+      },
+      "columns": [
+        {
+          "index": 1,
+          "name": "A",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 2,
+          "name": "B",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 3,
+          "name": "C",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 4,
+          "name": "D",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 5,
+          "name": "E",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 6,
+          "name": "F",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 7,
+          "name": "G",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 8,
+          "name": "H",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 9,
+          "name": "I",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 10,
+          "name": "J",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 11,
+          "name": "K",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        },
+        {
+          "index": 12,
+          "name": "L",
+          "enabled": true,
+          "duration_s": 180,
+          "windows": {}
+        }
+      ],
+      "electrodes": [
+        {
+          "id": "A",
+          "name": "样品A",
+          "enabled": true
+        },
+        {
+          "id": "B",
+          "name": "样品B",
+          "enabled": true
+        },
+        {
+          "id": "C",
+          "name": "样品C",
+          "enabled": true
+        },
+        {
+          "id": "D",
+          "name": "样品D",
+          "enabled": true
+        },
+        {
+          "id": "E",
+          "name": "样品E",
+          "enabled": true
+        },
+        {
+          "id": "F",
+          "name": "样品F",
+          "enabled": true
+        },
+        {
+          "id": "G",
+          "name": "样品G",
+          "enabled": true
+        },
+        {
+          "id": "H",
+          "name": "样品H",
+          "enabled": true
+        }
+      ]
+    },
+    "calibration": null,
+    "manual": {
+      "active": true,
+      "supported": true,
+      "status": "blocked",
+      "points": {
+        "last": {
+          "physical_column": 12,
+          "raw_counts": {
+            "X": 3616307,
+            "Z": 438549
+          }
+        },
+        "first": {
+          "physical_column": 1,
+          "raw_counts": {
+            "X": -4099551,
+            "Z": 438549
+          }
+        },
+        "working": {
+          "physical_column": null,
+          "raw_counts": {
+            "X": -4099549,
+            "Z": 2950251
+          }
+        }
+      },
+      "error": {
+        "code": "reconnect_required",
+        "message": "Motion fault requires reconnect and reference confirmation"
+      },
+      "control_mode": "keyboard",
+      "session_token": "00000000-0000-0000-0000-000000000201",
+      "required_points": [
+        "first",
+        "last",
+        "working",
+        "safe"
+      ],
+      "message": "保持两轴锁定，按住方向键对位后分别读取四点",
+      "connection_token": "00000000-0000-0000-0000-000000000202",
+      "alignment": {
+        "session_token": "00000000-0000-0000-0000-000000000201",
+        "status": "blocked",
+        "active": false,
+        "press_id": null,
+        "axis": null,
+        "direction": null,
+        "distance_mm": 0,
+        "last_stop_reason": "fault",
+        "error": {
+          "code": "reconnect_required",
+          "message": "Motion fault requires reconnect and reference confirmation"
+        },
+        "stop_result": {
+          "stop_confirmed": true,
+          "axes": {
+            "X": {
+              "stop_confirmed": true,
+              "error": null,
+              "stop_acknowledged": true,
+              "stop_reply": "02",
+              "stop_basis": "acknowledged_stop"
+            },
+            "Z": {
+              "stop_confirmed": true,
+              "error": null,
+              "stop_acknowledged": true,
+              "stop_reply": "02",
+              "stop_basis": "acknowledged_stop"
+            }
+          },
+          "errors": []
+        },
+        "boundaries": [],
+        "settings": {
+          "speed_mm_s": 20,
+          "max_speed_mm_s": 20,
+          "fast_motion_confirmed": true,
+          "hard_max_speed_mm_s": 20,
+          "lease_ms": 350,
+          "heartbeat_ms": 100,
+          "max_hold_s": null,
+          "max_hold_mm": null,
+          "hold_mode": "until_release"
+        }
+      }
+    },
+    "four_point_required": true
+  },
+  "devices": {
+    "motion": {
+      "connected": true,
+      "port": "/dev/fixture-rs485",
+      "baud": 115200,
+      "connection_token": "00000000-0000-0000-0000-000000000202",
+      "stop_generation": 13,
+      "absolute_limits": null,
+      "experiment_calibration": null,
+      "absolute_limits_required": false,
+      "faulted": true,
+      "axes": {
+        "X": {
+          "mechanical": {
+            "lead_mm": 2,
+            "travel_mm": 150,
+            "max_speed_mm_s": 20,
+            "positive_direction": 0,
+            "address": 1
+          },
+          "address": 1,
+          "referenced": false,
+          "enabled": true,
+          "enable_confirmed": false,
+          "position_mm": null,
+          "speed_mm_s": 0,
+          "status": 3,
+          "raw_count": -4099549,
+          "reference_count": null,
+          "telemetry_valid": false,
+          "updated_monotonic": 43483.931501166,
+          "config": {
+            "microstep": 16,
+            "step_angle": 1.8,
+            "pulses_per_rev": 3200,
+            "response_mode": 1,
+            "stall_protect": 1,
+            "position_window_deg": 0.8,
+            "raw_hex": "01422115190202020010010002580bb813880507010001010008089807d000086b",
+            "options_hex": "011a00066b"
+          },
+          "firmware_version": 206,
+          "hardware_version": 8468,
+          "power_flag_baseline": 0,
+          "speed_rpm": 0,
+          "input_target_count": -4099549,
+          "position_error_count": 0,
+          "feedback_age_s": 57.959831334002956
+        },
+        "Z": {
+          "mechanical": {
+            "lead_mm": 2,
+            "travel_mm": 50,
+            "max_speed_mm_s": 20,
+            "positive_direction": 0,
+            "address": 2
+          },
+          "address": 2,
+          "referenced": false,
+          "enabled": true,
+          "enable_confirmed": false,
+          "position_mm": null,
+          "speed_mm_s": 0,
+          "status": 3,
+          "raw_count": 2835235,
+          "reference_count": null,
+          "telemetry_valid": false,
+          "updated_monotonic": 43483.988946041,
+          "config": {
+            "microstep": 16,
+            "step_angle": 1.8,
+            "pulses_per_rev": 3200,
+            "response_mode": 1,
+            "stall_protect": 1,
+            "position_window_deg": 0.8,
+            "raw_hex": "02422115190202020010010002580bb813880507020001010008089807d000086b",
+            "options_hex": "021a00066b"
+          },
+          "firmware_version": 206,
+          "hardware_version": 8468,
+          "power_flag_baseline": 0,
+          "speed_rpm": 0,
+          "input_target_count": 2835235,
+          "position_error_count": 0,
+          "feedback_age_s": 57.902386459005356
+        }
+      },
+      "referenced": false,
+      "position": {
+        "X": null,
+        "Z": null
+      },
+      "manual": {
+        "active": false,
+        "status": "blocked",
+        "mode": "keyboard",
+        "control_mode": "keyboard",
+        "generation": null,
+        "connection_token": "00000000-0000-0000-0000-000000000202",
+        "session_token": "00000000-0000-0000-0000-000000000201",
+        "profiles": {
+          "X": {
+            "firmware_version": 206,
+            "hardware_version": 8468,
+            "config": {
+              "microstep": 16,
+              "step_angle": 1.8,
+              "pulses_per_rev": 3200,
+              "response_mode": 1,
+              "stall_protect": 1,
+              "position_window_deg": 0.8,
+              "raw_hex": "01422115190202020010010002580bb813880507010001010008089807d000086b",
+              "options_hex": "011a00066b"
+            },
+            "power_flag_baseline": 0
+          },
+          "Z": {
+            "firmware_version": 206,
+            "hardware_version": 8468,
+            "config": {
+              "microstep": 16,
+              "step_angle": 1.8,
+              "pulses_per_rev": 3200,
+              "response_mode": 1,
+              "stall_protect": 1,
+              "position_window_deg": 0.8,
+              "raw_hex": "02422115190202020010010002580bb813880507020001010008089807d000086b",
+              "options_hex": "021a00066b"
+            },
+            "power_flag_baseline": 0
+          }
+        },
+        "motion": {
+          "port": "/dev/fixture-rs485",
+          "baud": 115200,
+          "axes": {
+            "X": {
+              "lead_mm": 2,
+              "travel_mm": 150,
+              "max_speed_mm_s": 20,
+              "positive_direction": 0,
+              "address": 1
+            },
+            "Z": {
+              "lead_mm": 2,
+              "travel_mm": 50,
+              "max_speed_mm_s": 20,
+              "positive_direction": 0,
+              "address": 2
+            }
+          }
+        },
+        "start_counts": {
+          "X": 3616307,
+          "Z": 438549
+        },
+        "supported": false,
+        "capture_supported": true,
+        "boundaries": []
+      },
+      "stop_confirmed": true,
+      "feedback_error": null
+    },
+    "boards": {
+      "A": {
+        "address": "",
+        "state": "unbound",
+        "channel_ids": [
+          "A",
+          "B",
+          "C",
+          "D"
+        ]
+      },
+      "B": {
+        "address": "",
+        "state": "unbound",
+        "channel_ids": [
+          "E",
+          "F",
+          "G",
+          "H"
+        ]
+      }
+    },
+    "limits": {
+      "state": "missing",
+      "active": false,
+      "calibrating": false,
+      "record": null,
+      "draft": null,
+      "error": null
+    },
+    "calibration": {
+      "required": true,
+      "ready": false,
+      "display_valid": false,
+      "state": "calibrating",
+      "points": [
+        "first",
+        "last",
+        "working",
+        "safe"
+      ]
+    }
+  },
+  "state": {
+    "state": "idle",
+    "mode": null,
+    "run_id": null,
+    "step_index": -1,
+    "column": null,
+    "position": {
+      "X": null,
+      "Z": null
+    },
+    "message": "Ready",
+    "error": null,
+    "stop_confirmed": true,
+    "manifest_path": null,
+    "channels": [],
+    "pause_requested": false,
+    "column_timing": null,
+    "boards": {},
+    "busy": true,
+    "motion": {
+      "connected": true,
+      "port": "/dev/fixture-rs485",
+      "baud": 115200,
+      "connection_token": "00000000-0000-0000-0000-000000000202",
+      "stop_generation": 13,
+      "absolute_limits": null,
+      "experiment_calibration": null,
+      "absolute_limits_required": false,
+      "faulted": true,
+      "axes": {
+        "X": {
+          "mechanical": {
+            "lead_mm": 2,
+            "travel_mm": 150,
+            "max_speed_mm_s": 20,
+            "positive_direction": 0,
+            "address": 1
+          },
+          "address": 1,
+          "referenced": false,
+          "enabled": true,
+          "enable_confirmed": false,
+          "position_mm": null,
+          "speed_mm_s": 0,
+          "status": 3,
+          "raw_count": -4099549,
+          "reference_count": null,
+          "telemetry_valid": false,
+          "updated_monotonic": 43483.931501166,
+          "config": {
+            "microstep": 16,
+            "step_angle": 1.8,
+            "pulses_per_rev": 3200,
+            "response_mode": 1,
+            "stall_protect": 1,
+            "position_window_deg": 0.8,
+            "raw_hex": "01422115190202020010010002580bb813880507010001010008089807d000086b",
+            "options_hex": "011a00066b"
+          },
+          "firmware_version": 206,
+          "hardware_version": 8468,
+          "power_flag_baseline": 0,
+          "speed_rpm": 0,
+          "input_target_count": -4099549,
+          "position_error_count": 0,
+          "feedback_age_s": 57.96673912499682
+        },
+        "Z": {
+          "mechanical": {
+            "lead_mm": 2,
+            "travel_mm": 50,
+            "max_speed_mm_s": 20,
+            "positive_direction": 0,
+            "address": 2
+          },
+          "address": 2,
+          "referenced": false,
+          "enabled": true,
+          "enable_confirmed": false,
+          "position_mm": null,
+          "speed_mm_s": 0,
+          "status": 3,
+          "raw_count": 2835235,
+          "reference_count": null,
+          "telemetry_valid": false,
+          "updated_monotonic": 43483.988946041,
+          "config": {
+            "microstep": 16,
+            "step_angle": 1.8,
+            "pulses_per_rev": 3200,
+            "response_mode": 1,
+            "stall_protect": 1,
+            "position_window_deg": 0.8,
+            "raw_hex": "02422115190202020010010002580bb813880507020001010008089807d000086b",
+            "options_hex": "021a00066b"
+          },
+          "firmware_version": 206,
+          "hardware_version": 8468,
+          "power_flag_baseline": 0,
+          "speed_rpm": 0,
+          "input_target_count": 2835235,
+          "position_error_count": 0,
+          "feedback_age_s": 57.90929424999922
+        }
+      },
+      "referenced": false,
+      "position": {
+        "X": null,
+        "Z": null
+      },
+      "manual": {
+        "active": false,
+        "status": "blocked",
+        "mode": "keyboard",
+        "control_mode": "keyboard",
+        "generation": null,
+        "connection_token": "00000000-0000-0000-0000-000000000202",
+        "session_token": "00000000-0000-0000-0000-000000000201",
+        "profiles": {
+          "X": {
+            "firmware_version": 206,
+            "hardware_version": 8468,
+            "config": {
+              "microstep": 16,
+              "step_angle": 1.8,
+              "pulses_per_rev": 3200,
+              "response_mode": 1,
+              "stall_protect": 1,
+              "position_window_deg": 0.8,
+              "raw_hex": "01422115190202020010010002580bb813880507010001010008089807d000086b",
+              "options_hex": "011a00066b"
+            },
+            "power_flag_baseline": 0
+          },
+          "Z": {
+            "firmware_version": 206,
+            "hardware_version": 8468,
+            "config": {
+              "microstep": 16,
+              "step_angle": 1.8,
+              "pulses_per_rev": 3200,
+              "response_mode": 1,
+              "stall_protect": 1,
+              "position_window_deg": 0.8,
+              "raw_hex": "02422115190202020010010002580bb813880507020001010008089807d000086b",
+              "options_hex": "021a00066b"
+            },
+            "power_flag_baseline": 0
+          }
+        },
+        "motion": {
+          "port": "/dev/fixture-rs485",
+          "baud": 115200,
+          "axes": {
+            "X": {
+              "lead_mm": 2,
+              "travel_mm": 150,
+              "max_speed_mm_s": 20,
+              "positive_direction": 0,
+              "address": 1
+            },
+            "Z": {
+              "lead_mm": 2,
+              "travel_mm": 50,
+              "max_speed_mm_s": 20,
+              "positive_direction": 0,
+              "address": 2
+            }
+          }
+        },
+        "start_counts": {
+          "X": 3616307,
+          "Z": 438549
+        },
+        "supported": false,
+        "capture_supported": true,
+        "boundaries": []
+      },
+      "stop_confirmed": true,
+      "feedback_error": null
+    },
+    "synthetic": false,
+    "simulation_scale": 0.02,
+    "recovery_required": false,
+    "events": [],
+    "experiment": {
+      "schema_version": "1.1",
+      "name": "Template 1",
+      "output_dir": "",
+      "bindings": {
+        "boards": {
+          "A": {
+            "address": "",
+            "settings": {}
+          },
+          "B": {
+            "address": "",
+            "settings": {}
+          }
+        },
+        "motion": {
+          "port": "",
+          "baud": 115200,
+          "axes": {
+            "X": {
+              "address": 1,
+              "lead_mm": 2,
+              "travel_mm": 150,
+              "positive_direction": 0,
+              "max_speed_mm_s": 10
+            },
+            "Z": {
+              "address": 2,
+              "lead_mm": 2,
+              "travel_mm": 50,
+              "positive_direction": 0,
+              "max_speed_mm_s": 10
+            }
+          }
+        }
+      },
+      "defaults": {
+        "descend_speed_mm_s": 0.5,
+        "ascend_speed_mm_s": 1,
+        "translate_speed_mm_s": 2,
+        "dwell_s": 180,
+        "settle_s": 2,
+        "z_safe_mm": 0,
+        "z_immersed_mm": 6,
+        "x_first_mm": 0,
+        "column_pitch_mm": 9,
+        "channels": [
+          "A",
+          "H"
+        ]
+      },
+      "electrodes": [
+        {
+          "id": "A",
+          "name": "样品A"
+        },
+        {
+          "id": "B",
+          "name": "样品B"
+        },
+        {
+          "id": "C",
+          "name": "样品C"
+        },
+        {
+          "id": "D",
+          "name": "样品D"
+        },
+        {
+          "id": "E",
+          "name": "样品E"
+        },
+        {
+          "id": "F",
+          "name": "样品F"
+        },
+        {
+          "id": "G",
+          "name": "样品G"
+        },
+        {
+          "id": "H",
+          "name": "样品H"
+        }
+      ],
+      "columns": [
+        {
+          "index": 7,
+          "solution": "G",
+          "concentration": null,
+          "overrides": {
+            "dwell_s": 10
+          }
+        }
+      ],
+      "program": [
+        {
+          "op": "move_to_column",
+          "column": 7
+        },
+        {
+          "op": "immerse"
+        },
+        {
+          "op": "dwell",
+          "seconds": 10,
+          "acquire": [
+            "A",
+            "H"
+          ],
+          "windows": {
+            "A": {
+              "start_s": 0,
+              "duration_s": 5
+            },
+            "H": {
+              "start_s": 2,
+              "duration_s": 8
+            }
+          }
+        },
+        {
+          "op": "withdraw"
+        }
+      ],
+      "safety": {
+        "motion_policy_confirmed": false,
+        "electrical_policy_confirmed": false
+      },
+      "run_policy": "guided",
+      "calibration_id": "synthetic"
+    }
+  },
+  "provenance": {
+    "source": "2026-10-24 actual three-point blocked calibration API capture",
+    "sanitized": "Serial path and session/connection UUID replaced consistently; event history omitted"
+  }
+}

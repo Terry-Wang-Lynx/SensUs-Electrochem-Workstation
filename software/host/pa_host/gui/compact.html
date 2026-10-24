@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SensUs 悬浮检测</title>
-  <link rel="stylesheet" href="/assets/compact.css">
+  <link rel="stylesheet" href="/assets/compact.css?v=20261019-v050-ble">
 </head>
 <body>
   <main>
@@ -14,6 +14,7 @@
         <strong id="statusText">连接中</strong>
       </div>
       <span id="conditionText">读取条件…</span>
+      <span class="ble-note" id="bleNote" hidden>V5.2 · 仅 I-T，无 CV / EIS / OTA。断线后可能仍采样，请在完整工作站重连并停止。</span>
     </header>
 
     <section class="live">
@@ -54,6 +55,6 @@
     <p id="message">正在连接工作站…</p>
     <button id="measureButton" class="measure" type="button" disabled>开始标定测量</button>
   </main>
-  <script src="/assets/compact.js?v=20260816-power-resize"></script>
+  <script src="/assets/compact.js?v=20261019-v050-ble"></script>
 </body>
 </html>

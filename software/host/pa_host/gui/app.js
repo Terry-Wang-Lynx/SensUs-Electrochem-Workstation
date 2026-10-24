@@ -5,10 +5,12 @@ const $ = (id) => {
 };
 const state = { measurement: null, measurementStartPending: false, measurementDrawRevision: null, measurementDrawPending: false, calibration: {points: [], model: null, curve: null}, drift: null, schedule: null, settings: null, workflow: null, history: {entries: []}, historyCurveCatalog: [], historyCurves: [], historyCurveIds: [], historyPreview: null, devices: {devices: [], selected_device_id: null, busy: false, probing: true}, deviceRefreshPromise: null, jlinkDriverPreparePending: false, workspaceSwitchPromise: null, appUpdate: null, appUpdateRequested: false, appUpdateApplying: false, appUpdatePollTimer: null, sampleRole: 'calibration', method: 'it', chartWindowS: 300, chartWindowFixed: true, chartRunId: null, lastHandledRunId: null, measureControlInitialized: false, measureRequestError: '', showRaw: true, calibrationDirty: false, validationDirty: false, settingsDirty: false, settingsApplyActive: false, settingsApplyRequestPending: false, settingsApplySequence: 0, settingsPollSequence: 0, driftDirty: false, exiting: false };
 state.diagnostics=null;state.diagnosticsRefreshPromise=null;state.clientIssueLast=new Map();
+let highThroughputDevicesPending=false;
 const pages = {
   measure: ['实时测量', '180 秒 IT 检测与末 20 秒稳态分析'],
   calibrate: ['标定与漂移', '选择标定范围并管理过渡期 bias'],
   schedule: ['稳定化 / 自动', '无人值守的定时连续 IT 检测'],
+  throughput: ['高通量自动化实验', '12 列模板 · 8 电极 · 物理第 1 / 12 列标定'],
   history: ['历史记录', '恢复完整工作区并继续标定或测试'],
   // 🔴 缺这一条会让整个切页 handler TypeError —— pages[view][0] 直接取下标
   debug: ['硬件 DEBUG', '运行时改采样参数 · 每次变更留审计 · 电流与电位同图']
@@ -133,7 +135,102 @@ function browseWorkspaceDirectory(initialPath) {
   });
 }
 
-const SETTINGS_INPUT_IDS = ['potentialV','workingElectrodeV','durationS','adaptiveStop','sensPeriodCode','sampleRateHz','fitWindowS','fsrNA','offsetNA','cvLowV','cvHighV','cvScanRate','cvCycles','cvQuietS','cvEisFsrUA'];
+const SETTINGS_INPUT_IDS = ['potentialV','workingElectrodeV','durationS','adaptiveStop','sensPeriodCode','sampleRateHz','fitWindowS','fsrNA','offsetNA','cvLowV','cvHighV','cvScanRate','cvCycles','cvQuietS','cvEisFsrUA','analysisChannel'];
+function isBleProfile(){
+  const payload=state.devices||{};
+  const selected=payload.selected_device||(payload.devices||[]).find(device=>device.id===payload.selected_device_id);
+  if(selected)return selected.kind==='ble'||selected.transport==='ble';
+  return state.settings?.settings?.board_profile==='v52'||state.settings?.transport==='ble';
+}
+function renderBoardOptions(){
+  const ble=isBleProfile(),profile=ble?'v52':'legacy';
+  if($('offsetNA').dataset.profile===profile)return;
+  const offsets=ble?['10nA','20nA','40nA','80nA']:['9nA','19nA','40nA','80nA'];
+  $('offsetNA').replaceChildren();
+  [...offsets,'10pct','20pct','50pct'].forEach(value=>{
+    const option=document.createElement('option');option.value=value;
+    if(value.endsWith('pct')){option.dataset.pct=value.slice(0,-3);option.textContent=`${option.dataset.pct}% FSR`}
+    else option.textContent=`${value.slice(0,-2)} nA`;
+    $('offsetNA').append(option);
+  });
+  $('offsetNA').dataset.profile=profile;
+  $('sensPeriodCode').replaceChildren();
+  const legacyRates=['8.06','4.13','2.10','1.06','0.53','0.27'];
+  Array.from({length:ble?11:6},(_,code)=>code).forEach(code=>{
+    const option=document.createElement('option');option.value=String(code);
+    option.textContent=ble?`PERIOD ${code}${code===0?'（默认）':''}`:`${legacyRates[code]} Hz`;
+    $('sensPeriodCode').append(option);
+  });
+}
+function renderBleControls(){
+  const ble=isBleProfile(),applying=Boolean(state.settingsApplyActive||state.settings?.state==='applying');
+  const busy=Boolean(state.measurementStartPending||state.measurement?.busy||state.measurement?.state==='running'||state.schedule?.active||state.devices?.busy||applying||state.bleAction);
+  $('analysisChannelField').hidden=!ble;$('analysisChannel').disabled=busy;
+  $('bleCapabilities').hidden=!ble;$('bleDebugNotice').hidden=!ble;
+  ['cellvLive','phaseLive','rangeLive'].forEach(id=>{$(id).hidden=ble});
+  document.querySelectorAll('#view-debug .dbg-chart, #view-debug .dbg-panel').forEach(panel=>{panel.hidden=ble});
+  $('methodMode').querySelectorAll('button').forEach(button=>{button.disabled=applying||(ble&&(busy||button.dataset.method==='cv'))});
+  $('fsrNA').querySelectorAll('option').forEach(option=>{option.hidden=option.disabled=ble&&Number(option.value)>2000});
+  $('itPresets').hidden=ble;
+  $('sampleRateField').hidden=ble;$('sampleRateHz').disabled=ble||applying;
+  $('sampleRateHz').title=ble?'V5.2 保存各通道原生采样点；硬件周期由 PERIOD 设置':'';
+  if(ble)SETTINGS_INPUT_IDS.forEach(id=>{$(id).disabled=busy||id==='sampleRateHz'||(id==='durationS'&&Boolean(state.settings?.settings?.adaptive_stop))});
+  $('scanBle').disabled=busy;$('scanBle').textContent=state.bleAction==='scan'?'扫描中…':'扫描蓝牙';
+  const selected=state.devices?.selected_device||(state.devices?.devices||[]).find(device=>device.id===state.devices?.selected_device_id);
+  $('stopBle').hidden=!ble;$('stopBle').disabled=busy||!selected?.protocol_verified;
+  $('stopBle').textContent=state.bleAction==='stop'?'正在确认停止…':'停止板端采样';
+}
+function bleMonitorValue(entry){
+  if(entry.value===null||entry.value===undefined||!Number.isFinite(Number(entry.value)))return '--';
+  if(entry.unit==='uV')return `${fmt(Number(entry.value)/1000000,6)} V`;
+  if(entry.unit==='milliC')return `${fmt(Number(entry.value)/1000,3)} °C`;
+  return `${fmt(entry.value,3)} ${entry.unit||''}`.trim();
+}
+function renderBleMeasurement(data=state.measurement){
+  const ble=Boolean(data?.ble)||isBleProfile();
+  $('blePanel').hidden=!ble;
+  if(!ble)return;
+  const snapshot=data?.ble||{},selected=Number(snapshot.analysis_channel||state.settings?.settings?.analysis_channel||1);
+  $('bleAnalysisLabel').textContent=`CH${selected} 用于主图、标定与分析；四路均保存 · 电流未校准`;
+  for(let channel=1;channel<=4;channel++){
+    const values=(snapshot.channels||[]).find(entry=>Number(entry.channel)===channel);
+    $(`bleCurrent${channel}`).textContent=fmt(values?.latest_current_nA,3);
+    $(`bleChannel${channel}`).classList.toggle('selected',selected===channel);
+    const invalid=values?.valid?.at(-1)===false;
+    $(`bleCurrent${channel}`).classList.toggle('invalid',invalid);
+    $(`bleChannelStatus${channel}`).textContent=invalid?'饱和 / 溢出':values?.current_nA?.length?'未校准':'等待数据';
+  }
+  const status=typeof snapshot.state==='string'?{phase:snapshot.state,stop_confirmed:snapshot.stop_confirmed}:snapshot.state||{},phase=status.phase||'idle';
+  const stopUnknown=['error','stopped','completed'].includes(phase)&&status.stop_confirmed!==true;
+  const labels={idle:'待机',configuring:'正在核对配置',running:'四路采集中',completed:'本轮完成',stopped:'已停止',error:'采集异常'};
+  $('bleRunState').textContent=stopUnknown?'停止未确认，板端仍可能采样；请重新连接并停止板端采样':`${labels[phase]||phase}${status.stop_confirmed===true?' · STOP 已确认':''}`;
+  $('bleRunState').classList.toggle('error-text',stopUnknown||phase==='error');
+  $('bleMonitor').replaceChildren();
+  Object.values(snapshot.monitor||{}).sort((left,right)=>String(left.quantity).localeCompare(String(right.quantity))||Number(left.channel)-Number(right.channel)).forEach(entry=>{
+    const row=document.createElement('div');row.className='ble-monitor-value';
+    row.textContent=`${entry.quantity}${Number(entry.channel)>0?` · CH${entry.channel}`:''}  ${bleMonitorValue(entry)}${entry.flags?` · flags=${entry.flags}`:''}${entry.stale?' · 旧读数':''}`;
+    row.classList.toggle('invalid',Boolean(Number(entry.flags)&3));$('bleMonitor').append(row);
+  });
+  if(!$('bleMonitor').children.length){const empty=document.createElement('div');empty.textContent='开始测量后显示温度与电压监测';$('bleMonitor').append(empty)}
+  $('bleFiles').textContent=[snapshot.all_channels_path,snapshot.monitor_path].filter(Boolean).join(' · ');
+}
+function drawBleChannels(data=state.measurement){
+  if(!data?.ble||document.visibilityState==='hidden')return;
+  const colors=['#167b74','#4267a8','#a26526','#8b4f97'];
+  for(let channel=1;channel<=4;channel++){
+    const values=(data.ble.channels||[]).find(entry=>Number(entry.channel)===channel)||{},valid=[],invalid=[];
+    (values.time_s||[]).forEach((time,index)=>{
+      const current=values.current_nA?.[index];
+      if(current===null||current===undefined||!Number.isFinite(Number(current)))return;
+      (values.valid?.[index]===false?invalid:valid).push([time,current]);
+    });
+    const latest=Number(values.time_s?.at(-1)||0),xmin=Math.max(0,latest-30),visible=points=>points.filter(point=>point[0]>=xmin);
+    drawChart($(`bleChart${channel}`),[
+      {points:visible(valid),color:colors[channel-1],width:1.2,dots:true,pointRadius:1.3},
+      {points:visible(invalid),color:'#c33c54',width:0,dots:true,pointRadius:2},
+    ],{xmin,xmax:Math.max(30,latest),xlabel:'时间 (s)',ylabel:`CH${channel} (nA)`});
+  }
+}
 function itPresetSettings(name){
   // 四个预设 = 两种电极 × 氧化/还原两步。
   //   氧化:微针 **+0.4V**、丝网印刷 **+0.2V**(两者电位不同,不是同一个值);V_WE 都是 1.2V、180 s
@@ -467,6 +564,8 @@ function hardwareOperationStatus(){
     if(usable.length>1)return {ready:false,message:'请先选择本次使用的设备'};
     return {ready:false,message:payload.probing?'正在核对硬件连接':'未发现可用硬件'};
   }
+  if(active.kind==='ble'||active.transport==='ble')return active.protocol_verified===true
+    ?{ready:true,message:''}:{ready:false,message:'已发现蓝牙设备，请先选择并验证协议'};
   if(active.kind==='jlink'){
     if(active.target_state==='reachable')return {ready:true,message:''};
     if(active.driver_state==='missing')return {ready:false,message:'请点击右上角“选择设备”，再点击该 J-Link 的“准备 J-Link”'};
@@ -718,13 +817,16 @@ $('dismissGlobalError').addEventListener('click',()=>{$('globalError').hidden=tr
 $('openDiagnostics').addEventListener('click',()=>{document.querySelector('.nav-item[data-view="debug"]').click();requestAnimationFrame(()=>$('diagnosticsPanel').scrollIntoView({behavior:'smooth',block:'start'}))});
 
 document.querySelectorAll('.nav-item').forEach(button => button.addEventListener('click', () => {
+  if(button.dataset.view!=='throughput')window.HighThroughput?.deactivate?.();
   document.querySelectorAll('.nav-item').forEach(x => x.classList.toggle('active', x === button));
   document.querySelectorAll('.view').forEach(x => x.classList.remove('active'));
   $(`view-${button.dataset.view}`).classList.add('active');
   $('pageTitle').textContent = pages[button.dataset.view][0];
   $('pageSubtitle').textContent = pages[button.dataset.view][1];
+  $('firmwareNote').hidden = button.dataset.view === 'throughput';
   if(button.dataset.view==='history')void refreshWorkspaceHistory();
   if(button.dataset.view==='debug')void refreshDiagnostics();
+  if(button.dataset.view==='throughput')window.HighThroughput?.activate();
   requestAnimationFrame(() => {drawAll(); drawDebug();});
 }));
 
@@ -954,6 +1056,7 @@ function pointColor(family,pointId){
 }
 function drawAll(){
   if(document.visibilityState==='hidden')return;
+  drawBleChannels();
   const live=state.measurement?.data||{},preview=state.historyPreview;
   const d=(!state.measurement?.busy&&!live.current_nA?.length&&preview)?preview:live;
   const current = d.current_nA || [], allSeries=[];
@@ -1226,8 +1329,76 @@ function renderCvMetricStrip(data){
   $('metricQuaternaryValue').textContent=metrics.progress_percent==null?'--':fmt(metrics.progress_percent,0);
   $('metricQuaternaryUnit').textContent='%';$('metricProgressDetail').hidden=true;
 }
+function highThroughputDeviceStatus(devices={},readError=null,elapsed_s=0){
+  const motion=devices.motion||{}, axes=motion.axes||{}, rows={};
+  const failed=!!readError||!!motion.faulted||!!motion.feedback_error;
+  const ageOf=axis=>Number.isFinite(axis?.feedback_age_s)?axis.feedback_age_s+Math.max(0,elapsed_s):null;
+  const fresh=axis=>motion.connected&&!failed&&axis?.telemetry_valid===true&&Number.isFinite(ageOf(axis))&&ageOf(axis)>=0&&ageOf(axis)<=2;
+  const allFresh=['X','Z'].every(axis=>fresh(axes[axis]));
+  const movingAxis=motion.connected&&!failed&&['X','Z'].includes(motion.automatic_motion_axis)?motion.automatic_motion_axis:null;
+  const motionLabel=failed?'状态未知 / 故障':movingAxis?movingAxis+' 自动移动中 · 停稳后复核双轴':allFresh?'X/Z 已读通':motion.connected?'已连接 · 反馈待确认':'未连接';
+  const problem=readError?.message||motion.feedback_error?.message||(motion.faulted?'驱动故障':'');
+  rows.Motion={text:'RS485 · '+motionLabel+(motion.port?' · '+motion.port:'')+(problem?' · '+problem:''),tone:failed?'error':movingAxis?'warning':allFresh?'ok':motion.connected?'warning':'unknown'};
+  for(const axis of ['X','Z']){
+    const data=axes[axis]||{},age=Number.isFinite(ageOf(data))?ageOf(data).toFixed(1)+' s':'未知';
+    const deferred=movingAxis&&axis!==movingAxis;
+    const valid=fresh(data),label=failed?'反馈未知':!motion.connected?'未连接':deferred?'保持轴反馈暂缓 · 待 '+movingAxis+' 停稳后复核':valid?(data.enabled===false?'已松轴':data.enabled===true?'已锁轴':'已读通'):Number.isFinite(ageOf(data))&&ageOf(data)>2?'反馈过期':'反馈未确认';
+    rows['Axis'+axis]={text:axis+(data.address??(axis==='X'?1:2))+' · '+label+' · '+(Number.isFinite(data.raw_count)?data.raw_count+' count':'计数未知')+' · '+(Number.isFinite(data.speed_rpm)?data.speed_rpm+' RPM':'转速未知')+' · 反馈年龄 '+age,tone:failed?'error':deferred?'warning':valid&&data.enabled!==false?'ok':motion.connected?'warning':'unknown'};
+  }
+  const boardNames={unbound:'未绑定',bound_unverified:'已绑定 · 未验证连接',connected:'已连接',disconnected:'未连接',connecting:'连接中',connection_error:'连接失败',acquiring:'采集中',reconnecting:'掉线 · 正在重连',stopped_unverified:'已停止 · 连接未验证',error:'故障 / 状态未知'};
+  for(const slot of ['A','B']){
+    const board=devices.boards?.[slot]||{},status=board.state||'unbound',channels=slot==='A'?'A–D':'E–H';
+    rows['Board'+slot]={text:'板 '+slot+' / '+channels+' · '+(readError?'状态未知':boardNames[status]||'连接未验证')+(board.address?' · '+board.address:'')+(board.connection_error?' · '+(board.connection_error.message||board.connection_error):''),tone:readError||['error','connection_error'].includes(status)?'error':['acquiring','connected'].includes(status)?'ok':['reconnecting','bound_unverified','stopped_unverified','disconnected','connecting'].includes(status)?'warning':'unknown'};
+  }
+  const limits=devices.limits||{};
+  rows.Limits={text:'运动限位 · '+(readError?'状态未知':limits.active?'当前连接有效':limits.state==='missing'?'未标定':limits.state==='calibrating'?'正在读取四边界':limits.state==='error'?'验证故障':'需重新读取四边界'),tone:readError||limits.state==='error'?'error':limits.active?'ok':'warning'};
+  if(devices.calibration?.required===true){const calibration=devices.calibration;rows.Limits={text:'实验标定 · '+(readError?'状态未知':calibration.state==='calibrating'?'正在读取四个实验坐标':calibration.ready===true?'本次连接有效':'本次连接尚未完成标定'),tone:readError?'error':calibration.ready===true?'ok':'warning'};}
+  const boardStates=['A','B'].map(slot=>devices.boards?.[slot]?.state||'unbound'),acquiring=boardStates.filter(value=>value==='acquiring').length,unbound=boardStates.filter(value=>value==='unbound').length,connected=boardStates.filter(value=>value==='connected').length;
+  const boardFault=boardStates.some(value=>['error','connection_error'].includes(value));
+  const boardCaption=readError?'板卡状态未知':boardFault?'板卡故障':boardStates.includes('reconnecting')?'板卡正在重连':acquiring?acquiring+'/2 板采集中':connected?connected+'/2 板已连接':boardStates.includes('connecting')?'板卡连接中':unbound?unbound+' 板未绑定':boardStates.includes('disconnected')?'板卡未连接':'两板未验证连接';
+  rows.CompactSummary={text:(failed?'RS485 状态未知':movingAxis?movingAxis+' 自动移动中':allFresh?'X/Z 已读通':motion.connected?'X/Z 反馈待确认':'RS485 未连接')+' · '+boardCaption,tone:failed||boardFault?'error':movingAxis?'warning':allFresh&&(acquiring===2||connected===2)?'ok':motion.connected?'warning':'unknown'};
+  return rows;
+}
+function renderHighThroughputDevices(devices={},readError=null,elapsed_s=0){
+  const rows=highThroughputDeviceStatus(devices,readError,elapsed_s);
+  for(const [key,row] of Object.entries(rows)){
+    const target=$('htDevices'+key);target.textContent=row.text;target.className='ht-device-line '+row.tone;
+  }
+  for(const key of ['AxisX','AxisZ','BoardA','BoardB','Limits']){
+    const target=$('htDevicesCompact'+key),row=rows[key];target.textContent=row.text;target.className='ht-device-line '+row.tone;
+  }
+}
+async function refreshHighThroughputDevices(){
+  if(state.exiting)return;
+  const cached=window.PAHighThroughputDevices;
+  if(cached){
+    renderHighThroughputDevices(cached.snapshot,cached.available?null:cached.error,Math.max(0,(Date.now()-(cached.received_at_ms||Date.now()))/1000));
+    window.HighThroughput?.acceptDevices(cached);
+  }
+  if(highThroughputDevicesPending)return;
+  highThroughputDevicesPending=true;
+  try{
+    const snapshot=await api('/api/automation/v1/devices');
+    window.PAHighThroughputDevices={snapshot,available:true,error:null,received_at_ms:Date.now()};
+    renderHighThroughputDevices(snapshot);
+  }catch(error){
+    window.PAHighThroughputDevices={snapshot:cached?.snapshot||{},received_at_ms:cached?.received_at_ms,available:false,error:{message:error.message||String(error)}};
+    renderHighThroughputDevices(window.PAHighThroughputDevices.snapshot,error);
+  }finally{
+    highThroughputDevicesPending=false;
+    window.HighThroughput?.acceptDevices(window.PAHighThroughputDevices);
+  }
+}
+$('htDevicesReset').addEventListener('click',async()=>{
+  $('htDevicesReset').disabled=true;
+  try{await window.HighThroughput?.resetDevices();await refreshHighThroughputDevices()}
+  finally{$('htDevicesReset').disabled=false}
+});
 function renderHardwareConnection(data=state.measurement){
   const payload=state.devices||{},devices=Array.isArray(payload.devices)?payload.devices:[];
+  const bleDevices=devices.filter(device=>device.kind==='ble'||device.transport==='ble');
+  const bleMode=String(payload.transport||data?.transport||payload.transport_requested||'')==='ble';
+  const bleScan=payload.ble_scan||{},bleCount=Number.isInteger(bleScan.count)?bleScan.count:bleDevices.length;
   const usable=devices.filter(device=>device.selectable),selected=payload.selected_device||devices.find(device=>device.id===payload.selected_device_id)||null;
   const activeDevice=selected||(usable.length===1?usable[0]:null);
   let dotClass='',title='硬件未连接',detail='未发现 USB DATA 或 J-Link';
@@ -1235,6 +1406,22 @@ function renderHardwareConnection(data=state.measurement){
     dotClass='busy';title='设备测量中';detail=String(data.device_name||activeDevice?.name||data.transport_label||'已连接硬件');
   }else if(selected?.present===false){
     dotClass='error';title='所选设备已断开';detail=String(selected.target_detail||'请重新插拔后刷新');
+  }else if((activeDevice?.kind==='ble'||activeDevice?.transport==='ble')&&state.bleAction!=='scan'&&!['scanning','error'].includes(bleScan.state)){
+    dotClass=activeDevice.protocol_verified?'ok':'warning';title=activeDevice.protocol_verified?'蓝牙协议已验证':'已发现蓝牙设备';
+    detail=activeDevice.protocol_verified?String(activeDevice.name||'V5.2 BLE'):'请选择设备完成协议验证';
+    if(bleScan.state==='complete')detail+=` · 上次扫描发现 ${bleCount} 块`;
+  }else if(bleMode){
+    if(state.bleAction==='scan'||bleScan.state==='scanning'){
+      dotClass='probing';title='正在扫描蓝牙';detail='正在查找 V5.2 广播，扫描不等于已连接';
+    }else if(bleScan.state==='error'){
+      dotClass='error';title='蓝牙扫描失败';detail='请检查蓝牙开启与应用权限；'+String(bleScan.error||'请重新扫描');
+    }else if(bleCount>0){
+      dotClass='warning';title=`发现 ${bleCount} 块蓝牙采集板`;detail='上次扫描结果 · 请核对身份并绑定板 A / B，尚未确认双板连接';
+    }else if(bleScan.state==='complete'){
+      dotClass='warning';title='未发现蓝牙采集板';detail='请开启蓝牙、给板卡供电并靠近电脑，再扫描';
+    }else{
+      dotClass='warning';title='蓝牙尚未扫描';detail='请开启蓝牙 → 右上角选择设备 → 扫描蓝牙';
+    }
   }else if(activeDevice?.kind==='jlink'){
     const targetState=String((payload.probing&&activeDevice.target_state==='unknown')?'checking':(activeDevice.target_state||'unknown'));
     if(activeDevice.driver_state==='missing'){
@@ -1259,10 +1446,11 @@ function renderHardwareConnection(data=state.measurement){
   }else if(devices.length){
     dotClass='warning';title='硬件尚未就绪';detail=devices.map(device=>device.name||device.transport_label).filter(Boolean).join(' · ')||'请重新插拔后刷新';
   }
-  const showModel=data?.state==='running'||activeDevice?.target_state==='reachable'||(activeDevice?.kind==='usb'&&activeDevice?.selectable);
+  const ble=data?.transport==='ble'||activeDevice?.kind==='ble'||activeDevice?.transport==='ble';
+  const showModel=data?.state==='running'||activeDevice?.target_state==='reachable'||(activeDevice?.kind==='usb'&&activeDevice?.selectable)||(ble&&activeDevice?.protocol_verified);
   $('deviceDot').className=`status-dot ${dotClass}`.trim();
   $('deviceState').textContent=title;
-  $('deviceTransport').textContent=`${detail}${showModel?' · MAX30131':''}`;
+  $('deviceTransport').textContent=`${detail}${showModel?(ble?' · MAX30134':' · MAX30131'):''}`;
   const diagnostics=String(activeDevice?.target_diagnostics||'');
   $('deviceStatus').title=diagnostics||`${title}：${detail}`;
 }
@@ -1273,6 +1461,7 @@ function measurementChartRevision(data){
     data?.run_id||'',data?.state||'',current.length,
     last>=0?time[last]:null,last>=0?current[last]:null,
     last>=0?potential[last]:null,
+    (data?.ble?.channels||[]).map(channel=>[channel.channel,channel.current_nA?.length,channel.time_s?.at(-1),channel.current_nA?.at(-1),channel.valid?.at(-1)]),
   ]);
 }
 function scheduleMeasurementDraw(data){
@@ -1291,6 +1480,7 @@ function updateMeasurement(data){
   state.measurement=data; const running=data.state==='running', complete=data.state==='completed', starting=Boolean(state.measurementStartPending)||data.operation_phase==='configuring'||data.config_gate?.state==='checking';
   setPlateauFormalRunLock(running&&!Boolean(data.metadata?.debug));
   renderRange(data); renderTransient(data); renderCellV(data);
+  renderBleMeasurement(data);renderBleControls();
   $('measureMessage').textContent=data.message||''; $('liveBadge').textContent=starting?'准备中':running?'采集中':complete?'已完成':data.state==='error'?'错误':'待机'; $('liveBadge').className=`live-badge ${running&&!starting?'running':data.state==='error'?'error':''}`;
   $('stopMeasure').disabled=!running; $('useForCalibration').disabled=!complete||data.summary?.steady_current_nA==null; $('predictConcentration').disabled=!complete||data.summary?.steady_current_nA==null;
   const cv=(data.settings?.method||state.method)==='cv';
@@ -1387,6 +1577,7 @@ $('appUpdate').onclick=async()=>{
   catch(e){state.appUpdateRequested=false;showGlobalError('无法开始软件更新',e)}
 };
 function deviceCardDetail(device){
+  if(device.kind==='ble'||device.transport==='ble')return `Bluetooth · MAX30134 · ${device.address||device.id}${device.rssi!==null&&device.rssi!==undefined?` · ${device.rssi} dBm`:''} · ${{connected:'已连接',disconnected:'未连接',connecting:'连接中',error:'连接失败'}[device.connection_state]||'连接状态未确认'} · ${device.protocol_verified?'协议已验证':'协议待验证'}${device.connection_error?` · ${device.connection_error.message||device.connection_error}`:''}`;
   if(device.kind==='jlink'){
     if(device.driver_state==='missing')return `${device.transport_label||'RTT / J-Link'}${device.probe_serial?` · 探针 SN ${device.probe_serial}`:''} · Windows 驱动待准备`;
     const stateText=device.target_state==='reachable'?'目标板已响应':device.target_failure==='probe_busy'?'被其他调试软件占用':device.target_failure==='probe_communication'?'探头 USB 通信超时':device.target_state==='unreachable'?'目标板无响应':state.devices.probing?'正在核对目标板':'目标板尚未核对';
@@ -1415,22 +1606,54 @@ function renderDeviceList(payload=state.devices){
     if(device.driver_action==='install_winusb'){
       delete action.dataset.deviceId;action.dataset.driverDeviceId=device.id;action.textContent=driverPreparing?'正在准备…':'准备 J-Link';action.title='安装 OpenOCD 需要的 WinUSB 驱动；Windows 会请求一次管理员确认';action.disabled=driverPreparing||Boolean(state.devices.busy);
     }else{
-      action.textContent=device.id===selected?'当前使用':'选择'; action.disabled=driverPreparing||Boolean(state.devices.busy)||device.id===selected||!device.selectable;
+      action.textContent=device.id===selected?'当前单板测量目标':device.kind==='ble'?'设为单板测量目标':'选择'; action.disabled=driverPreparing||Boolean(state.devices.busy)||Boolean(state.bleAction)||device.id===selected||!device.selectable;
     }
-    card.append(title,action);
+    const actions=document.createElement('div');actions.className='device-card-actions';actions.append(action);
+    if(device.kind==='ble'||device.transport==='ble'){
+      const connected=device.connection_state==='connected',connectionAction=document.createElement('button');
+      connectionAction.type='button';connectionAction.className='secondary';connectionAction.dataset.bleAddress=device.address;
+      connectionAction.dataset.bleConnect=String(!connected);connectionAction.textContent=connected?'断开蓝牙':'连接蓝牙';
+      connectionAction.disabled=driverPreparing||Boolean(state.devices.busy)||Boolean(state.bleAction)||device.connection_state==='connecting'||!device.address;
+      actions.append(connectionAction);
+    }
+    card.append(title,actions);
     const note=document.createElement('small'); note.className='device-state';
-    note.textContent=device.driver_state==='missing'?(device.driver_message||'需要准备 Windows WinUSB 驱动'):device.target_state==='unreachable'?(device.target_detail||(device.id===selected?'已选中，但目标板无响应':'探针在线，但目标板无响应')):device.id===selected?'当前测量将使用此设备':device.selectable?'空闲时可选择':'设备尚未准备好'; card.append(note);
+    note.textContent=device.driver_state==='missing'?(device.driver_message||'需要准备 Windows WinUSB 驱动'):device.target_state==='unreachable'?(device.target_detail||(device.id===selected?'已选中，但目标板无响应':'探针在线，但目标板无响应')):device.kind==='ble'?(device.id===selected?'单板测量使用此板；':'')+'各板可独立保持连接；前后板 A / B 请在高通量页指定':device.id===selected?'当前测量将使用此设备':device.selectable?'空闲时可选择':'设备尚未准备好'; card.append(note);
     list.append(card);
   });
   if(!devices.length){const empty=document.createElement('div');empty.className='device-empty';empty.textContent='没有发现可识别的 USB DATA 或 J-Link。';list.append(empty)}
   const count=devices.length?`${devices.length} 个设备`:'未发现设备';
-  $('deviceDialogSummary').textContent=driverPreparing?`${count} · 正在准备 J-Link Windows 驱动`:state.devices.busy?`${count} · 硬件操作进行中，暂不能切换`:`${count} · 选择后会锁定该设备`;
-  const discoveryError=String(state.devices.error||'');
+  $('deviceDialogSummary').textContent=driverPreparing?`${count} · 正在准备 J-Link Windows 驱动`:state.devices.busy?`${count} · 硬件操作进行中，暂不能切换`:`${count} · 单板测量目标与各板蓝牙连接独立`;
+  const discoveryError=String(state.devices.error||state.bleConnectionError||'');
   $('deviceDialogBusy').classList.toggle('error',!driverPreparing&&(Boolean(state.devices.busy)||Boolean(discoveryError)||Boolean(driverError)));
   $('deviceDialogBusy').classList.toggle('progress',driverPreparing);
   $('deviceDialogBusy').hidden=!driverPreparing&&!state.devices.busy&&!discoveryError&&!driverError;
   $('deviceDialogBusy').textContent=driverPreparing?String(driverTask.message||'正在准备 J-Link Windows 驱动，请按界面提示操作'):driverError?`${driverError}${driverTask.diagnostic_id?`（诊断 ${driverTask.diagnostic_id}）`:''}`:state.devices.busy?'硬件操作期间不能切换设备':discoveryError?`设备探测失败：${discoveryError}`:'';
-  renderHardwareConnection();updateStartState();updateScheduleStartState();if(state.settings)updateSettingsApplyState();
+  renderHardwareConnection();renderBleControls();updateStartState();updateScheduleStartState();if(state.settings)updateSettingsApplyState();
+}
+async function scanBleDevices(){
+  if(state.bleAction)return;
+  state.bleAction='scan';renderBleControls();renderHardwareConnection();$('deviceDialogBusy').hidden=true;
+  try{renderDeviceList(await api('/api/devices/ble/scan',{method:'POST',body:'{}',timeoutMs:20000}))}
+  catch(error){state.devices={...(state.devices||{}),ble_scan:{...(state.devices?.ble_scan||{}),state:'error',error:diagnosticMessage(error)}};$('deviceDialogBusy').textContent=diagnosticMessage(error);$('deviceDialogBusy').hidden=false}
+  finally{state.bleAction=null;renderBleControls();renderHardwareConnection()}
+}
+async function stopBleDevice(){
+  if(state.bleAction)return;
+  state.bleAction='stop';renderBleControls();$('deviceDialogBusy').hidden=true;
+  try{
+    const result=await api('/api/devices/ble/stop',{method:'POST',body:'{}',timeoutMs:20000});
+    if(result.stop_confirmed!==true)throw new Error('STOP 未确认；板端仍可能采样，请重新连接后重试');
+    toast('板端 STOP 已确认，采样已停止');await refreshMeasurement();
+  }catch(error){$('deviceDialogBusy').textContent=diagnosticMessage(error);$('deviceDialogBusy').hidden=false}
+  finally{state.bleAction=null;renderBleControls()}
+}
+async function setBleDeviceConnection(address,connect){
+  if(state.bleAction||state.devices?.busy)return;
+  state.bleConnectionError='';state.bleAction=connect?'connect':'disconnect';renderDeviceList(state.devices);$('deviceDialogBusy').hidden=true;
+  try{renderDeviceList(await api('/api/devices/ble/'+(connect?'connect':'disconnect'),{method:'POST',body:JSON.stringify({address}),timeoutMs:20000}))}
+  catch(error){state.bleConnectionError=diagnosticMessage(error);$('deviceDialogBusy').textContent=state.bleConnectionError;$('deviceDialogBusy').hidden=false}
+  finally{state.bleAction=null;renderBleControls();void refreshDevices(false)}
 }
 async function refreshDevices(open=false){
   if(state.deviceRefreshPromise)return state.deviceRefreshPromise;
@@ -1456,7 +1679,7 @@ async function chooseDevice(deviceId){
   const buttons=$('deviceList').querySelectorAll('button');buttons.forEach(button=>{button.disabled=true});
   try{
     const data=await api('/api/devices/select',{method:'POST',body:JSON.stringify({device_id:deviceId}),timeoutMs:20000});
-    renderDeviceList(data); await refreshMeasurement();
+    renderDeviceList(data);renderSettings(await api('/api/settings'));await refreshMeasurement();
     const dialog=$('deviceDialog');if(typeof dialog.close==='function')dialog.close();else dialog.removeAttribute('open');
     toast(data.message||'设备选择已更新');
   }catch(e){buttons.forEach(button=>{button.disabled=false});$('deviceDialogBusy').textContent=diagnosticMessage(e);$('deviceDialogBusy').hidden=false}
@@ -1485,7 +1708,9 @@ async function prepareJlinkDriver(deviceId){
 }
 $('selectDevice').addEventListener('click',()=>void refreshDevices(true));
 $('refreshDevices').addEventListener('click',()=>void refreshDevices(false));
-$('deviceList').addEventListener('click',event=>{const button=event.target.closest('button[data-driver-device-id],button[data-device-id]');if(!button||button.disabled)return;if(button.dataset.driverDeviceId)void prepareJlinkDriver(button.dataset.driverDeviceId);else void chooseDevice(button.dataset.deviceId)});
+$('scanBle').addEventListener('click',()=>void scanBleDevices());
+$('stopBle').addEventListener('click',()=>void stopBleDevice());
+$('deviceList').addEventListener('click',event=>{const button=event.target.closest('button[data-driver-device-id],button[data-device-id],button[data-ble-address]');if(!button||button.disabled)return;if(button.dataset.driverDeviceId)void prepareJlinkDriver(button.dataset.driverDeviceId);else if(button.dataset.bleAddress)void setBleDeviceConnection(button.dataset.bleAddress,button.dataset.bleConnect==='true');else void chooseDevice(button.dataset.deviceId)});
 $('chartWindow').addEventListener('click', event => {
   const button = event.target.closest('button[data-window]');
   if (!button) return;
@@ -1499,7 +1724,7 @@ $('startMeasure').addEventListener('click',async()=>{
   clearMeasurementInputState();
   const issue=measurementInputIssue();
   if(issue){const input=$(issue.field);input.setAttribute('aria-invalid','true');input.focus();errorBox('measureError',issue.message);return}
-  state.measurementStartPending=true;updateStartState();
+  state.measurementStartPending=true;updateStartState();renderBleControls();
   const startRequestId=globalThis.crypto?.randomUUID?.()||`measure-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   try{
     const payload={sample_name:$('sampleName').value,known_concentration_um:concentrationValue(),sample_role:state.sampleRole,source:'manual_gui',start_request_id:startRequestId};
@@ -1522,7 +1747,7 @@ $('startMeasure').addEventListener('click',async()=>{
         if(!resolved)throw new Error('未能确认测量已启动；请查看诊断日志后重试');
       }catch(reconcileError){errorBox('measureError',reconcileError)}
     }
-  }finally{state.measurementStartPending=false;updateStartState()}
+  }finally{state.measurementStartPending=false;updateStartState();renderBleControls()}
 });
 $('stopMeasure').addEventListener('click',async()=>{clearMeasureError();try{updateMeasurement(await post('/api/measurement/stop'))}catch(e){errorBox('measureError',e)}});
 $('toggleHiddenPoints')?.addEventListener('click',()=>{const l=$('hiddenPointsList');l.hidden=!l.hidden;$('toggleHiddenPoints').textContent=l.hidden?'展开':'收起'});
@@ -1558,7 +1783,12 @@ $('saveDirectory').addEventListener('blur',event=>{if(state.workspaceBrowsePoint
 $('saveDirectory').addEventListener('keydown',event=>{if(event.key!=='Enter')return;event.preventDefault();void confirmAndSwitchWorkspace(event.currentTarget.value)});
 $('resetCalibration').onclick=async()=>{const batchName=requestedBatchName('请输入新批次名称');if(batchName===null)return;try{renderWorkflow(await post('/api/workflow/reset-calibration',{batch_name:batchName}));state.calibration=await api('/api/calibration');state.historyPreview=null;state.historyCurves=[];state.historyCurveIds=[];renderCalibration();setSampleRole('calibration',true);toast('已新建批次并切换到新目录')}catch(e){errorBox('measureError',e)}};
 
-function readSettings(){const potential=Number($('potentialV').value),low=Number($('cvLowV').value),high=Number($('cvHighV').value),rate=Number($('cvScanRate').value),cycles=Number($('cvCycles').value),cv=state.method==='cv',duration=cv?2*(high-low)/rate*cycles:Number($('durationS').value);return {method:state.method,initial_potential_v:cv?low:potential,potential_v:cv?low:potential,working_electrode_v:Number($('workingElectrodeV').value),prestep_s:cv?Number($('cvQuietS').value):0,duration_s:duration,adaptive_stop:!cv&&$('adaptiveStop').checked,sens_period_code:Number($('sensPeriodCode').value),target_rate_hz:Number($('sampleRateHz').value),fit_window_s:Number($('fitWindowS').value),fsr_nA:Number($('fsrNA').value),offset_mode:$('offsetNA').value,cv_low_v:low,cv_high_v:high,cv_scan_rate_v_s:rate,cv_cycles:cycles,cv_step_v:.001,cv_quiet_s:Number($('cvQuietS').value),cv_eis_fsr_uA:Number($('cvEisFsrUA').value)}}
+function readSettings(){
+  const potential=Number($('potentialV').value),low=Number($('cvLowV').value),high=Number($('cvHighV').value),rate=Number($('cvScanRate').value),cycles=Number($('cvCycles').value),cv=state.method==='cv',duration=cv?2*(high-low)/rate*cycles:Number($('durationS').value);
+  const settings={method:state.method,initial_potential_v:cv?low:potential,potential_v:cv?low:potential,working_electrode_v:Number($('workingElectrodeV').value),prestep_s:cv?Number($('cvQuietS').value):0,duration_s:duration,adaptive_stop:!cv&&$('adaptiveStop').checked,sens_period_code:Number($('sensPeriodCode').value),target_rate_hz:Number($('sampleRateHz').value),fit_window_s:Number($('fitWindowS').value),fsr_nA:Number($('fsrNA').value),offset_mode:$('offsetNA').value,cv_low_v:low,cv_high_v:high,cv_scan_rate_v_s:rate,cv_cycles:cycles,cv_step_v:.001,cv_quiet_s:Number($('cvQuietS').value),cv_eis_fsr_uA:Number($('cvEisFsrUA').value)};
+  if(isBleProfile())Object.assign(settings,{board_profile:'v52',protocol:'v52-0.1',analysis_channel:Number($('analysisChannel').value)});
+  return settings;
+}
 function renderOffsetLabels(fsr){$('offsetNA').querySelectorAll('option[data-pct]').forEach(option=>{const pct=Number(option.dataset.pct);option.textContent=`${pct}% FSR (${fsr*pct/100} nA)`})}
 function signedPotential(value){const number=Number(value);return `${number>0?'+':''}${number.toFixed(2)}`}
 function settingsInputIssue(settings){
@@ -1625,6 +1855,8 @@ function ensureSettingsProgressPolling(){
 }
 function renderSettings(data){
   state.settings=data; const s=data.settings, periods=[124,242,476,945,1882,3757];
+  renderBoardOptions();
+  const ble=isBleProfile();$('analysisChannel').value=String(s.analysis_channel||1);
   if(!state.measureControlInitialized){setMeasureControlTab(data.applied?'sample':'settings');state.measureControlInitialized=true}
   state.method=s.method||'it';const cv=state.method==='cv',adaptive=!cv&&Boolean(s.adaptive_stop),wideIt=!cv&&s.fsr_nA>2000;
   const nativeRate=cv?s.cv_scan_rate_v_s/s.cv_step_v:wideIt?s.target_rate_hz:1000/periods[s.sens_period_code??0];
@@ -1632,12 +1864,17 @@ function renderSettings(data){
   $('cvLowV').value=s.cv_low_v;$('cvHighV').value=s.cv_high_v;$('cvScanRate').value=s.cv_scan_rate_v_s;$('cvCycles').value=s.cv_cycles;$('cvQuietS').value=s.cv_quiet_s;$('cvEisFsrUA').value=String(s.cv_eis_fsr_uA??20);
   $('methodMode').querySelectorAll('button').forEach(button=>button.classList.toggle('active',button.dataset.method===state.method));$('itSettings').hidden=cv;$('cvSettings').hidden=!cv;$('sampleRoleBlock').hidden=cv;$('concentrationField').hidden=cv;$('dcSamplingField').hidden=cv||wideIt;$('dcRangeField').hidden=cv;$('dcOffsetField').hidden=cv||wideIt;
   $('chartTitle').textContent=cv?'CV 循环伏安曲线':'I-T 计时电流曲线';$('settingsTitle').textContent=cv?'CV 条件':'I-T 条件';
+  if(ble){$('chartTitle').textContent=`CH${s.analysis_channel||1} · I-T 分析曲线`;$('settingsTitle').textContent='V5.2 · 四路共用条件'}
   $('itChart').setAttribute('aria-label',cv?'CV 电位电流曲线':'I-T 电流时间曲线');
   if(cv)renderCvMetricStrip({settings:s,rolling_metrics:{status:'idle'}});
   else renderItMetricStrip({settings:s,rolling_metrics:{status:'idle'},stability_eta:{display_text:'--'}},false);
   const points=cv?Math.round(s.duration_s*nativeRate):Math.round(s.duration_s*s.target_rate_hz);
   $('outputPoints').textContent=cv?`${s.cv_cycles} 圈 · ${s.cv_cycles*2} 段 · 约 ${points} 个原生电流点`:adaptive?`持续采集 · 原生 ${fmt(nativeRate,2)} Hz`:`${points} 点 · 原生 ${fmt(nativeRate,2)} Hz`;
   $('outputPoints').nextElementSibling.textContent=cv?'波形按 1 mV 步进；每个 EIS ADC 原生电流点实时显示并保存':wideIt?'宽量程 I-T 使用 EIS ADC；单次电位扰动小于 0.4 mV':`MAX30131 原生约 ${fmt(nativeRate,2)} Hz；更高输出频率由时间戳重采样生成`;
+  if(ble){
+    $('outputPoints').textContent=`四路原生采样 · PERIOD ${s.sens_period_code??0}`;
+    $('outputPoints').nextElementSibling.textContent=`MAX30134 四路原始文件不重采样；CH${s.analysis_channel||1} 分析导出按 ${fmt(s.target_rate_hz,2)} Hz 重采样，不增加硬件采样率。固定偏置为 10 / 20 nA，区别于旧板 9 / 19 nA。`;
+  }
   pages.measure[1]=cv?`${signedPotential(s.cv_low_v)} 至 ${signedPotential(s.cv_high_v)} V · ${s.cv_scan_rate_v_s} V/s · ${s.cv_cycles} 圈`:adaptive?`I-T 智能平台检测与末 ${s.fit_window_s} 秒稳态分析`:`${s.duration_s} 秒 I-T 检测与末 ${s.fit_window_s} 秒稳态分析`; if($('view-measure').classList.contains('active'))$('pageSubtitle').textContent=pages.measure[1];
   const applying=state.settingsApplyActive||data.state==='applying',settingsFailed=data.state==='error', failDetail=String(data.error||'').trim();
   $('settingsMessage').textContent=settingsFailed&&failDetail?failDetail:data.message; $('settingsMessage').title=settingsFailed&&failDetail?failDetail:''; $('settingsMessage').classList.toggle('error-text',settingsFailed&&!!failDetail);
@@ -1655,6 +1892,7 @@ function renderSettings(data){
   $('methodMode').querySelectorAll('button').forEach(button=>button.disabled=applying);
   $('itPresets').querySelectorAll('button').forEach(button=>button.disabled=applying);renderItPresetState(s);
   $('applySettings').textContent=applying?'正在应用…':'应用条件';updateSettingsApplyState();
+  renderBleControls();renderBleMeasurement();
   if(applying)ensureSettingsProgressPolling();
   renderWorkflow(state.workflow||{save_dir:'',stage:'collect',calibration_ready:false,points_count:0,selected_points_count:0,settings_match:true});renderScheduleMode();drawAll();
   updateStartState();updateScheduleStartState();
@@ -1666,8 +1904,8 @@ function updateSettingsApplyState(){
   button.title=measurementBusy?'测量进行中，不能修改硬件条件':scheduleBusy?'自动任务进行中，不能修改硬件条件':deviceBusy?'硬件操作进行中':!applying&&!hardware.ready?hardware.message:'';
 }
 function settingsChanged(){if(!state.settings)return;clearSettingsError();state.settingsDirty=true;state.settings.applied=false;state.settings.state='not_applied';state.settings.message='参数已修改，请重新应用';state.settings.error='';const s=readSettings();state.settings.settings=s;renderSettings(state.settings)}
-['potentialV','workingElectrodeV','durationS','adaptiveStop','sensPeriodCode','sampleRateHz','fitWindowS','fsrNA','offsetNA','cvLowV','cvHighV','cvScanRate','cvCycles','cvQuietS','cvEisFsrUA'].forEach(id=>$(id).addEventListener('change',settingsChanged));
-$('methodMode').addEventListener('click',event=>{const button=event.target.closest('button[data-method]');if(!button||button.dataset.method===state.method)return;state.method=button.dataset.method;settingsChanged()});
+SETTINGS_INPUT_IDS.forEach(id=>$(id).addEventListener('change',settingsChanged));
+$('methodMode').addEventListener('click',event=>{const button=event.target.closest('button[data-method]');if(!button||button.disabled||button.dataset.method===state.method)return;state.method=button.dataset.method;settingsChanged()});
 $('itPresets').addEventListener('click',event=>{const button=event.target.closest('button[data-it-preset]');if(button)applyItPreset(button.dataset.itPreset)});
 $('applySettings').onclick=async()=>{
   if(state.settingsApplyActive)return;
@@ -1899,6 +2137,8 @@ async function initializePart(step,operation,{visible=false}={}){
 }
 async function init(){
   setInterval(()=>$('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);
+  void refreshHighThroughputDevices();
+  setInterval(()=>{if(!state.exiting)void refreshHighThroughputDevices()},1000);
   appUpdatePollLoop();
   await loadFilter();await loadPlateau();
   await initializePart('硬件参数',async()=>{state.settingsDirty=false;renderSettings(await api('/api/settings'))},{visible:true});
@@ -2443,6 +2683,7 @@ async function dbgSend(line) {
   } catch (e) { errorBox('dbgError', e); }
 }
 async function refreshDebug() {
+  if(isBleProfile())return;
   try {
     const generation=state.dbgSnapshotGeneration;
     const d = await fetchDebugSnapshot();

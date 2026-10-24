@@ -271,3 +271,5 @@ input:focus {
   .chart-shell, input, .segmented { border-color: #3b4a4d; }
   .segmented, .progress { background: #2b393c; }
 }
+header:has(.ble-note:not([hidden])){flex-wrap:wrap}
+header>.ble-note{flex:0 0 100%;max-width:none;margin-top:5px;font-size:10px;line-height:1.5;color:#8a692b;white-space:normal;text-align:left}

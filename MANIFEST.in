@@ -17,10 +17,13 @@ recursive-include branding *.png
 recursive-include protocols *.md *.json *.h
 recursive-include software/firmware *.c *.h *.conf *.overlay *.yml *.yaml *.dts *.cmake *.txt *.md CMakeLists.txt Makefile Kconfig Kconfig.* *_defconfig
 recursive-include software/firmware/prebuilt *.json *.hex *.elf
-recursive-include software/host/pa_host/gui *.html *.js *.css *.png
+recursive-include software/host/pa_host/gui *.html *.js *.css *.png *.json *.txt
 recursive-include software/host/tests *.py
+recursive-include software/host/tests/fixtures *.json
 recursive-include docs *.md
-recursive-include packaging *.py *.sh *.ps1 *.txt *.lock *.spec *.json *.bin *.hex *.zip
+recursive-include docs/examples *.json
+recursive-include tools *.py
+recursive-include packaging *.py *.sh *.ps1 *.txt *.lock *.in *.spec *.json *.bin *.hex *.zip
 exclude software/firmware/src/measurement_config.h
 prune software/firmware/build
 prune software/firmware/tests/build

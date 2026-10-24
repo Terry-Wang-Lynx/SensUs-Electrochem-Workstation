@@ -107,6 +107,7 @@ def module_command(module: str, *args: object) -> list[str]:
             "pa_host.gui_server": "gui",
             "pa_host.it_tool": "it-tool",
             "pa_host.collect": "collect",
+            "pa_host.collect_ble": "collect-ble",
             "smpmgr": "smpmgr",
         }
         try:

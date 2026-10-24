@@ -101,7 +101,10 @@ function renderSettings(payload) {
   const range = Number(settings.fsr_nA) > 2000
     ? Number(settings.fsr_nA) / 1000 + ' µA'
     : settings.fsr_nA + ' nA';
-  $('conditionText').textContent = method + ' · ' + potential + ' · ' + range;
+  const ble = settings.board_profile === 'v52';
+  $('conditionText').textContent = method + ' · ' + potential + ' · ' + range
+    + (ble ? ` · CH${settings.analysis_channel || 1} · 未校准` : '');
+  $('bleNote').hidden = !ble;
   $('sampleControls').hidden = settings.method === 'cv';
   updateButton();
 }
@@ -139,6 +142,11 @@ function hardwareOperationStatus() {
     if (usable.length > 1) return {ready: false, message: '请在完整工作站中选择本次使用的设备'};
     return {ready: false, message: payload.probing ? '正在核对硬件连接' : '未发现可用硬件'};
   }
+  if (active.kind === 'ble' || active.transport === 'ble') {
+    return active.protocol_verified === true
+      ? {ready: true, message: ''}
+      : {ready: false, message: '请在完整工作站中选择蓝牙设备并验证协议'};
+  }
   if (active.kind === 'jlink') {
     if (active.target_state === 'reachable') return {ready: true, message: ''};
     if (active.driver_state === 'missing') return {ready: false, message: '请在完整工作站中准备 J-Link Windows 驱动'};
@@ -166,6 +174,10 @@ function renderMeasurement(payload) {
   $('statusDot').className = 'status-dot ' + (running&&!starting ? 'running' : errored ? 'error' : '');
 
   const settings = payload.settings || state.settings?.settings || {};
+  if (settings.board_profile === 'v52') {
+    $('conditionText').textContent = `I-T · ${signed(settings.potential_v)} V · ${settings.fsr_nA} nA · CH${settings.analysis_channel || 1} · 未校准`;
+    $('bleNote').hidden = false;
+  }
   const cv = settings.method === 'cv';
   const latest = payload.latest_sample;
   if (latest) {
@@ -173,7 +185,8 @@ function renderMeasurement(payload) {
     $('liveUnit').textContent = cv ? 'µA' : 'nA';
     $('liveMeta').textContent = cv
       ? fmt(latest.potential_v, 3) + ' V · 第 ' + (latest.cycle || '--') + ' 圈 · 点 ' + (Number(latest.index) + 1)
-      : 't = ' + fmt(latest.time_s, 2) + ' s · 点 ' + (Number(latest.index) + 1);
+      : (settings.board_profile === 'v52' ? `CH${settings.analysis_channel || 1} · ` : '')
+        + 't = ' + fmt(latest.time_s, 2) + ' s · 点 ' + (Number(latest.index) + 1);
   } else {
     $('liveCurrent').textContent = '--';
     $('liveMeta').textContent = '尚无实时数据';

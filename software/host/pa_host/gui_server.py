@@ -95,6 +95,8 @@ from .app_update import AppUpdateError, AppUpdateManager
 from .diagnostics import DiagnosticStore
 from . import __version__
 from . import runtime
+from . import v52_ble
+from .v52_view import V52RunFiles
 from .windows_jlink import (
     JLINK_VENDOR_ID,
     commander_reports_probe_connected,
@@ -140,6 +142,27 @@ APP_UPDATER = AppUpdateManager(
     __version__, STATE_DIR, event_callback=_app_update_event
 )
 GUI_DIR = FRONTEND_UPDATER.prepare_startup()
+FRONTEND_REVISION_LOCK = threading.Lock()
+FRONTEND_REVISION_CACHE = {"key": None, "revision": None}
+
+
+def _frontend_revision():
+    files = [GUI_DIR / name for name in ("index.html", "styles.css", "app.js", "high_throughput.js")]
+    with FRONTEND_REVISION_LOCK:
+        try:
+            key = []
+            for path in files:
+                stat_result = path.stat()
+                key.append((str(path), stat_result.st_mtime_ns, stat_result.st_size))
+            if key != FRONTEND_REVISION_CACHE["key"]:
+                digest = hashlib.sha256()
+                for path in files:
+                    digest.update(path.name.encode())
+                    digest.update(path.read_bytes())
+                FRONTEND_REVISION_CACHE.update(key=key, revision=digest.hexdigest()[:16])
+            return FRONTEND_REVISION_CACHE["revision"]
+        except OSError:
+            return None
 RUNS_DIR = STATE_DIR / "gui_runs"
 DEFAULT_PORT = 8765
 MEASUREMENT_DURATION_S = 180.0
@@ -187,6 +210,10 @@ SENSUS_USB_IDS = {(0x2FE3, 0x0100)}
 # "自动检测" choice and is never changed while a hardware operation is busy.
 DEVICE_SELECTION_LOCK = threading.RLock()
 SELECTED_DEVICE: dict[str, Any] | None = None
+BLE_DEVICE_CACHE: list[dict[str, Any]] = []
+BLE_SCAN_STATE: dict[str, Any] = {
+    "state": "not_scanned", "count": 0, "completed_unix_s": None, "error": "",
+}
 # Serial probing is deliberately kept out of the HTTP request path. A USB
 # device can take several seconds to answer while macOS is re-enumerating it;
 # the browser should keep rendering and receive the previous snapshot instead.
@@ -235,6 +262,14 @@ V51_PREBUILT_IMAGE = V51_RESOURCE_DIR / "images" / "app.signed.bin"
 def _ensure_not_shutting_down() -> None:
     if SHUTDOWN_INTENT.is_set():
         raise RuntimeError("应用正在安全退出，不能再启动新的硬件任务")
+    automation = _automation_owner()
+    if automation is not None and automation.is_busy():
+        raise RuntimeError("高通量实验正在运行，不能同时操作普通测量硬件")
+
+
+def _automation_owner():
+    app = globals().get("APP")
+    return vars(app).get("automation") if app is not None else None
 
 
 def _transport_status(transport: str | None = None) -> dict[str, Any]:
@@ -243,6 +278,7 @@ def _transport_status(transport: str | None = None) -> dict[str, Any]:
     labels = {
         "serial": "USB DATA CDC",
         "rtt": "RTT / J-Link",
+        "ble": "Bluetooth / V5.2",
         "auto": "自动检测",
     }
     payload: dict[str, Any] = {
@@ -678,7 +714,13 @@ def _all_serial_port_infos() -> list[Any]:
             continue
         missing_count = max(0, len(native_group) - existing_counts.get(serial, 0))
         infos.extend(native_group[:missing_count])
-    return infos
+    reserved = _reserved_motion_port()
+    return [info for info in infos if not reserved or str(getattr(info, "device", "")) != reserved]
+
+
+def _reserved_motion_port() -> str:
+    controller = _automation_owner()
+    return controller.reserved_motion_port() if controller is not None else ""
 
 
 def _port_descriptor(info: Any) -> str:
@@ -712,7 +754,9 @@ def _serial_port_infos() -> list[Any]:
     """Return non-J-Link USB CDC candidates for V5.1 DATA/SMP discovery."""
     # Native J-Link discovery invokes PowerShell/ioreg and yields no CDC path.
     # USB DATA/SMP operations must not pay for that unrelated subprocess.
-    return [info for info in _listed_serial_port_infos() if not _is_jlink_port(info)]
+    reserved = _reserved_motion_port()
+    return [info for info in _listed_serial_port_infos() if not _is_jlink_port(info)
+            and (not reserved or str(getattr(info, "device", "")) != reserved)]
 
 
 def _normalise_probe_serial(value: object) -> str:
@@ -1125,7 +1169,11 @@ def _annotate_target_states(
     cancel_event: threading.Event | None = None,
 ) -> list[dict[str, Any]]:
     for device in devices:
-        if device.get("kind") == "jlink":
+        if device.get("kind") == "ble":
+            device.update({"target_state": "reachable" if device.get("protocol_verified") else "unknown",
+                           "target_detail": "V5.2 协议已识别" if device.get("protocol_verified") else "蓝牙广播已发现，选择后核对协议",
+                           "target_backend": "Bluetooth NUS"})
+        elif device.get("kind") == "jlink":
             if device.get("target_failure") == "duplicate_probe_serial":
                 continue
             probe_serial = str(device.get("probe_serial") or "")
@@ -1388,6 +1436,8 @@ def _probe_serial_data_candidate(
     candidate: str, *, cancel_event: threading.Event | None = None,
 ) -> bool:
     """Read-only probe for one CDC candidate; never resets or writes firmware."""
+    if candidate == _reserved_motion_port():
+        return False
     if cancel_event is not None and cancel_event.is_set():
         return False
     try:
@@ -1649,6 +1699,7 @@ def _discover_devices(
             "selectable": bool(data_port and smp_port),
             "probe_required": not probe and not data_port,
         })
+    devices.extend(copy.deepcopy(BLE_DEVICE_CACHE))
     return _annotate_target_states(
         sorted(devices, key=_device_sort_key), refresh_jlink=False
     )
@@ -1665,6 +1716,26 @@ def _discover_devices_with_probe(
 def _selected_device_copy() -> dict[str, Any] | None:
     with DEVICE_SELECTION_LOCK:
         return copy.deepcopy(SELECTED_DEVICE) if SELECTED_DEVICE else None
+
+
+def _scan_ble_devices(*, board_management=False) -> dict[str, Any]:
+    global BLE_DEVICE_CACHE
+    if (_board_connections_busy() if board_management else not APP.hardware_idle()):
+        raise RuntimeError("请先停止测量再扫描蓝牙")
+    with DEVICE_DISCOVERY_LOCK:
+        BLE_SCAN_STATE.update(state="scanning", error="")
+    try:
+        rows = v52_ble.scan_devices(timeout=4.0)
+    except Exception as error:
+        with DEVICE_DISCOVERY_LOCK:
+            BLE_SCAN_STATE.update(state="error", error=str(error))
+        raise
+    with DEVICE_DISCOVERY_LOCK:
+        BLE_DEVICE_CACHE = copy.deepcopy(rows)
+        BLE_SCAN_STATE.update(state="complete", count=len(rows), completed_unix_s=time.time(), error="")
+        devices = [copy.deepcopy(item) for item in DEVICE_DISCOVERY_CACHE if item.get("kind") != "ble"] + rows
+    _remember_device_discovery(devices)
+    return _devices_payload_from_devices(devices)
 
 
 def _ports_for_identity(identity: str) -> list[Any]:
@@ -2114,6 +2185,8 @@ def _set_device_selection(device: dict[str, Any] | None) -> None:
         global SELECTED_DEVICE
         SELECTED_DEVICE = copy.deepcopy(device) if device else None
     if device is None:
+        if HARDWARE_TRANSPORT == "ble":
+            HARDWARE_TRANSPORT = "ble" if HARDWARE_TRANSPORT_REQUESTED == "ble" else "rtt"
         JLINK_SERIAL = CONFIGURED_JLINK_SERIAL
         if HARDWARE_TRANSPORT_REQUESTED == "rtt":
             HARDWARE_TRANSPORT = "rtt"
@@ -2123,6 +2196,11 @@ def _set_device_selection(device: dict[str, Any] | None) -> None:
             "info", "device.selection.auto", "Device selection returned to auto",
             transport=HARDWARE_TRANSPORT,
         )
+        return
+    if device.get("kind") == "ble":
+        HARDWARE_TRANSPORT = "ble"
+        SERIAL_DATA_PORT = ""
+        SERIAL_SMP_PORT = ""
         return
     if device.get("kind") == "usb":
         SERIAL_DATA_PORT = str(device.get("data_port") or "")
@@ -2152,6 +2230,7 @@ def _devices_payload_from_devices(
     probing: bool = False,
     error: str = "",
 ) -> dict[str, Any]:
+    devices = _with_ble_connections(devices)
     selected = _selected_device_copy()
     selected_id = selected.get("id") if selected else None
     if selected_id:
@@ -2160,6 +2239,12 @@ def _devices_payload_from_devices(
         )
         if present is not None:
             selected = {**present, "present": True}
+            if present.get("kind") == "ble":
+                selected.update(_selected_device_copy() or {})
+                if present.get("connection_state") in {"connected", "connecting", "disconnected", "error"}:
+                    selected.update({key: present[key] for key in ("connection_state", "connection_error", "protocol_verified", "firmware") if key in present})
+        elif busy and selected and selected.get("kind") == "ble":
+            selected = {**selected, "present": True}
         else:
             selected = {
                 **(selected or {}),
@@ -2177,6 +2262,7 @@ def _devices_payload_from_devices(
         "driver_preparing": JLINK_DRIVER_INSTALL_LOCK.locked(),
         "driver_task": _jlink_driver_task_snapshot(),
         "probing": probing,
+        "ble_scan": copy.deepcopy(BLE_SCAN_STATE),
         **_transport_status(),
     }
     if error:
@@ -2228,8 +2314,10 @@ def _run_device_discovery() -> None:
             with DEVICE_DISCOVERY_LOCK:
                 devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
         else:
-            devices = _discover_devices_with_probe(
-                cancel_event=DEVICE_DISCOVERY_CANCEL,
+            devices = (
+                _discover_devices(probe=False)
+                if HARDWARE_TRANSPORT == "ble"
+                else _discover_devices_with_probe(cancel_event=DEVICE_DISCOVERY_CANCEL)
             )
             cancelled = DEVICE_DISCOVERY_CANCEL.is_set()
             if cancelled:
@@ -2240,7 +2328,7 @@ def _run_device_discovery() -> None:
             # ownership of the operation lock as soon as enumeration finishes.
             _annotate_target_states(
                 devices,
-                refresh_jlink=not JLINK_DRIVER_INSTALL_LOCK.locked(),
+                refresh_jlink=HARDWARE_TRANSPORT != "ble" and not JLINK_DRIVER_INSTALL_LOCK.locked(),
                 cancel_event=DEVICE_DISCOVERY_CANCEL,
             )
             cancelled = cancelled or DEVICE_DISCOVERY_CANCEL.is_set()
@@ -2360,6 +2448,13 @@ def _refresh_usb_transport(*, reuse_verified_transport: bool = False) -> None:
     """Refresh USB CDC paths immediately before an idle hardware operation."""
     global HARDWARE_TRANSPORT, SERIAL_DATA_PORT, SERIAL_SMP_PORT, JLINK_SERIAL
     selected = _selected_device_copy()
+    if selected is not None and selected.get("kind") == "ble":
+        if not selected.get("address"):
+            raise RuntimeError("请扫描并选择 V5.2 蓝牙设备")
+        HARDWARE_TRANSPORT = "ble"
+        return
+    if HARDWARE_TRANSPORT == "ble":
+        raise RuntimeError("请先扫描并选择 V5.2 蓝牙设备")
     if HARDWARE_TRANSPORT_REQUESTED == "rtt" and selected is None:
         return
     if selected is not None:
@@ -2634,7 +2729,7 @@ def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
     """Resolve auto mode once when the GUI starts, preserving explicit modes."""
     global SERIAL_DATA_PORT, SERIAL_SMP_PORT
     mode = requested.lower()
-    if mode not in {"auto", "rtt", "serial"}:
+    if mode not in {"auto", "rtt", "serial", "ble"}:
         raise ValueError(f"未知硬件传输模式:{requested}")
     if serial_port:
         SERIAL_DATA_PORT = serial_port
@@ -2647,8 +2742,8 @@ def _resolve_hardware_transport(requested: str, serial_port: str) -> str:
             _discover_serial_smp_port(SERIAL_DATA_PORT) or SERIAL_SMP_PORT
         )
         return "serial"
-    if mode == "rtt":
-        return "rtt"
+    if mode in {"rtt", "ble"}:
+        return mode
     discovered = _discover_serial_data_port()
     if discovered:
         SERIAL_DATA_PORT = discovered
@@ -2871,6 +2966,8 @@ class SettingsController:
                     "Saved hardware settings could not be restored",
                     path=SETTINGS_PATH, error=str(exc),
                 )
+        self._ble_settings = copy.deepcopy(self.settings) if self.settings.get("board_profile") == "v52" else None
+        self._legacy_settings = copy.deepcopy(self.DEFAULTS if self._ble_settings else self.settings)
         self.applied = False
         self.state = "not_applied"
         if loaded_saved:
@@ -2878,7 +2975,7 @@ class SettingsController:
         else:
             self.message = "参数尚未应用到硬件"
         self.error = ""
-        if HARDWARE_TRANSPORT in {"rtt", "serial"}:
+        if HARDWARE_TRANSPORT in {"rtt", "serial", "ble"}:
             self.restore_for_transport(HARDWARE_TRANSPORT)
 
     @staticmethod
@@ -2956,6 +3053,25 @@ class SettingsController:
         return last_state, " || ".join(details)
 
     def restore_for_transport(self, transport: str) -> None:
+        if transport == "ble":
+            with self.lock:
+                if self.settings.get("board_profile") != "v52":
+                    self._legacy_settings = copy.deepcopy(self.settings)
+                    self.settings = copy.deepcopy(self._ble_settings) if self._ble_settings else v52_ble.validate_settings({**self.DEFAULTS,
+                        "board_profile": "v52", "working_electrode_v": 0.4,
+                        "potential_v": -0.2, "initial_potential_v": -0.2,
+                        "fsr_nA": 50, "offset_mode": "20pct", "offset_nA": 10})
+                self.applied = False
+                self.state = "not_applied"
+                self.message = "V5.2 已选择；请应用蓝牙参数，不会烧录固件"
+            return
+        if self.settings.get("board_profile") == "v52":
+            self._ble_settings = copy.deepcopy(self.settings)
+            self.settings = copy.deepcopy(self._legacy_settings)
+            self.applied = False
+            self.state = "not_applied"
+            self.message = "已恢复旧板参数，请重新应用到所选硬件"
+            return
         if not self._loaded_saved:
             return
         if self._saved_firmware_source == "prebuilt":
@@ -3694,6 +3810,10 @@ class SettingsController:
     def validate(cls, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):
             raise ValueError("检测条件必须是 JSON 对象")
+        if payload.get("board_profile") == "v52":
+            normalized = v52_ble.validate_settings({**cls.DEFAULTS, **payload})
+            return {key: normalized[key] for key in (
+                *cls.DEFAULTS, "board_profile", "protocol", "analysis_channel")}
         merged = {**cls.DEFAULTS, **payload}
         method = str(merged["method"]).lower()
         raw_adaptive_stop = merged.get("adaptive_stop", False)
@@ -3964,6 +4084,39 @@ class SettingsController:
             self.apply_lock.release()
 
     def _apply_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if HARDWARE_TRANSPORT == "ble":
+            settings = self.validate({**payload, "board_profile": "v52"})
+            _refresh_usb_transport(reuse_verified_transport=True)
+            device = _selected_device_copy()
+            with self.lock:
+                self.state = "applying"
+                self.applied = False
+                self.message = "正在通过蓝牙停止、配置并核对 V5.2"
+                self.error = ""
+            try:
+                actual = APP.ble_connections.configure(device["address"], settings)
+                SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                SETTINGS_PATH.write_text(json.dumps({"settings": settings,
+                    "transport": "ble", "firmware_source": "v52-ble"},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
+                with self.lock:
+                    self.settings = settings
+                    self._saved_transport = "ble"
+                    self._saved_firmware_source = "v52-ble"
+                    self._saved_firmware_hash = ""
+                    self.applied = True
+                    self.state = "applied"
+                    self.message = "V5.2 蓝牙配置与状态已核对；电极驱动关闭"
+                    self.ble_configuration = actual
+                return self.snapshot()
+            except Exception as exc:
+                with self.lock:
+                    self.state = "error"
+                    self.error = str(exc)
+                    self.message = "V5.2 参数应用失败；未执行任何烧录"
+                raise
+        if payload.get("board_profile") == "v52":
+            raise ValueError("V5.2 条件只能用于已选择的蓝牙设备")
         settings = self.validate(payload)
         with self.lock:
             self.settings = settings
@@ -4256,12 +4409,16 @@ class SettingsController:
                 "firmware_source": self._saved_firmware_source,
                 "firmware_sha256": self._saved_firmware_hash,
                 "firmware_transport": self._saved_transport,
+                **_transport_status(),
+                "ble_configuration": getattr(self, "ble_configuration", None),
                 "native_rate_hz": (
                     self.settings["cv_scan_rate_v_s"] / self.settings["cv_step_v"]
                     if self.settings["method"] == "cv"
                     else (
                         self.settings["target_rate_hz"]
                         if self.settings["fsr_nA"] in IT_WIDE_FSR_OPTIONS
+                        else 1 / v52_ble.period_seconds(self.settings["sens_period_code"])
+                        if self.settings.get("board_profile") == "v52"
                         else 1000 / SENS_PERIOD_MS[self.settings["sens_period_code"]]
                     )
                 ),
@@ -4300,6 +4457,7 @@ class MeasurementController:
         self.started_at: float | None = None
         self.finished_at: float | None = None
         self.process: subprocess.Popen[str] | None = None
+        self.ble_files: V52RunFiles | None = None
         self.cmd_path: Path | None = None   # 方案 C:在线切档命令文件
         self.cell_v_path: Path | None = None  # 电极电压连采 CSV(与电流不同速率)
         self.audit_path: Path | None = None   # 配置变更审计 jsonl(每次改参数留痕)
@@ -4930,6 +5088,9 @@ class MeasurementController:
             ):
                 raise RuntimeError("已有测量正在运行或正在保存结果")
             self.settings = SettingsController.validate(settings or self.settings)
+            is_ble = HARDWARE_TRANSPORT == "ble"
+            if is_ble != (self.settings.get("board_profile") == "v52"):
+                raise ValueError("所选板卡与检测条件不匹配，请重新应用条件")
             self.filter_config = validate_filter_config(filter_config or self.filter_config)
             self.plateau_config = PlateauConfig.validate(
                 plateau_config if plateau_config is not None else self.plateau_config
@@ -5067,8 +5228,12 @@ class MeasurementController:
                         ),
                     },
                 }
-                if verify_runtime_config else {"state": "idle"}
+                if verify_runtime_config and not is_ble else {"state": "idle"}
             )
+            self.ble_files = V52RunFiles(self.run_dir) if is_ble else None
+            if is_ble:
+                self._config_gate = {"state": "checking", "request_id": gate_request_id,
+                                     "started_at": time.time(), "phase": "ble_configuring"}
             self._reset_data_cache()
             self.state = "running"
             if self.settings.get("adaptive_stop") and method == "it":
@@ -5078,7 +5243,7 @@ class MeasurementController:
                     "reason": "insufficient_data",
                 })
             transport_label = (
-                "V5.1 USB DATA" if HARDWARE_TRANSPORT == "serial" else "RTT"
+                "V5.2 Bluetooth" if is_ble else "V5.1 USB DATA" if HARDWARE_TRANSPORT == "serial" else "RTT"
             )
             self.message = (
                 f"已启动硬件 {method.upper()} 测量，等待 {transport_label} 数据"
@@ -5123,7 +5288,17 @@ class MeasurementController:
                 "--progress-every",
                 "100",
             )
-            if HARDWARE_TRANSPORT == "serial":
+            if is_ble:
+                settings_path = self.run_dir / "ble-settings.json"
+                settings_path.write_text(json.dumps(self.settings), encoding="utf-8")
+                device = _selected_device_copy()
+                command = runtime.module_command("pa_host.collect_ble",
+                    "--address", device["address"], "--settings", settings_path,
+                    "--out", self.raw_path, "--all-channels", self.ble_files.all_channels_path,
+                    "--monitor", self.ble_files.monitor_path, "--state-file", self.ble_files.state_path,
+                    "--audit", self.audit_path, "--raw-log", self.raw_log,
+                    "--cmd-file", self.cmd_path, "--run-token", gate_request_id)
+            elif HARDWARE_TRANSPORT == "serial":
                 if not SERIAL_DATA_PORT:
                     self.state = "error"
                     self.error = "V5.1 需要明确指定 DATA CDC 路径"
@@ -5139,11 +5314,14 @@ class MeasurementController:
                 ]
                 if JLINK_SERIAL:
                     command += ["--probe-serial", JLINK_SERIAL]
-            command.append("--cv" if method == "cv" else "--it-10hz")
+            if not is_ble:
+                command.append("--cv" if method == "cv" else "--it-10hz")
             log_handle = (self.run_dir / "collector.log").open(
                 "w", buffering=1, encoding="utf-8", errors="replace"
             )
             try:
+                if is_ble:
+                    APP.ble_connections.disconnect(device["address"])
                 self.process = subprocess.Popen(
                     command,
                     cwd=PROJECT_DIR,
@@ -5188,7 +5366,7 @@ class MeasurementController:
                 config_gate=self._config_gate,
             )
             self._mark_config_gate_timing_locked("collector_spawned")
-            if verify_runtime_config:
+            if verify_runtime_config and not is_ble:
                 # ARMED keeps the firmware idle. The full AFE and measurement
                 # snapshots are committed before a tagged physical GET; START
                 # is emitted only after both confirmations match the UI.
@@ -5345,11 +5523,13 @@ class MeasurementController:
         else:
             threading.Thread(
                 target=self._terminate_if_running,
-                args=(process, 1.5), daemon=True,
+                args=(process, 20.0 if self.ble_files is not None else 1.5), daemon=True,
             ).start()
         return True
 
     def send_range(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if HARDWARE_TRANSPORT == "ble":
+            raise RuntimeError("V5.2 运行中不能切换量程；请停止后重新应用条件")
         """方案 C:测量进行中在线切换 FSR / offset 档,**不复位、不中断极化**。
 
         为什么必须经采集器的命令文件:JLinkExe 的 RTT telnet 只把采集器持有的
@@ -5393,6 +5573,8 @@ class MeasurementController:
         return line
 
     def send_command(self, line: str) -> dict[str, Any]:
+        if HARDWARE_TRANSPORT == "ble":
+            raise RuntimeError("V5.2 不支持旧板硬件 DEBUG 命令")
         """下发任意一行命令。send_range() 是它的一个特例。
 
         🔴 同样必须经采集器的命令文件 —— JLinkExe 的 RTT telnet 只把**采集器持有
@@ -5542,10 +5724,32 @@ class MeasurementController:
             self._config_gate["diagnostic_id"] = diagnostic_id
             self._config_gate_event.set()
         if process is not None and process.poll() is None:
+            if self.ble_files is not None and self.cmd_path is not None:
+                try:
+                    with self.cmd_path.open("a", encoding="utf-8") as stream:
+                        stream.write("STOP\n")
+                except OSError:
+                    pass
             threading.Thread(
                 target=self._terminate_if_running,
-                args=(process, 0.0), daemon=True,
+                args=(process, 20.0 if self.ble_files is not None else 0.0), daemon=True,
             ).start()
+
+    def _poll_ble_state_locked(self) -> None:
+        if self.ble_files is None:
+            return
+        state = self.ble_files.state()
+        if state.get("run_token") != self._config_gate.get("request_id"):
+            return
+        if self._config_gate.get("state") != "checking":
+            return
+        if state.get("phase") == "running" and state.get("config_confirmed"):
+            self._config_gate.update({"state": "matched", "actual": state.get("config", {}),
+                "verified_at": time.time(), "verification_level": "v52-command-ack-and-status"})
+            self.debug_waiting_for_start = False
+            self._config_gate_event.set()
+        elif state.get("phase") == "error":
+            self._fail_config_gate("ble_error", str(state.get("error") or "V5.2 蓝牙配置失败"))
 
     def _write_config_gate_command_locked(self, line: str, failure: str) -> bool:
         """Append one gate command or atomically fail and tear down the ARMED run."""
@@ -5924,6 +6128,7 @@ class MeasurementController:
     def _audit_events(self, limit: int = 60) -> list[dict[str, Any]]:
         """读 audit.jsonl 的尾部。增量读:只从上次位置往后追加,不全量重读。"""
         with self.lock:
+            self._poll_ble_state_locked()
             path = self.audit_path
             if path is None or not path.exists():
                 return []
@@ -6757,8 +6962,9 @@ class MeasurementController:
         while process.poll() is None:
             self._audit_events()
             with self.lock:
-                self._maybe_retry_tagged_gate_get_locked()
-                self._maybe_send_legacy_gate_get_locked()
+                if self.ble_files is None:
+                    self._maybe_retry_tagged_gate_get_locked()
+                    self._maybe_send_legacy_gate_get_locked()
                 gate_checking = self._config_gate.get("state") == "checking"
             if not gate_checking:
                 self._scan_range_events()
@@ -6816,6 +7022,15 @@ class MeasurementController:
             self.finished_at = time.time()
             self.debug_waiting_for_start = False
             self._debug_pending_cfg = None
+            if self.ble_files is not None:
+                terminal = self.ble_files.state()
+                if not terminal.get("stop_confirmed"):
+                    self.state = "error"
+                    self.error = str(terminal.get("error") or "蓝牙断开或 STOP 未确认；板端可能仍在采样，请重连后停止")
+                    self.message = "未确认板端安全停止，原始数据已保留"
+                    self._config_gate_event.set()
+                    self._notify_complete()
+                    return
             if self._prestart_gate_failed:
                 gate_state = self._config_gate.get("state")
                 self.state = "idle" if gate_state == "aborted" else "error"
@@ -6857,7 +7072,7 @@ class MeasurementController:
                     log_text = ""
                 detail = _meaningful_process_tail(log_text)
                 transport = (
-                    "V5.1 USB DATA CDC"
+                    "V5.2 Bluetooth" if self.ble_files is not None else "V5.1 USB DATA CDC"
                     if HARDWARE_TRANSPORT == "serial"
                     else "RTT/J-Link"
                 )
@@ -6986,6 +7201,10 @@ class MeasurementController:
                     "trigger_evidence": trigger_evidence,
                 }
                 self.summary["hardware_config"] = self.metadata.get("hardware_config")
+                if self.ble_files is not None:
+                    self.summary["v52"] = {"analysis_channel": self.settings["analysis_channel"],
+                        "current_positive": "out_of_WE", "uncalibrated": True,
+                        "configuration": self.ble_files.state().get("config", {})}
                 if self.summary_path is not None:
                     self.summary_path.write_text(
                         json.dumps(self.summary, indent=2, ensure_ascii=False),
@@ -7392,11 +7611,15 @@ class MeasurementController:
                         else (
                             "宽量程 I-T 使用 EIS ADC；单次电位扰动小于 0.4 mV"
                             if self.settings["fsr_nA"] in IT_WIDE_FSR_OPTIONS
+                            else "MAX30134 四路 I-t；原始数据未校准，高于原生的输出频率由主机重采样"
+                            if self.settings.get("board_profile") == "v52"
                             else "MAX30131 原生约 8.06 Hz；高于原生的输出频率由主机重采样"
                         )
                     ),
                 },
             }
+            if self.ble_files is not None:
+                payload["ble"] = {**self.ble_files.snapshot(), "analysis_channel": self.settings.get("analysis_channel", 1)}
             return _json_safe(payload)
 
 
@@ -7704,6 +7927,23 @@ class AppState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.operation_lock = threading.RLock()
+        from .automation import AutomationController
+        from .guided_automation import GuidedAutomation
+        from .digital_twin import DigitalTwin
+        from .ble_connections import BleConnections
+
+        self.ble_connections = BleConnections()
+        self.automation = AutomationController(STATE_DIR / "automation", STATE_DIR / "automation-runs", PROJECT_DIR,
+                                               simulation_scale=0.02, require_absolute_limits=False,
+                                               motion_feedback_interval_s=0.5,
+                                               board_release_factory=self.ble_connections.disconnect,
+                                               board_stop_factory=self.ble_connections.stop)
+        self.guided_automation = GuidedAutomation(STATE_DIR / "automation", require_four_point=True,
+            alignment_error_callback=lambda error, stop_result: _alignment_fault(self.automation, error, stop_result))
+        self.automation._motion_calibration_validator = lambda compiled: self.guided_automation.trusted_calibration(self.automation._motion)
+        self.digital_twin = DigitalTwin(STATE_DIR / "automation", GUI_DIR / "ht-apparatus.json")
+        self.automation._manual_calibration_active = self.guided_automation.snapshot()["manual"]["active"]
+        self.automation._parked_callback = self.guided_automation.checkpoint_reference
         self.history = WorkspaceHistory(HISTORY_PATH, PROJECT_DIR)
         self.settings = SettingsController()
         self.filter = FilterController()
@@ -7784,6 +8024,7 @@ class AppState:
             not self.measurement.is_busy()
             and not self.schedule.snapshot()["active"]
             and self.settings.snapshot()["state"] != "applying"
+            and not self.automation.is_busy()
         )
 
     @staticmethod
@@ -9517,6 +9758,14 @@ class AppState:
                     result["raw_path"] = str(raw_target)
                 else:
                     result["raw_path"] = ""
+                ble_run = run.get("ble") or {}
+                for key, suffix in (("all_channels_path", "all-channels.csv"), ("monitor_path", "monitor.csv"),
+                                    ("state_path", "ble-state.json"), ("audit_path", "ble-audit.jsonl")):
+                    source_text = str(ble_run.get(key) or "")
+                    if source_text and Path(source_text).is_file():
+                        destination = save_dir / f"{stem}-{suffix}"
+                        shutil.copy2(source_text, destination)
+                        result[key] = str(destination)
                 if data_source.exists():
                     shutil.copy2(data_source, data_target)
                     result["data_path"] = str(data_target)
@@ -10353,6 +10602,16 @@ def _release_hardware_for_shutdown(timeout_s: float = 330.0) -> dict[str, Any]:
     SHUTDOWN_INTENT.set()
     deadline = time.monotonic() + max(0.0, timeout_s)
     try:
+        alignment_service = getattr(APP, "guided_automation", None)
+        alignment_controller = getattr(APP, "automation", None)
+        if alignment_service is not None and alignment_controller is not None:
+            if vars(alignment_controller).get("_keyboard_operation_active", False):
+                _halt_keyboard_input(alignment_controller, alignment_service)
+            else:
+                manual = alignment_service.snapshot().get("manual", {})
+                if (manual.get("active") is True and manual.get("control_mode") == "keyboard"
+                        and isinstance(alignment_service.alignment_snapshot().get("session_token"), str)):
+                    _halt_keyboard_input(alignment_controller, alignment_service)
         # Driver preparation acquires its own lock before APP.operation_lock.
         # Waiting here avoids taking those locks in the reverse order when the
         # user closes the application immediately after clicking Prepare.
@@ -10364,6 +10623,9 @@ def _release_hardware_for_shutdown(timeout_s: float = 330.0) -> dict[str, Any]:
                 )
             time.sleep(min(0.1, remaining))
         with APP.operation_lock:
+            automation = getattr(APP, "automation", None)
+            if automation is not None and automation.is_busy():
+                automation.stop()
             if APP.schedule.snapshot()["active"]:
                 APP.schedule.stop()
             if APP.measurement.is_busy():
@@ -10373,12 +10635,20 @@ def _release_hardware_for_shutdown(timeout_s: float = 330.0) -> dict[str, Any]:
         # shutdown can deadlock against its own completion callback.
         while time.monotonic() < deadline:
             if APP.hardware_idle():
+                if automation is not None:
+                    automation.disconnect_motion()
+                if getattr(APP, "ble_connections", None) is not None:
+                    APP.ble_connections.close()
                 return {
                     "ok": True,
                     "message": "硬件已安全释放，后端正在退出",
                 }
             time.sleep(0.1)
         if APP.hardware_idle():
+            if automation is not None:
+                automation.disconnect_motion()
+            if getattr(APP, "ble_connections", None) is not None:
+                APP.ble_connections.close()
             return {
                 "ok": True,
                 "message": "硬件已安全释放，后端正在退出",
@@ -10387,6 +10657,699 @@ def _release_hardware_for_shutdown(timeout_s: float = 330.0) -> dict[str, Any]:
     except Exception:
         SHUTDOWN_INTENT.clear()
         raise
+
+
+def _high_throughput_devices() -> dict:
+    from .automation_devices import calibration_status
+
+    guided = APP.guided_automation.snapshot()
+    document = guided["document"]
+    result = APP.automation.device_status(board_bindings=document.get("bindings", {}).get("boards", {}))
+    connections = _ble_connection_snapshot()
+    for board in result["boards"].values():
+        entry = next((value for address, value in connections.items()
+                      if address.casefold() == board.get("address", "").casefold()), None)
+        if entry is not None:
+            board["connection_state"] = entry["state"]
+            board["connection_error"] = entry.get("error", "")
+            if board["state"] in {"bound_unverified", "stopped_unverified"}:
+                board["state"] = "connection_error" if entry["state"] == "error" else entry["state"]
+    result["calibration"] = calibration_status(guided, result.get("motion", {}))
+    return result
+
+
+def _ble_connection_snapshot():
+    pool = getattr(APP, "ble_connections", None)
+    return pool.snapshot() if pool is not None else {}
+
+
+def _with_ble_connections(devices):
+    result = copy.deepcopy(devices)
+    for address, connection in _ble_connection_snapshot().items():
+        device = next((row for row in result if row.get("kind") == "ble"
+                       and row.get("address", "").casefold() == address.casefold()), None)
+        if device is None:
+            device = {"id": "ble:" + address, "address": address, "name": connection.get("name") or "V5.2",
+                      "kind": "ble", "transport": "ble", "board_profile": "v52", "selectable": True}
+            result.append(device)
+        device.update(connection_state=connection["state"], connection_error=connection.get("error", ""),
+                      protocol_verified=connection.get("protocol_verified", False))
+        if connection.get("firmware") is not None:
+            device["firmware"] = connection["firmware"]
+    return result
+
+
+def _board_connections_busy():
+    controller = APP.automation
+    with controller._lock:
+        worker = vars(controller).get("_thread")
+        active = bool(worker and worker.is_alive() or controller._owned_boards and not controller._state["stop_confirmed"])
+    return bool(active or APP.measurement.is_busy() or APP.schedule.snapshot()["active"]
+                or APP.settings.snapshot()["state"] == "applying" or SHUTDOWN_INTENT.is_set()
+                or APP_UPDATER.busy or JLINK_DRIVER_INSTALL_LOCK.locked())
+
+
+def _board_connections_payload():
+    with DEVICE_DISCOVERY_LOCK:
+        devices = _with_ble_connections(DEVICE_DISCOVERY_CACHE)
+    return {"devices": [device for device in devices if device.get("kind") == "ble"],
+            "bindings": APP.guided_automation.snapshot()["document"]["bindings"]["boards"],
+            "connections": _ble_connection_snapshot(), "busy": _board_connections_busy(),
+            "runtime_boards": _high_throughput_devices()["boards"],
+            "ble_scan": copy.deepcopy(BLE_SCAN_STATE)}
+
+
+def _manage_board_connections(action, payload):
+    from .automation import AutomationError, _keys
+
+    with _preempting_operation_lock():
+        if _board_connections_busy():
+            raise AutomationError("boards_busy", "采集任务或板卡停止确认尚未结束。请先停止采集，再连接、断开或更换板卡绑定。", status=409)
+        if action == "scan":
+            _keys(payload, set(), "boards/scan")
+            _scan_ble_devices(board_management=True)
+        elif action == "bind":
+            _keys(payload, {"addresses"}, "boards/bind")
+            guided = APP.guided_automation.bind_boards(payload.get("addresses"))
+            return {**_board_connections_payload(), "guided": guided}
+        elif action in {"connect", "disconnect"}:
+            _keys(payload, {"addresses"}, "boards/" + action)
+            addresses = payload.get("addresses")
+            if (not isinstance(addresses, list) or not 1 <= len(addresses) <= 2
+                    or any(not isinstance(address, str) or not address.strip() or len(address) > 200 for address in addresses)
+                    or len({address.strip().casefold() for address in addresses}) != len(addresses)):
+                raise AutomationError("invalid_value", "请选择一块或两块不同的蓝牙设备", "addresses")
+            errors = {}
+            available = _board_connections_payload()["devices"]
+            for address in addresses:
+                try:
+                    if action == "disconnect":
+                        APP.ble_connections.disconnect(address)
+                    else:
+                        device = next((device for device in available if device["address"].casefold() == address.strip().casefold()), {})
+                        APP.ble_connections.connect(address, device.get("name", ""))
+                except Exception as error:
+                    errors[address] = str(error)
+            return {**_board_connections_payload(), "errors": errors}
+        else:
+            raise AutomationError("not_found", "unknown board operation", action, status=404)
+        return _board_connections_payload()
+
+
+def _alignment_fault(controller, error, stop_result):
+    from .automation import AutomationError
+
+    with controller._lock:
+        controller._event("keyboard_alignment_fault", error=error, stop_result=stop_result)
+        if not isinstance(stop_result, dict) or stop_result.get("stop_confirmed") is not True:
+            message = error.get("message", "Keyboard alignment STOP is unconfirmed") if isinstance(error, dict) else str(error)
+            controller._retain_motion_ownership(AutomationError("alignment_stop_unconfirmed", message))
+
+
+def _alignment_gate(controller, service, *, require_active):
+    from .automation import AutomationError
+
+    current = controller.snapshot()
+    worker = vars(controller).get("_thread")
+    if (current.get("stop_confirmed") is not True or current.get("recovery_required") is True
+            or worker and worker.is_alive()
+            or current.get("state") in {"running", "waiting_operator", "waiting_recovery", "stopping", "paused"}):
+        raise AutomationError("busy", "Stop other work and confirm outputs before keyboard alignment", status=409)
+    if require_active:
+        manual = service.snapshot()["manual"]
+        if manual.get("active") is not True or manual.get("control_mode") != "keyboard":
+            raise AutomationError("alignment_session", "Enter keyboard calibration before jogging", status=409)
+
+
+def _freeze_keyboard(service, *, allow_stopped_blocked=False):
+    from .automation import AutomationError
+
+    manual = service.snapshot()["manual"]
+    if manual.get("control_mode") != "keyboard" or manual.get("active") is not True:
+        return False
+    try:
+        service.freeze_alignment()
+    except AutomationError:
+        stopped = service.alignment_snapshot()
+        if not (allow_stopped_blocked and stopped.get("status") == "blocked"
+                and isinstance(stopped.get("stop_result"), dict)
+                and stopped["stop_result"].get("stop_confirmed") is True):
+            raise
+    return True
+
+
+@contextlib.contextmanager
+def _alignment_observer_pause(controller):
+    with controller._lock:
+        controller._alignment_io_count = vars(controller).get("_alignment_io_count", 0) + 1
+        controller._alignment_io_active = True
+    try:
+        yield
+    finally:
+        with controller._lock:
+            controller._alignment_io_count -= 1
+            controller._alignment_io_active = controller._alignment_io_count > 0
+
+
+@contextlib.contextmanager
+def _keyboard_hardware_io(controller, service):
+    with _alignment_observer_pause(controller):
+        with controller._lock:
+            controller._keyboard_operation_count = vars(controller).get("_keyboard_operation_count", 0) + 1
+            controller._keyboard_operation_active = True
+        try:
+            yield
+        except Exception as error:
+            stop_result = getattr(error, "stop_result", None)
+            if isinstance(stop_result, dict):
+                _alignment_fault(controller, {"code": getattr(error, "code", "alignment_io"), "message": str(error)}, stop_result)
+            raise
+        finally:
+            manual_active = service.snapshot()["manual"]["active"]
+            with controller._lock:
+                controller._keyboard_operation_count -= 1
+                controller._keyboard_operation_active = controller._keyboard_operation_count > 0
+                controller._manual_calibration_active = manual_active
+
+
+def _prepare_alignment_connection(controller, service):
+    from .automation import AutomationError
+
+    with _alignment_observer_pause(controller):
+        motion = controller._motion
+        cached = motion.snapshot() if motion is not None else {}
+        if cached.get("connected") is not True or cached.get("faulted") is not False:
+            settings = service.snapshot()["document"].get("bindings", {}).get("motion")
+            if not isinstance(settings, dict) or not str(settings.get("port", "")).strip():
+                raise AutomationError("motion_required", "请先在高级设置选择共享USB–RS485端口", status=409)
+            with controller._lock:
+                previous = controller._manual_calibration_active
+                controller._alignment_connection_io = True
+                controller._manual_calibration_active = False
+            try:
+                if motion is not None:
+                    controller.disconnect_motion()
+                controller.connect_motion(settings)
+            finally:
+                with controller._lock:
+                    controller._manual_calibration_active = previous
+                    controller._alignment_connection_io = False
+        manual = service.snapshot()["manual"]
+        if (manual.get("active") is True and manual.get("status") == "blocked"
+                and controller._motion.snapshot().get("stop_confirmed") is not True):
+            result = controller._motion.stop_all()
+            if not isinstance(result, dict) or result.get("stop_confirmed") is not True:
+                error = AutomationError("alignment_stop_unconfirmed",
+                                        "若要重新开始标定，请先检查电机供电与RS485连线，再点击「停止」；双轴停止确认前不会重新使能。",
+                                        "calibration", 409)
+                error.stop_result = result
+                _alignment_fault(controller, {"code": error.code, "message": str(error)}, result)
+                raise error
+        if controller._motion_factory is None:
+            prepare = getattr(controller._motion, "enable_responsive_keyboard", None)
+            if callable(prepare):
+                prepare()
+
+
+def _halt_keyboard_input(controller, service):
+    controller._stop_event.set()
+    if vars(controller).get("_alignment_connection_io", False):
+        return
+    with _alignment_observer_pause(controller):
+        if vars(controller).get("_keyboard_operation_active", False) and controller._motion is not None:
+            result = controller._motion.stop_all()
+            if not isinstance(result, dict) or result.get("stop_confirmed") is not True:
+                _alignment_fault(controller, {"message": "Keyboard operation STOP remains unconfirmed"}, result)
+        if _freeze_keyboard(service):
+            try:
+                service.cancel_calibration(controller._motion)
+            finally:
+                active = service.snapshot()["manual"]["active"]
+                with controller._lock:
+                    controller._manual_calibration_active = active
+
+
+def _explicit_automation_stop(controller, service, *, motion_only=False):
+    recovery = None
+    try:
+        _halt_keyboard_input(controller, service)
+    except Exception as error:
+        controller._event("keyboard_stop_failed", error=str(error))
+    try:
+        recovery = service.prepare_alignment_stop_recovery(controller._motion)
+    except Exception as error:
+        controller._event("keyboard_stop_drain_failed", error=str(error))
+    if isinstance(recovery, dict):
+        with controller._lock:
+            controller._owns_motion = True
+            controller._recovery_motion_config = copy.deepcopy(controller._motion_config)
+    result = controller.stop_motion() if motion_only else controller.stop()
+    if isinstance(recovery, dict):
+        worker = vars(controller).get("_thread")
+        if worker is not None:
+            worker.join(15)
+        if worker is None or not worker.is_alive():
+            try:
+                service.reconcile_alignment_stop_recovery(recovery)
+            except Exception as error:
+                controller._event("keyboard_stop_reconciliation_failed", error=str(error))
+        return controller.snapshot()
+    return result
+
+
+def _replace_disconnected_motion_port(controller, service, settings, port, same_bus_confirmed):
+    from serial.tools import list_ports
+    from .automation import AutomationError
+    from .emm_motion import SharedEmmBus
+
+    if same_bus_confirmed is not True:
+        raise AutomationError("motion_port_confirmation", "更换串口前，请确认新串口连接的是原来的 X/Z 双轴设备；不会自动猜测设备身份。", "port", 409)
+    available = {item.device for item in list_ports.comports()}
+    with controller._lock:
+        previous = controller._motion
+        previous_state = previous.snapshot() if previous is not None else {}
+        worker = vars(controller).get("_thread")
+        if (worker and worker.is_alive() or previous_state.get("connected")
+                or settings["port"] in available or port not in available):
+            raise AutomationError("motion_port_replacement", "只能在旧串口已消失、旧连接已断开且任务已停止时，选择系统实际存在的新串口。", "port", 409)
+        generation = previous_state.get("stop_generation")
+        feedback = controller._stop_motion_feedback()
+        controller._stop_event.set()
+    if feedback is not None and feedback is not threading.current_thread():
+        feedback.join(2)
+        if feedback.is_alive():
+            raise AutomationError("motion_port_replacement", "旧串口读取尚未结束，请稍后重试。", "port", 409)
+    manager = service._alignment
+    if manager is not None:
+        manager.retire()
+    replacement = copy.deepcopy(settings)
+    replacement["port"] = port
+    factory = controller._motion_factory or SharedEmmBus
+    candidate = factory(port, settings["baud"], settings["axes"], event_callback=controller._motion_event,
+                        **({"require_absolute_limits": True} if controller._require_absolute_limits else {}))
+    try:
+        candidate.connect()
+        current = candidate.snapshot()
+        for axis in ("X", "Z"):
+            for field in ("firmware_version", "hardware_version", "config", "power_flag_baseline"):
+                expected = previous_state.get("axes", {}).get(axis, {}).get(field)
+                if expected is not None and current["axes"][axis].get(field) != expected:
+                    raise AutomationError("recovery_identity", f"新串口的 {axis} 驱动身份或配置与原设备不一致，不会解除恢复锁。", "port", 409)
+        stopped = candidate.stop_all()
+        if stopped.get("stop_confirmed") is not True:
+            raise AutomationError("device_reset_stop_unknown", "新串口已打开，但双轴停止未确认；保留旧恢复状态，请检查电机供电与 RS485 接线。", "port", 409)
+        with controller._lock:
+            worker = vars(controller).get("_thread")
+            if (controller._motion is not previous or worker and worker.is_alive()
+                    or previous is not None and previous.snapshot().get("stop_generation") != generation):
+                raise AutomationError("cancelled", "串口恢复期间收到新的停止或连接操作，请重试；不会自动运动。", "port", 409)
+            controller._motion = candidate
+            controller._motion_config = copy.deepcopy(replacement)
+            controller._recovery_motion_config = copy.deepcopy(replacement)
+            controller._motion_feedback_error = None
+            controller._owns_motion = True
+            controller._recovery_required = True
+            controller._state["stop_confirmed"] = False
+            controller._persist_best_effort()
+        service.reset_after_confirmed_stop(candidate)
+        document = service.snapshot()["document"]
+        document["bindings"]["motion"]["port"] = port
+        service.save(document)
+        controller._manual_calibration_active = False
+        controller._event("motion_port_replaced", previous_port=settings["port"], port=port,
+                          same_bus_confirmed=True, calibration_cleared=True, stop_confirmed=True)
+        return replacement
+    except Exception as error:
+        if controller._motion is not candidate:
+            try:
+                if candidate.snapshot().get("connected"):
+                    candidate.stop_all()
+            finally:
+                candidate._close_port()
+        if isinstance(error, AutomationError):
+            raise
+        raise AutomationError("device_reset_connection", f"新串口 {port} 连接未完成，旧恢复状态已保留：{error}", "port", 409) from error
+
+
+def _reset_automation_devices(controller, service, boundary_at_current=None, *, port=None, same_bus_confirmed=False):
+    from .automation import AutomationError
+
+    with _preempting_operation_lock(), _alignment_observer_pause(controller):
+        settings = copy.deepcopy(controller._recovery_motion_config or controller._motion_config
+                                 or service.snapshot()["document"]["bindings"]["motion"])
+        if port is not None and port != settings["port"]:
+            settings = _replace_disconnected_motion_port(controller, service, settings, port, same_bus_confirmed)
+        if controller._motion is None:
+            with controller._lock:
+                manual_active = controller._manual_calibration_active
+                controller._manual_calibration_active = False
+            try:
+                controller.connect_motion(settings)
+            except Exception as error:
+                raise AutomationError("device_reset_connection", "无法重新连接 RS485，请确认 USB 和电机电源已接好：" + str(error), status=409) from error
+            finally:
+                with controller._lock:
+                    controller._manual_calibration_active = manual_active
+        _explicit_automation_stop(controller, service)
+        worker = vars(controller).get("_thread")
+        if worker is not None:
+            worker.join(15)
+        current = controller.snapshot()
+        if current.get("stop_confirmed") is not True or current.get("recovery_required") or worker and worker.is_alive():
+            raise AutomationError("device_reset_stop_unknown", "重置未完成：当前设备尚未确认停止。请检查 USB、RS485 和电机供电，再点击重连并重置；不会清空故障后盲目运动。", status=409)
+        stopped = controller._motion.stop_all()
+        if stopped.get("stop_confirmed") is not True:
+            with controller._lock:
+                controller._retain_motion_ownership(AutomationError("stop_unconfirmed", "Fresh reset STOP remains unconfirmed"))
+            raise AutomationError("device_reset_stop_unknown", "重置未完成：双轴停止尚未确认，请检查连接后重试", status=409)
+        service.reset_after_confirmed_stop(controller._motion, boundary_at_current=boundary_at_current)
+        with controller._lock:
+            controller._manual_calibration_active = False
+        if vars(controller).get("_limit_calibration_active", False):
+            controller.cancel_limits()
+        try:
+            controller.disconnect_motion()
+            controller.connect_motion(settings)
+            current = controller.stop_motion()
+        except Exception as error:
+            raise AutomationError("device_reset_connection", "旧会话已结束，但重新连接未完成；请检查 USB 和电机供电后重试：" + str(error), status=409) from error
+        if current.get("stop_confirmed") is not True or current.get("recovery_required"):
+            raise AutomationError("device_reset_stop_unknown", "新连接尚未确认双轴停止，请检查接线后重试", status=409)
+        controller._event("devices_reset_completed", port=settings["port"], calibration_cleared=True, data_preserved=True)
+        return {"state": current, "guided": service.snapshot(), "motion": controller._motion.snapshot(),
+                "message": "设备已重新连接，旧故障和标定会话已清除；数据、模板和日志保留。请重新进入标定。"}
+
+
+def _automation_dispatch(method: str, action: str, payload: dict, query: dict) -> dict:
+    if method == "POST" and action.startswith("guided/calibration/jog/"):
+        from .keyboard_trace import emit
+        emit({"source": "api", "kind": "keyboard_request_received", "action": action,
+              **{key: str(payload.get(key, ""))[:160] for key in ("press_id", "session_token", "axis", "direction", "sequence")}})
+    from .automation import AutomationError, _keys, compile_experiment, experiment_schema, openapi_document
+
+    controller = APP.automation
+    if method == "POST" and action.startswith("boards/"):
+        return _manage_board_connections(action.removeprefix("boards/"), payload)
+    if method == "GET":
+        if action == "boards":
+            return _board_connections_payload()
+        if action == "devices":
+            return _high_throughput_devices()
+        if action == "twin":
+            with controller._lock:
+                devices = _high_throughput_devices()
+                guided = APP.guided_automation.snapshot()
+                if guided.get("four_point_required") is True:
+                    return APP.digital_twin.snapshot_experiment(devices["motion"], guided)
+                return APP.digital_twin.snapshot(devices["motion"], devices["limits"])
+        if action == "limits":
+            return controller.limits_snapshot()
+        if action == "guided":
+            return APP.guided_automation.snapshot()
+        if action == "guided/calibration/jog":
+            return APP.guided_automation.alignment_snapshot()
+        if action == "state":
+            return controller.snapshot()
+        if action == "ports":
+            return controller.ports()
+        if action == "schema":
+            version = query.get("version", ["1.0"])[0]
+            if version not in {"1.0", "1.1"}:
+                raise AutomationError("schema_version", "Use schema version 1.0 or 1.1", "version")
+            return experiment_schema(version)
+        if action == "openapi.json":
+            return openapi_document()
+        if action == "events":
+            try:
+                after = int(query.get("after", ["0"])[0])
+                if after < 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise AutomationError("invalid_cursor", "after must be a nonnegative integer", "after")
+            return controller.events(after=after)
+        if action == "capabilities":
+            from .keyboard_fast_jog import _target_representation_budget
+            return {"api_version": "1.0", "default_mode": "simulate", "boards": 2,
+                    "channels": list("ABCDEFGH"), "motion_bus": "shared-rs485-emm",
+                    "automatic_motion_bus": {"revision": "20261024-natural-arrival-r1",
+                        "in_flight_feedback": "active_axis_only", "quiesce_before_peer_reads": True,
+                        "normal_arrival": "natural_finite_completion_without_FE", "natural_quiet_ms": 200,
+                        "endpoint_approach": {"revision": "20261024-endpoint-approach-r1",
+                            "final_speed_cap_mm_s": 0.5, "interior_clearance_mm": 1,
+                            "requested_target_unchanged": True, "guard_tolerance_unchanged": True,
+                            "keyboard_jog_affected": False},
+                        "full_profile_checks": "before_and_after_each_move"},
+                    "motion_port_recovery": {"revision": "20261024-explicit-port-r1",
+                        "same_bus_confirmation_required": True, "automatic_motion": False},
+                    "operations": ["move_to_column", "immerse", "withdraw", "wait", "dwell", "wait_operator", "repeat"],
+                    "guided_execution": {"revision": "20261024-guided-routes-r1",
+                        "document_versions": ["guided-1.0", "guided-1.1"],
+                        "modes": ["once", "repeat", "custom"], "preserve_order_and_duplicates": True,
+                        "maximum_expanded_steps": 500, "maximum_runtime_s": 28800,
+                        "progress": "whole_run_with_estimated_remaining_time"},
+                    "synchronization": "software start gate; independent board clocks",
+                    "fingerprints": "sha256 identity/configuration/action/sample provenance",
+                    "absolute_motion_limits": {"required_for_live_motion": False,
+                        "boundaries": ["x_left", "x_right", "z_up", "z_down"],
+                        "capture_mode": "legacy_optional", "hardware_limit_switches_verified": False},
+                    "experiment_calibration": {"required_for_live_motion": True,
+                        "coordinate_revision": "20261024-completion-pose-r2",
+                        "startup_approach": "first_z_to_safe_only",
+                        "points": ["first", "last", "working", "safe"], "same_connection_required": True,
+                        "power_cycle_restore": False, "independent_extreme_limits_required": False},
+                    "keyboard_alignment": {"calibration_only": True, "keys": ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "W", "A", "S", "D"],
+                        "target_guard_revision": "20261024-fixed-representation-r2",
+                        "target_guard_reference": {"pulses_per_rev": 3200,
+                            "budget_counts": _target_representation_budget(65536 / 3200), "baseline": "fixed"},
+                        "default_speed_mm_s": 0.5, "default_max_speed_mm_s": 1.0, "hard_max_speed_mm_s": 20.0,
+                        "fast_lookahead_mm": 6, "fast_clearance_confirmation_required": True,
+                        "lease_ms": 350, "heartbeat_ms": 100, "max_segment_mm": 0.1, "max_hold_s": None,
+                        "max_hold_mm": None, "hold_mode": "until_release"},
+                    "physical_motion_tested": False, "arbitrary_code_execution": False}
+        raise AutomationError("not_found", "unknown automation endpoint", action, status=404)
+    if action == "stop":
+        return _explicit_automation_stop(controller, APP.guided_automation)
+    if action == "motion/stop":
+        return _explicit_automation_stop(controller, APP.guided_automation, motion_only=True)
+    if action == "motion/reset":
+        _keys(payload, {"boundary_at_current", "port", "same_bus_confirmed"}, action)
+        port = payload.get("port")
+        if port is not None and (not isinstance(port, str) or not port.strip() or port != port.strip() or len(port) > 500):
+            raise AutomationError("invalid_value", "请选择实际存在的 RS485 串口", "port")
+        boundary = payload.get("boundary_at_current")
+        if boundary is not None and (not isinstance(boundary, dict) or set(boundary) != {"axis", "direction"}
+                or not isinstance(boundary.get("axis"), str) or not isinstance(boundary.get("direction"), str)
+                or (boundary["axis"], boundary["direction"]) not in {("X", "left"), ("X", "right"), ("Z", "up"), ("Z", "down")}):
+            raise AutomationError("invalid_value", "附加方向保护须为 X 左/右或 Z 上/下", "boundary_at_current")
+        return _reset_automation_devices(controller, APP.guided_automation, boundary,
+                                         port=port, same_bus_confirmed=payload.get("same_bus_confirmed") is True)
+    jog_fields = {"start": {"session_token", "press_id", "axis", "direction"},
+                  "heartbeat": {"session_token", "press_id", "sequence"},
+                  "stop": {"session_token", "press_id"},
+                  "config": {"session_token", "speed_mm_s", "max_speed_mm_s", "fast_motion_confirmed"}}
+    if action in {"guided/calibration/jog/heartbeat", "guided/calibration/jog/stop"}:
+        operation = action.rsplit("/", 1)[-1]
+        _keys(payload, jog_fields[operation], action)
+        if operation == "heartbeat":
+            return APP.guided_automation.heartbeat_jog(payload)
+        with _alignment_observer_pause(controller):
+            return APP.guided_automation.stop_jog(payload)
+    if action == "resume":
+        return controller.resume()
+    if action == "pause":
+        return controller.pause()
+    if action in {"validate", "preview"}:
+        return compile_experiment(payload.get("experiment"))
+    with _preempting_operation_lock():
+        if SHUTDOWN_INTENT.is_set():
+            raise AutomationError("shutting_down", "应用正在安全退出", status=409)
+        if (APP.measurement.is_busy() or APP.schedule.snapshot()["active"]
+                or APP.settings.snapshot()["state"] == "applying"
+                or APP_UPDATER.busy or JLINK_DRIVER_INSTALL_LOCK.locked()):
+            raise AutomationError("hardware_busy", "已有普通测量或硬件操作，不能启动高通量任务", status=409)
+        if action == "motion/refresh":
+            _keys(payload, set(), action)
+            return controller.refresh_motion()
+        if action.startswith("guided/calibration/jog/"):
+            operation = action.rsplit("/", 1)[-1]
+            if operation not in {"start", "config"}:
+                raise AutomationError("not_found", "unknown keyboard alignment endpoint", action, status=404)
+            _keys(payload, jog_fields[operation], action)
+            with controller._lock:
+                _alignment_gate(controller, APP.guided_automation, require_active=True)
+            return (APP.guided_automation.start_jog(payload) if operation == "start"
+                    else APP.guided_automation.configure_jog(payload))
+        if action == "guided/calibration/begin" and payload.get("control_mode") == "keyboard":
+            _keys(payload, {"control_mode", "motion_confirmed", "boundary_at_current"}, action)
+            if payload.get("motion_confirmed") is not True:
+                raise AutomationError("alignment_confirmation", "确认观察区域与移动空间后才能开启键盘对位", "motion_confirmed")
+            service = APP.guided_automation
+            with controller._lock:
+                _alignment_gate(controller, service, require_active=False)
+                if vars(controller).get("_limit_calibration_active", False):
+                    raise AutomationError("limit_calibration_active", "Cancel historical boundary capture first", status=409)
+                controller._stop_event.clear()
+            _freeze_keyboard(service, allow_stopped_blocked=True)
+            _prepare_alignment_connection(controller, service)
+            if controller._stop_event.is_set():
+                raise AutomationError("cancelled", "STOP interrupted keyboard calibration begin", status=409)
+            with _keyboard_hardware_io(controller, service):
+                options = {} if payload.get("boundary_at_current") is None else {"boundary_at_current": payload["boundary_at_current"]}
+                result = service.begin_keyboard_calibration(controller._motion, confirmed=True, **options)
+                if controller._stop_event.is_set():
+                    service.freeze_alignment()
+                    raise AutomationError("cancelled", "STOP interrupted keyboard calibration begin", status=409)
+                return result
+        if action == "twin/register-datum":
+            _keys(payload, {"confirmed", "datum"}, action)
+            with controller._lock:
+                current = controller.snapshot()
+                worker = vars(controller).get("_thread")
+                if (controller._manual_calibration_active or current.get("stop_confirmed") is not True
+                        or current.get("recovery_required") is True or worker and worker.is_alive()
+                        or current.get("state") in {"running", "waiting_operator", "waiting_recovery", "stopping"}
+                        or current.get("busy") is True and not vars(controller).get("_limit_calibration_active", False)):
+                    raise AutomationError("busy", "Complete other operations and confirm STOP before registering a display datum", status=409)
+                devices = _high_throughput_devices()
+                return APP.digital_twin.register_datum(devices["motion"], devices["limits"],
+                                                      confirmed=payload.get("confirmed") is True,
+                                                      datum=payload.get("datum", "left_up"))
+        if action.startswith("limits/"):
+            operation = action.removeprefix("limits/")
+            fields = {"begin": set(), "capture": {"boundary"}, "save": {"clearance_confirmed"}, "cancel": set()}
+            if operation not in fields:
+                raise AutomationError("not_found", "unknown limit endpoint", action, status=404)
+            _keys(payload, fields[operation], action)
+            if operation == "begin":
+                return controller.begin_limits()
+            if operation == "capture":
+                return controller.capture_limit(payload.get("boundary"))
+            if operation == "save":
+                return controller.save_limits(clearance_confirmed=payload.get("clearance_confirmed") is True)
+            return controller.cancel_limits()
+        if vars(controller).get("_limit_calibration_active", False):
+            raise AutomationError("limit_calibration_active", "正在读取绝对限位，请先保存或取消；停止始终可用", status=409)
+        if action.startswith("guided/calibration/"):
+            operation = action.removeprefix("guided/calibration/")
+            service = APP.guided_automation
+            manual = service.snapshot()["manual"]
+            if operation in {"capture", "finish", "cancel"} and manual.get("control_mode") == "keyboard":
+                _keys(payload, {"point"} if operation == "capture" else set(), action)
+                _freeze_keyboard(service)
+                with _keyboard_hardware_io(controller, service):
+                    if operation == "capture":
+                        return service.capture_calibration(controller._motion, payload.get("point"))
+                    if operation == "finish":
+                        result = service.finish_calibration(controller._motion)
+                        with controller._lock:
+                            controller._motion_config = copy.deepcopy(result["document"]["bindings"]["motion"])
+                            if controller._recovery_motion_config is not None:
+                                controller._recovery_motion_config = copy.deepcopy(controller._motion_config)
+                        return result
+                    return service.cancel_calibration(controller._motion)
+            with controller._lock:
+                if operation == "begin":
+                    _keys(payload, {"release_confirmed", "z_supported"}, action)
+                    controller._idle()
+                    if controller._motion is None:
+                        raise AutomationError("motion_required", "请先在高级设置连接滑台，再主动开始标定", status=409)
+                    controller._manual_calibration_active = True
+                    try:
+                        if vars(service).get("_require_four_point") is True:
+                            result = service.begin_calibration(controller._motion,
+                                                               release_confirmed=payload.get("release_confirmed") is True,
+                                                               z_supported=payload.get("z_supported") is True)
+                        else:
+                            result = service.begin_calibration(controller._motion)
+                    finally:
+                        controller._manual_calibration_active = service.snapshot()["manual"]["active"]
+                    return result
+                if not controller._manual_calibration_active:
+                    raise AutomationError("calibration_inactive", "请先点击标定，不能直接读取或保存标定点", status=409)
+                try:
+                    if operation == "capture":
+                        return service.capture_calibration(controller._motion, payload.get("point"))
+                    if operation == "finish":
+                        return service.finish_calibration(controller._motion)
+                    if operation == "cancel":
+                        return service.cancel_calibration(controller._motion)
+                    raise AutomationError("not_found", "unknown calibration endpoint", action, status=404)
+                finally:
+                    controller._manual_calibration_active = service.snapshot()["manual"]["active"]
+        if action == "motion/connect" and controller._motion is None:
+            service = APP.guided_automation
+            manual = service.snapshot()["manual"]
+            if ((manual.get("error") or {}).get("code") == "manual_interrupted"
+                    and service.alignment_snapshot().get("session_token") is None):
+                with _alignment_observer_pause(controller):
+                    with controller._lock:
+                        previous = controller._manual_calibration_active
+                        controller._manual_calibration_active = False
+                        controller._alignment_connection_io = True
+                    try:
+                        return controller.connect_motion(payload.get("motion"))
+                    finally:
+                        with controller._lock:
+                            controller._manual_calibration_active = previous
+                            controller._alignment_connection_io = False
+        if vars(controller).get("_manual_calibration_active", False):
+            raise AutomationError("calibration_active", "正在手动标定，请先保存或取消；停止始终可用", status=409)
+        if action == "twin/register":
+            _keys(payload, {"cad_bounds", "confirmed"}, action)
+            with controller._lock:
+                controller._idle()
+                devices = _high_throughput_devices()
+                return APP.digital_twin.register(devices["motion"], devices["limits"], payload.get("cad_bounds"),
+                                                confirmed=payload.get("confirmed") is True)
+        if action == "guided/experiment":
+            with controller._lock:
+                controller._idle()
+                return APP.guided_automation.save(payload.get("document"))
+        if action in {"guided/preview", "guided/run"}:
+            if action == "guided/run":
+                for field in ("plan_hash", "idempotency_key"):
+                    if not isinstance(payload.get(field), str) or not payload[field].strip():
+                        raise AutomationError("required", f"{field} is required", field)
+            with controller._lock:
+                compiled = APP.guided_automation.compile(
+                    payload.get("document"), mode=payload.get("mode", "simulate"), motion=controller._motion,
+                )
+                if action == "guided/preview":
+                    return compiled
+                if compiled["plan_hash"] != payload["plan_hash"]:
+                    raise AutomationError("plan_changed", "模板或标定已变更，请重新预览再运行", "plan_hash", 409)
+                return controller.start(
+                    compiled["experiment"], mode=payload.get("mode", "simulate"),
+                    plan_hash=payload["plan_hash"], idempotency_key=payload["idempotency_key"],
+                )
+        if action == "experiment":
+            return controller.save(payload.get("experiment"))
+        if action == "run":
+            for field in ("plan_hash", "idempotency_key"):
+                if not isinstance(payload.get(field), str) or not payload[field].strip():
+                    raise AutomationError("required", f"{field} is required", field)
+            document = payload.get("experiment")
+            if document is None:
+                document = controller.snapshot()["experiment"]
+            if payload.get("mode", "simulate") == "live" and vars(APP.guided_automation).get("_require_four_point") is True:
+                compiled = compile_experiment(document)
+                if any(step["op"].startswith("move_") for step in compiled["steps"]):
+                    raise AutomationError("guided_calibration_required", "实物运动请通过本次四点标定的模板入口运行", "calibration", 409)
+            return controller.start(document, mode=payload.get("mode", "simulate"),
+                                    plan_hash=payload["plan_hash"], idempotency_key=payload["idempotency_key"])
+        if action == "motion/connect":
+            return controller.connect_motion(payload.get("motion"))
+        if action == "motion/reference":
+            if vars(APP.guided_automation).get("_require_four_point") is True:
+                raise AutomationError("alignment_session", "生产标定请使用键盘对位流程，不单独改参考点", status=409)
+            return controller.reference_motion(confirmed=payload.get("confirmed") is True)
+        if action == "motion/enable":
+            if vars(APP.guided_automation).get("_require_four_point") is True:
+                raise AutomationError("alignment_session", "生产标定只在键盘对位入口核验后锁轴", status=409)
+            return controller.enable_motion(payload.get("axis"))
+        if action == "motion/disconnect":
+            return controller.disconnect_motion()
+        raise AutomationError("not_found", "unknown automation endpoint", action, status=404)
 
 
 class DiagnosticHTTPServer(ThreadingHTTPServer):
@@ -10584,6 +11547,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/automation/v1/"):
+            self._automation_response("GET", parsed, {})
+            return
         if parsed.path == "/":
             # Keep the workstation usable in embedded browsers that may drop an
             # external stylesheet after handing the tab back to the user.
@@ -10660,6 +11626,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "version": __version__,
                 "diagnostic_session": DIAGNOSTICS.session_id,
                 "backend_pid": os.getpid(),
+                "frontend_revision": _frontend_revision(),
                 "launcher_pid": str(os.environ.get("SENSUS_APP_PID", "")),
                 "launch_token": str(
                     os.environ.get("SENSUS_LAUNCH_TOKEN", "")
@@ -10706,20 +11673,55 @@ class RequestHandler(BaseHTTPRequestHandler):
             name = Path(parsed.path.removeprefix("/assets/")).name
             asset = GUI_DIR / name
             if asset.exists() and asset.is_file():
-                content_type = "text/css; charset=utf-8" if asset.suffix == ".css" else "text/javascript; charset=utf-8"
+                content_type = {".css": "text/css; charset=utf-8", ".json": "application/json; charset=utf-8",
+                                ".txt": "text/plain; charset=utf-8", ".png": "image/png"}.get(
+                                    asset.suffix, "text/javascript; charset=utf-8")
                 self._send_bytes(asset.read_bytes(), content_type)
                 return
         self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def _automation_response(self, method, parsed, payload):
+        from .automation import AutomationError
+
+        action = parsed.path.removeprefix("/api/automation/v1/")
+        try:
+            if method == "POST" and payload is None:
+                payload = self._body()
+            if method == "POST" and SHUTDOWN_INTENT.is_set() and action not in {"stop", "motion/stop"}:
+                raise AutomationError("shutting_down", "应用正在安全退出", status=409)
+            result = _automation_dispatch(method, action, payload, parse_qs(parsed.query))
+            self._send_json(result)
+        except AutomationError as error:
+            self._send_json({"error": error.as_dict(), "request_id": getattr(self, "_request_id", "")}, HTTPStatus(error.status))
+        except ValueError as error:
+            self._send_json({"error": {"code": "invalid_request", "message": str(error), "path": action},
+                             "request_id": getattr(self, "_request_id", "")}, HTTPStatus.BAD_REQUEST)
+        except Exception as error:
+            diagnostic_id = DIAGNOSTICS.exception(
+                "automation.api.failed", "Automation API failure", error,
+                method=method, path=parsed.path,
+            )
+            self._send_json({"error": {"code": "internal_error", "message": "后台操作失败，请查看诊断日志", "path": action},
+                             "request_id": getattr(self, "_request_id", ""), "diagnostic_id": diagnostic_id},
+                            HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         self._run_request("POST", self._do_POST)
 
     def _do_POST(self) -> None:
+        if self.path.startswith("/api/automation/v1/"):
+            self._automation_response("POST", urlparse(self.path), None)
+            return
         shutdown_requested = False
         try:
             payload = self._body()
             if SHUTDOWN_INTENT.is_set() and self.path != "/api/shutdown":
                 raise RuntimeError("应用正在安全退出，不能再启动新的硬件任务")
+            if HARDWARE_TRANSPORT == "ble" and self.path in {
+                "/api/debug/start", "/api/debug/begin", "/api/debug/cmd",
+                "/api/range", "/api/range/measurement", "/api/range/auto",
+            }:
+                raise RuntimeError("V5.2 不支持旧板 DEBUG/运行中切档；请在停止后应用蓝牙条件")
             update_blocked_paths = {
                 "/api/devices/select", "/api/devices/jlink-driver/install",
                 "/api/measurement/start", "/api/range",
@@ -10727,6 +11729,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "/api/debug/start", "/api/debug/begin", "/api/debug/cmd",
                 "/api/schedule/start", "/api/settings/apply",
             }
+            automation = _automation_owner()
+            if automation is not None and automation.is_busy() and self.path in update_blocked_paths:
+                raise RuntimeError("高通量实验正在运行，不能同时操作普通测量硬件")
             if APP_UPDATER.busy and self.path in update_blocked_paths:
                 raise RuntimeError("软件更新正在准备，暂时不能启动测量、烧录或硬件操作")
             driver_blocked_paths = {
@@ -10743,6 +11748,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             if self.path == "/api/frontend/ready":
                 result = FRONTEND_UPDATER.mark_ready()
             elif self.path == "/api/diagnostics/client":
+                if payload.get("kind") == "keyboard_trace":
+                    from .keyboard_trace import emit
+                    events = (payload.get("context") or {}).get("events", [])
+                    for event in events[:32] if isinstance(events, list) else []:
+                        if isinstance(event, dict):
+                            allowed = {"stage", "wall_ms", "mono_ms", "session_token", "connection_token", "press_id",
+                                       "input", "axis", "direction", "queued_stops", "still_current", "key", "repeat",
+                                       "dom_time_ms", "reason", "require_release", "status", "confirmed", "sequence",
+                                       "page_id", "trace_sequence", "dropped_total"}
+                            clean = {key: value[:256] if isinstance(value, str) else value for key, value in event.items()
+                                     if key in allowed and isinstance(value, (str, int, float, bool, type(None)))}
+                            emit({"source": "browser", "client": clean})
+                    self._send_json({"ok": True, "server_unix_ms": time.time() * 1000})
+                    return
                 message = str(payload.get("message") or "Frontend error")[
                     :CLIENT_DIAGNOSTIC_MAX_LENGTH
                 ]
@@ -10777,6 +11796,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                         raise RuntimeError("请先停止测量、自动任务或硬件参数更新")
                     result = APP_UPDATER.begin_install()
                     shutdown_requested = True
+            elif self.path == "/api/devices/ble/scan":
+                with _preempting_operation_lock():
+                    _ensure_not_shutting_down()
+                    result = _scan_ble_devices()
+            elif self.path == "/api/devices/ble/stop":
+                with _preempting_operation_lock():
+                    _ensure_not_shutting_down()
+                    if not APP.hardware_idle():
+                        raise RuntimeError("测量期间请使用测量停止按钮")
+                    device = _selected_device_copy()
+                    if not device or device.get("kind") != "ble":
+                        raise RuntimeError("请先选择 V5.2 蓝牙设备")
+                    result = {**APP.ble_connections.stop(device["address"]), "message": "已收到 V5.2 STOP 确认"}
+            elif self.path in {"/api/devices/ble/connect", "/api/devices/ble/disconnect"}:
+                managed = _manage_board_connections(self.path.rsplit("/", 1)[-1], {"addresses": [payload.get("address")]})
+                result = {**_cached_devices_payload(), "errors": managed.get("errors", {})}
             elif self.path == "/api/devices/select":
                 with _preempting_operation_lock():
                     _ensure_not_shutting_down()
@@ -10790,7 +11825,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         result["message"] = "已恢复自动检测"
                     else:
                         with DEVICE_DISCOVERY_LOCK:
-                            devices = copy.deepcopy(DEVICE_DISCOVERY_CACHE)
+                            devices = _with_ble_connections(DEVICE_DISCOVERY_CACHE)
                         device = next(
                             (item for item in devices if item.get("id") == requested_id),
                             None,
@@ -10803,6 +11838,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                                     "该 USB 设备尚未同时识别 DATA 和 SMP CDC，请重新插拔后刷新"
                                 )
                             raise RuntimeError("该 J-Link 没有可用的探头序列号")
+                        if device.get("kind") == "ble":
+                            connection = APP.ble_connections.connect(device["address"], device.get("name", ""))
+                            device = {**device, "protocol_verified": True,
+                                      "connection_state": "connected", "firmware": connection["firmware"]}
                         _set_device_selection(device)
                         try:
                             _refresh_usb_transport()
@@ -10984,6 +12023,8 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
           open_browser: bool = False) -> None:
     global HTTP_SERVER, _SHUTDOWN_REQUESTED
     DIAGNOSTICS.install_exception_hooks()
+    from .keyboard_trace import configure as configure_keyboard_trace
+    configure_keyboard_trace(DIAGNOSTICS.log_dir)
     DIAGNOSTICS.record(
         "info", "application.starting", "Workstation backend is starting",
         host=host,
@@ -11087,6 +12128,8 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
             except subprocess.TimeoutExpired:
                 MeasurementController._kill_tree(proc)
         APP.measurement.wait_for_completion()
+        if getattr(APP, "ble_connections", None) is not None:
+            APP.ble_connections.close()
         server.server_close()
         with _SHUTDOWN_LOCK:
             if HTTP_SERVER is server:
@@ -11105,7 +12148,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--open-browser", action="store_true")
-    parser.add_argument("--transport", choices=("auto", "rtt", "serial"),
+    parser.add_argument("--transport", choices=("auto", "rtt", "serial", "ble"),
                         default=HARDWARE_TRANSPORT,
                         help="auto 自动检测；V4.0 用 rtt；V5.1 用 serial")
     parser.add_argument("--serial-port", default=SERIAL_DATA_PORT,

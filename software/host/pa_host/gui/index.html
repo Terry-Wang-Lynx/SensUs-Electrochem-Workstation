@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SensUs 电化学工作站</title>
   <link rel="icon" type="image/png" href="/assets/sensus-logo.png?v=20260817-v047">
-  <link rel="stylesheet" href="/assets/styles.css?v=20260817-v047">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260817-v047&amp;ble=20261022-v050&amp;automation=20261023-keyboard-alignment">
 </head>
 <body>
   <div class="app-shell">
@@ -15,9 +15,21 @@
         <button class="nav-item active" data-view="measure"><span>⌁</span>实时测量</button>
         <button class="nav-item" data-view="calibrate"><span>⌗</span>标定与漂移</button>
         <button class="nav-item" data-view="schedule"><span>◷</span>稳定化 / 自动</button>
+        <button class="nav-item" data-view="throughput"><span>▦</span>高通量自动化实验</button>
         <button class="nav-item" data-view="history"><span>◴</span>历史记录</button>
         <button class="nav-item" data-view="debug"><span>⚙</span>硬件 DEBUG</button>
       </nav>
+      <section class="ht-devices-block" id="htDevicesBlock" aria-label="高通量设备" aria-live="polite">
+        <strong>高通量设备</strong>
+        <p class="ht-device-line unknown" id="htDevicesMotion">RS485 · 正在读取状态</p>
+        <p class="ht-device-line unknown" id="htDevicesAxisX">X1 · 反馈未确认</p>
+        <p class="ht-device-line unknown" id="htDevicesAxisZ">Z2 · 反馈未确认</p>
+        <p class="ht-device-line unknown" id="htDevicesBoardA">板 A / A–D · 未验证连接</p>
+        <p class="ht-device-line unknown" id="htDevicesBoardB">板 B / E–H · 未验证连接</p>
+        <p class="ht-device-line warning" id="htDevicesLimits">运动限位 · 未确认</p>
+        <button id="htDevicesReset" class="secondary" type="button" title="停止任务、重新连接并清除旧会话；保留实验数据与日志，不移动电机">重连并重置</button>
+        <small>通信正常不代表已标定或允许运动</small>
+      </section>
       <div class="sidebar-footer">
         <div class="device-row" id="deviceStatus"><span class="status-dot" id="deviceDot"></span><div><strong id="deviceState">正在检查</strong><small id="deviceTransport">连接方式检查中</small></div></div>
         <div class="firmware-note" id="firmwareNote">+0.2 V · 500 nA FSR</div>
@@ -29,6 +41,16 @@
         <div><h1 id="pageTitle">实时测量</h1><p id="pageSubtitle">180 秒 IT 检测与末 20 秒稳态分析</p></div>
         <div class="topbar-actions"><div class="clock" id="clock"></div><button class="secondary device-picker-button" id="selectDevice" type="button" title="查看并选择当前硬件设备">选择设备</button><button class="exit-button" id="exitApp" type="button" title="关闭当前标签页并退出后端">退出</button></div>
       </header>
+      <details class="ht-devices-compact" id="htDevicesCompact">
+        <summary><strong>高通量设备</strong><span class="ht-device-line unknown" id="htDevicesCompactSummary">状态读取中</span></summary>
+        <div class="ht-devices-compact-body">
+          <p class="ht-device-line unknown" id="htDevicesCompactAxisX">X1 · 反馈未确认</p>
+          <p class="ht-device-line unknown" id="htDevicesCompactAxisZ">Z2 · 反馈未确认</p>
+          <p class="ht-device-line unknown" id="htDevicesCompactBoardA">板 A / A–D · 未验证连接</p>
+          <p class="ht-device-line unknown" id="htDevicesCompactBoardB">板 B / E–H · 未验证连接</p>
+          <small class="ht-device-line warning" id="htDevicesCompactLimits">运动限位 · 未确认</small>
+        </div>
+      </details>
       <div class="app-alert" id="globalError" role="alert" hidden>
         <div><strong id="globalErrorTitle">应用发生错误</strong><span id="globalErrorMessage"></span></div>
         <button class="secondary" id="openDiagnostics" type="button">查看诊断</button>
@@ -107,6 +129,8 @@
               </section>
 
               <section class="measure-control-panel it-settings active" data-control-panel="settings" role="tabpanel">
+                <div class="notice ble-capabilities" id="bleCapabilities" hidden>V5.2 当前支持四路恒电位 I-T，共用 DAC、量程与采样周期。电流未校准；不支持 CV / EIS、预阶跃、在线切档或 OTA。断线后板端可能仍采样，请重连并明确停止。</div>
+                <label id="analysisChannelField" hidden>标定与分析通道<select id="analysisChannel"><option value="1">CH1</option><option value="2">CH2</option><option value="3">CH3</option><option value="4">CH4</option></select><small>开始前选择；四路始终同时记录，不跨通道共用标定。</small></label>
                 <div class="method-switch">
                   <div class="method-picker"><span>测量方法</span><div class="segmented" id="methodMode"><button class="active" data-method="it">I-T</button><button data-method="cv">CV</button></div></div>
                   <div class="it-preset-picker"><span>快速预设</span><div class="segmented" id="itPresets" role="group" aria-label="I-T 快速预设"><button type="button" data-it-preset="needle-ox" aria-pressed="false">微针 +0.4V</button><button type="button" data-it-preset="printed-ox" aria-pressed="false">丝网印刷 +0.2V</button><button type="button" data-it-preset="needle-red" aria-pressed="false">微针 -0.2V</button><button type="button" data-it-preset="printed-red" aria-pressed="false">丝网印刷 -0.2V</button></div></div>
@@ -115,7 +139,7 @@
                   <div class="field-pair">
                     <label>测试电位<div class="input-unit"><input id="potentialV" type="number" min="-0.4" max="0.4" step="0.01" value="0.2"><span>V</span></div></label>
                     <label>WE 电位<div class="input-unit"><input id="workingElectrodeV" type="number" min="0.25" max="1.535" step="0.01" value="1.2"><span>V</span></div></label>
-                    <label>输出采样频率<div class="input-unit"><input id="sampleRateHz" type="number" min="0.5" max="10" step="0.5" value="10"><span>Hz</span></div></label>
+                    <label id="sampleRateField">输出采样频率<div class="input-unit"><input id="sampleRateHz" type="number" min="0.5" max="10" step="0.5" value="10"><span>Hz</span></div></label>
                   </div>
                   <div class="adaptive-row">
                     <label class="inline-toggle adaptive-stop"><input type="checkbox" id="adaptiveStop"><span>自动停止</span></label>
@@ -185,6 +209,18 @@
             <div class="notice error control-error" id="measureError" hidden></div>
           </section>
         </div>
+        <section class="panel ble-panel" id="blePanel" hidden>
+          <div class="panel-head"><div><h2>V5.2 · 四路实时电流</h2><p id="bleAnalysisLabel">四路均保存 · 电流未校准</p></div><span class="live-badge">MAX30134 · BLE</span></div>
+          <div class="ble-channel-grid">
+            <article class="ble-channel" id="bleChannel1"><div class="ble-channel-head"><strong>CH1</strong><span><b id="bleCurrent1">--</b> nA</span><small id="bleChannelStatus1">等待数据</small></div><canvas id="bleChart1" aria-label="CH1 原生电流曲线"></canvas></article>
+            <article class="ble-channel" id="bleChannel2"><div class="ble-channel-head"><strong>CH2</strong><span><b id="bleCurrent2">--</b> nA</span><small id="bleChannelStatus2">等待数据</small></div><canvas id="bleChart2" aria-label="CH2 原生电流曲线"></canvas></article>
+            <article class="ble-channel" id="bleChannel3"><div class="ble-channel-head"><strong>CH3</strong><span><b id="bleCurrent3">--</b> nA</span><small id="bleChannelStatus3">等待数据</small></div><canvas id="bleChart3" aria-label="CH3 原生电流曲线"></canvas></article>
+            <article class="ble-channel" id="bleChannel4"><div class="ble-channel-head"><strong>CH4</strong><span><b id="bleCurrent4">--</b> nA</span><small id="bleChannelStatus4">等待数据</small></div><canvas id="bleChart4" aria-label="CH4 原生电流曲线"></canvas></article>
+          </div>
+          <div class="ble-monitor-head"><strong>温度与电压监测</strong><span id="bleRunState">待机</span></div>
+          <div class="ble-monitor-grid" id="bleMonitor"></div>
+          <p class="ble-files" id="bleFiles"></p>
+        </section>
       </section>
 
       <section class="view" id="view-calibrate">
@@ -273,6 +309,7 @@
         </div>
       </section>
 
+      <section class="view" id="view-throughput"></section>
       <section class="view" id="view-history">
         <section class="panel workspace-history-panel">
           <div class="panel-head workspace-history-head">
@@ -291,6 +328,7 @@
            所有 id 一律 dbg 前缀 —— app.js 全篇假定 id 全局唯一且在模块顶层
            直接 $('id').onclick,复用现有 id 会让第二个永远不画。 -->
       <section class="view" id="view-debug">
+        <div class="notice ble-capabilities" id="bleDebugNotice" hidden>V5.2 不支持旧板硬件 DEBUG 命令。请在“实时测量”查看四路电流、温度与电压；停止采样可在“选择设备”中操作。应用诊断仍可使用。</div>
         <!-- 上下布局:图在上、控制在下。参数面板需要横向空间,挤在右侧窄栏里读不动。 -->
         <section class="panel chart-panel dbg-chart">
           <div class="panel-head">
@@ -437,13 +475,17 @@
   </div>
   <dialog id="deviceDialog" class="device-dialog">
     <form method="dialog" class="device-dialog-head">
-      <div><h2>选择设备</h2><p id="deviceDialogSummary">正在读取 USB / J-Link</p></div>
+      <div><h2>选择设备</h2><p id="deviceDialogSummary">正在读取 USB / J-Link；蓝牙需主动扫描</p></div>
       <button class="icon-button" value="cancel" aria-label="关闭设备选择">×</button>
     </form>
-    <div class="device-dialog-actions"><button class="secondary" id="refreshDevices" type="button">刷新设备</button><span id="deviceDialogBusy" class="notice error" hidden></span></div>
+    <div class="device-dialog-actions"><button class="secondary" id="refreshDevices" type="button">刷新设备</button><button class="secondary" id="scanBle" type="button">扫描蓝牙</button><button class="secondary" id="stopBle" type="button" hidden>停止板端采样</button><span id="deviceDialogBusy" class="notice error" hidden></span></div>
+    <p class="device-ble-note">V5.2：发现广播后选择并验证协议。连接期间可能不再广播；断线不代表板端已停止，重连后请确认 STOP。</p>
     <div id="deviceList" class="device-list"></div>
   </dialog>
   <div class="toast" id="toast"></div>
-  <script src="/assets/app.js?v=20260817-v047"></script>
+  <script src="/assets/app.js?v=20260817-v047&amp;ble=20261022-v050&amp;automation=20261023-keyboard-alignment"></script>
+  <script src="/assets/three.min.js?v=0.160.1"></script>
+  <script src="/assets/high_throughput_3d.js?v=20261023-live-feedback"></script>
+  <script src="/assets/high_throughput.js?v=20261024-retained-points-r1"></script>
 </body>
 </html>

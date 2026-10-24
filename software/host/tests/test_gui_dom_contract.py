@@ -11,6 +11,27 @@ from pa_host.gui_server import OFFSET_OPTIONS
 GUI_DIR = Path(__file__).parents[1] / "pa_host" / "gui"
 
 
+def test_guided_view_does_not_show_unrelated_single_board_sampling_conditions():
+    source = (GUI_DIR / "app.js").read_text(encoding="utf-8")
+    start = source.index("document.querySelectorAll('.nav-item').forEach(button => button.addEventListener")
+    navigation = source[start:source.index("\n\nfunction setMeasureControlTab", start)]
+    script = """
+const callbacks={};
+const nodes=new Proxy({}, {get(target,key){return target[key]||(target[key]={classList:{add(){}},hidden:false})}});
+const $=id=>nodes[id];
+const buttons=['measure','throughput'].map(view=>({dataset:{view},classList:{toggle(){}},addEventListener(event,handler){callbacks[view]=handler}}));
+const document={querySelectorAll:selector=>selector==='.nav-item'?buttons:[]};
+const pages={measure:['测量','条件'],throughput:['高通量','模板']};
+const window={HighThroughput:{activate(){}}};
+const requestAnimationFrame=()=>{};
+""" + navigation + """
+callbacks.throughput();const hidden=nodes.firmwareNote.hidden;
+callbacks.measure();console.log(JSON.stringify({hidden,restored:!nodes.firmwareNote.hidden}));
+"""
+    completed = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    assert json.loads(completed.stdout) == {"hidden": True, "restored": True}
+
+
 def _extract_js_function(source: str, name: str) -> str:
     start = source.index(f"function {name}(")
     if source[max(0, start - 6):start] == "async ":

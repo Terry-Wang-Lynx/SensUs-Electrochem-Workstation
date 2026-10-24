@@ -44,6 +44,7 @@ pywebview==6.2.1; sys_platform == "win32"
 pywin32-ctypes==0.2.3; sys_platform == "win32"
 readchar==4.2.1
 rich==15.0.0
+scipy==1.18.1
 setuptools==84.0.0
 shellingham==1.5.4
 six==1.17.0

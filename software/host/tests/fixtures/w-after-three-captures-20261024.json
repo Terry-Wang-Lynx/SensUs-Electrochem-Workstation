@@ -1,0 +1,246 @@
+[
+  {
+    "name": "two-segments",
+    "captures": {
+      "first": {
+        "X": -4099551,
+        "Z": 438549
+      },
+      "last": {
+        "X": 3616307,
+        "Z": 438549
+      },
+      "working": {
+        "X": -4099549,
+        "Z": 2950251
+      }
+    },
+    "initial": {
+      "X": {
+        "raw": -4099549,
+        "target": -4099549,
+        "rpm": 0,
+        "status": 3
+      },
+      "Z": {
+        "raw": 2950249,
+        "target": 2950251,
+        "rpm": 0,
+        "status": 3
+      }
+    },
+    "commands": [
+      {
+        "command": "02fd010258fa000024d700006b",
+        "feedback": [
+          {
+            "raw": 2946634,
+            "target": 2757094,
+            "rpm": -59,
+            "status": 1
+          },
+          {
+            "raw": 2940782,
+            "target": 2757094,
+            "rpm": -151,
+            "status": 1
+          },
+          {
+            "raw": 2932380,
+            "target": 2757094,
+            "rpm": -245,
+            "status": 1
+          },
+          {
+            "raw": 2921612,
+            "target": 2757094,
+            "rpm": -331,
+            "status": 1
+          },
+          {
+            "raw": 2907928,
+            "target": 2757094,
+            "rpm": -423,
+            "status": 1
+          },
+          {
+            "raw": 2891536,
+            "target": 2757094,
+            "rpm": -513,
+            "status": 1
+          },
+          {
+            "raw": 2874114,
+            "target": 2757094,
+            "rpm": -576,
+            "status": 1
+          }
+        ],
+        "target": 2757094
+      },
+      {
+        "command": "02fd010258fa00000e8600006b",
+        "feedback": [],
+        "target": 2680949
+      }
+    ]
+  },
+  {
+    "name": "six-segments",
+    "captures": {
+      "first": {
+        "X": -3570377,
+        "Z": 2238027
+      },
+      "last": {
+        "X": 3033571,
+        "Z": 2238027
+      },
+      "working": {
+        "X": -3570377,
+        "Z": 2714567
+      }
+    },
+    "initial": {
+      "X": {
+        "raw": -3570377,
+        "target": -3570377,
+        "rpm": 0,
+        "status": 3
+      },
+      "Z": {
+        "raw": 2714567,
+        "target": 2714567,
+        "rpm": 0,
+        "status": 3
+      }
+    },
+    "commands": [
+      {
+        "command": "02fd010258fa000024d700006b",
+        "feedback": [
+          {
+            "raw": 2710944,
+            "target": 2521410,
+            "rpm": -59,
+            "status": 1
+          },
+          {
+            "raw": 2705094,
+            "target": 2521410,
+            "rpm": -152,
+            "status": 1
+          },
+          {
+            "raw": 2696646,
+            "target": 2521410,
+            "rpm": -245,
+            "status": 1
+          },
+          {
+            "raw": 2685942,
+            "target": 2521410,
+            "rpm": -326,
+            "status": 1
+          },
+          {
+            "raw": 2671474,
+            "target": 2521410,
+            "rpm": -429,
+            "status": 1
+          },
+          {
+            "raw": 2655102,
+            "target": 2521410,
+            "rpm": -522,
+            "status": 1
+          },
+          {
+            "raw": 2637634,
+            "target": 2521410,
+            "rpm": -580,
+            "status": 1
+          }
+        ],
+        "target": 2521410
+      },
+      {
+        "command": "02fd010258fa00000ead00006b",
+        "feedback": [
+          {
+            "raw": 2587668,
+            "target": 2444467,
+            "rpm": -604,
+            "status": 1
+          },
+          {
+            "raw": 2570276,
+            "target": 2444467,
+            "rpm": -598,
+            "status": 1
+          }
+        ],
+        "target": 2444467
+      },
+      {
+        "command": "02fd010258fa00000cd900006b",
+        "feedback": [
+          {
+            "raw": 2520514,
+            "target": 2377108,
+            "rpm": -603,
+            "status": 1
+          },
+          {
+            "raw": 2503048,
+            "target": 2377108,
+            "rpm": -598,
+            "status": 1
+          }
+        ],
+        "target": 2377108
+      },
+      {
+        "command": "02fd010258fa00000cd200006b",
+        "feedback": [
+          {
+            "raw": 2453304,
+            "target": 2309893,
+            "rpm": -601,
+            "status": 1
+          },
+          {
+            "raw": 2435860,
+            "target": 2309893,
+            "rpm": -597,
+            "status": 1
+          }
+        ],
+        "target": 2309893
+      },
+      {
+        "command": "02fd010258fa00000cd100006b",
+        "feedback": [
+          {
+            "raw": 2385880,
+            "target": 2242698,
+            "rpm": -602,
+            "status": 1
+          },
+          {
+            "raw": 2368600,
+            "target": 2242698,
+            "rpm": -598,
+            "status": 1
+          }
+        ],
+        "target": 2242698
+      },
+      {
+        "command": "02fd010258fa00000cd400006b",
+        "feedback": [],
+        "target": 2175441
+      }
+    ]
+  }
+]

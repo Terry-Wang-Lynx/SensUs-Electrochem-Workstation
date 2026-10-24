@@ -18,9 +18,11 @@ Windows 与 macOS 使用同一套 Python LTS 后端和本地 HTTP API。后端�
 
 本机构建：
 
+需要 Apple Silicon/macOS14+、Python精确版本3.12.10、Xcode Command Line Tools、make/curl/tar和pkg-config；Node.js22用于测试。干净克隆与锁定依赖步骤见[0.5.0复现指南](REPRODUCING-0.5.0.md)。构建时明确选择解释器：
+
 ```bash
-make portable-macos
-make dmg
+make portable-macos PYTHON=/absolute/path/to/python3.12
+make dmg PYTHON=/absolute/path/to/python3.12
 ```
 
 Windows 原生构建：

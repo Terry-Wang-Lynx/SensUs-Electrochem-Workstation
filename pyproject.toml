@@ -4,20 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sensus-electrochem-workstation"
-version = "0.4.16"
-description = "Local GUI and acquisition workflow for the SensUs MAX30131 electrochemistry workstation"
+version = "0.5.0"
+description = "Local GUI and RTT, USB and BLE acquisition for SensUs MAX30131/MAX30134 workstations"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",
   "matplotlib>=3.7",
   "pyserial>=3.5",
+  "bleak>=1.0,<4",
 ]
 
 [project.optional-dependencies]
 analysis = ["scipy>=1.10"]
 dev = ["build>=1.2", "pytest>=8"]
 portable = [
+  "scipy>=1.10",
   "cryptography>=43",
   "pyinstaller>=6.11",
   "pillow>=10",
@@ -42,7 +44,11 @@ where = ["software/host"]
 include = ["pa_host*"]
 
 [tool.setuptools.package-data]
-pa_host = ["gui/*.html", "gui/*.js", "gui/*.css", "gui/*.png"]
+pa_host = ["gui/*.html", "gui/*.js", "gui/*.css", "gui/*.png", "gui/*.json", "gui/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["software/host/tests"]
+
+[tool.sensus.release]
+channel = "preview"
+publisher = "manual"

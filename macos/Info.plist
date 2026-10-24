@@ -19,9 +19,11 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.4.16</string>
+	<string>0.5.0</string>
 	<key>CFBundleVersion</key>
-	<string>0.4.16</string>
+	<string>0.5.0</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>通过蓝牙连接 V5.2 电化学采集板，接收四路电流与温度电压数据。</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>

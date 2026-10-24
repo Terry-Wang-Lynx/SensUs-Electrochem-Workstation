@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0",
+  "name": "第1列到第8列 · 八电极示例",
+  "output_dir": "",
+  "bindings": {
+    "boards": {"A": {"address": "", "settings": {}}, "B": {"address": "", "settings": {}}},
+    "motion": {
+      "port": "", "baud": 115200,
+      "axes": {
+        "X": {"address": 1, "lead_mm": 2, "travel_mm": 150, "positive_direction": 0, "max_speed_mm_s": 10},
+        "Z": {"address": 2, "lead_mm": 2, "travel_mm": 50, "positive_direction": 0, "max_speed_mm_s": 10}
+      }
+    }
+  },
+  "defaults": {
+    "descend_speed_mm_s": 0.5, "ascend_speed_mm_s": 1, "translate_speed_mm_s": 2,
+    "dwell_s": 180, "settle_s": 2, "z_safe_mm": 0, "z_immersed_mm": 6,
+    "x_first_mm": 0, "column_pitch_mm": 9, "channels": ["A", "B", "C", "D", "E", "F", "G", "H"]
+  },
+  "electrodes": [
+    {"id": "A", "name": "样品A"}, {"id": "B", "name": "样品B"},
+    {"id": "C", "name": "样品C"}, {"id": "D", "name": "样品D"},
+    {"id": "E", "name": "样品E"}, {"id": "F", "name": "样品F"},
+    {"id": "G", "name": "样品G"}, {"id": "H", "name": "样品H"}
+  ],
+  "columns": [
+    {"index": 1, "solution": "PBS", "concentration": {"value": 0, "unit": "uM"}, "overrides": {}},
+    {"index": 8, "solution": "葡萄糖标准液", "concentration": {"value": 20, "unit": "uM"},
+     "overrides": {"ascend_speed_mm_s": 0.4}}
+  ],
+  "program": [
+    {"op": "move_to_column", "column": 1}, {"op": "immerse"}, {"op": "dwell"}, {"op": "withdraw"},
+    {"op": "move_to_column", "column": 8}, {"op": "immerse"},
+    {"op": "dwell", "seconds": 180, "acquire": ["A", "C", "E", "G"]}, {"op": "withdraw"}
+  ],
+  "safety": {"motion_policy_confirmed": false, "electrical_policy_confirmed": false}
+}
