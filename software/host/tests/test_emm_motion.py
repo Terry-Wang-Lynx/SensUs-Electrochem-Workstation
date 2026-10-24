@@ -17,6 +17,33 @@ AXES = {
 }
 
 
+class MotionTestClock:
+    def __init__(self):
+        self.now = time.monotonic()
+        self.lock = threading.Lock()
+
+    def monotonic(self):
+        with self.lock:
+            return self.now
+
+    def time(self):
+        return 1700000000 + self.monotonic()
+
+    def sleep(self, seconds):
+        with self.lock:
+            self.now += seconds
+
+    def attach(self, monkeypatch, serial):
+        original_read = serial.read
+
+        def read(count):
+            self.sleep(0.0001 if serial.buffer else min(serial.timeout, 0.001))
+            return original_read(count)
+
+        monkeypatch.setattr("pa_host.emm_motion.time", self)
+        monkeypatch.setattr(serial, "read", read)
+
+
 def config_reply(address):
     payload = bytearray.fromhex("19 02 02 02 00 10 01 00 04 b0 0b b8 0f a0 05 02 01 00 01 01 00 08 08 98 07 d0 00 08")
     payload[16] = address
@@ -275,12 +302,17 @@ def test_connect_rejects_position_window_wider_than_one_full_motor_step(motor_ty
 
 
 @pytest.mark.parametrize("target", [0, 150])
-def test_fractional_endpoint_rounding_stays_inside_soft_limits(target):
+@pytest.mark.parametrize("host_preemption", [0, 0.45])
+def test_fractional_endpoint_rounding_stays_inside_soft_limits(target, host_preemption, monkeypatch):
     bus, serial = ready_bus()
+    clock = MotionTestClock()
+    clock.attach(monkeypatch, serial)
+    serial.on_move = lambda: time.sleep(host_preemption)
     serial.positions[1] += 16378 if target == 0 else 150 * 32768 - 16378
     result = bus.move_to("X", target, 0.5)
     command = next(frame for frame in serial.writes if frame[1] == 0xFD)
     assert int.from_bytes(command[6:10], "big") == 799
+    assert len([frame for frame in serial.writes if frame[1] == 0xFD]) == 1
     assert 0 <= result["position"]["X"] <= 150
     assert abs(result["position"]["X"] - target) <= 2 / 3200
 
@@ -477,11 +509,36 @@ def test_stop_request_between_move_gate_and_wire_write_cannot_be_cleared():
     assert not any(frame[1] == 0xFD for frame in serial.writes)
 
 
-def test_external_stop_interrupts_wait_for_arrival_with_bounded_latency():
+@pytest.mark.parametrize("host_preemption", [0, 0.55])
+def test_external_stop_interrupts_wait_for_arrival_with_bounded_latency(host_preemption, monkeypatch):
     bus, serial = ready_bus()
+    clock = MotionTestClock()
+    clock.attach(monkeypatch, serial)
     serial.move_completes = False
     started = threading.Event()
+    arrival_waiting = threading.Event()
     serial.on_move = started.set
+    original_write = serial.write
+
+    def write(frame):
+        result = original_write(frame)
+        if started.is_set() and frame[1] == 0x36 and not arrival_waiting.is_set():
+            arrival_waiting.set()
+            assert bus._stop_event.wait(2)
+        return result
+
+    serial.write = write
+    original_read_axis = bus._read_axis
+    preempted = False
+
+    def read_axis(axis, **options):
+        nonlocal preempted
+        if bus._stop_event.is_set() and not preempted:
+            preempted = True
+            time.sleep(host_preemption)
+        return original_read_axis(axis, **options)
+
+    bus._read_axis = read_axis
     failures = []
 
     def move():
@@ -493,11 +550,18 @@ def test_external_stop_interrupts_wait_for_arrival_with_bounded_latency():
     worker = threading.Thread(target=move)
     worker.start()
     assert started.wait(1)
-    before = time.monotonic()
+    assert arrival_waiting.wait(2)
+    before = clock.monotonic()
+    stop_offset = len(serial.writes)
     result = bus.stop_all()
-    worker.join(1)
+    worker.join(2)
     assert not worker.is_alive()
-    assert time.monotonic() - before < 0.5
+    assert clock.monotonic() - before < 0.5
+    stop_frames = serial.writes[stop_offset:]
+    first_feedback = next(index for index, frame in enumerate(stop_frames) if frame[1] != 0xFE)
+    assert stop_frames[0][:2] == bytes([1, 0xFE])
+    assert {frame[0] for frame in stop_frames[:first_feedback]} == {1, 2}
+    assert len([frame for frame in serial.writes if frame[1] == 0xFD]) == 1
     assert result["stop_confirmed"]
     assert failures and failures[0].code == "cancelled"
 

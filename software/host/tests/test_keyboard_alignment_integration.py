@@ -183,16 +183,32 @@ def test_overlapping_keyboard_io_holds_do_not_resume_observer_early(alignment_ap
     assert alignment_app.automation._alignment_io_active is False
 
 
-def test_real_controller_shaped_keyboard_flow_uses_finite_steps_and_no_reenable(guided_app, tmp_path):
+@pytest.mark.parametrize("schedule", ["real_workers", "controlled", "delayed_preflight"])
+def test_real_controller_shaped_keyboard_flow_uses_finite_steps_and_no_reenable(guided_app, tmp_path, monkeypatch, schedule):
     import copy
     import time
 
+    from pa_host import guided_automation
+    from pa_host.alignment_jog import AlignmentJog
     from pa_host.automation import AutomationController
     from pa_host.emm_motion import SharedEmmBus
     from pa_host.guided_automation import GuidedAutomation
     from test_powered_manual_driver import PoweredManualSerial
 
+    clock = [0.0]
+    def alignment_factory(*args, **options):
+        return AlignmentJog(*args, **options, clock=lambda: clock[0], start_threads=False)
+    if schedule == "controlled":
+        monkeypatch.setattr(guided_automation, "AlignmentJog", alignment_factory)
     serial = PoweredManualSerial(timeout=0.2, write_timeout=0.2)
+    motion_command = threading.Event()
+    original_write = serial.write
+    def observe_write(frame):
+        result = original_write(frame)
+        if frame[1] == 0xFD:
+            motion_command.set()
+        return result
+    serial.write = observe_write
     serial.statuses = {1: 3, 2: 3}
     def factory(port, baud, axes, **options):
         return SharedEmmBus(port, baud, axes, serial_factory=lambda **settings: serial, **options)
@@ -211,20 +227,43 @@ def test_real_controller_shaped_keyboard_flow_uses_finite_steps_and_no_reenable(
         assert controller.snapshot()["busy"] is True
         assert began["manual"]["control_mode"] == "keyboard"
         token = began["manual"]["session_token"]
-        time.sleep(2.1)
+        if schedule == "controlled":
+            clock[0] += 2.1
+            service._alignment._watch_once(refresh_idle=True)
+        else:
+            time.sleep(2.1)
         assert all(axis["telemetry_valid"] for axis in controller.snapshot()["motion"]["axes"].values())
         dispatch("guided/calibration/jog/config", {"session_token": token, "speed_mm_s": 0.5, "max_speed_mm_s": 1})
         press = {"session_token": token, "press_id": "integration-hold"}
+        preflight_started = threading.Event()
+        if schedule == "delayed_preflight":
+            original_preflight = controller._motion._keyboard_start_states
+            def delayed_preflight(*args, **options):
+                preflight_started.set()
+                time.sleep(2.2)
+                return original_preflight(*args, **options)
+            monkeypatch.setattr(controller._motion, "_keyboard_start_states", delayed_preflight)
         dispatch("guided/calibration/jog/start", {**press, "axis": "X", "direction": "left"})
-        deadline = time.monotonic() + 2
-        heartbeat_at = time.monotonic()
-        sequence = 0
-        while not any(frame[1] == 0xFD for frame in serial.writes) and time.monotonic() < deadline:
-            if time.monotonic() >= heartbeat_at:
+        assert service._alignment.LEASE_SECONDS == 0.35
+        if schedule == "controlled":
+            clock[0] += 0.1
+            dispatch("guided/calibration/jog/heartbeat", {**press, "sequence": 1})
+            service._alignment._step_once()
+        else:
+            started = time.monotonic()
+            deadline = started + 10
+            sequence = 0
+            checked_old_budget = False
+            while not motion_command.is_set() and time.monotonic() < deadline:
                 sequence += 1
                 dispatch("guided/calibration/jog/heartbeat", {**press, "sequence": sequence})
-                heartbeat_at = time.monotonic() + 0.1
-            time.sleep(0.002)
+                if schedule == "delayed_preflight" and time.monotonic() - started >= 2:
+                    assert preflight_started.is_set()
+                    checked_old_budget = True
+                motion_command.wait(0.1)
+            if schedule == "delayed_preflight":
+                assert checked_old_budget
+        assert any(frame[1] == 0xFD for frame in serial.writes), service.alignment_snapshot()
         dispatch("guided/calibration/jog/stop", press)
         sampled = dispatch("guided/calibration/capture", {"point": "first"})
         assert set(sampled["manual"]["points"]) == {"first"}

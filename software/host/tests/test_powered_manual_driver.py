@@ -6,7 +6,7 @@ import time
 import pytest
 
 from pa_host.emm_motion import MotionError, SharedEmmBus
-from test_emm_motion import AXES, FakeSerial, config_reply, signed
+from test_emm_motion import AXES, FakeSerial, MotionTestClock, config_reply, signed
 
 
 class PoweredManualSerial(FakeSerial):
@@ -562,17 +562,43 @@ def test_stopped_calibration_cannot_reconfirm_unknown_or_misaligned_lock(tmp_pat
     assert not any(frame[1] in (0xF3, 0xFD) for frame in serial.writes)
 
 
-def test_calibrated_polling_profile_reads_respect_the_existing_move_deadline(tmp_path):
+@pytest.mark.parametrize("host_preemption", [0, 0.3])
+def test_calibrated_polling_profile_reads_respect_the_existing_move_deadline(tmp_path, host_preemption, monkeypatch):
     bus, serial, _, record = calibrated_powered_bus(tmp_path)
     bus.install_experiment_calibration(record)
+    clock = MotionTestClock()
+    clock.attach(monkeypatch, serial)
+    monkeypatch.setattr("pa_host.calibrated_motion.time", clock)
+    original_wait = bus._stop_event.wait
+
+    def wait(timeout=None):
+        clock.sleep(timeout or 0)
+        return original_wait(0)
+
+    monkeypatch.setattr(bus._stop_event, "wait", wait)
+    arrived = bus.move_to("X", 54, 0.5)
+    assert arrived["position"]["X"] == 54
     bus._move_timeout = 0.05
-    serial.on_move = lambda: serial.overrides.update({(1, 0x42): b""})
-    started = time.monotonic()
+    serial.overrides[1, 0x42] = b""
+    profile_deadline = clock.monotonic() + bus._move_timeout
+    with pytest.raises(MotionError) as profile_failure:
+        bus._read_experiment_axes(record, verify_profiles=True, deadline=profile_deadline)
+    assert profile_failure.value.code == "transaction_timeout"
+    assert clock.monotonic() == pytest.approx(profile_deadline, abs=0.001)
+    serial.overrides.clear()
+
+    def moved():
+        serial.overrides.update({(1, 0x42): b""})
+        time.sleep(host_preemption)
+
+    serial.on_move = moved
+    started = clock.monotonic()
     with pytest.raises(MotionError) as caught:
         bus.move_to("X", 55, 0.5)
     assert caught.value.code == "move_timeout"
-    assert time.monotonic() - started < 0.18
+    assert clock.monotonic() - started < 0.18
     assert caught.value.stop_result is not None
+    assert caught.value.stop_result["stop_confirmed"]
 
 
 def test_calibrated_moves_compare_current_mechanical_settings_to_the_trusted_record(tmp_path):
