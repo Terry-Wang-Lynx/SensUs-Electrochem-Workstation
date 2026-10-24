@@ -1,4 +1,5 @@
 import copy
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -25,7 +26,9 @@ def unavailable_controller(tmp_path, failure, *, identity_fails=False):
                 serial.overrides[2, 0xFE] = b""
             serials.append(serial)
             return serial
-        bus = SharedEmmBus(port, baud, axes, serial_factory=open_port, transaction_timeout_s=0.01, **options)
+        if identity_fails:
+            options["transaction_timeout_s"] = 0.01
+        bus = SharedEmmBus(port, baud, axes, serial_factory=open_port, **options)
         bus._command_gap_s = 0
         return bus
     controller = AutomationController(tmp_path / "state", tmp_path / "runs", tmp_path,
@@ -52,6 +55,34 @@ def test_never_opened_port_does_not_latch_unknown_stop(tmp_path, failure):
     finally:
         controller._stop_motion_feedback()
         if serials:
+            controller._motion.close()
+
+
+def test_successful_replacement_connection_tolerates_one_windows_timer_tick(tmp_path, monkeypatch):
+    read = PoweredManualSerial.read
+    delayed = []
+
+    def delayed_first_reply(serial, count):
+        if not delayed:
+            delayed.append(True)
+            time.sleep(0.02)
+        return read(serial, count)
+
+    monkeypatch.setattr(PoweredManualSerial, "read", delayed_first_reply)
+    controller, motion, serials = unavailable_controller(tmp_path, FileNotFoundError("USB removed"))
+    try:
+        with pytest.raises(AutomationError) as caught:
+            controller.connect_motion(motion)
+        assert caught.value.code == "motion_port_unavailable"
+        controller.connect_motion({**motion, "port": "replacement-port"})
+        assert delayed
+        assert controller._motion.snapshot()["connected"] is True
+        assert controller._motion._timeout == 1.0
+        assert not controller.snapshot()["recovery_required"]
+        assert not controller.is_busy()
+    finally:
+        controller._stop_motion_feedback()
+        if controller._motion is not None:
             controller._motion.close()
 
 

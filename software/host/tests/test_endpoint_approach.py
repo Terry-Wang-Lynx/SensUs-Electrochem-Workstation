@@ -1,6 +1,7 @@
 import copy
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -235,21 +236,27 @@ def test_whole_deadline_includes_preflight(tmp_path, monkeypatch):
 
 
 def test_deadline_after_initial_preflight_reports_move_timeout(tmp_path, monkeypatch):
+    from pa_host import emm_motion
+
     bus, serial, record = incident_bus(tmp_path, monkeypatch, LiveMotionSerial)
+    clock = SimpleNamespace(offset=0)
+    monotonic = time.monotonic
+    monkeypatch.setattr(emm_motion, "time", SimpleNamespace(
+        monotonic=lambda: monotonic() + clock.offset, time=time.time, sleep=time.sleep))
     read_axes = bus._read_experiment_axes
     reads = []
     def expire_second_preflight(*arguments, **options):
         reads.append(True)
         if len(reads) == 2:
-            time.sleep(max(0, options["deadline"] - time.monotonic()) + 0.002)
+            clock.offset = options["deadline"] - monotonic() + 0.01
             raise MotionError("transaction_timeout", "Injected exhausted phase preflight")
         return read_axes(*arguments, **options)
     monkeypatch.setattr(bus, "_read_experiment_axes", expire_second_preflight)
-    bus._move_timeout = 0.15
     with pytest.raises(MotionError) as caught:
         bus.move_to("X", record["x_first_mm"], 20)
     assert len(reads) == 2
     assert caught.value.code == "move_timeout"
+    assert caught.value.stop_result["stop_confirmed"] is True
     assert not any(frame[1] == 0xFD for frame in serial.writes)
 
 
