@@ -2010,6 +2010,12 @@ def _split_glued_lifecycle_line(line: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if callable(getattr(stream, "reconfigure", None)):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     ap = argparse.ArgumentParser(description="从 RTT/USB CDC 实时收数并落盘 CSV")
     ap.add_argument("--out", required=True, type=Path, help="输出 CSV 路径")
     ap.add_argument("--raw-log", type=Path,

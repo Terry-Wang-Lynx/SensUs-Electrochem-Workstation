@@ -100,7 +100,7 @@ def test_settings_defaults_quantization_and_common_keys():
     settings = v52_ble.validate_settings({"fit_window_s": 5, "experiment": "keep"})
     assert settings["board_profile"] == "v52"
     assert settings["protocol"] == "v52-0.1"
-    assert settings["working_electrode_v"] == 0.4
+    assert settings["working_electrode_v"] == 1.2
     assert settings["potential_v"] == settings["initial_potential_v"] == -0.2
     assert settings["offset_mode"] == "20pct"
     assert settings["offset_nA"] == 10
@@ -115,7 +115,7 @@ def test_settings_defaults_quantization_and_common_keys():
     {"analysis_channel": 0}, {"analysis_channel": 1.5}, {"sens_period_code": 11},
     {"duration_s": 9}, {"duration_s": 3601}, {"duration_s": float("nan")},
     {"working_electrode_v": 0.1}, {"working_electrode_v": 1.6},
-    {"potential_v": 0.4}, {"conv_time_code": 1}, {"charge_pump": 1},
+    {"potential_v": 1.2}, {"conv_time_code": 1}, {"charge_pump": 1},
 ])
 def test_settings_reject_unsupported_or_unsafe_values(change):
     with pytest.raises(ValueError):
@@ -157,8 +157,8 @@ def test_configure_requires_full_status_and_reports_actual_dacs(fake_bleak):
     result = v52_ble.configure_device("test", {"analysis_channel": 3})
     assert result["config_confirmed"] is True
     assert result["status"]["channels"]["3"]["fsr_nA"] == 50
-    assert result["requested"]["we_uv"] == 400000
-    assert result["actual"]["we_uv"] == 400125
+    assert result["requested"]["we_uv"] == 1200000
+    assert result["actual"]["we_uv"] == 1200000
     assert result["actual"]["potential_uv"] == -199875
     assert fake_bleak.instances[0].commands[0] == "STOP"
     assert "START 15" not in fake_bleak.instances[0].commands

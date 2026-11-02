@@ -2,10 +2,10 @@
   'use strict';
   const CHANNELS = 'ABCDEFGH'.split('');
   const API_ROOT = '/api/automation/v1/';
-  const FRONTEND_BUILD = '2026-10-24 · endpoint-approach-r1';
+  const FRONTEND_BUILD = '2026-11-01 · AFE bias';
   const copy = value => JSON.parse(JSON.stringify(value));
   const failure = (code, message, path = '') => Object.assign(new Error(message), {code, path});
-  const SAMPLING_DEFAULTS = {potential_v: -0.2, working_electrode_v: 0.4, sens_period_code: 0, fsr_nA: 50, offset_mode: '20pct'};
+  const SAMPLING_DEFAULTS = {potential_v: -0.2, working_electrode_v: 1.2, sens_period_code: 0, fsr_nA: 50, offset_mode: '20pct'};
   const SAMPLING_FIELDS = Object.keys(SAMPLING_DEFAULTS);
   const SAMPLING_OFFSETS = ['10nA', '20nA', '40nA', '80nA', '10pct', '20pct', '50pct'];
   const LIMIT_BOUNDARIES = [['x_left', 'X 最左'], ['x_right', 'X 最右'], ['z_up', 'Z 最高'], ['z_down', 'Z 最低']];
@@ -59,6 +59,10 @@
     }
     const canRestart = controller.recovery_required !== true && controller.stop_confirmed !== false
       && (controller.stop_confirmed === true || manual.alignment?.stop_result?.stop_confirmed === true);
+    const cause = String(error?.cause?.code || '').toLowerCase();
+    if (!manual.active && canRestart && ['move_timeout', 'calibration_motion', 'calibration_reference', 'recovery_evidence'].some(value => value === code || value === cause)) {
+      return '设备已确认停止。若实物位置未改变，请先点击「原位核验并恢复标定」；编码器、目标寄存器和驱动配置核验通过后可继续使用原四点。核验不通过时，再检查设备并重新标定。';
+    }
     const restart = canRestart
       ? '若要继续标定，请先松开所有方向键，确认现场安全并勾选本次运动确认，再点击「重新开始键盘标定（旧点作废）」。软件会先复核双轴停止，再重新检查电机；旧点位不能沿用。'
       : '双轴停止尚未确认。若要重新标定，请先松开方向键，检查电机供电与 RS485 连线，再点击「停止」；确认停止后勾选本次运动确认，再点击「重新开始键盘标定（旧点作废）」。';
@@ -154,12 +158,36 @@
     model.selectedColumns = function () { return this.document.columns.filter(column => column.enabled).sort((left, right) => left.index - right.index); };
     model.applyExecution = function (mode, count, routeText) {
       if (!['once', 'repeat', 'custom'].includes(mode)) throw failure('EXECUTION_INVALID', '请选择有限实验模式');
-      if (mode === 'repeat' && (!Number.isInteger(count) || count < 1 || count > 500)) throw failure('EXECUTION_INVALID', '重复次数须为 1–500 的整数');
+      const repeats = mode === 'repeat' || (mode === 'custom' && this.document.endurance === true);
+      if (repeats && (!Number.isInteger(count) || count < 1 || count > 500)) throw failure('EXECUTION_INVALID', '重复次数须为 1–500 的整数');
       const route = mode === 'custom' ? parseCustomRoute(routeText) : null;
       this.edit(document => {
         document.schema_version = 'guided-1.1';
-        document.execution = {mode, count: mode === 'repeat' ? count : 1, route};
+        document.execution = {mode, count: repeats ? count : 1, route};
         if (route) for (const column of document.columns) column.enabled = route.includes(column.index);
+      });
+    };
+    model.setMotionOnly = function (enabled) {
+      this.edit(document => {
+        document.schema_version = 'guided-1.1';
+        document.execution ||= {mode: 'once', count: 1, route: null};
+        document.motion_only = !!enabled;
+      });
+    };
+    model.setPbsColumn = function (column) {
+      if (column !== null && (!Number.isInteger(column) || column < 1 || column > 12)) throw failure('COLUMN_INVALID', 'PBS 列须为 1–12');
+      this.edit(document => {
+        document.schema_version = 'guided-1.1';
+        document.execution ||= {mode: 'once', count: 1, route: null};
+        document.pbs_column = column;
+      });
+    };
+    model.setEndurance = function (enabled) {
+      this.edit(document => {
+        document.schema_version = 'guided-1.1';
+        document.execution ||= {mode: 'once', count: 1, route: null};
+        document.endurance = !!enabled;
+        if (!enabled && document.execution.mode === 'custom') document.execution.count = 1;
       });
     };
     model.selectedElectrodes = function () { return this.document.electrodes.filter(electrode => electrode.enabled); };
@@ -500,10 +528,11 @@
 
   root.innerHTML = [
     '<div class="ht-toolbar panel"><div><span class="ht-eyebrow">高通量自动化实验</span><span id="htFrontendVersion" class="ht-frontend-version"></span><h2>模板实验</h2><p id="htStatus" role="status">正在读取模板…</p></div>',
-    '<div class="ht-run-actions"><select id="htMode" aria-label="运行模式"><option value="simulate">模拟实验</option><option value="live">实物实验</option></select><button id="htRun" class="primary" type="button" disabled>开始模拟实验</button><button id="htPause" class="secondary" type="button" disabled>本列结束后暂停</button><button id="htResume" class="secondary" type="button" hidden>继续实验</button><button id="htResetDevices" class="secondary" type="button" title="停止任务、重新连接并清除旧会话；保留数据与日志，不移动电机">重连并重置</button><button id="htStop" class="danger" type="button">停止</button></div></div>',
+    '<div class="ht-run-actions"><select id="htMode" aria-label="运行模式"><option value="simulate">模拟实验</option><option value="live">实物实验</option></select><label class="ht-check"><input id="htMotionOnly" type="checkbox">仅运动（不采集）</label><button id="htRun" class="primary" type="button" disabled>开始模拟实验</button><button id="htPause" class="secondary" type="button" disabled>本列结束后暂停</button><button id="htResume" class="secondary" type="button" hidden>继续实验</button><button id="htRecoverArrival" class="secondary" type="button" title="确认实物列已对齐、电极在安全高度；只读核验停止与位置后恢复原标定，不移动电机">原位核验并恢复标定</button><button id="htResetDevices" class="secondary" type="button" title="停止任务、重新连接并清除旧会话；保留数据与日志，不移动电机">重连并重置</button><button id="htStop" class="danger" type="button">停止</button></div></div>',
     '<section id="htFrontendUpdate" class="ht-frontend-update" role="status" hidden><div><strong>当前界面需要刷新</strong><p id="htFrontendUpdateText"></p></div><button id="htFrontendReload" class="secondary" type="button" disabled>确认已松键，刷新界面</button></section>',
     '<section class="panel ht-total-progress"><div class="ht-section-head"><h3>全程进度</h3><strong id="htTotalPercent">—</strong></div><progress id="htTotalProgress" max="100" aria-label="全程实验进度"></progress><p id="htTotalRoute">暂无本次进度</p><p id="htTotalTiming">等待开始</p></section>',
-    '<section class="panel ht-execution-panel"><label>实验模式<select id="htExecutionMode"><option value="once">一次性实验</option><option value="repeat">重复实验</option><option value="custom">自定义路径</option></select></label><label id="htExecutionCountLabel" hidden>重复轮数<input id="htExecutionCount" type="number" min="1" max="500" step="1"></label><label id="htExecutionRouteLabel" hidden>列访问顺序<input id="htExecutionRoute" placeholder="13579 或 1,3,10,12"></label><button id="htApplyExecution" class="secondary" type="button">应用执行设置</button><p id="htExecutionStatus" role="status">一次性执行已选列，按列号升序。</p></section>',
+    '<section class="panel ht-execution-panel"><label>实验模式<select id="htExecutionMode"><option value="once">一次性实验</option><option value="repeat">重复实验</option><option value="custom">自定义路径</option></select></label><label id="htExecutionCountLabel" hidden>重复轮数<input id="htExecutionCount" type="number" min="1" max="500" step="1"></label><label id="htExecutionRouteLabel" hidden>列访问顺序<input id="htExecutionRoute" placeholder="13579 或 1,3,10,12"></label><button id="htApplyExecution" class="secondary" type="button">应用执行设置</button><p id="htExecutionStatus" role="status">一次性执行已选列，按列号升序。</p><label class="ht-check"><input id="htPbsReturn" type="checkbox">整轮完成后回 PBS 浸泡</label><label>PBS 物理列<input id="htPbsColumn" type="number" min="1" max="12" step="1" value="7"></label><p id="htPbsStatus" class="ht-hint"></p></section>',
+    '<section class="panel ht-pad"><label class="ht-check"><input id="htEndurance" type="checkbox">长时间压力测试（最长72小时）</label><p class="ht-hint">启用后可重复自定义往返路径；手动停止或故障后不会自动续跑。每列时长和电位保持原设置。</p></section>',
     '<div id="htError" class="ht-message ht-error" role="alert" hidden></div>',
     '<details id="htErrorDetails" class="ht-error-details" hidden><summary>技术详情（提供给维护人员）</summary><pre id="htErrorDetailText"></pre></details>',
     '<div id="htSimulationNotice" class="ht-message ht-simulation">模拟实验 · 生成合成数据，不操作实物。3D 仅作流程示意。</div>',
@@ -524,7 +553,7 @@
     '<div class="ht-scene-footer"><span id="htPose">CAD 参考姿态 · 非实物位置</span><button id="htAnimate" class="text-button" type="button" disabled>播放流程示意</button></div><p class="ht-caption">X 只移动孔板托盘，Z 只带动悬臂、电极与双板；固定卡座与孔位不随勾选挤位。CAD 参考抬升 35 mm，不代表控制器零点、浸入深度或碰撞验证。</p></section>',
     '<aside class="ht-editor-stack"><section class="panel ht-electrode-panel"><div class="ht-section-head"><h3>使用的电极</h3><span class="ht-pill">固定位置 A–H</span></div><div class="ht-pad"><div id="htAcquire" class="ht-channel-picks"></div><p class="ht-hint">取消勾选将隐藏电极与示意线束，卡座仍留在原位。所有电极共同升降；下方可分别设置有效采集时长。</p></div></section>',
     '<section class="panel ht-column-panel"><div class="ht-section-head"><h3 id="htColumnTitle">物理第 1 列</h3><span class="ht-pill" id="htColumnTag">已选择</span></div><div class="ht-pad"><label>本列名称<input id="htColumnName" placeholder="例如 A / 10微摩尔每升"></label><label><span id="htColumnDurationLabel">本列覆盖时长（留空继承 180 s）</span><input id="htColumnDuration" type="number" min="0.001" step="any" placeholder="继承默认 180"></label><p class="ht-hint">名称为自由文字，允许重复；有数值即覆盖模板时长。按物理列号依次执行，跳过列保留真实间距。</p><div class="ht-small-head"><strong id="htWindowHeading">第 1 列 · 八个电极的有效采集时长 (s)</strong><span>留空覆盖本列</span></div><p id="htWindowScope" class="ht-hint">仅编辑当前列，不会修改其他列。</p><div id="htWindows" class="ht-window-grid"></div><p id="htWindowSummary" class="ht-hint">停稳并收到 START 成功确认后计时。</p></div></section>',
-    '<section class="panel ht-progress-panel"><div class="ht-section-head"><h3>实验进度</h3><span id="htProgressMode" class="ht-pill">模拟</span></div><div class="ht-pad"><p id="htClock" class="ht-clock">等待开始</p><p id="htTimingDetail" class="ht-hint">到位前的移动与准备不计入采集时长。</p><div id="htBoardRecovery" class="ht-board-recovery"></div><p class="ht-hint">暂停在本列完成、抬至安全高度后生效。末列完成后停在该列上方，不自动返回。</p></div></section></aside></div>',
+    '<section class="panel ht-progress-panel"><div class="ht-section-head"><h3>实验进度</h3><span id="htProgressMode" class="ht-pill">模拟</span></div><div class="ht-pad"><p id="htClock" class="ht-clock">等待开始</p><p id="htTimingDetail" class="ht-hint">到位前的移动与准备不计入采集时长。</p><div id="htBoardRecovery" class="ht-board-recovery"></div><p id="htEndingNote" class="ht-hint">暂停在本列完成、抬至安全高度后生效。末列完成后停在该列上方，不自动返回。</p></div></section></aside></div>',
     '<section class="panel ht-results-panel"><div class="ht-section-head"><h3>采集结果</h3><span id="htPosition" class="ht-hint">控制器坐标未确认</span></div><div id="htChannels" class="ht-channels"></div><div class="ht-result-footer"><span id="htRunInfo">尚无运行</span><span id="htManifest"></span></div><p class="ht-caption">A–D 属于板 A，E–H 属于板 B；整板掉线影响该板四路。缺失保留为空，不插值、不补零；两板非硬件同步。既有 CH3 模拟异常仍待定位。</p></section>',
     '<details id="htAdvanced" class="panel ht-secondary"><summary>高级设置 · 起始延迟、设备、运动、JSON 与日志</summary><div class="ht-pad"><p class="ht-hint">日常操作直接编辑上方模板。自动实验接近四点端点时低速精靠近，末段不超过 0.5 mm/s；首次安全高度接近也会限速。键盘对位速度不受影响。运动数值为编辑预设，不代表已通过实物碰撞或行程验收。</p>',
     '<section class="ht-advanced-section"><h3>本列起始延迟</h3><p class="ht-hint">各通道窗口须完整包含在本列时长内；超出时请先延长本列。</p><div id="htDelays" class="ht-window-grid"></div></section>',
@@ -665,7 +694,8 @@
   const keyboardMode = () => guided.manual?.control_mode === 'keyboard';
   function keyboardControllerAvailable() {
     return !stateUnavailable && snapshot.stop_confirmed === true && !snapshot.recovery_required
-      && ['idle', 'completed', 'stopped'].includes(snapshot.state) && !limitCalibrationActive()
+      && (['idle', 'completed', 'stopped'].includes(snapshot.state)
+          || (snapshot.state === 'error' && snapshot.motion?.connected === true && snapshot.motion?.faulted === false)) && !limitCalibrationActive()
       && (!snapshot.busy || (keyboardMode() && guided.manual?.active === true));
   }
   function keyboardRestartAvailable() {
@@ -822,9 +852,16 @@
   });
   function updateControls() {
     element('htResetDevices').disabled = pending;
+    element('htRecoverArrival').disabled = pending || !!snapshot.busy || !!guided.manual?.active || snapshot.stop_confirmed !== true;
     const busy = !!snapshot.busy, manual = !!guided.manual?.active, readingLimits = limitCalibrationActive(), blocked = !model || pending || !!boardsPending || busy || manual || readingLimits;
     element('htRun').disabled = blocked || jsonDirty || draftAreas.size > 0 || normalDrafts.size > 0 || stateUnavailable || (requestedMode === 'live' && (!element('htLiveConfirmed').checked || !liveCalibrationReady()));
-    element('htRun').textContent = requestedMode === 'simulate' ? '开始模拟实验' : '开始实物实验';
+    element('htMotionOnly').disabled = blocked;
+    const activeRun = snapshot.experiment && ['running', 'paused', 'waiting_operator', 'waiting_recovery', 'stopping'].includes(snapshot.state);
+    const motionOnly = activeRun ? snapshot.experiment.motion_only === true : model?.document.motion_only === true;
+    element('htMotionOnly').checked = motionOnly;
+    element('htRun').textContent = motionOnly
+      ? (requestedMode === 'simulate' ? '开始模拟运动检查' : '开始实物运动检查')
+      : (requestedMode === 'simulate' ? '开始模拟实验' : '开始实物实验');
     element('htMode').disabled = blocked;
     element('htLiveConfirmed').disabled = pending || busy || manual || readingLimits;
     element('htPause').disabled = !busy || pending || readingLimits || snapshot.pause_requested || ['paused', 'waiting_recovery', 'waiting_operator', 'stopping'].includes(snapshot.state);
@@ -833,7 +870,7 @@
     element('htResume').disabled = pending || readingLimits;
     element('htLiveGate').hidden = requestedMode !== 'live'; element('htSimulationNotice').hidden = requestedMode !== 'simulate';
     for (const id of ['htSave', 'htApplyDefaults', 'htApplyBindings', 'htApplyJson', 'htCompile', 'htApplySharedSampling']) element(id).disabled = blocked;
-    for (const id of ['htExecutionMode', 'htExecutionCount', 'htExecutionRoute', 'htApplyExecution']) element(id).disabled = blocked;
+    for (const id of ['htExecutionMode', 'htExecutionCount', 'htExecutionRoute', 'htApplyExecution', 'htPbsReturn', 'htPbsColumn', 'htEndurance']) element(id).disabled = blocked;
     element('htAnimate').disabled = !model?.plan || jsonDirty || busy || readingLimits || physicalAttached();
     for (const id of ['htMotionReference', 'htEnableX', 'htEnableZ', 'htMotionDisconnect']) element(id).disabled = blocked;
     element('htMotionConnect').disabled = !model || pending || manual || readingLimits || !canConnectMotion(snapshot);
@@ -935,6 +972,13 @@
     renderSelection();
   }
   function renderDocument() {
+    element('htEndurance').checked = model.document.endurance === true;
+    element('htPbsReturn').checked = model.document.pbs_column != null;
+    element('htPbsColumn').value = model.document.pbs_column ?? 7;
+    element('htPbsStatus').textContent = model.document.pbs_column != null
+      ? '整轮正常结束后停止输出，抬升并返回第 ' + model.document.pbs_column + ' 列，再下降保持浸泡；故障或急停不自动返回。'
+      : '整轮结束后抬至安全高度，停在末列上方。';
+    element('htEndingNote').textContent = '暂停在本列完成、抬至安全高度后生效。' + element('htPbsStatus').textContent;
     const document = model.document;
     if (!draftAreas.has('execution')) {
       const execution = document.execution || {mode: 'once', count: 1, route: null};
@@ -1601,7 +1645,7 @@
   }
   function renderExecutionInputs() {
     const mode = element('htExecutionMode').value;
-    element('htExecutionCountLabel').hidden = mode !== 'repeat';
+    element('htExecutionCountLabel').hidden = mode !== 'repeat' && !(mode === 'custom' && model?.document.endurance === true);
     element('htExecutionRouteLabel').hidden = mode !== 'custom';
   }
   function executionDraftChanged() {
@@ -1710,6 +1754,10 @@
     renderPlan(); const result = await api('guided/run', payload); if (result.state) renderState(result);
     runKey = null; element('htLiveConfirmed').checked = false; await refresh();
   }));
+  element('htMotionOnly').addEventListener('change', () => { editDocument(() => model.setMotionOnly(element('htMotionOnly').checked)); });
+  element('htEndurance').addEventListener('change', () => handle(async () => { editDocument(() => model.setEndurance(element('htEndurance').checked), true); }));
+  element('htPbsReturn').addEventListener('change', () => handle(async () => { editDocument(() => model.setPbsColumn(element('htPbsReturn').checked ? Number(element('htPbsColumn').value) : null), true); }));
+  element('htPbsColumn').addEventListener('change', () => handle(async () => { if (element('htPbsReturn').checked) editDocument(() => model.setPbsColumn(Number(element('htPbsColumn').value)), true); }));
   element('htMode').addEventListener('change', () => { requestedMode = element('htMode').value; element('htLiveConfirmed').checked = false; model?.invalidate(); runKey = null; updateControls(); });
   element('htLiveConfirmed').addEventListener('change', updateControls);
   element('htStop').addEventListener('click', async () => { cancelDefaultsFeedback(); scene?.stopPreview(); keyboardSessionStopped = true; void keyboardInput.stop('global'); updateControls(); try { await api('stop', {}); await refresh(); } catch (error) { showError(error); } });
@@ -1932,6 +1980,16 @@
       await refresh(); return false;
     } finally { pending = false; updateControls(); }
   }
+  element('htRecoverArrival').addEventListener('click', async () => {
+    pending = true; updateControls();
+    try {
+      const result = await api('guided/calibration/recover-arrival', {position_confirmed: true});
+      keyboardSessionStopped = false;
+      await refresh();
+      scope.toast?.(result.message);
+    } catch (error) { showError(error); }
+    finally { pending = false; updateControls(); }
+  });
   element('htResetDevices').addEventListener('click', () => { void resetDevices(); });
   scope.HighThroughput = {
     resetDevices,

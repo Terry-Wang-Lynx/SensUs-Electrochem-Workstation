@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -76,7 +77,7 @@ def test_backend_restart_or_frontend_change_warns_without_reload_or_hardware_wri
 """.replace("CHANGE", change), before_source=REVISION_BOOTSTRAP)
     assert result["original"]["supported"] is True
     assert result["original"]["hidden"] is True
-    assert "界面" in result["original"]["build"] and "2026-10-24" in result["original"]["build"]
+    assert re.fullmatch(r"界面 \d{4}-\d{2}-\d{2} · .+", result["original"]["build"])
     assert result["updated"]["hidden"] is False
     assert "后台已更新" in result["updated"]["text"]
     assert "不会清空后台采点" in result["updated"]["text"]

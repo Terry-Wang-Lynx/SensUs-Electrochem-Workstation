@@ -67,6 +67,7 @@ API前缀仍为 `/api/automation/v1`。普通模板使用独立的 `guided-1.0` 
 | POST | `/guided/experiment` | `{document}` 保存模板 |
 | POST | `/guided/preview` | `{document,mode}` 校验并返回展开计划及哈希 |
 | POST | `/guided/run` | `{document,mode,plan_hash,idempotency_key}` 运行匹配的计划 |
+| POST | `/guided/park` | `{column:1..12,idempotency_key}` 用当前连接的有效四点标定抬到安全高度，再横移到该列上方；不下降、不采集 |
 | POST | `/guided/calibration/begin` | 明确进入标定；驱动能力不足时先阻断 |
 | POST | `/guided/calibration/capture` | `{point:"first"\|"last"\|"safe"}` 主动读点 |
 | POST | `/guided/calibration/finish` | 验证并保存，不自动回原点 |

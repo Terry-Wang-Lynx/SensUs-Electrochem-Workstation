@@ -21,8 +21,11 @@ def recovery_app(guided_app, tmp_path, monkeypatch):
         serial = PoweredManualSerial(timeout=0.2, write_timeout=0.2)
         serial.statuses = {1: 3, 2: 3}
         serials.append(serial)
+        # Match the fake port budget: 10 ms can expire on one Windows
+        # scheduling tick despite a valid buffered reply. This fixture tests
+        # STOP recovery semantics, not the production transaction timeout.
         bus = SharedEmmBus(port, baud, axes, serial_factory=lambda **settings: serial,
-                           transaction_timeout_s=0.01, **options)
+                           transaction_timeout_s=0.2, **options)
         bus._command_gap_s = 0
         return bus
 

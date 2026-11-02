@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -19,7 +21,7 @@ OFFSET_CODES = {"0nA": 0, "10pct": 1, "20pct": 2, "50pct": 3,
                 "10nA": 4, "20nA": 5, "40nA": 6, "80nA": 7}
 DEFAULTS = {
     "method": "it", "potential_v": -0.2, "initial_potential_v": -0.2,
-    "working_electrode_v": 0.4, "prestep_s": 0.0, "duration_s": 180.0,
+    "working_electrode_v": 1.2, "prestep_s": 0.0, "duration_s": 180.0,
     "adaptive_stop": False, "target_rate_hz": 8.0, "sens_period_code": 0,
     "fit_window_s": 5.0, "fsr_nA": 50, "offset_mode": "20pct", "analysis_channel": 1,
 }
@@ -195,6 +197,27 @@ def encode_command(command: str) -> bytes:
     return (command + "\n").encode("ascii")
 
 
+async def _windows_cached_device(address):
+    """Resolve a real Windows device when advertisement discovery is empty.
+
+    WinRT can establish GATT to a known peripheral without a fresh advertising
+    report. The BLEDevice is derived from that OS identity; NUS and INFO/STATUS
+    verification are still performed by the normal session and broker.
+    """
+    if sys.platform != "win32" or not re.fullmatch(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}", address):
+        return None
+    from bleak.backends.device import BLEDevice
+    from winrt.windows.devices.bluetooth import BluetoothLEDevice
+    device = await asyncio.wait_for(BluetoothLEDevice.from_bluetooth_address_async(
+        int(address.replace(":", ""), 16)), timeout=5)
+    if device is None:
+        return None
+    try:
+        return BLEDevice(address, device.name, {"winrt_device_id": device.device_id})
+    finally:
+        device.close()
+
+
 class BleSession:
     def __init__(self, address: str, on_line: Callable[[str, float], None] | None = None,
                  command_timeout: float | None = None):
@@ -206,6 +229,7 @@ class BleSession:
         self.responses: asyncio.Queue[str] = asyncio.Queue(maxsize=64)
         self.lock = asyncio.Lock()
         self.active_command: str | None = None
+        self._abandoned_start = False
         self.failure: Exception | None = None
         self.client = None
 
@@ -214,7 +238,18 @@ class BleSession:
 
         self.client = BleakClient(self.address, disconnected_callback=lambda client: self.disconnected.set(),
                                   timeout=10.0)
-        await self.client.__aenter__()
+        try:
+            await self.client.__aenter__()
+        except Exception as error:
+            if sys.platform != "win32" or type(error).__name__ != "BleakDeviceNotFoundError":
+                raise
+            target = await _windows_cached_device(self.address)
+            if target is None:
+                raise
+            self.disconnected.clear()
+            self.client = BleakClient(target, disconnected_callback=lambda client: self.disconnected.set(),
+                                      timeout=10.0)
+            await self.client.__aenter__()
         try:
             await self.client.start_notify(NUS_TX, self._notification)
         except BaseException:
@@ -274,12 +309,27 @@ class BleSession:
                         continue
                     if line.startswith("ERR "):
                         raise RuntimeError(line)
+                    # A cancelled/timed-out START can acknowledge after STOP
+                    # has already been sent. It is not a STOP confirmation.
+                    # Drain only this known outstanding reply; still require
+                    # the actual OK STOP within the original bounded deadline.
+                    if cleanup and self.active_command == "STOP" and self._abandoned_start and (line == "OK START" or line.startswith("OK START ")):
+                        self._abandoned_start = False
+                        continue
                     lines.append(line)
                     expected = "OK " + self.active_command
                     if line == expected or line.startswith(expected + " "):
+                        if self.active_command in ("START", "STOP"):
+                            self._abandoned_start = False
                         return lines
-                    if self.active_command != "STATUS" or not line.startswith(("C,", "A,")):
+                    list_record = (self.active_command == "STATUS" and line.startswith(("C,", "A,"))
+                                   or self.active_command == "HELP" and line.startswith("H,"))
+                    if not list_record:
                         raise RuntimeError(f"unexpected reply to {command}: {line}")
+            except (asyncio.CancelledError, TimeoutError):
+                if self.active_command == "START":
+                    self._abandoned_start = True
+                raise
             finally:
                 self.active_command = None
 
@@ -346,11 +396,34 @@ async def configure_session(session: BleSession, settings: dict[str, Any]) -> di
     requested = {"we_uv": round(settings["working_electrode_v"] * 1_000_000),
                  "re_uv": round((settings["working_electrode_v"] - settings["potential_v"]) * 1_000_000)}
     requested["potential_uv"] = requested["we_uv"] - requested["re_uv"]
-    await session.command(f"DAC A {requested['we_uv']}")
-    await session.command(f"DAC B {requested['re_uv']}")
+    before = parse_status(await session.command("STATUS"))
+    if before["mask"] != 0 or before["fault"] or before["io"]:
+        raise RuntimeError("STATUS is not healthy and stopped before configuration")
+    # Stage a new bias on unused DACs. Rewriting active WE then RE DACs in
+    # separate BLE commands otherwise applies the entire common-mode change
+    # temporarily as electrode polarization (for example +1.0 V instead of
+    # +0.2 V during a 0.4 -> 1.2 V common-mode correction).
+    pairs = (("A", "B", 0, 1), ("C", "D", 2, 3))
+    expected_we = quantize_dac(requested["we_uv"])
+    expected_re = quantize_dac(requested["re_uv"])
+    used = {config[key] for config in before["channels"].values() for key in ("we_dac", "re_dac")}
+    pair = next((p for p in pairs if before["dacs"][p[0]]["uv"] == expected_we
+                 and before["dacs"][p[1]]["uv"] == expected_re), None)
+    if pair is None:
+        pair = next((p for p in pairs if not {p[2], p[3]} & used), None)
+        if pair is None:
+            raise RuntimeError("No unused DAC pair to stage the requested bias without changing an active electrode voltage")
+        await session.command(f"DAC {pair[0]} {requested['we_uv']}")
+        await session.command(f"DAC {pair[1]} {requested['re_uv']}")
+        staged = parse_status(await session.command("STATUS"))
+        if (staged["mask"] != 0 or staged["fault"] or staged["io"]
+                or staged["channels"] != before["channels"]
+                or staged["dacs"][pair[0]]["uv"] != expected_we
+                or staged["dacs"][pair[1]]["uv"] != expected_re):
+            raise RuntimeError("Staged DAC readback mismatch; electrode routing was not changed")
     await session.command(f"PERIOD {settings['sens_period_code']}")
     channel_config = {"fsr_nA": settings["fsr_nA"], "offset_code": OFFSET_CODES[settings["offset_mode"]],
-                      "conv_time_code": 0, "we_dac": 0, "re_dac": 1, "cp": 0}
+                      "conv_time_code": 0, "we_dac": pair[2], "re_dac": pair[3], "cp": 0}
     for channel in range(1, 5):
         await session.command(f"CONFIG {channel} " + " ".join(map(str, channel_config.values())))
     status = parse_status(await session.command("STATUS"))
@@ -358,12 +431,12 @@ async def configure_session(session: BleSession, settings: dict[str, Any]) -> di
         raise RuntimeError("STATUS run/period/fault mismatch")
     if any(config != channel_config for config in status["channels"].values()):
         raise RuntimeError("STATUS channel configuration mismatch")
-    actual = {"we_uv": status["dacs"]["A"]["uv"], "re_uv": status["dacs"]["B"]["uv"]}
+    actual = {"we_uv": status["dacs"][pair[0]]["uv"], "re_uv": status["dacs"][pair[1]]["uv"]}
     if any(actual[key] != quantize_dac(requested[key]) for key in ("we_uv", "re_uv")):
         raise RuntimeError("STATUS DAC configuration mismatch")
     actual["potential_uv"] = actual["we_uv"] - actual["re_uv"]
     return {"info": info, "status": status, "requested": requested, "actual": actual,
-            "settings": settings, "config_confirmed": True}
+            "settings": settings, "config_confirmed": True, "dac_pair": pair[0] + pair[1]}
 
 
 def scan_devices(timeout: float = 4.0) -> list[dict[str, Any]]:

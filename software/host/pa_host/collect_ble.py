@@ -32,21 +32,45 @@ def _write_state(path: Path, state: dict[str, Any]):
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        for delay in (0, .005, .01, .02, .04, .08):
+            if delay:
+                time.sleep(delay)
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError as error:
+                winerror = getattr(error, "winerror", None)
+                contention = winerror in (5, 32, 33) or (
+                    os.name == "nt" and winerror is None and error.errno == 13)
+                if not contention or delay == .08:
+                    raise
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _stop_requested(path: Path, stop_event: asyncio.Event) -> bool:
     if stop_event.is_set():
         return True
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip() == "STOP":
-                    return True
-    except FileNotFoundError:
-        pass
+    for delay in (0, .005, .01, .02, .04, .08):
+        if delay:
+            time.sleep(delay)
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip() == "STOP":
+                        return True
+            break
+        except FileNotFoundError:
+            break
+        except PermissionError as error:
+            winerror = getattr(error, "winerror", None)
+            contention = winerror in (5, 32, 33) or (
+                os.name == "nt" and winerror is None and error.errno == 13)
+            if not contention or delay == .08:
+                raise
     return False
 
 
@@ -81,14 +105,37 @@ async def _wait_start_gate(args, session, stop_event):
     raise TimeoutError("matching start gate was not released within deadline")
 
 
-def _shared_column_deadline(args):
+async def _shared_column_deadline(args, stop_event=None):
     deadline = getattr(args, "column_deadline_unix_s", None)
     gate = getattr(args, "start_gate", None)
     if gate is not None:
-        try:
-            value = json.loads(Path(gate).read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return deadline
+        # Windows can briefly deny reads while the parent replaces this file.
+        # Yield to BLE callbacks during bounded retries; never extend the
+        # shared deadline or suppress persistent access/identity errors.
+        for delay in (0, .005, .01, .02, .04, .08):
+            if stop_event is not None and _stop_requested(Path(args.cmd_file), stop_event):
+                raise asyncio.CancelledError()
+            if deadline is not None and time.time() >= deadline:
+                return deadline
+            if delay:
+                await asyncio.sleep(delay)
+                if stop_event is not None and _stop_requested(Path(args.cmd_file), stop_event):
+                    raise asyncio.CancelledError()
+                if deadline is not None and time.time() >= deadline:
+                    return deadline
+            try:
+                value = json.loads(Path(gate).read_text(encoding="utf-8"))
+                break
+            except FileNotFoundError:
+                return deadline
+            except PermissionError as error:
+                winerror = getattr(error, "winerror", None)
+                # CPython's Windows CRT fopen may expose only EACCES and
+                # omit winerror even for a sharing violation.
+                contention = winerror in (5, 32, 33) or (
+                    os.name == "nt" and winerror is None and error.errno == 13)
+                if not contention or delay == .08:
+                    raise
         if (not isinstance(value, dict) or value.get("run_token") != args.run_token
                 or value.get("attempt_id") != args.attempt_id):
             raise RuntimeError("shared deadline gate does not belong to this attempt")
@@ -108,13 +155,13 @@ async def _start_capture(args, session, channel_mask, stop_event):
     pending = asyncio.create_task(session.command(f"START {channel_mask}"))
     try:
         while not pending.done():
-            deadline = _shared_column_deadline(args)
+            deadline = await _shared_column_deadline(args, stop_event)
             if (_stop_requested(Path(args.cmd_file), stop_event)
                     or deadline is not None and time.time() >= deadline):
                 raise asyncio.CancelledError()
             await asyncio.wait({pending}, timeout=POLL_INTERVAL_S)
         await pending
-        deadline = _shared_column_deadline(args)
+        deadline = await _shared_column_deadline(args, stop_event)
         if deadline is not None and time.time() >= deadline:
             raise asyncio.CancelledError()
     finally:
@@ -272,7 +319,7 @@ async def collect(args: argparse.Namespace, stop_event: asyncio.Event | None = N
                             break
                         now = time.monotonic()
                         if guided:
-                            shared_deadline = _shared_column_deadline(args)
+                            shared_deadline = await _shared_column_deadline(args, stop_event)
                             if shared_deadline is not None:
                                 deadline = min(deadline, now + max(0, shared_deadline - time.time()))
                         missing = [channel for channel in expected_channels
@@ -361,6 +408,12 @@ async def collect(args: argparse.Namespace, stop_event: asyncio.Event | None = N
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if callable(getattr(stream, "reconfigure", None)):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     parser = argparse.ArgumentParser(description="Verified V5.2 BLE four-channel collector")
     parser.add_argument("--address", required=True)
     parser.add_argument("--settings", type=Path, required=True, help="path to normalized settings JSON file")

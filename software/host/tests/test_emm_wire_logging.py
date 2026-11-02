@@ -52,13 +52,18 @@ def test_explicit_axis_deadline_is_not_extended_by_logging():
     assert serial.writes == [bytes.fromhex("01366b")]
 
 
-def test_expired_position_sample_is_not_relabelled_fresh_after_slow_logging():
+def test_expired_position_sample_is_not_relabelled_fresh_after_slow_logging(monkeypatch):
     bus, serial, events = powered_bus(enabled=True)
+    from test_emm_motion import MotionTestClock
+    clock = MotionTestClock()
+    clock.attach(monkeypatch, serial)
     original_event = bus._event
 
     def stalled_position_log(kind, **fields):
         if kind == "wire" and fields.get("direction") == "rx" and fields.get("opcode") == 0x36:
-            time.sleep(2.01)
+            # Windows monotonic ticks can report 2.000 after a real 2.010 s
+            # sleep. Inject expired feedback age without that timer rounding.
+            clock.sleep(2.1)
         original_event(kind, **fields)
 
     bus._event = stalled_position_log

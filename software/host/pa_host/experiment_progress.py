@@ -4,7 +4,7 @@ from .motion_approach import endpoint_phases
 
 
 class Progress:
-    def __init__(self, steps, initial_position, execution=None, *, started, calibration=None):
+    def __init__(self, steps, initial_position, execution=None, *, started, calibration=None, motion_only=False):
         self.steps = steps
         self.started = started
         self.finished = None
@@ -37,7 +37,7 @@ class Progress:
             else:
                 duration = params.get("seconds", 0)
             self.durations.append(duration)
-            if step["op"] == "dwell":
+            if step["op"] == "dwell" or (motion_only and step["op"] == "wait" and params.get("purpose") is None):
                 self.visits.append((index, step["column"]))
         self.execution = execution or {"mode": "once", "count": 1, "route": [column for _, column in self.visits]}
 

@@ -77,6 +77,7 @@ def test_ble_selection_never_falls_through_to_jlink(ble_globals):
 
 def test_ble_apply_never_builds_or_flashes(ble_globals):
     fake = Mock()
+    fake.DEFAULTS = dict(gui_server.v52_ble.DEFAULTS)
     fake.validate_settings.side_effect = lambda values: values
     fake.period_seconds.return_value = 0.124
     pool = Mock()

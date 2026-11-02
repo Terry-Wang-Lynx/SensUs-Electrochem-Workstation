@@ -24,6 +24,8 @@ API_PREFIX = "/api/automation/v1"
 CHANNELS = "ABCDEFGH"
 MAX_STEPS = 500
 MAX_SECONDS = 8 * 3600
+MAX_MOTION_CHECK_STEPS = 50000
+MAX_MOTION_CHECK_SECONDS = 72 * 3600
 GATE_TIMEOUT_S = 55.0
 STOP_TIMEOUT_S = 15.0
 POLL_SECONDS = 0.05
@@ -60,7 +62,24 @@ def _write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
-    temporary.replace(path)
+    try:
+        # A Windows reader may briefly deny replacement of the start gate.
+        # Retry only sharing/access contention, keeping the previous JSON
+        # intact and bounding the delay to 155ms; never retry an experiment.
+        for delay in (0, .005, .01, .02, .04, .08):
+            if delay:
+                time.sleep(delay)
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError as error:
+                if getattr(error, "winerror", None) not in (5, 32, 33) or delay == .08:
+                    raise
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _number(value, path, minimum=0, maximum=MAX_SECONDS):
@@ -181,7 +200,15 @@ def compile_experiment(document):
         raise AutomationError("schema_version", "Supported schema versions are 1.0 and 1.1", "schema_version")
     guided = version == "1.1"
     _keys(experiment, {"schema_version", "name", "output_dir", "bindings", "defaults", "electrodes", "columns", "program", "safety"}
-          | ({"run_policy", "calibration_id", "execution"} if guided else set()), "experiment")
+          | ({"run_policy", "calibration_id", "execution", "motion_only", "pbs_column", "endurance"} if guided else set()), "experiment")
+    if "motion_only" in experiment and type(experiment["motion_only"]) is not bool:
+        raise AutomationError("invalid_value", "motion_only must be boolean", "motion_only")
+    motion_only = experiment.get("motion_only") is True
+    if "endurance" in experiment and type(experiment["endurance"]) is not bool:
+        raise AutomationError("invalid_value", "endurance must be boolean", "endurance")
+    endurance = experiment.get("endurance") is True
+    max_steps = MAX_MOTION_CHECK_STEPS if motion_only or endurance else MAX_STEPS
+    max_seconds = MAX_MOTION_CHECK_SECONDS if motion_only or endurance else MAX_SECONDS
     if guided:
         if experiment.get("run_policy") != "guided":
             raise AutomationError("invalid_value", "Schema 1.1 requires guided run policy", "run_policy")
@@ -268,8 +295,8 @@ def compile_experiment(document):
 
     def append(op, params, source_path):
         nonlocal duration
-        if len(steps) >= MAX_STEPS:
-            raise AutomationError("plan_limit", "Expanded plan exceeds 500 steps", source_path)
+        if len(steps) >= max_steps:
+            raise AutomationError("plan_limit", f"Expanded plan exceeds {max_steps} steps", source_path)
         step = {"id": f"step-{len(steps) + 1:04d}", "op": op, "column": current_column,
                 "resolved_params": params, "source_path": source_path}
         if current_column is not None:
@@ -281,8 +308,8 @@ def compile_experiment(document):
             position[axis] = params["target_mm"]
         else:
             duration += params.get("seconds", 0)
-        if duration > MAX_SECONDS:
-            raise AutomationError("plan_limit", "Estimated plan duration exceeds eight hours", source_path)
+        if duration > max_seconds:
+            raise AutomationError("plan_limit", f"Estimated plan duration exceeds {max_seconds / 3600:g} hours", source_path)
         step["fingerprint"] = _hash(step)
         steps.append(step)
 
@@ -403,6 +430,27 @@ def compile_experiment(document):
                 if "Operator waiting is excluded from estimated duration; runtime is limited to eight hours." not in warnings:
                     warnings.append("Operator waiting is excluded from estimated duration; runtime is limited to eight hours.")
     expand(experiment.get("program"))
+    if motion_only and any(step["resolved_params"].get("acquire") for step in steps):
+        raise AutomationError("invalid_value", "Motion-only checks cannot acquire or polarize", "program")
+    visit_steps = steps
+    pbs_column = experiment.get("pbs_column")
+    if pbs_column is not None:
+        if type(pbs_column) is not int or pbs_column not in column_map:
+            raise AutomationError("invalid_value", "PBS column must be a defined physical column", "pbs_column")
+        count = 4 if steps and steps[-1]["op"] == "wait" and steps[-1]["resolved_params"].get("purpose") == "settle" else 3
+        storage_steps = steps[-count:]
+        expected = [("move_z", "safe_before_x", "Z", defaults["z_safe_mm"]),
+                    ("move_x", None, "X", defaults["x_first_mm"] + (pbs_column-1)*defaults["column_pitch_mm"]),
+                    ("move_z", "immerse", "Z", defaults["z_immersed_mm"])]
+        if len(storage_steps) != count or any(
+                s["op"] != op or s["column"] != pbs_column or s["resolved_params"].get("purpose") != purpose
+                or s["resolved_params"].get("axis") != axis or s["resolved_params"].get("target_mm") != target
+                for s, (op, purpose, axis, target) in zip(storage_steps[:3], expected)):
+            raise AutomationError("invalid_value", "PBS return requires safe lift, positioning and unpowered immersion", "pbs_column")
+        for step in storage_steps:
+            step["pbs_storage"] = True
+            step["fingerprint"] = _hash({k: v for k, v in step.items() if k != "fingerprint"})
+        visit_steps = steps[:-count]
     if "execution" in experiment:
         execution = _object(experiment["execution"], "execution")
         route = execution.get("route")
@@ -410,13 +458,15 @@ def compile_experiment(document):
         mode = execution.get("mode")
         if (set(execution) != {"mode", "count", "route"} or mode not in ("once", "repeat", "custom")
                 or isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 500
-                or (mode != "repeat" and count != 1)
+                or (mode != "repeat" and not (mode == "custom" and endurance) and count != 1)
                 or not isinstance(route, list) or not route
                 or any(isinstance(column, bool) or not isinstance(column, int) or column not in column_map for column in route)
                 or (mode != "custom" and route != sorted(set(route)))):
             raise AutomationError("invalid_value", "Invalid finite execution descriptor", "execution")
-        moves = [step["column"] for step in steps if step["op"] == "move_x"]
-        dwells = [step["column"] for step in steps if step["op"] == "dwell"]
+        moves = [step["column"] for step in visit_steps if step["op"] == "move_x"]
+        visit_op = "wait" if motion_only else "dwell"
+        dwells = [step["column"] for step in visit_steps if step["op"] == visit_op
+                  and step["resolved_params"].get("purpose") is None]
         if moves != route * count or dwells != route * count:
             raise AutomationError("invalid_value", "Execution route does not match actual visits", "execution")
         cursor = 0
@@ -431,17 +481,17 @@ def compile_experiment(document):
             if (cursor < len(steps) and steps[cursor]["op"] == "wait"
                     and steps[cursor]["resolved_params"].get("purpose") == "settle"):
                 cursor += 1
-            for operation, purpose in [("dwell", None), ("move_z", "withdraw")]:
+            for operation, purpose in [(visit_op, None), ("move_z", "withdraw")]:
                 if (cursor >= len(steps) or steps[cursor]["op"] != operation
                         or steps[cursor]["column"] != column
                         or steps[cursor]["resolved_params"].get("purpose") != purpose):
                     raise AutomationError("invalid_value", "Execution visit requires exactly one dwell and safe withdrawal", "execution")
                 cursor += 1
-        if cursor != len(steps):
+        if cursor != len(visit_steps):
             raise AutomationError("invalid_value", "Execution contains actions outside its visits", "execution")
         visit_index = 0
         for step in steps:
-            if step["op"] == "move_z" and step["resolved_params"].get("purpose") == "safe_before_x":
+            if not step.get("pbs_storage") and step["op"] == "move_z" and step["resolved_params"].get("purpose") == "safe_before_x":
                 visit_index += 1
             step.update(cycle_index=(max(1, visit_index) - 1) // len(route) + 1,
                         path_index=(max(1, visit_index) - 1) % len(route) + 1, visit_index=max(1, visit_index))
@@ -504,7 +554,10 @@ def experiment_schema(version="1.0"):
         schema["$id"] = "urn:sensus:automation:1.1"
         schema["required"] += ["run_policy", "calibration_id"]
         schema["properties"].update(schema_version={"const": "1.1"}, run_policy={"const": "guided"},
-                                    calibration_id={"type": "string", "minLength": 1, "maxLength": 200})
+                                    calibration_id={"type": "string", "minLength": 1, "maxLength": 200},
+                                    motion_only={"type": "boolean", "default": False})
+        schema["properties"]["pbs_column"] = {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 12}, {"type": "null"}]}
+        schema["properties"]["endurance"] = {"type": "boolean", "default": False}
         schema["properties"]["execution"] = {"type": "object", "additionalProperties": False,
             "required": ["mode", "count", "route"], "properties": {
                 "mode": {"enum": ["once", "repeat", "custom"]},
@@ -519,6 +572,10 @@ def experiment_schema(version="1.0"):
         schema["properties"]["columns"]["items"]["properties"]["concentration"] = {"anyOf": [concentration, {"type": "null"}]}
         schema["x-runtime-limits"]["acquisition_seconds"] = [0, 3600]
         schema["x-runtime-limits"]["physical_calibration_columns"] = [1, 12]
+        schema["x-runtime-limits"]["motion_only"] = {"expanded_steps": MAX_MOTION_CHECK_STEPS,
+            "duration_s": MAX_MOTION_CHECK_SECONDS, "acquisition": False}
+        schema["x-runtime-limits"]["endurance"] = {"expanded_steps": MAX_MOTION_CHECK_STEPS,
+            "duration_s": MAX_MOTION_CHECK_SECONDS, "acquisition": True, "custom_route_repeat": True}
     return schema
 
 
@@ -528,8 +585,8 @@ def openapi_document():
                           ("post", ("validate", "preview", "experiment", "run", "stop", "resume", "pause", "motion/connect",
                                     "boards/scan", "boards/bind", "boards/connect", "boards/disconnect",
                                     "motion/reference", "motion/enable", "motion/stop", "motion/disconnect", "motion/refresh", "twin/register", "twin/register-datum",
-                                    "guided/experiment", "guided/preview", "guided/run", "guided/calibration/begin",
-                                    "guided/calibration/capture", "guided/calibration/finish", "guided/calibration/cancel",
+                                    "guided/experiment", "guided/preview", "guided/run", "guided/park", "guided/calibration/begin",
+                                    "guided/calibration/capture", "guided/calibration/finish", "guided/calibration/cancel", "guided/calibration/recover-arrival",
                                     "guided/calibration/jog/start", "guided/calibration/jog/heartbeat", "guided/calibration/jog/stop", "guided/calibration/jog/config",
                                     "limits/begin", "limits/capture", "limits/save", "limits/cancel"))):
         for name in names:
@@ -574,9 +631,17 @@ def openapi_document():
                 if name == "guided/run":
                     properties.update(plan_hash={"type": "string"}, idempotency_key={"type": "string"})
                     required += ["plan_hash", "idempotency_key"]
+                if name == "guided/park":
+                    properties.update(column={"type": "integer", "minimum": 1, "maximum": 12},
+                                      idempotency_key={"type": "string", "minLength": 1})
+                    required = ["column", "idempotency_key"]
+                    operation["description"] = "Use the current verified four-point calibration to lift to safe Z and translate above a column; never descend or acquire."
                 if name == "guided/calibration/capture":
                     properties["point"] = {"enum": ["first", "last", "working", "safe"]}
                     required = ["point"]
+                if name == "guided/calibration/recover-arrival":
+                    properties["position_confirmed"] = {"const": True}
+                    required = ["position_confirmed"]
                 if name == "guided/calibration/begin":
                     properties["control_mode"] = {"const": "keyboard"}
                     properties["motion_confirmed"] = {"const": True}
@@ -618,7 +683,7 @@ def openapi_document():
                     required = ["confirmed"]
                 operation["requestBody"] = {"required": bool(required), "content": {"application/json": {"schema": {
                     "type": "object", "properties": properties, "required": required,
-                    **({"additionalProperties": False} if name.startswith(("limits/", "guided/calibration/jog/")) or name in ("twin/register", "twin/register-datum", "motion/refresh", "guided/calibration/begin") else {})}}}}
+                    **({"additionalProperties": False} if name.startswith(("limits/", "guided/calibration/jog/")) or name in ("twin/register", "twin/register-datum", "motion/refresh", "guided/calibration/begin", "guided/park") else {})}}}}
             paths[f"{API_PREFIX}/{name}"] = {method: operation}
     schema = experiment_schema()
     schema.pop("$id", None)
@@ -667,6 +732,9 @@ class AutomationController:
         self._board_stop_factory = board_stop_factory or v52_ble.stop_device
         self._board_release_factory = board_release_factory
         self._parked_callback = parked_callback
+        self._stopped_callback = None
+        self._stop_reference_candidate = None
+        self._board_preflight = None
         self._simulation_scale = _number(simulation_scale, "simulation_scale", 0, 1)
         self._lock = threading.RLock()
         self._motion = None
@@ -1144,6 +1212,10 @@ class AutomationController:
                 raise AutomationError("live_gate", "Live experiments require two distinct configured BLE identities", "bindings.boards", 409)
             if safety.get("electrical_policy_confirmed") is not True:
                 raise AutomationError("live_gate", "Confirm the polarization/electrical policy before live acquisition", "safety.electrical_policy_confirmed", 409)
+            if self._board_preflight is not None:
+                self._board_preflight([boards[slot]["address"] for slot in slots])
+                if self._stop_event.is_set():
+                    raise AutomationError("cancelled", "STOP interrupted board preflight", status=409)
         if moves:
             if safety.get("motion_policy_confirmed") is not True or safety.get("electrical_policy_confirmed") is not True:
                 raise AutomationError("live_gate", "Confirm motion and electrical policies before live motion", "safety", 409)
@@ -1214,6 +1286,8 @@ class AutomationController:
             if len(self._idempotency) >= 10000:
                 raise AutomationError("idempotency_limit", "Idempotency registry reached its safety limit; archive this state directory", status=409)
             self._stop_event.clear()
+            self._state.pop("pbs_storage", None)
+            self._stop_reference_candidate = None
             self._run_motion_calibration = None
             enforced_limits = self._live_gates(compiled) if mode == "live" else None
             if self._stop_event.is_set():
@@ -1246,7 +1320,8 @@ class AutomationController:
                                manifest_path=str(self._run_dir / "manifest.json"))
             self._progress = Progress(compiled["steps"], self._state["position"],
                                       compiled["experiment"].get("execution"), started=time.time(),
-                                      calibration=self._run_motion_calibration)
+                                      calibration=self._run_motion_calibration,
+                                      motion_only=compiled["experiment"].get("motion_only") is True)
             self._resume_event.clear()
             self._audit_failure = None
             self._limit_failure = None
@@ -1256,7 +1331,8 @@ class AutomationController:
             self._guided_attempts.clear()
             self._guided_last_step = None
             self._state["audit_error"] = None
-            self._deadline = time.monotonic() + MAX_SECONDS
+            self._deadline = time.monotonic() + (MAX_MOTION_CHECK_SECONDS if self._experiment.get("motion_only") is True
+                                               or self._experiment.get("endurance") is True else MAX_SECONDS)
             self._idempotency[idempotency_key] = {"identity": identity, "run_id": run_id, "result": self.snapshot()}
             self._event("run_started", plan_hash=compiled["plan_hash"], mode=mode, warnings=compiled["warnings"],
                         **({"absolute_limits_fingerprint": _hash(enforced_limits)} if enforced_limits is not None else {}))
@@ -1273,7 +1349,7 @@ class AutomationController:
         if self._stop_event.is_set():
             raise _Cancelled()
         if self._deadline and time.monotonic() >= self._deadline:
-            raise AutomationError("runtime_limit", "Eight-hour runtime limit reached")
+            raise AutomationError("runtime_limit", "Configured finite-run time limit reached")
 
     def _wait(self, seconds):
         deadline = time.monotonic() + seconds
@@ -1356,6 +1432,11 @@ class AutomationController:
                         self._progress.begin(index, time.time(), self._simulation_scale if self._state["mode"] == "simulate" else 1)
                 self._event("step_started", step=step)
                 params = step["resolved_params"]
+                if step.get("pbs_storage") and self._state["mode"] == "live":
+                    if (self._children or self._guided_unknown_slots or any(
+                            b.get("stop_confirmed") is not True or b.get("output_state") != "stopped"
+                            for b in self._state.get("boards", {}).values())):
+                        raise AutomationError("pbs_output_active", "PBS return requires confirmed acquisition STOP", "pbs_column")
                 if step["op"].startswith("move_"):
                     if self._experiment["schema_version"] == "1.1" and step["op"] == "move_x" and self._guided_unknown_slots:
                         self._guided_wait_recovery()
@@ -1443,6 +1524,8 @@ class AutomationController:
             natural_completion = (final_state == "completed" and not self._audit_failure and not self._stop_event.is_set()
                                   and self._state["mode"] == "live" and self._run_motion_calibration is not None)
             confirmed = self._cleanup(natural_completion=natural_completion)
+            if confirmed:
+                self._checkpoint_stationary_stop()
             if self._completion_failure is not None:
                 final_state, failure = "error", copy.deepcopy(self._completion_failure)
                 parked_reference = None
@@ -1472,6 +1555,9 @@ class AutomationController:
                         final_state = "error"
                 self._state.update(state=final_state, stop_confirmed=confirmed, error=failure,
                                    message=final_state if failure is None else failure["message"])
+                if final_state == "completed" and confirmed and self._experiment.get("pbs_column") is not None:
+                    self._state["pbs_storage"] = {"column": self._experiment["pbs_column"], "immersed": True,
+                                                  "output_state": "stopped"}
                 if self._progress:
                     self._progress.finished = time.time()
                 self._recovery_required = not confirmed
@@ -1505,8 +1591,22 @@ class AutomationController:
                     "progress": self.snapshot()["progress"],
                     **({"execution": compiled["experiment"]["execution"], "visits": [
                         {key: step[key] for key in ("id", "column", "cycle_index", "path_index", "visit_index")}
-                        for step in compiled["steps"] if step["op"] == "dwell"]} if "execution" in compiled["experiment"] else {}),
+                        for step in compiled["steps"] if step["op"] == "dwell" or
+                        (compiled["experiment"].get("motion_only") is True and step["op"] == "wait"
+                         and step["resolved_params"].get("purpose") is None)]} if "execution" in compiled["experiment"] else {}),
                     "execution_error": self._state.get("execution_error"), "audit_error": self._state.get("audit_error")})
+
+    def _checkpoint_stationary_stop(self):
+        with self._lock:
+            candidate, self._stop_reference_candidate = self._stop_reference_candidate, None
+            if candidate is None or self._stopped_callback is None:
+                return
+            try:
+                preserved = self._stopped_callback(self._motion, candidate)
+                self._event("stationary_stop_reference", preserved=preserved is True)
+            except Exception as error:
+                # STOP is still successful; only optional reference reuse failed.
+                self._event("stationary_stop_reference", preserved=False, error=str(error))
 
     def stop(self):
         self._stop_event.set()
@@ -1514,6 +1614,10 @@ class AutomationController:
         with self._lock:
             self._stop_event.set()
             self._resume_event.set()
+            if self._stopped_callback is not None and self._stop_reference_candidate is None and self._motion is not None:
+                capture = getattr(self._motion, "stationary_reference_candidate", None)
+                if callable(capture):
+                    self._stop_reference_candidate = capture()
             parked_stop = (getattr(self, "_natural_park_proof", None) is not None
                            and self._state["mode"] == "live" and self._motion is not None
                            and self._state["state"] in ("completed", "stopped", "error"))
@@ -1599,6 +1703,8 @@ class AutomationController:
                     errors.append(str(error))
                     self._event("recovery_motion_stop", stop_confirmed=False, error=str(error))
             with self._lock:
+                if confirmed:
+                    self._checkpoint_stationary_stop()
                 self._recovery_required = not confirmed
                 error = None if confirmed else AutomationError("stop_unconfirmed", "; ".join(errors) or "STOP remains unconfirmed").as_dict()
                 self._state.update(state="stopped" if confirmed else "error", stop_confirmed=confirmed,
@@ -1800,6 +1906,7 @@ class AutomationController:
             command.extend(["--attempt-id", attempt_id, "--fault-policy", "guided"])
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["PYTHONIOENCODING"] = "utf-8:replace"
         if not runtime.is_frozen():
             environment["PYTHONPATH"] = str(self.project_dir / "software" / "host") + os.pathsep + environment.get("PYTHONPATH", "")
         log = (directory / "collector.log").open("w", encoding="utf-8")
@@ -2066,6 +2173,9 @@ class AutomationController:
         self._event("paused_after_withdraw", column=self._state["column"])
         while not self._resume_event.wait(POLL_SECONDS):
             self._check_cancelled()
+            # The live monitor already refreshes stationary feedback under the
+            # controller lock. A second reader here inverts serial/controller
+            # lock order and can turn ordinary bus contention into a deadlock.
         self._check_cancelled()
         self._state["state"] = "running"
 

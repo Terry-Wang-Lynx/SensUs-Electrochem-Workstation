@@ -346,7 +346,7 @@ console.log(JSON.stringify({errors,unchanged:before===model.serialize(),defaults
 """)
     assert result["errors"] == ["SAMPLING_INVALID"] * 5
     assert result["unchanged"] is True
-    assert result["defaults"] == {"potential_v": -0.2, "working_electrode_v": 0.4,
+    assert result["defaults"] == {"potential_v": -0.2, "working_electrode_v": 1.2,
                                   "sens_period_code": 0, "fsr_nA": 50, "offset_mode": "20pct"}
 
 

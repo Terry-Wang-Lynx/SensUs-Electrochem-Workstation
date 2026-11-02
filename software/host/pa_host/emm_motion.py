@@ -10,8 +10,9 @@ accepted. Unknown profiles fail closed; nothing configures the drive for them.
 neither replaces fresh position, speed and reached-status checks.
 
 The fixed checksum is a protocol terminator, not payload corruption detection.
-The protocol has no request sequence number. No transaction is retried; a fault
-invalidates reference/enable authorization and requires reconnection. Queued
+The protocol has no request sequence number. Motor commands are never retried;
+one wholly missing read response may be retried within a bounded automatic-move
+budget. A fault invalidates reference/enable authorization. Queued
 bytes, wrong-address frames and unsolicited replies are rejected. This cannot
 prove the freshness of a delayed, otherwise identical response on the wire.
 
@@ -213,6 +214,32 @@ class SharedEmmBus:
 
     def _transact(self, body: bytes, response_length: int, *, deadline=None, ack=False,
                   cancel_event=None, interruptible=False, stop_command=False, keyboard_read=False):
+        started = time.monotonic()
+        options = dict(deadline=deadline, ack=ack, cancel_event=cancel_event,
+                       interruptible=interruptible, stop_command=stop_command, keyboard_read=keyboard_read)
+        try:
+            return self._transact_once(body, response_length, **options)
+        except MotionError as error:
+            diagnostic = getattr(error, "wire_diagnostic", {})
+            # Retry one wholly missing read response during finite automatic
+            # motion. Never replay a move/enable/STOP, partial frame or invalid
+            # reply. The original move deadline and 2 s sample-age guard remain.
+            retry_deadline = min(deadline or float("inf"), started + 1.8)
+            if (error.code != "transaction_timeout" or not interruptible or ack or stop_command
+                    or self._automatic_motion_axis is None
+                    or body[1] not in (0x1F, 0x42, 0x1A, 0x33, 0x34, 0x35, 0x36, 0x3A, 0x43)
+                    or diagnostic.get("response_hex") or diagnostic.get("pending_hex")
+                    or diagnostic.get("diagnostic_error")
+                    or time.monotonic() + self._command_gap_s >= retry_deadline):
+                raise
+            self._check_cancel(cancel_event)
+            self._event("read_retry", address=body[0], opcode=body[1], attempt=2,
+                        deadline_monotonic_s=retry_deadline, reason=error.code)
+            options["deadline"] = retry_deadline
+            return self._transact_once(body, response_length, **options)
+
+    def _transact_once(self, body: bytes, response_length: int, *, deadline=None, ack=False,
+                       cancel_event=None, interruptible=False, stop_command=False, keyboard_read=False):
         with self._serial_lock:
             if self._serial is None:
                 raise MotionError("not_connected", "Motion port is closed")
@@ -442,6 +469,16 @@ class SharedEmmBus:
         if require_enabled and (not state["enabled"] or not state["enable_confirmed"]):
             raise MotionError("not_enabled", f"{axis} needs explicit enable and enabled readback")
 
+    def _arrival_verification_deadline(self, deadline, operation_deadline=None):
+        # Only called after fresh zero-speed/at-target feedback. A successful
+        # finite move must not lose its reference because profile readback starts
+        # at the end of the travel budget. Explicit caller deadlines stay hard.
+        if self._move_timeout is not None:
+            return deadline
+        budget = max(5.0, self._timeout * 12 + self._command_gap_s * 36)
+        return min(max(deadline, time.monotonic() + budget),
+                   operation_deadline or float("inf"))
+
     def connect(self):
         with self._operation():
             self._require_manual_clear()
@@ -640,7 +677,8 @@ class SharedEmmBus:
                     budget = 0
                     for phase_target, phase_speed in phases:
                         phase_rpm = math.floor(phase_speed * 60 / config["lead_mm"] + 1e-12)
-                        budget += abs(phase_target - previous) / (phase_rpm * config["lead_mm"] / 60) * 1.5 + 5
+                        budget += (abs(phase_target - previous) / (phase_rpm * config["lead_mm"] / 60) * 1.5
+                                   + 8 + max(5.0, self._timeout * 12 + self._command_gap_s * 36))
                         previous = phase_target
                     if budget > 28800:
                         raise MotionError("move_duration", "Endpoint approach deadline exceeds eight hours")
@@ -769,7 +807,11 @@ class SharedEmmBus:
                              if calibration is not None else
                              max(resolution_tolerance, config["lead_mm"] * state["config"]["position_window_deg"] / 360))
                 self._limit_target(axis, target, quantized_target, tolerance)
-                timeout = self._move_timeout or (abs(delta) / actual_speed * 1.5 + 5)
+                # At 20 mm/s the drive's finite accel/decel ramp can consume
+                # more than the old 5 s fixed allowance (54 mm took 9.7 s).
+                # Keep a finite ramp/communication margin; explicit caller
+                # deadlines and STOP still take precedence.
+                timeout = self._move_timeout or (abs(delta) / actual_speed * 1.5 + 8)
                 if timeout > 28800:
                     raise MotionError("move_duration", "Move deadline exceeds eight hours")
                 deadline = min(time.monotonic() + timeout, operation_deadline or float("inf"))
@@ -792,6 +834,7 @@ class SharedEmmBus:
                     self._transact(body, 4, deadline=deadline, ack=True,
                                    cancel_event=cancel_event, interruptible=True)
                 stable_samples = 0
+                arrival_verification_started = False
                 settled_target = None
                 if not pulses:
                     settled_target = self._automatic_target_observation(axis, state, quantized_target, calibration,
@@ -811,12 +854,21 @@ class SharedEmmBus:
                     self._check_cancel(cancel_event)
                     reached = (abs(state["position_mm"] - quantized_target) <= tolerance + 1e-12
                                and state["speed_rpm"] == 0 and bool(state["status"] & 2))
+                    if reached and not arrival_verification_started:
+                        # The first fresh stopped-at-target sample is the
+                        # boundary between travel and arrival verification.
+                        # Waiting for a second sample can exhaust the travel
+                        # deadline even though the drive has already arrived.
+                        deadline = self._arrival_verification_deadline(deadline, operation_deadline)
+                        arrival_verification_started = True
                     stable_samples = stable_samples + 1 if reached else 0
                     if stable_samples >= 2:
+                        deadline = self._arrival_verification_deadline(deadline, operation_deadline)
                         if command_outstanding:
                             state, settled_target = self._settle_automatic_axis(axis, quantized_target, tolerance, calibration,
                                 deadline=deadline, cancel_event=cancel_event)
                             command_outstanding = False
+                        deadline = self._arrival_verification_deadline(deadline, operation_deadline)
                         with self._state_lock:
                             self._startup_approach = None
                         if calibration is not None:
@@ -910,7 +962,8 @@ class SharedEmmBus:
             mechanical = self.axes[axis]
             sign = -1 if mechanical["positive_direction"] else 1
             expected = state["reference_count"] + sign * target * 65536 / mechanical["lead_mm"]
-            budget = _target_representation_budget(65536 / state["config"]["pulses_per_rev"])
+            budget = self._keyboard_jog_counts(state) + _target_representation_budget(
+                65536 / state["config"]["pulses_per_rev"])
             if abs(observed - expected) > budget:
                 raise MotionError("calibration_motion", f"{axis} reported a different finite command target")
         return (observed,)
@@ -1985,7 +2038,7 @@ class SharedEmmBus:
                 self._fault(error)
                 raise
 
-    def restore_reference(self, identity):
+    def restore_reference(self, identity, *, verified_position_window=False):
         with self._operation():
             self._require_connected()
             self._require_manual_clear()
@@ -2009,7 +2062,8 @@ class SharedEmmBus:
                 if identity["profiles"] != self._reference_profiles():
                     raise MotionError("reference_identity", "Motor configuration, firmware or power flags changed")
                 for axis, state in states.items():
-                    if abs(state["raw_count"] - identity["raw_counts"][axis]) > 1:
+                    tolerance_counts = self._keyboard_jog_counts(state) if verified_position_window else 1
+                    if abs(state["raw_count"] - identity["raw_counts"][axis]) > tolerance_counts:
                         raise MotionError("reference_checkpoint", f"{axis} encoder differs from its saved parked reference checkpoint")
                     sign = -1 if self.axes[axis]["positive_direction"] else 1
                     position = sign * (state["raw_count"] - identity["reference_counts"][axis]) * self.axes[axis]["lead_mm"] / 65536
@@ -2030,6 +2084,93 @@ class SharedEmmBus:
             except MotionError as error:
                 self._fault(error)
                 raise
+
+    def recover_stopped_reference(self, identity, *, verified_position_window=False):
+        """Verify an artifact-backed checkpoint, without enable or move commands."""
+        if self._current_stop_result().get("stop_confirmed") is not True:
+            raise MotionError("stop_unconfirmed", "Arrival recovery requires a fresh confirmed STOP")
+        self.restore_reference(identity, verified_position_window=verified_position_window)
+        with self._operation():
+            try:
+                generation = self._stop_generation
+                states = self._stationary_states(enabled=True)
+                for axis, state in states.items():
+                    targets = [self._read_manual_target(axis, opcode, manual_session=False) for opcode in (0x33, 0x34)]
+                    tolerance = self._keyboard_jog_counts(state)
+                    checkpoint_tolerance = tolerance if verified_position_window else 1
+                    if (abs(state["raw_count"] - identity["raw_counts"][axis]) > checkpoint_tolerance
+                            or any(abs(value - state["raw_count"]) > tolerance for value in targets)
+                            or abs(targets[0] - targets[1]) > 1):
+                        raise MotionError("reference_checkpoint", "Stopped encoder/target checkpoint changed")
+                states = self._stationary_states(enabled=True)
+                if any(abs(state["raw_count"] - identity["raw_counts"][axis]) >
+                       (self._keyboard_jog_counts(state) if verified_position_window else 1)
+                       for axis, state in states.items()):
+                    raise MotionError("reference_checkpoint", "Encoder moved during arrival recovery")
+                with self._state_lock:
+                    if generation != self._stop_generation:
+                        raise MotionError("cancelled", "STOP interrupted arrival reference recovery")
+                    for axis in states:
+                        self._state[axis]["enable_confirmed"] = True
+                return self.snapshot()
+            except MotionError as error:
+                self._fault(error)
+                raise
+
+    def stationary_reference_candidate(self):
+        """Capture existing coordinates without delaying an explicit STOP."""
+        with self._state_lock:
+            now = time.monotonic()
+            if (not self._connected or self._faulted or self._manual["active"]
+                    or self._automatic_motion_axis is not None):
+                return None
+            for state in self._state.values():
+                if (not state["referenced"] or not state["enable_confirmed"] or not state["telemetry_valid"]
+                        or state["speed_rpm"] != 0 or state["status"] & 0x3C or state["status"] & 3 != 3
+                        or state["updated_monotonic"] is None or not 0 <= now - state["updated_monotonic"] <= 2):
+                    return None
+            return {"identity": self._reference_identity(self._state),
+                    "connection_token": self._connection_token, "generation": self._stop_generation}
+
+    def verify_stationary_stop_checkpoint(self, candidate):
+        """Read-only proof for a STOP requested while already stationary.
+
+        Coordinate origin never changes. Only drive-window settling around the
+        captured position is allowed; moving, changed profiles or power flags
+        still require a new reference. STOP remains latched after this read.
+        """
+        with self._operation():
+            self._require_connected()
+            self._require_manual_clear()
+            if (candidate["connection_token"] != self._connection_token
+                    or candidate["generation"] >= self._stop_generation
+                    or self._current_stop_result().get("stop_confirmed") is not True):
+                raise MotionError("reference_checkpoint", "Stationary STOP identity changed or is unconfirmed")
+            generation = self._stop_generation
+            identity = candidate["identity"]
+            for axis in self.axes:
+                self._identity(axis)
+            if identity["motion"] != {"port": self.port, "baud": self.baud, "axes": self.axes} or identity["profiles"] != self._reference_profiles():
+                raise MotionError("reference_identity", "Configuration or power state changed during STOP")
+            for _ in range(2):
+                states = self._stationary_states(enabled=True)
+                for axis, state in states.items():
+                    tolerance = self._keyboard_jog_counts(state)
+                    if abs(state["raw_count"] - identity["raw_counts"][axis]) > tolerance:
+                        raise MotionError("reference_checkpoint", "Encoder moved outside its stationary position window")
+                    targets = []
+                    for opcode in (0x33, 0x34):
+                        reply = self._transact(bytes([self.axes[axis]["address"], opcode]), 8)
+                        if reply[2] not in (0, 1):
+                            raise MotionError("invalid_telemetry", "Invalid stopped target sign")
+                        targets.append(int.from_bytes(reply[3:7], "big") * (-1 if reply[2] else 1))
+                    if abs(targets[0] - targets[1]) > 1 or any(abs(t - state["raw_count"]) > tolerance for t in targets):
+                        raise MotionError("reference_checkpoint", "STOP target registers are not stationary at the encoder")
+            if generation != self._stop_generation:
+                raise MotionError("cancelled", "Another STOP interrupted reference checkpoint verification")
+            result = copy.deepcopy(identity)
+            result["raw_counts"] = {axis: state["raw_count"] for axis, state in states.items()}
+            return result
 
     def parked_reference_checkpoint(self, identity):
         with self._operation():

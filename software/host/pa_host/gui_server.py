@@ -3058,7 +3058,7 @@ class SettingsController:
                 if self.settings.get("board_profile") != "v52":
                     self._legacy_settings = copy.deepcopy(self.settings)
                     self.settings = copy.deepcopy(self._ble_settings) if self._ble_settings else v52_ble.validate_settings({**self.DEFAULTS,
-                        "board_profile": "v52", "working_electrode_v": 0.4,
+                        "board_profile": "v52", "working_electrode_v": v52_ble.DEFAULTS["working_electrode_v"],
                         "potential_v": -0.2, "initial_potential_v": -0.2,
                         "fsr_nA": 50, "offset_mode": "20pct", "offset_nA": 10})
                 self.applied = False
@@ -5255,6 +5255,7 @@ class MeasurementController:
             # is redirected to collector.log, hiding the only actionable RTT
             # backend details until after a forced stop.
             env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8:replace"
             if not runtime.is_frozen():
                 host_dir = str(PROJECT_DIR / "software" / "host")
                 env["PYTHONPATH"] = host_dir + os.pathsep + env.get("PYTHONPATH", "")
@@ -7944,6 +7945,8 @@ class AppState:
         self.digital_twin = DigitalTwin(STATE_DIR / "automation", GUI_DIR / "ht-apparatus.json")
         self.automation._manual_calibration_active = self.guided_automation.snapshot()["manual"]["active"]
         self.automation._parked_callback = self.guided_automation.checkpoint_reference
+        self.automation._stopped_callback = self.guided_automation.checkpoint_stationary_stop
+        self.automation._board_preflight = self._preflight_automation_boards
         self.history = WorkspaceHistory(HISTORY_PATH, PROJECT_DIR)
         self.settings = SettingsController()
         self.filter = FilterController()
@@ -8017,6 +8020,22 @@ class AppState:
                 )
         self.schedule.metadata_hook = self._prepare_export_metadata
         self.measurement.completion_hook = self._measurement_completed
+
+    def _preflight_automation_boards(self, addresses):
+        """Verify INFO/STATUS before any automatic motion or polarization."""
+        from .automation import AutomationError
+        for address in addresses:
+            if self.automation._stop_event.is_set():
+                raise AutomationError("cancelled", "STOP interrupted board preflight", status=409)
+            try:
+                result = self.ble_connections.connect(address)
+                if result.get("protocol_verified") is not True:
+                    raise ValueError("V5.2 INFO/STATUS handshake not verified")
+                status = result.get("firmware", {}).get("status", {})
+                if status.get("mask") != 0 or status.get("fault") != 0 or status.get("io") != 0:
+                    raise ValueError("板卡仍在采集或报告硬件错误，请先确认板卡停止状态")
+            except Exception as error:
+                raise AutomationError("board_unavailable", f"采集板 {address} 未通过连接检查，未启动运动或施加电位。请恢复连接后直接重试，原标定保留：{error}", "bindings.boards", 409) from error
 
     def hardware_idle(self) -> bool:
         """Updates may use the network only while no hardware operation is active."""
@@ -11035,6 +11054,10 @@ def _reset_automation_devices(controller, service, boundary_at_current=None, *, 
             raise AutomationError("device_reset_connection", "旧会话已结束，但重新连接未完成；请检查 USB 和电机供电后重试：" + str(error), status=409) from error
         if current.get("stop_confirmed") is not True or current.get("recovery_required"):
             raise AutomationError("device_reset_stop_unknown", "新连接尚未确认双轴停止，请检查接线后重试", status=409)
+        with controller._lock:
+            controller._state.update(state="stopped", message="Devices reset; ready for alignment", error=None)
+            controller._persist_best_effort()
+            current = controller.snapshot()
         controller._event("devices_reset_completed", port=settings["port"], calibration_cleared=True, data_preserved=True)
         return {"state": current, "guided": service.snapshot(), "motion": controller._motion.snapshot(),
                 "message": "设备已重新连接，旧故障和标定会话已清除；数据、模板和日志保留。请重新进入标定。"}
@@ -11106,7 +11129,14 @@ def _automation_dispatch(method: str, action: str, payload: dict, query: dict) -
                         "document_versions": ["guided-1.0", "guided-1.1"],
                         "modes": ["once", "repeat", "custom"], "preserve_order_and_duplicates": True,
                         "maximum_expanded_steps": 500, "maximum_runtime_s": 28800,
+                        "motion_only": {"maximum_expanded_steps": 50000, "maximum_runtime_s": 259200,
+                                        "acquisition": False},
+                        "endurance": {"maximum_expanded_steps": 50000, "maximum_runtime_s": 259200,
+                                      "custom_route_repeat": True, "automatic_restart": False},
                         "progress": "whole_run_with_estimated_remaining_time"},
+                    "safe_park": {"endpoint": "guided/park", "current_session_calibration_required": True,
+                                  "actions": ["lift_to_safe_z", "translate_above_column"],
+                                  "descend": False, "acquisition": False},
                     "synchronization": "software start gate; independent board clocks",
                     "fingerprints": "sha256 identity/configuration/action/sample provenance",
                     "absolute_motion_limits": {"required_for_live_motion": False,
@@ -11170,6 +11200,12 @@ def _automation_dispatch(method: str, action: str, payload: dict, query: dict) -
         if action == "motion/refresh":
             _keys(payload, set(), action)
             return controller.refresh_motion()
+        if action == "guided/calibration/recover-arrival":
+            _keys(payload, {"position_confirmed"}, action)
+            from .arrival_recovery import recover_arrival
+            with _alignment_observer_pause(controller):
+                return recover_arrival(controller, APP.guided_automation,
+                                       position_confirmed=payload.get("position_confirmed") is True)
         if action.startswith("guided/calibration/jog/"):
             operation = action.rsplit("/", 1)[-1]
             if operation not in {"start", "config"}:
@@ -11301,6 +11337,19 @@ def _automation_dispatch(method: str, action: str, payload: dict, query: dict) -
                 devices = _high_throughput_devices()
                 return APP.digital_twin.register(devices["motion"], devices["limits"], payload.get("cad_bounds"),
                                                 confirmed=payload.get("confirmed") is True)
+        if action == "guided/park":
+            from .safe_park import compile_safe_park
+            _keys(payload, {"column", "idempotency_key"}, action)
+            if not isinstance(payload.get("idempotency_key"), str) or not payload["idempotency_key"].strip():
+                raise AutomationError("required", "idempotency_key is required", "idempotency_key")
+            with controller._lock:
+                controller._idle()
+                current = controller.snapshot()
+                if current.get("stop_confirmed") is not True or current.get("recovery_required"):
+                    raise AutomationError("stop_unconfirmed", "Confirm all outputs stopped before parking", status=409)
+                compiled = compile_safe_park(APP.guided_automation, controller._motion, payload.get("column"))
+                return controller.start(compiled["experiment"], mode="live", plan_hash=compiled["plan_hash"],
+                                        idempotency_key=payload["idempotency_key"])
         if action == "guided/experiment":
             with controller._lock:
                 controller._idle()
@@ -11622,6 +11671,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "product": "SensUs-Electrochem-Workstation",
                 "health_schema": 2,
+                "local_patch": "reliability-20261101",
                 "project": str(PROJECT_DIR),
                 "version": __version__,
                 "diagnostic_session": DIAGNOSTICS.session_id,
@@ -11691,6 +11741,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 raise AutomationError("shutting_down", "应用正在安全退出", status=409)
             result = _automation_dispatch(method, action, payload, parse_qs(parsed.query))
             self._send_json(result)
+        except (
+            BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+        ):
+            raise
         except AutomationError as error:
             self._send_json({"error": error.as_dict(), "request_id": getattr(self, "_request_id", "")}, HTTPStatus(error.status))
         except ValueError as error:

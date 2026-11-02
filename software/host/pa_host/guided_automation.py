@@ -50,7 +50,7 @@ def _execution_settings(document):
         raise AutomationError("invalid_value", "请选择一次性、重复或自定义路径实验", "execution.mode")
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 500:
         raise AutomationError("invalid_value", "实验轮数必须为 1–500 的整数", "execution.count")
-    if mode != "repeat" and count != 1:
+    if mode != "repeat" and not (mode == "custom" and document.get("endurance") is True) and count != 1:
         raise AutomationError("invalid_value", "一次性和自定义路径只执行一轮", "execution.count")
     if mode != "custom":
         if route is not None:
@@ -90,23 +90,34 @@ def _translated(document, calibration=None):
     execution = _execution_settings(document)
     columns = {column["index"]: column for column in document["columns"]}
     for column in sorted(document["columns"], key=lambda item: item["index"]):
-        if column["index"] not in execution["route"]:
+        if column["index"] not in execution["route"] and column["index"] != document.get("pbs_column"):
             continue
         duration = document["defaults"]["dwell_s"] if column["duration_s"] is None else column["duration_s"]
         experiment["columns"].append({"index": column["index"], "solution": column["name"],
-                                      "concentration": None, "overrides": {"dwell_s": duration}})
+                                      "concentration": ({"value": 0, "unit": "uM"} if column["index"] == document.get("pbs_column") else None),
+                                      "overrides": {"dwell_s": duration}})
     for number in execution["route"]:
         column = columns[number]
         duration = document["defaults"]["dwell_s"] if column["duration_s"] is None else column["duration_s"]
         windows = _effective_windows(column, document["defaults"], channels)
+        dwell = ({"op": "wait", "seconds": duration} if document.get("motion_only") is True else
+                 {"op": "dwell", "seconds": duration, "acquire": list(windows), "windows": windows})
         experiment["program"].extend([
             {"op": "move_to_column", "column": column["index"]}, {"op": "immerse"},
-            {"op": "dwell", "seconds": duration, "acquire": list(windows), "windows": windows},
+            dwell,
             {"op": "withdraw"}])
     if execution["count"] > 1:
         experiment["program"] = [{"op": "repeat", "count": execution["count"], "body": experiment["program"]}]
+    if document.get("pbs_column") is not None:
+        experiment["pbs_column"] = document["pbs_column"]
+        experiment["program"].extend([
+            {"op": "move_to_column", "column": document["pbs_column"]}, {"op": "immerse"}])
     if document["schema_version"] == "guided-1.1":
         experiment["execution"] = execution
+    if document.get("motion_only") is True:
+        experiment["motion_only"] = True
+    if document.get("endurance") is True:
+        experiment["endurance"] = True
     return experiment
 
 
@@ -122,7 +133,14 @@ def _validate_document(document):
     if version not in ("guided-1.0", "guided-1.1"):
         raise AutomationError("schema_version", "支持 guided-1.0 和 guided-1.1 模板", "schema_version")
     _keys(document, {"schema_version", "name", "output_dir", "bindings", "safety", "defaults", "columns", "electrodes"}
-          | ({"execution"} if version == "guided-1.1" else set()), "document")
+          | ({"execution", "motion_only", "pbs_column", "endurance"} if version == "guided-1.1" else set()), "document")
+    if "motion_only" in document and type(document["motion_only"]) is not bool:
+        raise AutomationError("invalid_value", "motion_only must be boolean", "motion_only")
+    if "endurance" in document and type(document["endurance"]) is not bool:
+        raise AutomationError("invalid_value", "endurance must be boolean", "endurance")
+    pbs = document.get("pbs_column")
+    if pbs is not None and (type(pbs) is not int or not 1 <= pbs <= 12):
+        raise AutomationError("invalid_value", "PBS 列须为 1–12 的整数或 null", "pbs_column")
     _text(document.get("name"), "name")
     _text(document.get("output_dir"), "output_dir", 4096, True)
     bindings = _object(document.get("bindings"), "bindings")
@@ -179,7 +197,7 @@ def _validate_document(document):
             length = _number(window["duration_s"], f"{window_path}.duration_s", 0, duration)
             if start + length > duration:
                 raise AutomationError("invalid_value", "A channel window cannot extend beyond the column duration", window_path)
-        if column["enabled"] and not _effective_windows(column, defaults, channels):
+        if column["enabled"] and document.get("motion_only") is not True and not _effective_windows(column, defaults, channels):
             raise AutomationError("invalid_value", "An enabled column needs at least one positive acquisition window", f"{path}.windows")
     if sorted(indices) != list(range(1, 13)) or not any(column["enabled"] for column in columns):
         raise AutomationError("invalid_value", "Select at least one column with fixed identities 1–12", "columns")
@@ -189,6 +207,8 @@ def _validate_document(document):
         compile_experiment(_translated(result))
     except AutomationError as error:
         if error.code == "plan_limit" and version == "guided-1.1":
+            if document.get("motion_only") is True or document.get("endurance") is True:
+                raise AutomationError("plan_limit", "长时间检查超出 50000 动作 / 72 小时的有限计划容量，请拆分计划", "execution") from error
             raise AutomationError("plan_limit", "路径或轮数超出单次实验 500 个动作 / 8 小时上限，请减少列访问次数、轮数或停留时间", "execution") from error
         raise
     return result
@@ -433,7 +453,9 @@ class GuidedAutomation:
             if state.get("referenced") is True:
                 return all(state["axes"][axis]["reference_count"] == calibration["reference"]["reference_counts"][axis]
                            for axis in ("X", "Z"))
-            return all(abs(state["axes"][axis]["raw_count"] - calibration["reference"]["raw_counts"][axis]) <= 1
+            return all(abs(state["axes"][axis]["raw_count"] - calibration["reference"]["raw_counts"][axis]) <=
+                       (max(1, state["axes"][axis]["config"]["position_window_deg"] * 65536 / 360)
+                        if state.get("stop_confirmed") is True else 1)
                        for axis in ("X", "Z"))
         except (ValueError, KeyError, TypeError, AttributeError):
             return False
@@ -707,6 +729,12 @@ class GuidedAutomation:
             if mode == "live":
                 calibration = self._live_calibration(validated, motion)
             compiled = compile_experiment(_translated(validated, calibration))
+            if validated.get("motion_only") is True:
+                compiled["warnings"].append("Motion-only check: no acquisition or polarization commands will be sent.")
+            if validated.get("pbs_column") is not None:
+                compiled["warnings"].append(f"正常完成后关闭采集输出，返回第 {validated['pbs_column']} 列 PBS 并保持浸泡；故障或停止时不自动返回。")
+            if validated.get("endurance") is True:
+                compiled["warnings"].append("长时间压力测试：最长 72 小时；手动停止或故障后不会自动续跑。")
             if calibration is None:
                 compiled["warnings"].append("Synthetic simulation geometry only; it cannot authorize live motion or replace physical calibration.")
             return compiled
@@ -726,7 +754,10 @@ class GuidedAutomation:
                         or identity["profiles"] != calibration["reference"]["profiles"]):
                     raise ValueError("Saved calibration belongs to another powered connection or motor profile")
             if not state.get("referenced"):
-                motion.restore_reference(copy.deepcopy(calibration["reference"]))
+                if self._four_point(calibration) and state.get("stop_confirmed") is True and callable(getattr(motion, "recover_stopped_reference", None)):
+                    motion.recover_stopped_reference(copy.deepcopy(calibration["reference"]), verified_position_window=True)
+                else:
+                    motion.restore_reference(copy.deepcopy(calibration["reference"]))
             current = motion.reference_identity()
             if any(current[field] != calibration["reference"][field] for field in ("motion", "reference_counts", "profiles")):
                 raise ValueError("Saved reference identity differs from the connected motion bus")
@@ -1009,6 +1040,23 @@ class GuidedAutomation:
             except Exception as error:
                 self._block_keyboard(error)
             return self.snapshot()
+
+    def checkpoint_stationary_stop(self, motion, candidate):
+        with self._lock:
+            self._idle()
+            if not self._calibration_matches(self._document) or not self._four_point(self._calibration):
+                return False
+            saved = self._calibration
+            identity = candidate["identity"]
+            if (candidate["connection_token"] != saved["connection_token"]
+                    or any(identity[k] != saved["reference"][k] for k in ("motion", "profiles", "reference_counts"))):
+                return False
+            checkpoint = motion.verify_stationary_stop_checkpoint(candidate)
+            calibration = {**saved, "reference": checkpoint}
+            self._persist(calibration=calibration, replace_calibration=True)
+            self._calibration = calibration
+            self._calibrated_motion = motion
+            return True
 
     def checkpoint_reference(self, motion, reference_before_stop=None):
         with self._lock:
