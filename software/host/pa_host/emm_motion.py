@@ -827,7 +827,7 @@ class SharedEmmBus:
                             if (self._stop_generation, self._connection_token, self._experiment_calibration) != _approach_identity:
                                 raise MotionError("calibration_motion", "Endpoint approach identity changed before command")
                     direction = config["positive_direction"] if delta > 0 else 1 - config["positive_direction"]
-                    acceleration = 10 if speed <= 2.0 else 242
+                    acceleration = 10 if speed <= 2.0 else 232
                     body = bytes([config["address"], 0xFD, direction]) + rpm.to_bytes(2, "big") + bytes([acceleration]) + pulses.to_bytes(4, "big") + bytes([2, 0])
                     command_outstanding = True
                     with self._state_lock:

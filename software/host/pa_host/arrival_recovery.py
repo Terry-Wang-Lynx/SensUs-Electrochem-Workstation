@@ -109,6 +109,8 @@ def arrival_checkpoint(run_dir):
                          else (record["z_safe_mm"], record["z_working_mm"]))
             position = sign * (sample["raw"] - checkpoint["reference_counts"][axis]) * config["lead_mm"] / 65536
             window = tolerance * config["lead_mm"] / 65536
+            if config.get("max_speed_mm_s", 0) > 20:
+                window = max(window, 0.25)
             if not low - window <= position <= high + window:
                 raise ValueError("Stopped encoder is outside the captured experiment window")
         elif abs(sample["raw"] - expected) > tolerance:

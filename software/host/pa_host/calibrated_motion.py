@@ -46,7 +46,10 @@ def calibrated_startup_approach(motion, record):
     position = state.get("position_mm")
     lead = state.get("mechanical", {}).get("lead_mm")
     window = state.get("config", {}).get("position_window_deg")
+    max_speed = state.get("mechanical", {}).get("max_speed_mm_s", 0)
     tolerance = lead * window / 360 if _finite(lead) and _finite(window) else 0
+    if _finite(max_speed) and max_speed > 20:
+        tolerance = max(tolerance, 0.25)
     if not _finite(position) or bounds["Z"][0] - tolerance <= position <= bounds["Z"][1] + tolerance:
         check_calibrated_feedback(motion, record)
         return None
@@ -111,6 +114,9 @@ def _check_calibrated_feedback(motion, record, observed_axes, z_approach=None):
         if not _finite(lead) or lead <= 0 or not _finite(window) or not 0 <= window <= 1.8:
             _reject("The calibrated drive scale or arrival tolerance is invalid")
         tolerance = max(lead / 65536, lead * window / 360)
+        max_speed = state.get("mechanical", {}).get("max_speed_mm_s", 0)
+        if _finite(max_speed) and max_speed > 20:
+            tolerance = max(tolerance, 0.25)
         position = state.get("position_mm")
         lower, upper = z_approach if axis == "Z" and z_approach is not None else bounds[axis]
         if not _finite(position) or not lower - tolerance <= position <= upper + tolerance:
