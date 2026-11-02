@@ -107,7 +107,12 @@ class AlignmentJog:
         axes = self._motion.snapshot()["axes"]
         for axis in ("X", "Z"):
             mechanical = axes[axis]["mechanical"]
-            if maximum > mechanical["max_speed_mm_s"]:
+            axis_limit = (
+                max(mechanical["max_speed_mm_s"], self.HARD_MAX_SPEED)
+                if settings["fast_motion_confirmed"] is True and mechanical["max_speed_mm_s"] >= 10
+                else mechanical["max_speed_mm_s"]
+            )
+            if maximum > axis_limit:
                 raise AutomationError("alignment_speed", "Jog maximum exceeds an axis speed limit", "max_speed_mm_s")
             if math.floor(speed * 60 / mechanical["lead_mm"]) < 1:
                 raise AutomationError("alignment_speed", "Jog speed must produce at least one RPM without rounding upward", "speed_mm_s")

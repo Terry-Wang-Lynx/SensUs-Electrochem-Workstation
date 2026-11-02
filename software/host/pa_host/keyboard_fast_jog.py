@@ -56,7 +56,8 @@ def run_fast_alignment(bus, axis, direction, speed_mm_s, max_speed_mm_s, max_dis
     distance = None if continuous else _number(max_distance_mm, "max_distance_mm", positive=True)
     duration = None if continuous else _number(duration_s, "duration_s", positive=True)
     rpm = math.floor(speed * 60 / config["lead_mm"])
-    if (not 2 < speed <= min(maximum, config["max_speed_mm_s"], FAST_MAX_SPEED)
+    axis_limit = max(config["max_speed_mm_s"], FAST_MAX_SPEED) if config["max_speed_mm_s"] >= 10 else config["max_speed_mm_s"]
+    if (not 2 < speed <= min(maximum, axis_limit, FAST_MAX_SPEED)
             or maximum > FAST_MAX_SPEED or not 1 <= rpm <= 6000):
         raise MotionError("speed_range", "Fast alignment requires >2..80 mm/s within the configured axis limit")
     if not continuous and (distance > 10 or duration > 30):
