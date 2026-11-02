@@ -182,7 +182,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", type=Path, required=True)
     parser.add_argument("--resources", type=Path, required=True)
-    parser.add_argument("--expected-version", default="0.5.5")
+    parser.add_argument("--expected-version", default="0.5.6")
     parser.add_argument("--report", type=Path, required=True)
     arguments = parser.parse_args(argv)
     report = {"ok": False, "hardware_operations": False}
