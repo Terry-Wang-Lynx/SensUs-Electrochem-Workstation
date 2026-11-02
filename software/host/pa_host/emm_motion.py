@@ -862,7 +862,7 @@ class SharedEmmBus:
                         deadline = self._arrival_verification_deadline(deadline, operation_deadline)
                         arrival_verification_started = True
                     stable_samples = stable_samples + 1 if reached else 0
-                    if stable_samples >= 2:
+                    if stable_samples >= (1 if not pulses else 2):
                         deadline = self._arrival_verification_deadline(deadline, operation_deadline)
                         if command_outstanding:
                             state, settled_target = self._settle_automatic_axis(axis, quantized_target, tolerance, calibration,

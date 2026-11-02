@@ -411,8 +411,8 @@ experiment.bindings.boards={A:{address:'uuid-a',settings:{analysis_channel:4}},B
 experiment.electrodes[1].enabled=false;
 console.log(JSON.stringify(ui.boardElectrodeMapping(experiment)));
 """)
-    assert result == [{"slot": "A", "address": "uuid-a", "channels": [{"electrode": "A", "channel": 1}, {"electrode": "B", "channel": 2}, {"electrode": "C", "channel": 3}, {"electrode": "D", "channel": 4}]},
-                      {"slot": "B", "address": "uuid-b", "channels": [{"electrode": "E", "channel": 1}, {"electrode": "F", "channel": 2}, {"electrode": "G", "channel": 3}, {"electrode": "H", "channel": 4}]}]
+    assert result == [{"slot": "A", "address": "uuid-a", "channels": [{"electrode": "A", "channel": 1}, {"electrode": "B", "channel": 3}, {"electrode": "C", "channel": 4}, {"electrode": "D", "channel": 2}]},
+                      {"slot": "B", "address": "uuid-b", "channels": [{"electrode": "E", "channel": 1}, {"electrode": "F", "channel": 3}, {"electrode": "G", "channel": 4}, {"electrode": "H", "channel": 2}]}]
 
 
 def test_duration_caption_distinguishes_column_override_from_template_inheritance():

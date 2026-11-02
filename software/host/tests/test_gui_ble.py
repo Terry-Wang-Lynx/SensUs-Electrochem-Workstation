@@ -47,7 +47,7 @@ def test_ble_discovery_requires_protocol_verification_before_measurement(file_na
     result = _evaluate_gui_js(
         file_name, ["hardwareOperationStatus"],
         """
-const device={id:'ble:board',kind:'ble',transport:'ble',name:'pA-V5.2',
+const device={id:'ble:board',kind:'ble',transport:'ble',name:'pa-v52-a',
   address:'board',selectable:true,protocol_verified:false};
 const state={devices:{devices:[device]}};
 const discovered=hardwareOperationStatus();
@@ -71,7 +71,7 @@ def test_ble_sidebar_reports_verification_without_claiming_usb_model():
         """
 const nodes=Object.fromEntries(['deviceDot','deviceState','deviceTransport','deviceStatus'].map(id=>[id,{}]));
 const $=id=>nodes[id];
-const device={id:'ble:board',kind:'ble',name:'pA-V5.2',address:'board',rssi:-61,selectable:true,protocol_verified:false};
+const device={id:'ble:board',kind:'ble',name:'pa-v52-a',address:'board',rssi:-61,selectable:true,protocol_verified:false};
 const state={devices:{devices:[device]},measurement:{state:'idle'}};
 renderHardwareConnection();
 const discovered={title:nodes.deviceState.textContent,detail:deviceCardDetail(device)};
@@ -98,8 +98,8 @@ const verified={title:nodes.deviceState.textContent,detail:nodes.deviceTransport
         {"id": "ble:cached", "kind": "ble", "address": "cached", "selectable": True},
     ], "蓝牙扫描失败", "权限"),
     ({"state": "complete", "count": 2}, [
-        {"id": "ble:first", "kind": "ble", "name": "pA-V5.2", "address": "first", "selectable": True},
-        {"id": "ble:second", "kind": "ble", "name": "pA-V5.2", "address": "second", "selectable": True},
+        {"id": "ble:first", "kind": "ble", "name": "pa-v52-a", "address": "first", "selectable": True},
+        {"id": "ble:second", "kind": "ble", "name": "pa-v52-a", "address": "second", "selectable": True},
     ], "发现 2 块蓝牙采集板", "上次扫描"),
 ])
 def test_ble_sidebar_distinguishes_not_scanned_empty_error_and_two_boards(scan, devices, title, detail):

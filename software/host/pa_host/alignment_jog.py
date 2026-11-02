@@ -14,7 +14,7 @@ class AlignmentJog:
     LEASE_SECONDS = 0.35
     MAX_SEGMENT_SECONDS = 0.12
     MAX_SEGMENT_MM = 0.1
-    HARD_MAX_SPEED = 20.0
+    HARD_MAX_SPEED = 80.0
     MAX_PRESS_IDS = 10000
     IDLE_REFRESH_SECONDS = 0.5
     DIRECTIONS = {("X", "left"): 0, ("X", "right"): 1, ("Z", "up"): 1, ("Z", "down"): 0}

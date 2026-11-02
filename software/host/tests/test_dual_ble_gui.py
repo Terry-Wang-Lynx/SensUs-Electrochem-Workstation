@@ -9,8 +9,8 @@ BOARD_BOOTSTRAP = """
 experiment.bindings.boards={A:{address:'front-uuid',settings:{fsr_nA:50}},B:{address:'rear-uuid',settings:{fsr_nA:100}}};
 const boardTimers=[];globalThis.setInterval=callback=>{boardTimers.push(callback);return boardTimers.length;};
 root.classList.toggle('active',true);
-let boardSnapshot={devices:[{id:'ble:rear-uuid',kind:'ble',address:'rear-uuid',name:'pA-V5.2',connection_state:'disconnected'},
- {id:'ble:front-uuid',kind:'ble',address:'front-uuid',name:'pA-V5.2',connection_state:'connected',protocol_verified:true}],
+let boardSnapshot={devices:[{id:'ble:rear-uuid',kind:'ble',address:'rear-uuid',name:'pa-v52-b',connection_state:'disconnected'},
+ {id:'ble:front-uuid',kind:'ble',address:'front-uuid',name:'pa-v52-a',connection_state:'connected',protocol_verified:true}],
  bindings:JSON.parse(JSON.stringify(experiment.bindings.boards)),connections:{'front-uuid':{state:'connected',protocol_verified:true},'rear-uuid':{state:'disconnected'}},busy:false};
 let boardFailure=null,partialFailure=false,motorBusy=false;
 const boardFetch=globalThis.fetch;
@@ -48,8 +48,8 @@ def test_normal_panel_has_explicit_slot_selection_without_automatic_binding():
     assert result["supported"]
     assert result["selected"] == ["front-uuid", "rear-uuid"]
     assert "远离 Z 轴电机" in result["headings"][0]
-    assert any("pA-V5.2" in option and "front-uuid" in option for option in result["options"])
-    assert any("pA-V5.2" in option and "rear-uuid" in option for option in result["options"])
+    assert any("pa-v52-a" in option and "front-uuid" in option for option in result["options"])
+    assert any("pa-v52-b" in option and "rear-uuid" in option for option in result["options"])
     assert "已连接" in result["statuses"][0]
     assert "未连接" in result["statuses"][1]
     assert result["writes"] == []
@@ -73,14 +73,14 @@ def test_scan_and_poll_preserve_pending_swap_and_save_both_slots_atomically():
 
 def test_uuid_case_differences_do_not_duplicate_options_or_clear_selection():
     result = evaluate_boards("""
-(async()=>{boardSnapshot.devices=[{id:'ble:FRONT-UUID',kind:'ble',address:'FRONT-UUID',name:'pA-V5.2'},...boardSnapshot.devices];
+(async()=>{boardSnapshot.devices=[{id:'ble:FRONT-UUID',kind:'ble',address:'FRONT-UUID',name:'pa-v52-a'},...boardSnapshot.devices];
  await openBoards();const selector=elements.get('htBoardSelect-A');
  console.log(JSON.stringify({options:selector.options.map(option=>({value:option.value,text:option.textContent})),selected:selector.value,
  state:elements.get('htBoardConnection-A').textContent}));})();
 """)
     assert len(result["options"]) == 3
     assert result["selected"] == "FRONT-UUID"
-    assert result["options"][1]["text"] == "pA-V5.2 · FRONT-UUID"
+    assert result["options"][1]["text"] == "pa-v52-a · FRONT-UUID"
     assert "已连接" in result["state"]
 
 

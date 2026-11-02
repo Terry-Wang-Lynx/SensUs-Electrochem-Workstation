@@ -31,8 +31,8 @@ def test_read_only_discovery_does_not_claim_radio_on_or_start_scan(ble_status, m
 
 
 def test_explicit_ble_scan_counts_distinct_same_name_boards(ble_status, monkeypatch):
-    rows = [{"id": "ble:first", "kind": "ble", "name": "pA-V5.2", "address": "first", "selectable": True},
-            {"id": "ble:second", "kind": "ble", "name": "pA-V5.2", "address": "second", "selectable": True}]
+    rows = [{"id": "ble:first", "kind": "ble", "name": "pa-v52-a", "address": "first", "selectable": True},
+            {"id": "ble:second", "kind": "ble", "name": "pa-v52-b", "address": "second", "selectable": True}]
     scanner = Mock(return_value=rows)
     monkeypatch.setattr(gui_server.v52_ble, "scan_devices", scanner)
     result = gui_server._scan_ble_devices()

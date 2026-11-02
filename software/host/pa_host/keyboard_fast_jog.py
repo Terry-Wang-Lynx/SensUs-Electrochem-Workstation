@@ -8,7 +8,7 @@ import time
 from .emm_motion import MotionError, _MotionCancellation, _number
 
 
-FAST_MAX_SPEED = 20.0
+FAST_MAX_SPEED = 80.0
 FAST_LOOKAHEAD_MM = 6.0
 FAST_ACCELERATION = 250
 FAST_SETTLING_RESERVE_MM = 0.1
@@ -57,8 +57,8 @@ def run_fast_alignment(bus, axis, direction, speed_mm_s, max_speed_mm_s, max_dis
     duration = None if continuous else _number(duration_s, "duration_s", positive=True)
     rpm = math.floor(speed * 60 / config["lead_mm"])
     if (not 2 < speed <= min(maximum, config["max_speed_mm_s"], FAST_MAX_SPEED)
-            or maximum > FAST_MAX_SPEED or not 1 <= rpm <= 3000):
-        raise MotionError("speed_range", "Fast alignment requires >2..20 mm/s within the configured axis limit")
+            or maximum > FAST_MAX_SPEED or not 1 <= rpm <= 6000):
+        raise MotionError("speed_range", "Fast alignment requires >2..80 mm/s within the configured axis limit")
     if not continuous and (distance > 10 or duration > 30):
         raise MotionError("move_duration", "A fast hold is bounded to 10 mm and 30 seconds")
     with bus._operation():

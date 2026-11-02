@@ -11,7 +11,7 @@ from pa_host import v52_ble
 def test_scan_miss_uses_verified_windows_identity_without_starting_acquisition(monkeypatch, cached):
     class BleakDeviceNotFoundError(Exception):
         pass
-    target = SimpleNamespace(address='E1:DF:A0:57:D8:78', name='pA-V5.2')
+    target = SimpleNamespace(address='E1:DF:A0:57:D8:78', name='pa-v52-a')
     instances = []
     class Client:
         def __init__(self, device, **options):

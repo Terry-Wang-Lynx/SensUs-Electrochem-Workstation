@@ -22,6 +22,15 @@ from .experiment_progress import Progress
 
 API_PREFIX = "/api/automation/v1"
 CHANNELS = "ABCDEFGH"
+PHYSICAL_BOARD_CHANNELS = (1, 3, 4, 2)
+
+
+def _electrode_board_channel(channel: str) -> int:
+    return PHYSICAL_BOARD_CHANNELS[CHANNELS.index(channel) % 4]
+
+
+def _board_channel_to_electrode(slot: str, board_channel: int) -> str:
+    return CHANNELS[(0 if slot == "A" else 4) + PHYSICAL_BOARD_CHANNELS.index(board_channel)]
 MAX_STEPS = 500
 MAX_SECONDS = 8 * 3600
 MAX_MOTION_CHECK_STEPS = 50000
@@ -123,10 +132,10 @@ def default_experiment(output_dir=""):
             "bindings": {"boards": {slot: {"address": "", "settings": {}} for slot in "AB"},
                          "motion": {"port": "", "baud": 115200, "axes": {
                              axis: {"address": address, "lead_mm": 2, "travel_mm": travel,
-                                    "positive_direction": 0, "max_speed_mm_s": 10}
+                                    "positive_direction": 0, "max_speed_mm_s": 80}
                              for axis, address, travel in (("X", 1, 150), ("Z", 2, 50))}}},
-            "defaults": {"descend_speed_mm_s": 0.5, "ascend_speed_mm_s": 1,
-                         "translate_speed_mm_s": 2, "dwell_s": 180, "settle_s": 2,
+            "defaults": {"descend_speed_mm_s": 10, "ascend_speed_mm_s": 10,
+                         "translate_speed_mm_s": 10, "dwell_s": 180, "settle_s": 0.5,
                          "z_safe_mm": 0, "z_immersed_mm": 6, "x_first_mm": 0,
                          "column_pitch_mm": 9, "channels": list(CHANNELS)},
             "electrodes": [{"id": channel, "name": f"样品{channel}"} for channel in CHANNELS],
@@ -228,7 +237,7 @@ def compile_experiment(document):
         _text(board.get("address"), f"bindings.boards.{slot}.address", 200, True)
         settings = _object(board.get("settings"), f"bindings.boards.{slot}.settings")
         _keys(settings, {*v52_ble.DEFAULTS, "board_profile", "protocol", "offset_nA", "conv_time_code",
-                         "conv_code", "charge_pump", "cp"}, f"bindings.boards.{slot}.settings")
+                         "conv_code", "charge_pump", "cp", "channel_potentials_v"}, f"bindings.boards.{slot}.settings")
         for key, value in settings.items():
             expected = v52_ble.DEFAULTS.get(key)
             if isinstance(expected, (int, float)) and not isinstance(expected, bool):
@@ -247,13 +256,28 @@ def compile_experiment(document):
     electrodes = experiment.get("electrodes")
     if not isinstance(electrodes, list) or len(electrodes) != 8:
         raise AutomationError("invalid_value", "Define eight electrode identities", "electrodes")
+    electrode_potentials = {"A": {}, "B": {}}
     for index, electrode in enumerate(electrodes):
         _object(electrode, f"electrodes[{index}]")
-        _keys(electrode, {"id", "name"}, f"electrodes[{index}]")
+        _keys(electrode, {"id", "name", "potential_v"}, f"electrodes[{index}]")
         _text(electrode.get("id"), f"electrodes[{index}].id", 1)
         _text(electrode.get("name"), f"electrodes[{index}].name")
+        if electrode.get("potential_v") is not None:
+            p_v = _number(electrode.get("potential_v"), f"electrodes[{index}].potential_v", -0.4, 0.4)
+            eid = electrode["id"]
+            if eid in CHANNELS:
+                slot = "A" if CHANNELS.index(eid) < 4 else "B"
+                electrode_potentials[slot][str(_electrode_board_channel(eid))] = float(p_v)
     if sorted(electrode.get("id", "") for electrode in electrodes) != list(CHANNELS):
         raise AutomationError("invalid_value", "Electrode ids must uniquely cover A–H", "electrodes")
+    for slot in "AB":
+        merged_potentials = dict(boards[slot]["settings"].get("channel_potentials_v") or {})
+        merged_potentials.update(electrode_potentials[slot])
+        if merged_potentials:
+            try:
+                v52_ble.validate_settings({**boards[slot]["settings"], "channel_potentials_v": merged_potentials})
+            except (TypeError, ValueError) as error:
+                raise AutomationError("invalid_value", str(error), f"bindings.boards.{slot}.settings") from error
     columns = experiment.get("columns")
     if not isinstance(columns, list) or not 1 <= len(columns) <= 12:
         raise AutomationError("invalid_value", "Define 1–12 columns", "columns")
@@ -408,13 +432,17 @@ def compile_experiment(document):
                     channels = list(resolved_windows)
                     if not channels:
                         raise AutomationError("invalid_value", "A guided dwell requires at least one nonzero acquisition window", f"{action_path}.windows")
-                masks = {slot: sum(1 << (CHANNELS.index(channel) % 4) for channel in channels
+                masks = {slot: sum(1 << (_electrode_board_channel(channel) - 1) for channel in channels
                                    if (CHANNELS.index(channel) // 4 == slot_index)) for slot_index, slot in enumerate("AB")}
                 settings = {}
                 for slot, mask in masks.items():
                     if mask:
                         try:
-                            settings[slot] = v52_ble.validate_settings({**boards[slot]["settings"], "duration_s": max(10, seconds) if guided else seconds,
+                            merged_potentials = dict(boards[slot]["settings"].get("channel_potentials_v") or {})
+                            merged_potentials.update(electrode_potentials[slot])
+                            extra_potentials = {"channel_potentials_v": merged_potentials} if merged_potentials else {}
+                            settings[slot] = v52_ble.validate_settings({**boards[slot]["settings"], **extra_potentials,
+                                "duration_s": max(10, seconds) if guided else seconds,
                                 "adaptive_stop": False, "analysis_channel": next(channel for channel in range(1, 5) if mask & (1 << (channel - 1)))})
                             if seconds < v52_ble.period_seconds(settings[slot]["sens_period_code"]):
                                 raise ValueError("Acquisition duration must include at least one conversion period")
@@ -518,7 +546,9 @@ def experiment_schema(version="1.0"):
     settings_properties = {key: {"type": "boolean" if isinstance(value, bool) else "number" if isinstance(value, (int, float)) else "string"}
                            for key, value in v52_ble.DEFAULTS.items()}
     settings_properties.update({key: {"type": "number"} for key in ("offset_nA", "conv_time_code", "conv_code", "charge_pump", "cp")})
-    settings_properties.update(board_profile={"const": "v52"}, protocol={"const": v52_ble.PROTOCOL})
+    settings_properties.update(board_profile={"const": "v52"}, protocol={"const": v52_ble.PROTOCOL},
+                               channel_potentials_v={"type": "object", "propertyNames": {"enum": ["1", "2", "3", "4"]},
+                                                     "additionalProperties": {"type": "number", "minimum": -0.4, "maximum": 0.4}})
     board_schema = {"type": "object", "required": ["address", "settings"], "additionalProperties": False,
                     "properties": {"address": {"type": "string", "maxLength": 200},
                                    "settings": {"type": "object", "properties": settings_properties, "additionalProperties": False}}}
@@ -538,7 +568,8 @@ def experiment_schema(version="1.0"):
                            "defaults": {"type": "object", "required": sorted(PARAMETERS), "properties": params, "additionalProperties": False},
                            "electrodes": {"type": "array", "minItems": 8, "maxItems": 8, "items": {
                                "type": "object", "required": ["id", "name"], "additionalProperties": False,
-                               "properties": {"id": {"enum": list(CHANNELS)}, "name": text_schema}}},
+                               "properties": {"id": {"enum": list(CHANNELS)}, "name": text_schema,
+                                              "potential_v": {"anyOf": [{"type": "number", "minimum": -0.4, "maximum": 0.4}, {"type": "null"}]}}}},
                            "columns": {"type": "array", "minItems": 1, "maxItems": 12, "items": {
                                "type": "object", "required": ["index", "solution", "concentration"], "additionalProperties": False,
                                "properties": {"index": {"type": "integer", "minimum": 1, "maximum": 12}, "solution": text_schema,
@@ -661,7 +692,7 @@ def openapi_document():
                         required.append("sequence")
                     if name.endswith("/config"):
                         for field in ("speed_mm_s", "max_speed_mm_s"):
-                            properties[field] = {"type": "number", "exclusiveMinimum": 0, "maximum": 20}
+                            properties[field] = {"type": "number", "exclusiveMinimum": 0, "maximum": 80}
                             required.append(field)
                         properties["fast_motion_confirmed"] = {"type": "boolean", "description":
                             "Must be true above 2 mm/s: electrodes clear of wells and at least 10 mm clear travel"}
@@ -1309,7 +1340,7 @@ class AutomationController:
                 (self._run_dir / name).touch(exist_ok=False)
             channels = [{"id": electrode["id"], "name": electrode["name"],
                          "board_slot": "A" if CHANNELS.index(electrode["id"]) < 4 else "B",
-                         "channel": CHANNELS.index(electrode["id"]) % 4 + 1,
+                         "channel": _electrode_board_channel(electrode["id"]),
                          "time_s": [], "current_nA": [], "valid": False, "latest_current_nA": None,
                          "synthetic": mode == "simulate"} for electrode in self._experiment["electrodes"]]
             self._state.update(state="running", mode=mode, run_id=run_id, step_index=-1, column=None,
@@ -1368,7 +1399,7 @@ class AutomationController:
         record = {"run_id": self._state["run_id"], "step_id": step["id"], "column": step["column"],
                   "solution": step.get("solution"), "concentration": step.get("concentration"),
                   "electrode_id": channel, "electrode_name": electrode["name"], "board_slot": slot,
-                  "board_address": identity["address"], "channel": channel_index % 4 + 1,
+                  "board_address": identity["address"], "channel": _electrode_board_channel(channel),
                   "host_utc": _utc(timestamp), "synthetic": synthetic, **data,
                   "device_fingerprint": _hash(identity), "electrode_fingerprint": _hash(electrode),
                   "config_fingerprint": _hash(config), "step_fingerprint": step["fingerprint"]}
@@ -1974,7 +2005,7 @@ class AutomationController:
             child["sample_counts"][board_channel] = child["sample_counts"].get(board_channel, 0) + 1
             if child["first_host_time"] is None:
                 child["first_host_time"] = timestamp
-            channel = CHANNELS[(0 if child["slot"] == "A" else 4) + board_channel - 1]
+            channel = _board_channel_to_electrode(child["slot"], board_channel)
             metadata = {}
             elapsed = timestamp - child["first_host_time"]
             if child.get("attempt_id") is not None:

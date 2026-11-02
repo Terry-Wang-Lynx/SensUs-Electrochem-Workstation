@@ -1,6 +1,8 @@
 (function (scope) {
   'use strict';
   const CHANNELS = 'ABCDEFGH'.split('');
+  const PHYSICAL_BOARD_CHANNELS = [1, 3, 4, 2];
+  const boardChannelForElectrode = id => PHYSICAL_BOARD_CHANNELS[CHANNELS.indexOf(id) % 4];
   const API_ROOT = '/api/automation/v1/';
   const FRONTEND_BUILD = '2026-11-01 · AFE bias';
   const copy = value => JSON.parse(JSON.stringify(value));
@@ -30,12 +32,33 @@
     if (!SAMPLING_OFFSETS.includes(settings.offset_mode)) invalid('请选择 V5.2 偏置电流', 'offset_mode');
     const offset = settings.offset_mode.endsWith('pct') ? settings.fsr_nA * Number(settings.offset_mode.slice(0, -3)) / 100 : Number(settings.offset_mode.slice(0, -2));
     if (offset >= settings.fsr_nA) invalid('偏置电流须小于所选量程', 'offset_mode');
-    return Object.fromEntries(SAMPLING_FIELDS.map(field => [field, settings[field]]));
+    const result = Object.fromEntries(SAMPLING_FIELDS.map(field => [field, settings[field]]));
+    if (settings.electrode_potentials && typeof settings.electrode_potentials === 'object') {
+      const overrides = {};
+      for (const [id, raw] of Object.entries(settings.electrode_potentials)) {
+        if (!CHANNELS.includes(id)) invalid('电极身份须为 A–H', 'electrode_potentials.' + id);
+        if (raw === null || raw === undefined || raw === '') continue;
+        const val = Number(raw);
+        if (!Number.isFinite(val) || val < -0.4 || val > 0.4) invalid(`电极 ${id} 电位须在 −0.4 至 +0.4 V 之间`, 'electrode_potentials.' + id);
+        const re = settings.working_electrode_v - val;
+        if (re < 0.1 || re > 1.535625) invalid(`电极 ${id} 对应的 RE 超出 0.1 至 1.535625 V 范围`, 'electrode_potentials.' + id);
+        overrides[id] = val;
+      }
+      for (const [slot, group] of [['A', CHANNELS.slice(0, 4)], ['B', CHANNELS.slice(4, 8)]]) {
+        const distinctRe = new Set(group.map(id => {
+          const p = overrides[id] ?? settings.potential_v;
+          return Math.round((settings.working_electrode_v - p) * 1e6 / 375) * 375;
+        }));
+        if (distinctRe.size > 3) invalid(`板 ${slot} 最多同时支持 3 种不同测试电位（DAC B/C/D）`, 'electrode_potentials');
+      }
+      if (Object.keys(overrides).length) result.electrode_potentials = overrides;
+    }
+    return result;
   }
 
   function boardElectrodeMapping(document) {
     return ['A', 'B'].map((slot, offset) => ({slot, address: document.bindings?.boards?.[slot]?.address || '',
-      channels: CHANNELS.slice(offset * 4, offset * 4 + 4).map((electrode, index) => ({electrode, channel: index + 1}))}));
+      channels: CHANNELS.slice(offset * 4, offset * 4 + 4).map(electrode => ({electrode, channel: boardChannelForElectrode(electrode)}))}));
   }
 
   function columnDurationCaption(document, index) {
@@ -217,11 +240,33 @@
       this.edit(document => { document.electrodes.find(item => item.id === id).enabled = !!enabled; });
     };
     model.applySharedSampling = function (settings) {
-      const shared = validateSamplingParameters(settings);
+      const validated = validateSamplingParameters(settings);
+      const {electrode_potentials, ...shared} = validated;
+      const hasElectrodeField = settings && typeof settings === 'object' && 'electrode_potentials' in settings;
       this.edit(document => {
         for (const slot of ['A', 'B']) {
           const board = document.bindings.boards[slot];
           board.settings = {...board.settings, ...shared};
+          if (hasElectrodeField) {
+            const group = slot === 'A' ? CHANNELS.slice(0, 4) : CHANNELS.slice(4, 8);
+            const boardPotentials = {};
+            for (const id of group) {
+              if (electrode_potentials && Number.isFinite(electrode_potentials[id])) {
+                boardPotentials[String(boardChannelForElectrode(id))] = electrode_potentials[id];
+              }
+            }
+            if (Object.keys(boardPotentials).length) board.settings.channel_potentials_v = boardPotentials;
+            else delete board.settings.channel_potentials_v;
+          }
+        }
+        if (hasElectrodeField && Array.isArray(document.electrodes)) {
+          for (const electrode of document.electrodes) {
+            if (electrode_potentials && Number.isFinite(electrode_potentials[electrode.id])) {
+              electrode.potential_v = electrode_potentials[electrode.id];
+            } else {
+              delete electrode.potential_v;
+            }
+          }
         }
       });
     };
@@ -333,8 +378,8 @@
 
   function validateJogSettings(speed_mm_s = 0.5, max_speed_mm_s = 1, fast_motion_confirmed = false) {
     if (!Number.isFinite(speed_mm_s) || !Number.isFinite(max_speed_mm_s) || speed_mm_s <= 0
-      || max_speed_mm_s <= 0 || max_speed_mm_s > 20 || speed_mm_s > max_speed_mm_s) {
-      throw failure('JOG_SPEED_INVALID', '目标速度须大于 0 且不超过本次上限；上限最多 20 mm/s');
+      || max_speed_mm_s <= 0 || max_speed_mm_s > 80 || speed_mm_s > max_speed_mm_s) {
+      throw failure('JOG_SPEED_INVALID', '目标速度须大于 0 且不超过本次上限；上限最多 80 mm/s');
     }
     if (max_speed_mm_s > 2 && fast_motion_confirmed !== true) throw failure('JOG_SPEED_INVALID', '快移速度启用前，请先确认电极已离孔、运动方向至少有 10 mm 净空');
     return {speed_mm_s, max_speed_mm_s, ...(max_speed_mm_s > 2 ? {fast_motion_confirmed: true} : {})};
@@ -538,10 +583,10 @@
     '<div id="htSimulationNotice" class="ht-message ht-simulation">模拟实验 · 生成合成数据，不操作实物。3D 仅作流程示意。</div>',
     '<div id="htLiveGate" class="ht-message ht-live-gate" hidden><label class="ht-check"><input id="htLiveConfirmed" type="checkbox">本次允许驱动实物与电极，已确认装夹、工作高度、安全高度及高级设置中的运动与电气策略</label></div>',
     '<section class="panel ht-template-panel"><div class="ht-template-fields"><label>实验模板<select id="htTemplate"><option value="template1">Template 1 · 逐列实验</option></select></label><label>实验名称<input id="htName" aria-label="实验名称"></label><label>模板默认（未覆盖列适用，s）<input id="htDefaultDuration" type="number" min="0.001" step="any" value="180"></label><button id="htSave" class="secondary" type="button">保存模板</button></div><div class="ht-template-summary"><span id="htSelectionSummary">固定物理列 1–12 · 电极 A–H</span><div class="ht-template-tabs" role="tablist" aria-label="模板参数与板卡对应"><button id="htSamplingToggle" type="button" role="tab" aria-selected="false" aria-controls="htSamplingPanel">采样参数（8电极共用）</button><button id="htMappingToggle" type="button" role="tab" aria-selected="false" aria-controls="htMappingPanel">板卡与电极对应</button></div><span id="htEditorState">加载中</span></div>',
-    '<section id="htSamplingPanel" class="ht-template-pane" role="tabpanel" aria-labelledby="htSamplingToggle" hidden><p id="htSharedSamplingState" class="ht-sampling-state" role="status">正在读取两板参数…</p><div class="ht-sampling-fields"><label>测试电位 WE−RE (V)<input id="htSharedPotential" type="number" min="-0.4" max="0.4" step="0.01"></label><label>WE 电位 (V)<input id="htSharedWorkingElectrode" type="number" min="0.25" max="1.535" step="0.01"></label><label>硬件采样周期<select id="htSharedPeriod"></select></label><label>电流量程<select id="htSharedFsr"></select></label><label>偏置电流<select id="htSharedOffset"></select></label></div><p id="htSharedPotentialSummary" class="ht-hint"></p><div class="ht-sampling-footer"><p class="ht-hint">当前模板给板 A 的 A–D、板 B 的 E–H 各四路统一设置；板内 DAC / 采样周期共享，量程逐通道配置。此处显式应用相同参数到两板，仅修改模板，实物运行时才下发。</p><button id="htApplySharedSampling" class="secondary" type="button">应用到两块板</button></div></section>',
+    '<section id="htSamplingPanel" class="ht-template-pane" role="tabpanel" aria-labelledby="htSamplingToggle" hidden><p id="htSharedSamplingState" class="ht-sampling-state" role="status">正在读取两板参数…</p><div class="ht-sampling-fields"><label>默认测试电位 WE−RE (V)<input id="htSharedPotential" type="number" min="-0.4" max="0.4" step="0.01"></label><label>WE 电位 (V)<input id="htSharedWorkingElectrode" type="number" min="0.25" max="1.535" step="0.01"></label><label>硬件采样周期<select id="htSharedPeriod"></select></label><label>电流量程<select id="htSharedFsr"></select></label><label>偏置电流<select id="htSharedOffset"></select></label></div><div class="ht-small-head"><strong>各电极独立电位 WE−RE (V，留空继承默认；每板最多 3 种不同电位)</strong><div><button id="htPresetEvapCal" class="text-button" type="button">预设：A–G −0.2 V + H +0.2 V（蒸发校准）</button><button id="htPresetUniformPotential" class="text-button" type="button">8 路统一电位</button></div></div><div id="htElectrodePotentials" class="ht-window-grid"></div><p id="htSharedPotentialSummary" class="ht-hint"></p><div class="ht-sampling-footer"><p class="ht-hint">板 A（A–D）与板 B（E–H）各自包含 DAC A（共用 WE）与 DAC B/C/D（支持同板最多 3 种不同 RE 电位，如 7 路 −0.2 V + 1 路 +0.2 V 蒸发校准）。点击「应用到两块板」保存至模板，实物运行时自动下发。</p><button id="htApplySharedSampling" class="secondary" type="button">应用到两块板</button></div></section>',
     '<section id="htMappingPanel" class="ht-template-pane" role="tabpanel" aria-labelledby="htMappingToggle" hidden><div class="ht-editor-actions"><button id="htBoardScan" class="secondary" type="button">扫描蓝牙板卡</button><button id="htBoardBind" class="secondary" type="button">保存 A / B 对应</button><button id="htBoardConnect" class="primary" type="button">连接已绑定板卡</button></div><p id="htBoardNotice" class="ht-hint" role="status">打开面板后读取连接状态</p><div id="htBoardMapping" class="ht-board-mapping"></div><p class="ht-hint">请自行核对实物，将前板指定为 A、后板指定为 B；软件不按扫描顺序、广播名或信号强度判断前后。可将不用的槽位留空。BLE 连接与主界面的单板测量目标独立；软件通道对应仍需核对实际接线。</p></section></section>',
     '<section class="panel ht-calibration-strip"><div><strong>本次上电四点标定</strong><p id="htCalibrationSummary">正在读取标定状态…</p></div><button id="htCalibrationToggle" class="secondary" type="button" aria-expanded="false">标定 / 查看</button></section>',
-    '<section id="htCalibrationPanel" class="panel ht-calibration-panel" hidden><div class="ht-section-head"><h3>键盘四点标定 · 第 1 / 12 列与工作 / 安全高度</h3><button id="htCalibrationHide" class="text-button" type="button">收起</button></div><div class="ht-pad"><p id="htCalibrationWarning" class="ht-calibration-warning">保持电机供电，确认电极、孔板与两轴有充足运动余量。进入标定后保持锁轴，用 WASD / 方向键或按住下方箭头对位；松开即请求停止。物理第 1 / 12 列只记录 X，浸入工作 Z 与提出安全 Z 独立记录。</p><p id="htCalibrationAxisStatus" class="ht-calibration-axis-state" role="status">双轴状态未确认</p><label id="htKeyboardConfirmation" class="ht-check"><input id="htCalibrationMotionConfirmed" type="checkbox">已确认电极与孔板姿态、两轴运动余量，允许本次键盘标定运动</label><div id="htLegacyManualConfirmations" hidden><input id="htCalibrationReleaseConfirmed" type="checkbox"><input id="htCalibrationZSupported" type="checkbox"></div><button id="htCalibrationBegin" class="secondary" type="button">进入键盘标定</button><div id="htKeyboardAlignment" class="ht-keyboard-alignment"><div class="ht-jog-settings"><label>目标速度 (mm/s)<input id="htJogSpeed" type="number" min="0.001" max="1" step="0.05" value="0.5"></label><label>本次速度上限 (mm/s)<input id="htJogMaxSpeed" type="number" min="0.001" max="20" step="0.1" value="1"></label><button id="htJogApply" class="secondary" type="button">应用速度</button></div><div class="ht-editor-actions"><button id="htJogFine" class="secondary" type="button">精调 0.5 mm/s</button><button id="htJogFast" class="secondary" type="button">快移 20 mm/s</button><label id="htJogFastClearance" class="ht-check" hidden><input id="htJogFastConfirmed" type="checkbox">已确认电极离孔，运动方向至少有 10 mm 净空</label></div><div class="ht-jog-pad" aria-label="按住对位，松开停止"><button id="htJogUp" type="button" class="secondary" aria-label="按住 Z 上移">↑<span>W · Z 上</span></button><button id="htJogLeft" type="button" class="secondary" aria-label="按住 X 左移">←<span>A · X 左</span></button><button id="htJogStop" type="button" class="danger">停止</button><button id="htJogRight" type="button" class="secondary" aria-label="按住 X 右移">→<span>D · X 右</span></button><button id="htJogDown" type="button" class="secondary" aria-label="按住 Z 下移">↓<span>S · Z 下</span></button></div><p id="htJogStatus" class="ht-jog-status" role="status">进入键盘标定后可按住方向对位</p><p id="htJogFeedback" class="ht-hint">实际位移以编码器反馈为准。</p><p class="ht-hint">速度是指令目标值；短按包含通信、加减速时间，不能用按键时长当实测位移。按住持续移动，松开停止；不再按固定距离或时长中断。快移待执行指令缓冲 ≤6 mm（不是总行程限制），会滚动续接；断连仍可能走完已下发部分。请持续观察剩余行程并提前松键。未标定机械零点，默认 X150 / Z50 行程不作为键盘边界；请目视留足余量。仅明确设置的方向保护、控制器计数范围、活动轴反馈与停止保护有效。运动中另一轴暂停轮询、读数可过期，松开后复核双轴。仅本标定面板与窗口可见、获得焦点时接受方向键；多键同时按下会停止。软件断线停止不能替代现场急停与机械余量。</p></div><div id="htCalibrationSteps" class="ht-calibration-steps"><button id="htCaptureFirst" class="secondary" type="button">读取第 1 列 X</button><button id="htCaptureLast" class="secondary" type="button">读取第 12 列 X</button><button id="htCaptureWorking" class="secondary" type="button">读取浸入工作 Z</button><button id="htCaptureSafe" class="secondary" type="button">读取提出安全 Z</button></div><p id="htCalibrationProgress" role="status"></p><div class="ht-editor-actions"><button id="htCalibrationFinish" class="primary" type="button">完成四点标定</button><button id="htCalibrationCancel" class="secondary" type="button">取消标定</button></div><p class="ht-hint">读取、完成或取消前先停止按键运动。四点只属于本次连接；断电或重连后须重新标定。不会回零、清零或自动返回。控制器旧目标与当前位置不一致时拒绝进入，请停止操作并按提示重新上电，勿再手拧轴。</p></div></section>',
+    '<section id="htCalibrationPanel" class="panel ht-calibration-panel" hidden><div class="ht-section-head"><h3>键盘四点标定 · 第 1 / 12 列与工作 / 安全高度</h3><button id="htCalibrationHide" class="text-button" type="button">收起</button></div><div class="ht-pad"><p id="htCalibrationWarning" class="ht-calibration-warning">保持电机供电，确认电极、孔板与两轴有充足运动余量。进入标定后保持锁轴，用 WASD / 方向键或按住下方箭头对位；松开即请求停止。物理第 1 / 12 列只记录 X，浸入工作 Z 与提出安全 Z 独立记录。</p><p id="htCalibrationAxisStatus" class="ht-calibration-axis-state" role="status">双轴状态未确认</p><label id="htKeyboardConfirmation" class="ht-check"><input id="htCalibrationMotionConfirmed" type="checkbox">已确认电极与孔板姿态、两轴运动余量，允许本次键盘标定运动</label><div id="htLegacyManualConfirmations" hidden><input id="htCalibrationReleaseConfirmed" type="checkbox"><input id="htCalibrationZSupported" type="checkbox"></div><button id="htCalibrationBegin" class="secondary" type="button">进入键盘标定</button><div id="htKeyboardAlignment" class="ht-keyboard-alignment"><div class="ht-jog-settings"><label>目标速度 (mm/s)<input id="htJogSpeed" type="number" min="0.001" max="1" step="0.05" value="0.5"></label><label>本次速度上限 (mm/s)<input id="htJogMaxSpeed" type="number" min="0.001" max="80" step="0.1" value="1"></label><button id="htJogApply" class="secondary" type="button">应用速度</button></div><div class="ht-editor-actions"><button id="htJogFine" class="secondary" type="button">精调 0.5 mm/s</button><button id="htJogFast" class="secondary" type="button">快移 20 mm/s</button><button id="htJogSuperFast" class="secondary" type="button">极速 60 mm/s</button><label id="htJogFastClearance" class="ht-check" hidden><input id="htJogFastConfirmed" type="checkbox">已确认电极离孔，运动方向至少有 10 mm 净空</label></div><div class="ht-jog-pad" aria-label="按住对位，松开停止"><button id="htJogUp" type="button" class="secondary" aria-label="按住 Z 上移">↑<span>W · Z 上</span></button><button id="htJogLeft" type="button" class="secondary" aria-label="按住 X 左移">←<span>A · X 左</span></button><button id="htJogStop" type="button" class="danger">停止</button><button id="htJogRight" type="button" class="secondary" aria-label="按住 X 右移">→<span>D · X 右</span></button><button id="htJogDown" type="button" class="secondary" aria-label="按住 Z 下移">↓<span>S · Z 下</span></button></div><p id="htJogStatus" class="ht-jog-status" role="status">进入键盘标定后可按住方向对位</p><p id="htJogFeedback" class="ht-hint">实际位移以编码器反馈为准。</p><p class="ht-hint">速度是指令目标值；短按包含通信、加减速时间，不能用按键时长当实测位移。按住持续移动，松开停止；不再按固定距离或时长中断。快移待执行指令缓冲 ≤6 mm（不是总行程限制），会滚动续接；断连仍可能走完已下发部分。请持续观察剩余行程并提前松键。未标定机械零点，默认 X150 / Z50 行程不作为键盘边界；请目视留足余量。仅明确设置的方向保护、控制器计数范围、活动轴反馈与停止保护有效。运动中另一轴暂停轮询、读数可过期，松开后复核双轴。仅本标定面板与窗口可见、获得焦点时接受方向键；多键同时按下会停止。软件断线停止不能替代现场急停与机械余量。</p></div><div id="htCalibrationSteps" class="ht-calibration-steps"><button id="htCaptureFirst" class="secondary" type="button">读取第 1 列 X</button><button id="htCaptureLast" class="secondary" type="button">读取第 12 列 X</button><button id="htCaptureWorking" class="secondary" type="button">读取浸入工作 Z</button><button id="htCaptureSafe" class="secondary" type="button">读取提出安全 Z</button></div><p id="htCalibrationProgress" role="status"></p><div class="ht-editor-actions"><button id="htCalibrationFinish" class="primary" type="button">完成四点标定</button><button id="htCalibrationCancel" class="secondary" type="button">取消标定</button></div><p class="ht-hint">读取、完成或取消前先停止按键运动。四点只属于本次连接；断电或重连后须重新标定。不会回零、清零或自动返回。控制器旧目标与当前位置不一致时拒绝进入，请停止操作并按提示重新上电，勿再手拧轴。</p></div></section>',
     '<div id="htLegacyCalibration" hidden>',
     '<section class="panel ht-calibration-strip ht-limits-strip"><div><strong>绝对运行限位</strong><p id="htLimitsSummary" role="status">正在读取限位状态…</p></div><button id="htLimitsToggle" class="secondary" type="button" aria-expanded="false" aria-controls="htLimitsPanel">设置 / 查看</button></section>',
     '<section id="htLimitsPanel" class="panel ht-limits-panel" hidden><div class="ht-section-head"><h3>绝对运行限位 · 四个安全边界</h3><button id="htLimitsHide" class="text-button" type="button">收起</button></div><div class="ht-pad"><p class="ht-hint">独立于孔板物理第 1 / 12 列、工作高度与安全高度标定。先主动开始，再按已验证的现场操作将轴对位并停稳，分别点击读取当前位置；按钮只读取编码器，不会移动、松轴、使能或回零。手拧后原位锁定仍须验证，既有标定门禁保持。</p><button id="htLimitsBegin" class="secondary" type="button">开始读取四个边界</button><div id="htLimitBoundaries" class="ht-limit-boundaries"></div><p id="htLimitsProgress" class="ht-hint" role="status"></p><p id="htLimitsSpan" class="ht-limit-span"></p><p id="htLimitsBinding" class="ht-hint"></p><label class="ht-check"><input id="htLimitsClearance" type="checkbox">已留安全余量，未把机械硬挡作为运行边界</label><div class="ht-editor-actions"><button id="htLimitsSave" class="primary" type="button">保存四边界限位</button><button id="htLimitsCancel" class="secondary" type="button">取消读取</button></div><p class="ht-limit-warning">这是软件保护：通信中断、电脑失效、驱动失控或惯性仍可能导致越界。独立保护需要硬限位开关 / 硬件急停；请为停止距离预留余量，不要碰撞机械硬挡找边界。</p><p class="ht-hint">重新连接后，已保存记录仅供查看，须重新读取四点才能用于当前连接。取消不恢复旧运动目标；模拟实验无需实物限位。</p></div></section>',
@@ -612,7 +657,11 @@
     const window = numberInput('htWindow-' + id, id, 's'); window.querySelector('input').min = '0.001'; element('htWindows').append(window);
     const delay = numberInput('htDelay-' + id, id + ' 起始延迟', 's'); delay.querySelector('input').min = '0'; element('htDelays').append(delay);
     for (const prefix of ['htWindow-', 'htDelay-']) element(prefix + id).addEventListener('input', () => updateWindow(id, prefix + id));
-    const identity = node('label', '', id + ' · 板 ' + (id < 'E' ? 'A' : 'B') + ' CH' + (CHANNELS.indexOf(id) % 4 + 1));
+    const potField = numberInput('htElectrodePotential-' + id, id + ' (' + (id < 'E' ? '板A' : '板B') + ' CH' + boardChannelForElectrode(id) + ')', 'V');
+    const potInput = potField.querySelector('input');
+    potInput.min = '-0.4'; potInput.max = '0.4'; potInput.step = '0.01'; potInput.placeholder = '跟随默认';
+    element('htElectrodePotentials')?.append(potField);
+    const identity = node('label', '', id + ' · 板 ' + (id < 'E' ? 'A' : 'B') + ' CH' + boardChannelForElectrode(id));
     const name = node('input'); name.id = 'htElectrode-' + id; identity.append(name); element('htElectrodes').append(identity);
     const card = node('article', 'ht-channel-card'); card.id = 'htCard-' + id;
     card.append(node('span', 'ht-channel-id', id), node('strong', 'ht-channel-value', '—'), node('span', 'ht-channel-unit', 'nA'), node('small', 'ht-channel-name', '等待记录'), node('small', 'ht-channel-detail', '尚无样本')); element('htChannels').append(card);
@@ -625,7 +674,7 @@
     const identity = node('code'); identity.id = 'htBoardIdentity-' + slot;
     const connection = node('p', 'ht-board-connection'); connection.id = 'htBoardConnection-' + slot; connection.setAttribute('role', 'status');
     const disconnect = node('button', 'secondary', '断开板 ' + slot); disconnect.id = 'htBoardDisconnect-' + slot; disconnect.type = 'button';
-    mapping.append(choiceLabel, identity, connection, node('p', '', CHANNELS.slice(slot === 'A' ? 0 : 4, slot === 'A' ? 4 : 8).map((electrode, index) => electrode + ' → CH' + (index + 1)).join(' · ')), disconnect);
+    mapping.append(choiceLabel, identity, connection, node('p', '', CHANNELS.slice(slot === 'A' ? 0 : 4, slot === 'A' ? 4 : 8).map(electrode => electrode + ' → CH' + boardChannelForElectrode(electrode)).join(' · ')), disconnect);
     element('htBoardMapping').append(mapping);
     const block = node('div'); block.append(node('h4', '', '板 ' + slot + ' · ' + (slot === 'A' ? 'A–D' : 'E–H')));
     const addressLabel = node('label', '', 'BLE 身份 / 地址'), address = node('input'); address.id = 'htBoardAddress-' + slot; addressLabel.append(address);
@@ -889,7 +938,7 @@
       element(id).disabled = !keyboardContext().active || jogSettingsDirty || limited;
       element(id).title = limited ? '该方向受到已报告的方向保护限制；反方向退出仍可用，不代表机械终点' : '';
     }
-    for (const id of ['htJogSpeed', 'htJogMaxSpeed', 'htJogApply', 'htJogFine', 'htJogFast', 'htJogFastConfirmed']) element(id).disabled = pending || !keyboardControllerAvailable() || !keyboardSessionOwned();
+    for (const id of ['htJogSpeed', 'htJogMaxSpeed', 'htJogApply', 'htJogFine', 'htJogFast', 'htJogSuperFast', 'htJogFastConfirmed']) if (element(id)) element(id).disabled = pending || !keyboardControllerAvailable() || !keyboardSessionOwned();
     keyboardInput.sync(guided);
     for (const input of root.querySelectorAll('.ht-template-panel input,.ht-template-panel select,.ht-column-panel input,.ht-electrode-panel input,.ht-column-choice input,.ht-advanced-section input,.ht-advanced-section textarea')) input.disabled = blocked;
     element('htJson').disabled = blocked;
@@ -1019,6 +1068,16 @@
     if (!draft) {
       element('htSharedPotential').value = shared.settings.potential_v; element('htSharedWorkingElectrode').value = shared.settings.working_electrode_v;
       element('htSharedPeriod').value = String(shared.settings.sens_period_code); element('htSharedFsr').value = String(shared.settings.fsr_nA); element('htSharedOffset').value = shared.settings.offset_mode;
+      for (const id of CHANNELS) {
+        const input = element('htElectrodePotential-' + id);
+        if (!input) continue;
+        const electrode = model.document.electrodes?.find(item => item.id === id);
+        const slot = id < 'E' ? 'A' : 'B';
+        const boardPots = model.document.bindings?.boards?.[slot]?.settings?.channel_potentials_v || {};
+        const val = electrode?.potential_v ?? boardPots[String(boardChannelForElectrode(id))];
+        input.value = Number.isFinite(val) ? String(val) : '';
+        input.placeholder = '默认 ' + shared.settings.potential_v;
+      }
     }
     renderSamplingPotential(); renderBoardConnections();
   }
@@ -1220,7 +1279,7 @@
       element('htJogFastConfirmed').checked = settings.fast_motion_confirmed === true;
     }
     element('htJogSpeed').max = jogSettingsDirty ? element('htJogMaxSpeed').value : String(settings.max_speed_mm_s ?? 1);
-    element('htJogMaxSpeed').max = String(Math.min(20, settings.hard_max_speed_mm_s ?? 20));
+    element('htJogMaxSpeed').max = String(Math.min(80, settings.hard_max_speed_mm_s ?? 80));
     element('htJogFastClearance').hidden = !(Number(element('htJogMaxSpeed').value) > 2);
     const stoppedByLimit = alignment.status !== 'holding' && ['hold_limit', 'travel_limit', 'lease_expired'].includes(alignment.last_stop_reason);
     const reachedBoundaries = (alignment.boundaries || []).filter(boundary => boundary.at_limit);
@@ -1456,7 +1515,7 @@
       const board = next.boards?.[id < 'E' ? 'A' : 'B'];
       card.querySelector('.ht-channel-value').textContent = Number.isFinite(current) ? current.toFixed(3) : '—';
       card.querySelector('.ht-channel-name').textContent = channel?.name || model?.document.electrodes.find(item => item.id === id)?.name || id;
-      card.querySelector('.ht-channel-detail').textContent = !selected ? '本模板未选用' : (channel?.synthetic || next.mode === 'simulate' ? '合成数据 · ' : '') + '板 ' + (id < 'E' ? 'A' : 'B') + ' CH' + (CHANNELS.indexOf(id) % 4 + 1) + ' · ' + (time == null ? '尚无样本' : '末次 ' + time + ' s') + (board?.phase === 'retrying' ? ' · 掉线缺数' : '');
+      card.querySelector('.ht-channel-detail').textContent = !selected ? '本模板未选用' : (channel?.synthetic || next.mode === 'simulate' ? '合成数据 · ' : '') + '板 ' + (id < 'E' ? 'A' : 'B') + ' CH' + boardChannelForElectrode(id) + ' · ' + (time == null ? '尚无样本' : '末次 ' + time + ' s') + (board?.phase === 'retrying' ? ' · 掉线缺数' : '');
       card.classList.toggle('invalid', channel?.valid === false); card.classList.toggle('synthetic', channel?.synthetic === true || next.mode === 'simulate'); card.classList.toggle('ht-unselected', !selected);
     }
     for (const step of element('htTimeline').children) step.classList.toggle('active', Number(step.dataset.stepIndex) === next.step_index && !!next.busy);
@@ -1557,15 +1616,41 @@
     const addresses = ['A', 'B'].map(slot => boards.bindings?.[slot]?.address).filter(Boolean);
     if (!boardDraftDirty && addresses.length) void boardAction('connect', {addresses});
   });
-  for (const id of ['htSharedPotential', 'htSharedWorkingElectrode', 'htSharedPeriod', 'htSharedFsr', 'htSharedOffset']) element(id).addEventListener('input', () => {
+  const markSamplingDraft = () => {
     draftAreas.add('sampling'); model?.invalidate(); runKey = null; element('htLiveConfirmed').checked = false; scene?.stopPreview();
     element('htEditorState').textContent = '共用采样参数草稿待应用'; renderSampling(); updateControls();
+  };
+  for (const id of ['htSharedPotential', 'htSharedWorkingElectrode', 'htSharedPeriod', 'htSharedFsr', 'htSharedOffset', ...CHANNELS.map(ch => 'htElectrodePotential-' + ch)]) {
+    element(id)?.addEventListener('input', markSamplingDraft);
+  }
+  element('htPresetEvapCal')?.addEventListener('click', () => {
+    element('htSharedPotential').value = '-0.2';
+    for (const id of CHANNELS) {
+      const input = element('htElectrodePotential-' + id);
+      if (input) input.value = id === 'H' ? '0.2' : '-0.2';
+    }
+    markSamplingDraft();
+  });
+  element('htPresetUniformPotential')?.addEventListener('click', () => {
+    for (const id of CHANNELS) {
+      const input = element('htElectrodePotential-' + id);
+      if (input) input.value = '';
+    }
+    markSamplingDraft();
   });
   element('htApplySharedSampling').addEventListener('click', () => handle(async () => {
     requireDocument('sampling');
     if ([...draftAreas].some(area => area !== 'sampling') || normalDrafts.size) throw failure('FIELDS_NOT_APPLIED', '请先应用其它编辑并修正列时长 / 采集窗口');
+    const electrode_potentials = {};
+    for (const id of CHANNELS) {
+      const raw = element('htElectrodePotential-' + id)?.value.trim();
+      if (raw !== undefined && raw !== '') electrode_potentials[id] = Number(raw);
+    }
     model.applySharedSampling({potential_v: numeric('htSharedPotential'), working_electrode_v: numeric('htSharedWorkingElectrode'),
-      sens_period_code: numeric('htSharedPeriod'), fsr_nA: numeric('htSharedFsr'), offset_mode: element('htSharedOffset').value});
+      sens_period_code: numeric('htSharedPeriod'), fsr_nA: numeric('htSharedFsr'), offset_mode: element('htSharedOffset').value,
+      ...(Object.keys(electrode_potentials).length || model.document.electrodes?.some(e => e.potential_v !== undefined)
+          || ['A', 'B'].some(s => model.document.bindings?.boards?.[s]?.settings?.channel_potentials_v)
+          ? {electrode_potentials} : {})});
     draftAreas.delete('sampling'); documentChanged();
     for (const slot of ['A', 'B']) element('htBoardSettings-' + slot).value = JSON.stringify(model.document.bindings.boards[slot].settings, null, 2);
   }));
@@ -1892,13 +1977,15 @@
     });
   });
   element('htJogStop').addEventListener('click', () => { void keyboardInput.stop('stop'); });
-  for (const [id, speed, maximum] of [['htJogFine', 0.5, 1], ['htJogFast', 20, 20]]) {
-    element(id).addEventListener('click', () => {
+  for (const [id, speed, maximum] of [['htJogFine', 0.5, 1], ['htJogFast', 20, 20], ['htJogSuperFast', 60, 60]]) {
+    element(id)?.addEventListener('click', () => {
       void keyboardInput.stop('settings');
-      element('htJogSpeed').value = String(speed); element('htJogMaxSpeed').value = String(maximum);
-      element('htJogSpeed').max = String(maximum);
+      const cap = Number(element('htJogMaxSpeed').max) || 80;
+      const effMax = Math.min(maximum, cap), effSpeed = Math.min(speed, effMax);
+      element('htJogSpeed').value = String(effSpeed); element('htJogMaxSpeed').value = String(effMax);
+      element('htJogSpeed').max = String(effMax);
       element('htJogFastConfirmed').checked = false; jogSettingsDirty = true;
-      element('htJogFastClearance').hidden = maximum <= 2; updateControls();
+      element('htJogFastClearance').hidden = effMax <= 2; updateControls();
     });
   }
   element('htJogFastConfirmed').addEventListener('change', () => { void keyboardInput.stop('settings'); jogSettingsDirty = true; });

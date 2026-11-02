@@ -14,7 +14,7 @@ SensUs 是一套基于 MAX30131/MAX30134 与 nRF52833 的三电极电化学工�
 - 设备反馈失效时明确显示位置未知；CAD配准仍含名义假设，不代表机械精度或碰撞签核。旧手拧/松轴/四边界方案的记录仅是历史，不覆盖当前键盘四点流程。
 - RS485 联调：X=1、Z=2；正面方向0对应X左/Z下。10月22日的20mm观察终点已被用户后续手工对位取代，不可再当当前位置。[2026-10-22历史联调记录](docs/RS485-BRINGUP-2026-10-22.md)
 - 固件与数据链路入口：[software/README.md](software/README.md)
-- 日常连接：板 1/V4 使用 J-Link + RTT；板 2/V5.1 使用 USB DATA + SMP；V5.2使用Bluetooth NUS（`pA-V5.2`，需预装V5.2固件）
+- 日常连接：板 1/V4 使用 J-Link + RTT；板 2/V5.1 使用 USB DATA + SMP；V5.2使用Bluetooth NUS（`pa-v52-a`，需预装V5.2固件）
 - 源码范围：完整上位机、网页/3D派生网格、V4/V5.1固件与镜像、测试及打包工具均在本仓库。V5.2板端固件/协议源、PCB和原始机械STEP位于独立工程，运行网页不依赖那些目录；实际接板需预烧录 `v52-0.1` 并另行取得[硬件仓库](https://github.com/clateral912/pA-Converter)访问权，不自动烧录V5.2。
 
 给实验人员使用时，直接下载 Release 中的自包含分发包：Windows 10/11 x64 使用 ZIP，Apple Silicon + macOS 14 及以上使用 DMG。正常测量、修改 I-T/CV 条件和升级已经初始化的 V5.1 板卡不需要安装 Python、NCS、Zephyr、OpenOCD 或 SEGGER 工具。

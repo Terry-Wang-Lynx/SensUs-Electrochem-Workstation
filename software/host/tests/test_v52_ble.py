@@ -212,7 +212,7 @@ def test_probe_rejects_other_firmware_and_stop_verifies_ack(fake_bleak):
 def test_scan_only_returns_explicit_nus_candidates(monkeypatch):
     async def discover(**kwargs):
         return {
-            "one": (SimpleNamespace(name="pA-V5.2", address="one"),
+            "one": (SimpleNamespace(name="pa-v52-a", address="one"),
                     SimpleNamespace(local_name=None, rssi=-42, service_uuids=[])),
             "two": (SimpleNamespace(name="Other", address="two"),
                     SimpleNamespace(local_name=None, rssi=-50, service_uuids=[])),
@@ -222,8 +222,34 @@ def test_scan_only_returns_explicit_nus_candidates(monkeypatch):
     result = v52_ble.scan_devices(0.1)
     assert len(result) == 1
     assert result[0]["id"] == "ble:one"
+    assert result[0]["name"] == "pa-v52-a"
     assert result[0]["rssi"] == -42
     assert result[0]["transport"] == result[0]["kind"] == "ble"
+
+
+def test_concurrency_token_and_queue_inspection(monkeypatch, tmp_path):
+    monkeypatch.setattr(v52_ble, "LOCK_DIR", tmp_path)
+
+    async def exercise():
+        lease1 = v52_ble.BleLockLease("A", owner="agent-1", purpose="diag", timeout=1.0)
+        await lease1.acquire()
+        try:
+            snap = v52_ble.inspect_locks()
+            assert snap["boards"]["pa-v52-a"]["state"] == "busy"
+            assert snap["boards"]["pa-v52-a"]["active"]["token"] == lease1.token
+            assert snap["boards"]["pa-v52-a"]["active"]["owner"] == "agent-1"
+
+            lease2 = v52_ble.BleLockLease("pa-v52-a", owner="agent-2", purpose="calibrate", timeout=0.08)
+            with pytest.raises(TimeoutError, match="BLE lock busy for pa-v52-a"):
+                await lease2.acquire()
+        finally:
+            lease1.release()
+
+        snap_after = v52_ble.inspect_locks()
+        assert snap_after["boards"]["pa-v52-a"]["state"] == "idle"
+        assert snap_after["boards"]["pa-v52-a"]["active"] is None
+
+    asyncio.run(exercise())
 
 
 def test_period_seconds_supports_all_firmware_periods():
@@ -231,6 +257,31 @@ def test_period_seconds_supports_all_firmware_periods():
     assert v52_ble.period_seconds(10) == 120.007
     with pytest.raises(ValueError):
         v52_ble.period_seconds(11)
+
+
+def test_per_channel_independent_potentials_programs_multiple_re_dacs(fake_bleak):
+    result = v52_ble.configure_device("test", {
+        "potential_v": -0.2,
+        "working_electrode_v": 0.4,
+        "channel_potentials_v": {"1": -0.2, "3": -0.2, "4": -0.2, "2": 0.2},
+    })
+    assert result["config_confirmed"] is True
+    cmds = fake_bleak.instances[0].commands
+    assert "DAC A 400000" in cmds
+    assert "DAC B 600000" in cmds
+    assert "DAC C 200000" in cmds
+    assert "CONFIG 1 50 2 0 0 1 0" in cmds
+    assert "CONFIG 3 50 2 0 0 1 0" in cmds
+    assert "CONFIG 4 50 2 0 0 1 0" in cmds
+    assert "CONFIG 2 50 2 0 0 2 0" in cmds
+    assert result["actual"]["channel_potentials_uv"]["1"] == -199875
+    assert result["actual"]["channel_potentials_uv"]["2"] == 200250
+    with pytest.raises(ValueError, match="at most 3 distinct"):
+        v52_ble.validate_settings({
+            "potential_v": -0.2,
+            "working_electrode_v": 0.4,
+            "channel_potentials_v": {"1": -0.2, "2": -0.1, "3": 0.1, "4": 0.2},
+        })
 
 
 def test_scan_timeout_explains_bluetooth_startup_failure(monkeypatch):

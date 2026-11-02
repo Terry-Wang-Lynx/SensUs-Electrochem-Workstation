@@ -122,12 +122,12 @@ def test_board_identity_and_frame_channel_map_all_eight_electrodes_not_arrival_o
                  "previous_seq": None, "first_host_time": None}
         controller._read_samples(child, step)
     records = [json.loads(line) for line in (controller._run_dir / "samples.jsonl").read_text().splitlines()]
-    assert [record["electrode_id"] for record in records] == list("HEGFDACB")
+    assert [record["electrode_id"] for record in records] == list("GEFHCABD")
     assert {(record["electrode_id"], record["board_slot"], record["channel"], record["board_address"])
             for record in records} == {
         (electrode, slot, channel, f"macos-uuid-{'first' if slot == 'A' else 'second'}-board")
         for slot, electrodes in (("A", "ABCD"), ("B", "EFGH"))
-        for channel, electrode in enumerate(electrodes, 1)
+        for electrode, channel in zip(electrodes, (1, 3, 4, 2))
     }
     assert len({record["sample_fingerprint"] for record in records}) == 8
 
@@ -375,7 +375,7 @@ def test_guided_zero_window_does_not_enable_that_electrode():
     document["program"][2]["windows"]["A"] = {"start_s": 0, "duration_s": 0}
     params = next(step["resolved_params"] for step in automation.compile_experiment(document)["steps"] if step["op"] == "dwell")
     assert params["acquire"] == ["F"]
-    assert params["channel_masks"] == {"A": 0, "B": 2}
+    assert params["channel_masks"] == {"A": 0, "B": 4}
     assert "A" not in params["settings"]
 
 

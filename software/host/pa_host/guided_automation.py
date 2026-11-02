@@ -83,7 +83,8 @@ def _translated(document, calibration=None):
         axes = document["bindings"]["motion"]["axes"]
         experiment["defaults"].update(column_pitch_mm=min(9, axes["X"]["travel_mm"] / 12),
                                       z_immersed_mm=min(6, axes["Z"]["travel_mm"]))
-    experiment["electrodes"] = [{"id": electrode["id"], "name": electrode["name"]}
+    experiment["electrodes"] = [{"id": electrode["id"], "name": electrode["name"],
+                                 **({"potential_v": electrode["potential_v"]} if electrode.get("potential_v") is not None else {})}
                                 for electrode in document["electrodes"]]
     experiment["columns"] = []
     experiment["program"] = []
@@ -158,11 +159,13 @@ def _validate_document(document):
     for index, electrode in enumerate(electrodes):
         path = f"electrodes[{index}]"
         _object(electrode, path)
-        _keys(electrode, {"id", "name", "enabled"}, path)
+        _keys(electrode, {"id", "name", "enabled", "potential_v"}, path)
         _text(electrode.get("id"), f"{path}.id", 1)
         _text(electrode.get("name"), f"{path}.name")
         if not isinstance(electrode.get("enabled"), bool):
             raise AutomationError("invalid_value", "Electrode selection must be boolean", f"{path}.enabled")
+        if electrode.get("potential_v") is not None:
+            _number(electrode.get("potential_v"), f"{path}.potential_v", -0.4, 0.4)
         identifiers.append(electrode["id"])
     if sorted(identifiers) != list(CHANNELS) or not any(electrode["enabled"] for electrode in electrodes):
         raise AutomationError("invalid_value", "Select at least one electrode with fixed identities A–H", "electrodes")
@@ -482,7 +485,7 @@ class GuidedAutomation:
         return {"status": "idle", "active": False, "session_token": None, "press_id": None,
                 "axis": None, "direction": None, "distance_mm": 0, "last_stop_reason": None,
                 "error": None, "stop_result": None,
-                "settings": {"speed_mm_s": 0.5, "max_speed_mm_s": 1.0, "hard_max_speed_mm_s": 20.0,
+                "settings": {"speed_mm_s": 0.5, "max_speed_mm_s": 1.0, "hard_max_speed_mm_s": 80.0,
                              "fast_motion_confirmed": False,
                              "lease_ms": 350, "heartbeat_ms": 100, "max_hold_s": None, "max_hold_mm": None,
                              "hold_mode": "until_release"}}

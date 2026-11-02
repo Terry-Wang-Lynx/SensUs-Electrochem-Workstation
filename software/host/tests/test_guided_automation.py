@@ -194,7 +194,7 @@ def test_channel_windows_defaults_and_duration_inheritance(tmp_path):
     assert dwell["resolved_params"]["windows"] == {"A": {"start_s": 0, "duration_s": 12},
                                                     "H": {"start_s": 3, "duration_s": 5}}
     assert dwell["resolved_params"]["acquire"] == ["A", "H"]
-    assert dwell["resolved_params"]["channel_masks"] == {"A": 1, "B": 8}
+    assert dwell["resolved_params"]["channel_masks"] == {"A": 1, "B": 2}
     assert compiled["experiment"]["calibration_id"] == "synthetic"
     assert any("synthetic" in warning.lower() for warning in compiled["warnings"])
 
@@ -331,7 +331,7 @@ def test_zero_duration_window_excludes_only_that_channel_and_preserves_identity(
     compiled = service.compile(document)
     dwell = next(step for step in compiled["steps"] if step["op"] == "dwell")
     assert dwell["resolved_params"]["acquire"] == ["H"]
-    assert dwell["resolved_params"]["channel_masks"] == {"A": 0, "B": 8}
+    assert dwell["resolved_params"]["channel_masks"] == {"A": 0, "B": 2}
     document["columns"][0]["windows"]["H"] = {"start_s": 0, "duration_s": 0}
     with pytest.raises(AutomationError):
         service.compile(document)

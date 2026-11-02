@@ -131,10 +131,10 @@ def test_fast_endpoint_move_first_targets_an_interior_position(tmp_path, monkeyp
     first_destination = -970685 - pulses * 65536 / 3200
     first_destination_mm = (first_destination + 7519405) / 32768
     assert rpm == 600
-    assert first_destination_mm > record["x_first_mm"] + 0.0044444444444444444
+    assert first_destination_mm == pytest.approx(record["x_first_mm"], abs=0.001)
     commands = [frame for frame in serial.writes if frame[1] == 0xFD]
-    assert len(commands) == 2
-    assert int.from_bytes(commands[-1][3:5], "big") == 15
+    assert len(commands) == 1
+    assert int.from_bytes(commands[-1][3:5], "big") == 600
     assert result["axes"]["X"]["target_mm"] == record["x_first_mm"]
     assert not any(frame[1] == 0xFE for frame in serial.writes)
     assert serial.collisions == []
@@ -156,7 +156,7 @@ def test_both_axes_and_both_endpoints_use_finite_fast_then_slow(tmp_path, monkey
         targets[address] = serial.positions[address]
     result = bus.move_to(axis, record[endpoint], 20)
     commands = [frame for frame in serial.writes if frame[1] == 0xFD]
-    assert [int.from_bytes(frame[3:5], "big") for frame in commands] == [600, 15]
+    assert [int.from_bytes(frame[3:5], "big") for frame in commands] == [600]
     assert result["axes"][axis]["target_mm"] == record[endpoint]
     assert not any(frame[1] == 0xFE for frame in serial.writes)
     assert serial.collisions == []
@@ -171,7 +171,7 @@ def test_close_endpoint_never_moves_away_to_create_approach(tmp_path, monkeypatc
     result = bus.move_to("X", 1, 20)
     commands = [frame for frame in serial.writes if frame[1] == 0xFD]
     assert len(commands) == (0 if distance == 0 else 1)
-    assert all(int.from_bytes(frame[3:5], "big") == 15 and frame[2] == 1 for frame in commands)
+    assert all(int.from_bytes(frame[3:5], "big") == 600 and frame[2] == 1 for frame in commands)
     assert result["axes"]["X"]["target_mm"] == 1
     assert not any(frame[1] == 0xFE for frame in serial.writes)
 
@@ -188,6 +188,9 @@ def test_startup_corridor_uses_only_exact_safe_target_at_slow_speed(tmp_path, mo
 
 @pytest.mark.parametrize("phase", [0, 1, 2])
 def test_cancel_before_or_between_phases_never_sends_next_fd(tmp_path, monkeypatch, phase):
+    from pa_host import motion_approach
+
+    monkeypatch.setattr(motion_approach, "endpoint_phases", lambda *arguments, **options: [(2, 20), (1, 0.5)])
     bus, serial, record = incident_bus(tmp_path, monkeypatch, LiveMotionSerial)
     cancellation = threading.Event()
     if phase == 0:
@@ -207,6 +210,9 @@ def test_cancel_before_or_between_phases_never_sends_next_fd(tmp_path, monkeypat
 
 @pytest.mark.parametrize("change", ["peer_drift", "generation", "calibration"])
 def test_changed_identity_or_held_peer_blocks_final_fd(tmp_path, monkeypatch, change):
+    from pa_host import motion_approach
+
+    monkeypatch.setattr(motion_approach, "endpoint_phases", lambda *arguments, **options: [(2, 20), (1, 0.5)])
     bus, serial, record = incident_bus(tmp_path, monkeypatch, LiveMotionSerial)
     def change_after_stage(event):
         if event["kind"] != "endpoint_approach_stage_arrived":
@@ -261,11 +267,14 @@ def test_deadline_after_initial_preflight_reports_move_timeout(tmp_path, monkeyp
 
 
 def test_unrepresentable_final_speed_rejects_before_any_fd(tmp_path, monkeypatch):
+    from pa_host import motion_approach
+
     bus, serial, record = incident_bus(tmp_path, monkeypatch, LiveMotionSerial)
     states = copy.deepcopy(bus.snapshot()["axes"])
     bounds = {"X": sorted((record["x_first_mm"], record["x_last_mm"])),
               "Z": (record["z_safe_mm"], record["z_working_mm"])}
     bus.axes["X"]["lead_mm"] = 60
+    monkeypatch.setattr(motion_approach, "endpoint_phases", lambda *arguments, **options: [(2, 20), (1, 0.5)])
     monkeypatch.setattr(bus, "_read_experiment_axes", lambda *arguments, **options: (states, bounds))
     with pytest.raises(MotionError) as caught:
         bus.move_to("X", record["x_first_mm"], 20)
@@ -301,6 +310,9 @@ def test_cancellation_in_fast_motion_preserves_dual_stop_result(tmp_path, monkey
 
 
 def test_stage_completion_does_not_publish_logical_arrival(tmp_path, monkeypatch):
+    from pa_host import motion_approach
+
+    monkeypatch.setattr(motion_approach, "endpoint_phases", lambda *arguments, **options: [(2, 20), (1, 0.5)])
     bus, serial, record = incident_bus(tmp_path, monkeypatch, LiveMotionSerial)
     bus.move_to("X", record["x_first_mm"], 20)
     arrivals = [event for event in serial.events if event["kind"] == "arrived"]
@@ -314,6 +326,9 @@ def test_stage_completion_does_not_publish_logical_arrival(tmp_path, monkeypatch
 
 
 def test_compound_approach_retains_operation_lock_between_phases(tmp_path, monkeypatch):
+    from pa_host import motion_approach
+
+    monkeypatch.setattr(motion_approach, "endpoint_phases", lambda *arguments, **options: [(2, 20), (1, 0.5)])
     bus, serial, record = incident_bus(tmp_path, monkeypatch, LiveMotionSerial)
     attempts = []
     def attempt_peer_move(event):
@@ -336,4 +351,4 @@ def test_compound_approach_retains_operation_lock_between_phases(tmp_path, monke
 def test_narrow_or_already_near_endpoint_only_uses_slow_exact_target(current, target, bounds):
     from pa_host.motion_approach import endpoint_phases
 
-    assert endpoint_phases(current, target, 20, bounds, 0.000625, 2 * 0.8 / 360) == [(target, 0.5)]
+    assert endpoint_phases(current, target, 20, bounds, 0.000625, 2 * 0.8 / 360) == [(target, 20)]

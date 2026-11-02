@@ -19,7 +19,7 @@ def test_runtime_selfcheck_uses_real_scipy(capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["scipy_welch"] is True
     assert report["protocol"] == "v52-0.1"
-    assert report["endpoint_phases"] == [[9.0, 2.0], [10.0, 0.5]]
+    assert report["endpoint_phases"] == [[10, 2]]
 
 
 def test_clean_environment_discards_developer_settings(tmp_path):

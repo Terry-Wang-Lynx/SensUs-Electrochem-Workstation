@@ -324,9 +324,9 @@ def test_actual_controller_runs_calibrated_movement_and_wait_without_ble(tmp_pat
         assert not any(event["kind"] == "arrived" for event in events[movement_event_index[0]:])
     else:
         assert result["state"] == "completed", result
-        assert len([frame for frame in serial.writes if frame[1] == 0xFD]) == 6
+        assert len([frame for frame in serial.writes if frame[1] == 0xFD]) == 4
         assert len([event for event in events if event["kind"] == "arrived"]) == 4
-        assert len([event for event in events if event["kind"] == "endpoint_approach_stage_arrived"]) == 2
+        assert len([event for event in events if event["kind"] == "endpoint_approach_stage_arrived"]) == 0
         assert not any(frame[1] == 0xFE for frame in serial.writes)
 
 

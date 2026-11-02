@@ -23,7 +23,7 @@ def v52_settings(channel=1):
 def ble_globals(monkeypatch, tmp_path):
     device = {
         "id": "ble:test-address", "kind": "ble", "transport": "ble",
-        "address": "test-address", "name": "pA-V5.2",
+        "address": "test-address", "name": "pa-v52-a",
         "board_profile": "v52", "selectable": True, "protocol_verified": True,
     }
     monkeypatch.setattr(gui_server, "HARDWARE_TRANSPORT", "ble")

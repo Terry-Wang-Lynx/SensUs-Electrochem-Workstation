@@ -11,7 +11,7 @@ def test_automatic_endpoint_policy_is_visible_without_motion(guided_app):
     capabilities = gui_server._automation_dispatch("GET", "capabilities", None, {})
     policy = capabilities["automatic_motion_bus"]["endpoint_approach"]
     assert policy["final_speed_cap_mm_s"] == 0.5
-    assert policy["interior_clearance_mm"] == 1
+    assert policy["interior_clearance_mm"] == 0
     assert policy["requested_target_unchanged"] is True
     assert policy["guard_tolerance_unchanged"] is True
     assert policy["keyboard_jog_affected"] is False
@@ -27,7 +27,7 @@ def test_remaining_estimate_includes_slow_landing_with_original_target():
               "resolved_params": {"axis": "X", "target_mm": 1, "speed_mm_s": 20}}]
     before = copy.deepcopy(steps)
     progress = Progress(steps, {"X": 100, "Z": 1}, started=0, calibration=calibration)
-    assert progress.snapshot("running", 0, None, 0)["remaining_s"] == pytest.approx(98 / 20 + 1 / 0.5)
+    assert progress.snapshot("running", 0, None, 0)["remaining_s"] == pytest.approx(99 / 20)
     assert steps == before
 
 

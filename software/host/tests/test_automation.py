@@ -29,7 +29,7 @@ def test_compile_inserts_safe_z_before_x_and_resolves_overrides():
     assert result["steps"][2]["resolved_params"]["speed_mm_s"] == 0.75
     dwell = next(step for step in result["steps"] if step["op"] == "dwell")
     assert dwell["resolved_params"]["seconds"] == 12
-    assert dwell["resolved_params"]["channel_masks"] == {"A": 5, "B": 2}
+    assert dwell["resolved_params"]["channel_masks"] == {"A": 9, "B": 4}
     assert result["steps"][-1]["resolved_params"]["speed_mm_s"] == 0.4
     assert module.compile_experiment(copy.deepcopy(document))["plan_hash"] == result["plan_hash"]
     document["columns"][0]["concentration"]["value"] = 5
@@ -39,7 +39,7 @@ def test_compile_inserts_safe_z_before_x_and_resolves_overrides():
 @pytest.mark.parametrize("change,code", [
     (lambda doc: doc["defaults"].update(z_immersed_mm=80), "invalid_value"),
     (lambda doc: doc["defaults"].update(descend_speed_mm_s=float("nan")), "invalid_value"),
-    (lambda doc: doc["defaults"].update(translate_speed_mm_s=30), "invalid_value"),
+    (lambda doc: doc["defaults"].update(translate_speed_mm_s=90), "invalid_value"),
     (lambda doc: doc["bindings"]["motion"]["axes"]["Z"].update(address=1), "invalid_value"),
     (lambda doc: doc["program"].insert(0, {"op": "python", "code": "print(1)"}), "invalid_action"),
     (lambda doc: doc.update(program=[{"op": "immerse"}]), "missing_column"),
@@ -226,7 +226,7 @@ def test_live_parallel_gates_and_real_channel_masks_with_complete_raw_provenance
     assert state["state"] == "completed", state
     assert len(factory.children) == 2
     assert not factory.gate_violation
-    assert [child.options["--channel-mask"] for child in factory.children] == ["5", "2"]
+    assert [child.options["--channel-mask"] for child in factory.children] == ["9", "4"]
     assert all(child.started for child in factory.children)
     samples = [json.loads(line) for line in (Path(state["manifest_path"]).parent / "samples.jsonl").read_text().splitlines()]
     assert {sample["electrode_id"] for sample in samples} == {"A", "C", "F"}
@@ -242,7 +242,7 @@ def test_only_selected_board_spawns_but_live_bindings_must_be_unique(tmp_path):
     controller.start(document, "live", module.compile_experiment(document)["plan_hash"], "one-board")
     assert wait_finished(controller)["state"] == "completed"
     assert len(factory.children) == 1
-    assert factory.children[0].options["--channel-mask"] == "10"
+    assert factory.children[0].options["--channel-mask"] == "6"
     document["bindings"]["boards"]["B"]["address"] = "BOARD-A"
     with pytest.raises(module.AutomationError) as caught:
         controller.start(document, "live", module.compile_experiment(document)["plan_hash"], "duplicate")
@@ -784,3 +784,17 @@ def test_failed_final_audit_event_cannot_leave_manifest_claiming_completion(tmp_
     manifest = json.loads(Path(state["manifest_path"]).read_text())
     assert manifest["state"] == "error"
     assert manifest["error"]["code"] == "audit_failed"
+
+
+def test_per_electrode_potentials_and_fast_motion_up_to_80mm_s():
+    module = automation()
+    document = module.default_experiment()
+    document["defaults"].update(translate_speed_mm_s=60, ascend_speed_mm_s=50, descend_speed_mm_s=40)
+    for electrode in document["electrodes"]:
+        electrode["potential_v"] = 0.2 if electrode["id"] == "H" else -0.2
+    result = module.compile_experiment(document)
+    dwell = next(step for step in result["steps"] if step["op"] == "dwell")
+    assert dwell["resolved_params"]["settings"]["A"]["channel_potentials_v"] == {"1": -0.2, "3": -0.2, "4": -0.2, "2": -0.2}
+    assert dwell["resolved_params"]["settings"]["B"]["channel_potentials_v"] == {"1": -0.2, "3": -0.2, "4": -0.2, "2": 0.2}
+    move_x = next(step for step in result["steps"] if step["op"] == "move_x")
+    assert move_x["resolved_params"]["speed_mm_s"] == 60
