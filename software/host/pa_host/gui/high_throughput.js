@@ -582,7 +582,7 @@
     '<details id="htErrorDetails" class="ht-error-details" hidden><summary>技术详情（提供给维护人员）</summary><pre id="htErrorDetailText"></pre></details>',
     '<div id="htSimulationNotice" class="ht-message ht-simulation">模拟实验 · 生成合成数据，不操作实物。3D 仅作流程示意。</div>',
     '<div id="htLiveGate" class="ht-message ht-live-gate" hidden><label class="ht-check"><input id="htLiveConfirmed" type="checkbox">本次允许驱动实物与电极，已确认装夹、工作高度、安全高度及高级设置中的运动与电气策略</label></div>',
-    '<section class="panel ht-template-panel"><div class="ht-template-fields"><label>实验模板<select id="htTemplate"><option value="template1">Template 1 · 逐列实验</option></select></label><label>实验名称<input id="htName" aria-label="实验名称"></label><label>模板默认（未覆盖列适用，s）<input id="htDefaultDuration" type="number" min="0.001" step="any" value="180"></label><button id="htSave" class="secondary" type="button">保存模板</button></div><div class="ht-template-summary"><span id="htSelectionSummary">固定物理列 1–12 · 电极 A–H</span><div class="ht-template-tabs" role="tablist" aria-label="模板参数与板卡对应"><button id="htSamplingToggle" type="button" role="tab" aria-selected="false" aria-controls="htSamplingPanel">采样参数（8电极共用）</button><button id="htMappingToggle" type="button" role="tab" aria-selected="false" aria-controls="htMappingPanel">板卡与电极对应</button></div><span id="htEditorState">加载中</span></div>',
+    '<section class="panel ht-template-panel"><div class="ht-template-fields"><label>实验模板<select id="htTemplate"><option value="template1">Template 1 · 逐列实验</option></select></label><label>实验名称<input id="htName" aria-label="实验名称"></label><label>全板每列默认时长 (s)<input id="htDefaultDuration" type="number" min="0.001" step="any" value="180"></label><button id="htApplyDurationAll" class="secondary" type="button" title="清除单列单独覆盖，让全部 12 列统一使用此默认时长">同步到全部12列</button><button id="htSave" class="secondary" type="button">保存模板</button></div><div class="ht-template-summary"><span id="htSelectionSummary">固定物理列 1–12 · 电极 A–H</span><div class="ht-template-tabs" role="tablist" aria-label="模板参数与板卡对应"><button id="htSamplingToggle" type="button" role="tab" aria-selected="false" aria-controls="htSamplingPanel">采样参数（8电极共用）</button><button id="htMappingToggle" type="button" role="tab" aria-selected="false" aria-controls="htMappingPanel">板卡与电极对应</button></div><span id="htEditorState">加载中</span></div>',
     '<section id="htSamplingPanel" class="ht-template-pane" role="tabpanel" aria-labelledby="htSamplingToggle" hidden><p id="htSharedSamplingState" class="ht-sampling-state" role="status">正在读取两板参数…</p><div class="ht-sampling-fields"><label>默认测试电位 WE−RE (V)<input id="htSharedPotential" type="number" min="-0.4" max="0.4" step="0.01"></label><label>WE 电位 (V)<input id="htSharedWorkingElectrode" type="number" min="0.25" max="1.535" step="0.01"></label><label>硬件采样周期<select id="htSharedPeriod"></select></label><label>电流量程<select id="htSharedFsr"></select></label><label>偏置电流<select id="htSharedOffset"></select></label></div><div class="ht-small-head"><strong>各电极独立电位 WE−RE (V，留空继承默认；每板最多 3 种不同电位)</strong><div><button id="htPresetEvapCal" class="text-button" type="button">预设：A–G −0.2 V + H +0.2 V（蒸发校准）</button><button id="htPresetUniformPotential" class="text-button" type="button">8 路统一电位</button></div></div><div id="htElectrodePotentials" class="ht-window-grid"></div><p id="htSharedPotentialSummary" class="ht-hint"></p><div class="ht-sampling-footer"><p class="ht-hint">板 A（A–D）与板 B（E–H）各自包含 DAC A（共用 WE）与 DAC B/C/D（支持同板最多 3 种不同 RE 电位，如 7 路 −0.2 V + 1 路 +0.2 V 蒸发校准）。点击「应用到两块板」保存至模板，实物运行时自动下发。</p><button id="htApplySharedSampling" class="secondary" type="button">应用到两块板</button></div></section>',
     '<section id="htMappingPanel" class="ht-template-pane" role="tabpanel" aria-labelledby="htMappingToggle" hidden><div class="ht-editor-actions"><button id="htBoardScan" class="secondary" type="button">扫描蓝牙板卡</button><button id="htBoardBind" class="secondary" type="button">保存 A / B 对应</button><button id="htBoardConnect" class="primary" type="button">连接已绑定板卡</button></div><p id="htBoardNotice" class="ht-hint" role="status">打开面板后读取连接状态</p><div id="htBoardMapping" class="ht-board-mapping"></div><p class="ht-hint">请自行核对实物，将前板指定为 A、后板指定为 B；软件不按扫描顺序、广播名或信号强度判断前后。可将不用的槽位留空。BLE 连接与主界面的单板测量目标独立；软件通道对应仍需核对实际接线。</p></section></section>',
     '<section class="panel ht-calibration-strip"><div><strong>本次上电四点标定</strong><p id="htCalibrationSummary">正在读取标定状态…</p></div><button id="htCalibrationToggle" class="secondary" type="button" aria-expanded="false">标定 / 查看</button></section>',
@@ -594,10 +594,10 @@
     '<details id="htTwinRegistration" class="panel ht-secondary ht-twin-registration"><summary>高级 · 四边界与CAD坐标精确对应（不额外移动实物）</summary><div class="ht-pad"><p class="ht-hint">可在读取四个安全边界时记录对应的模型坐标，再在保存限位后配准。填写 X 左 / 右边界对应的孔板中心坐标，以及 Z 上 / 下边界对应的模型 lift；这些数值须来自实际装配对应关系，不是运行行程或孔板第 1 / 12 列默认值。无需另摆实物姿态。</p><div class="ht-twin-fields"><label>X 左边界 · 孔板中心 (mm)<input id="htTwinXLeft" type="number" step="any"></label><label>X 右边界 · 孔板中心 (mm)<input id="htTwinXRight" type="number" step="any"></label><label>Z 上边界 · 模型 lift (mm)<input id="htTwinZUp" type="number" step="any"></label><label>Z 下边界 · 模型 lift (mm)<input id="htTwinZDown" type="number" step="any"></label></div><label class="ht-check"><input id="htTwinConfirm" type="checkbox">已确认这四个值是各实测安全边界对应的真实 CAD 坐标</label><div class="ht-editor-actions"><button id="htTwinRegister" class="secondary" type="button" disabled>保存CAD坐标对应</button><span id="htTwinRegisterStatus" class="ht-hint" role="status">请先读取并保存当前连接的四边界限位</span></div><p class="ht-hint">以编码器和实测导程换算，保持 1 mm 对应 1 mm；跨度配准容差 0.1 mm，不缩放模型。CAD 孔板中心参考 49.5 mm、模型参考 lift 35 mm 仅是展示坐标，不是机械零点。保存对应不会改变运动限位，也不移动、使能或清零。</p></div></details>',
     '</div><div class="ht-workspace"><section class="panel ht-scene-panel"><div class="ht-section-head"><div><span class="ht-eyebrow">装置与物理孔位</span><h3>八电极工作台</h3></div><div class="ht-camera-tools"><button class="secondary" id="htCameraAll" type="button">整体</button><button class="secondary" id="htCameraPlate" type="button">孔板</button><button class="secondary" id="htCameraBoards" type="button">双板</button></div></div>',
     '<div id="htStage" class="ht-stage" aria-label="装置3D：拖动旋转，滚轮缩放，点击物理列编辑"><div id="htSceneLoading" class="ht-scene-loading">加载本地 CAD 网格…</div><div id="htTwinStatus" class="ht-twin-status unknown" role="status">3D 未配准 · 实物位置未知 · CAD 参考姿态</div><div id="htSceneLabels" class="ht-scene-labels"></div><div class="ht-scene-legend"><i></i>原始装配 CAD<span>拖动旋转 · 滚轮缩放 · 点选列</span></div></div>',
-    '<div class="ht-small-head ht-column-toolbar"><strong>执行哪些物理列</strong><div><button id="htSelectAllColumns" class="text-button" type="button">全选</button><button id="htClearColumns" class="text-button" type="button">清空</button></div></div><div class="ht-plate-strip" id="htColumns" aria-label="物理列勾选与编辑"></div>',
+    '<div class="ht-small-head ht-column-toolbar"><strong>执行哪些物理列（点击下方列卡片可在右侧单独修改该列时长）</strong><div><button id="htSelectAllColumns" class="text-button" type="button">全选</button><button id="htClearColumns" class="text-button" type="button">清空</button></div></div><div class="ht-plate-strip" id="htColumns" aria-label="物理列勾选与编辑"></div>',
     '<div class="ht-scene-footer"><span id="htPose">CAD 参考姿态 · 非实物位置</span><button id="htAnimate" class="text-button" type="button" disabled>播放流程示意</button></div><p class="ht-caption">X 只移动孔板托盘，Z 只带动悬臂、电极与双板；固定卡座与孔位不随勾选挤位。CAD 参考抬升 35 mm，不代表控制器零点、浸入深度或碰撞验证。</p></section>',
-    '<aside class="ht-editor-stack"><section class="panel ht-electrode-panel"><div class="ht-section-head"><h3>使用的电极</h3><span class="ht-pill">固定位置 A–H</span></div><div class="ht-pad"><div id="htAcquire" class="ht-channel-picks"></div><p class="ht-hint">取消勾选将隐藏电极与示意线束，卡座仍留在原位。所有电极共同升降；下方可分别设置有效采集时长。</p></div></section>',
-    '<section class="panel ht-column-panel"><div class="ht-section-head"><h3 id="htColumnTitle">物理第 1 列</h3><span class="ht-pill" id="htColumnTag">已选择</span></div><div class="ht-pad"><label>本列名称<input id="htColumnName" placeholder="例如 A / 10微摩尔每升"></label><label><span id="htColumnDurationLabel">本列覆盖时长（留空继承 180 s）</span><input id="htColumnDuration" type="number" min="0.001" step="any" placeholder="继承默认 180"></label><p class="ht-hint">名称为自由文字，允许重复；有数值即覆盖模板时长。按物理列号依次执行，跳过列保留真实间距。</p><div class="ht-small-head"><strong id="htWindowHeading">第 1 列 · 八个电极的有效采集时长 (s)</strong><span>留空覆盖本列</span></div><p id="htWindowScope" class="ht-hint">仅编辑当前列，不会修改其他列。</p><div id="htWindows" class="ht-window-grid"></div><p id="htWindowSummary" class="ht-hint">停稳并收到 START 成功确认后计时。</p></div></section>',
+    '<aside class="ht-editor-stack"><section class="panel ht-electrode-panel"><div class="ht-section-head"><h3>使用的电极</h3><span class="ht-pill">固定位置 A–H</span></div><div class="ht-pad"><div id="htAcquire" class="ht-channel-picks"></div><p class="ht-hint">取消勾选将隐藏电极与示意线束，卡座仍留在原位。所有电极在同一列共同升降并同步采集。</p></div></section>',
+    '<section class="panel ht-column-panel"><div class="ht-section-head"><div><span class="ht-eyebrow">单列独立微调 · 仅作用于当前点选列</span><h3 id="htColumnTitle">物理第 1 列</h3></div><span class="ht-pill" id="htColumnTag">已选择</span></div><div class="ht-pad"><label>本列名称<input id="htColumnName" placeholder="例如 A / 10微摩尔每升"></label><div class="ht-small-head"><span id="htColumnDurationLabel">本列覆盖时长（留空继承 180 s）</span><button id="htResetColumnDuration" class="text-button" type="button">恢复跟随全板默认</button></div><input id="htColumnDuration" type="number" min="0.001" step="any" placeholder="继承默认 180"><p id="htWindowSummary" class="ht-hint">停稳并收到 START 成功确认后计时。</p><details id="htColumnWindowsDetails" class="ht-secondary"><summary>高级：仅对本列 8 根电极 (A–H) 截取子采集窗口（默认无需填写）</summary><div class="ht-pad"><div class="ht-small-head"><strong id="htWindowHeading">第 1 列 · 八个电极的有效采集时长 (s)</strong><span>留空覆盖本列</span></div><p id="htWindowScope" class="ht-hint">仅编辑当前列，不会修改其他列。</p><div id="htWindows" class="ht-window-grid"></div></div></details></div></section>',
     '<section class="panel ht-progress-panel"><div class="ht-section-head"><h3>实验进度</h3><span id="htProgressMode" class="ht-pill">模拟</span></div><div class="ht-pad"><p id="htClock" class="ht-clock">等待开始</p><p id="htTimingDetail" class="ht-hint">到位前的移动与准备不计入采集时长。</p><div id="htBoardRecovery" class="ht-board-recovery"></div><p id="htEndingNote" class="ht-hint">暂停在本列完成、抬至安全高度后生效。末列完成后停在该列上方，不自动返回。</p></div></section></aside></div>',
     '<section class="panel ht-results-panel"><div class="ht-section-head"><h3>采集结果</h3><span id="htPosition" class="ht-hint">控制器坐标未确认</span></div><div id="htChannels" class="ht-channels"></div><div class="ht-result-footer"><span id="htRunInfo">尚无运行</span><span id="htManifest"></span></div><p class="ht-caption">A–D 属于板 A，E–H 属于板 B；整板掉线影响该板四路。缺失保留为空，不插值、不补零；两板非硬件同步。既有 CH3 模拟异常仍待定位。</p></section>',
     '<details id="htAdvanced" class="panel ht-secondary"><summary>高级设置 · 起始延迟、设备、运动、JSON 与日志</summary><div class="ht-pad"><p class="ht-hint">日常操作直接编辑上方模板。自动实验接近四点端点时低速精靠近，末段不超过 0.5 mm/s；首次安全高度接近也会限速。键盘对位速度不受影响。运动数值为编辑预设，不代表已通过实物碰撞或行程验收。</p>',
@@ -917,7 +917,7 @@
     element('htResume').hidden = !['paused', 'waiting_recovery', 'waiting_operator'].includes(snapshot.state);
     element('htResume').disabled = pending || readingLimits;
     element('htLiveGate').hidden = requestedMode !== 'live'; element('htSimulationNotice').hidden = requestedMode !== 'simulate';
-    for (const id of ['htSave', 'htApplyDefaults', 'htApplyBindings', 'htApplyJson', 'htCompile', 'htApplySharedSampling']) element(id).disabled = blocked;
+    for (const id of ['htSave', 'htApplyDurationAll', 'htResetColumnDuration', 'htApplyDefaults', 'htApplyBindings', 'htApplyJson', 'htCompile', 'htApplySharedSampling']) if (element(id)) element(id).disabled = blocked;
     for (const id of ['htExecutionMode', 'htExecutionCount', 'htExecutionRoute', 'htApplyExecution', 'htPbsReturn', 'htPbsColumn', 'htEndurance']) element(id).disabled = blocked;
     element('htAnimate').disabled = !model?.plan || jsonDirty || busy || readingLimits || physicalAttached();
     for (const id of ['htMotionReference', 'htEnableX', 'htEnableZ', 'htMotionDisconnect']) element(id).disabled = blocked;
@@ -1586,11 +1586,43 @@
   element('htName').addEventListener('input', () => editDocument(() => model.edit(document => { document.name = element('htName').value; })));
   element('htColumnName').addEventListener('input', () => editDocument(() => model.updateColumn(model.selectedColumn, {name: element('htColumnName').value})));
   element('htColumnDuration').addEventListener('input', () => editNormalField('htColumnDuration', () => model.setColumnDuration(model.selectedColumn, element('htColumnDuration').value.trim() ? numeric('htColumnDuration') : null)));
+  element('htResetColumnDuration')?.addEventListener('click', () => editNormalField('htColumnDuration', () => {
+    model.setColumnDuration(model.selectedColumn, null);
+    element('htColumnDuration').value = '';
+  }));
   element('htDefaultDuration').addEventListener('input', () => editNormalField('htDefaultDuration', () => {
     const duration = numeric('htDefaultDuration');
     if (duration <= 0) throw failure('DURATION_INVALID', '默认时长须大于 0');
-    for (const column of model.document.columns.filter(item => item.duration_s == null)) for (const window of Object.values(column.windows || {})) if (window.start_s + window.duration_s > duration) throw failure('WINDOW_INVALID', '已有采集窗口超过新的默认时长');
-    model.edit(document => { document.defaults.dwell_s = duration; });
+    const previousDefault = model.document.defaults.dwell_s;
+    const inheritedColumns = model.document.columns.filter(item =>
+      item.duration_s == null
+      || item.duration_s === previousDefault
+      || (item.duration_s === 180 && Object.keys(item.windows || {}).length === 0)
+    );
+    for (const column of inheritedColumns) for (const window of Object.values(column.windows || {})) if (window.start_s + window.duration_s > duration) throw failure('WINDOW_INVALID', '已有采集窗口超过新的默认时长');
+    model.edit(document => {
+      document.defaults.dwell_s = duration;
+      for (const column of document.columns) {
+        if (column.duration_s === previousDefault || (column.duration_s === 180 && Object.keys(column.windows || {}).length === 0)) {
+          column.duration_s = null;
+        }
+      }
+    });
+    if (!normalDrafts.has('htColumnDuration')) {
+      const selected = model.document.columns.find(item => item.index === model.selectedColumn);
+      element('htColumnDuration').value = selected?.duration_s ?? '';
+    }
+  }));
+  element('htApplyDurationAll')?.addEventListener('click', () => editNormalField('htDefaultDuration', () => {
+    const duration = numeric('htDefaultDuration');
+    if (duration <= 0) throw failure('DURATION_INVALID', '默认时长须大于 0');
+    for (const column of model.document.columns) for (const window of Object.values(column.windows || {})) if (window.start_s + window.duration_s > duration) throw failure('WINDOW_INVALID', '物理第 ' + column.index + ' 列已有采集窗口超过新的默认时长');
+    model.edit(document => {
+      document.defaults.dwell_s = duration;
+      for (const column of document.columns) column.duration_s = null;
+    });
+    normalDrafts.delete('htColumnDuration');
+    element('htColumnDuration').value = '';
   }));
   function showTemplatePane(selected) {
     for (const [name, toggleId, panelId] of [['sampling', 'htSamplingToggle', 'htSamplingPanel'], ['mapping', 'htMappingToggle', 'htMappingPanel']]) {

@@ -40,3 +40,19 @@ console.log(JSON.stringify({heading:elements.get('htWindowHeading')?.textContent
     assert result["duration"] == str(duration)
     assert result["windows"] == [str(duration)] * 8
     assert result["writes"] == []
+
+
+def test_default_duration_syncs_factory_180s_columns_and_apply_all_unifies_every_column():
+    result = evaluate_browser("""
+(async()=>{HighThroughput.activate();await tick();
+input('htDefaultDuration',60);
+const afterDefaultEdit=experiment.columns.map((_,i)=>elements.get('htColumnEdit-'+(i+1)).textContent);
+await click('htApplyDurationAll');
+const afterApplyAll=experiment.columns.map((_,i)=>elements.get('htColumnEdit-'+(i+1)).textContent);
+console.log(JSON.stringify({afterDefaultEdit,afterApplyAll,columnDurationValue:elements.get('htColumnDuration').value}));})();
+""", before_source=BOOTSTRAP)
+    assert "5 s" in result["afterDefaultEdit"][0]
+    assert all("60 s" in text for text in result["afterDefaultEdit"][1:])
+    assert all("60 s" in text for text in result["afterApplyAll"])
+    assert result["columnDurationValue"] == ""
+
