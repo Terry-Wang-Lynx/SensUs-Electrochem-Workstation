@@ -678,7 +678,7 @@ class SharedEmmBus:
                     for phase_target, phase_speed in phases:
                         phase_rpm = math.floor(phase_speed * 60 / config["lead_mm"] + 1e-12)
                         budget += (abs(phase_target - previous) / (phase_rpm * config["lead_mm"] / 60) * 1.5
-                                   + 8 + max(5.0, self._timeout * 12 + self._command_gap_s * 36))
+                                   + 16 + max(5.0, self._timeout * 12 + self._command_gap_s * 36))
                         previous = phase_target
                     if budget > 28800:
                         raise MotionError("move_duration", "Endpoint approach deadline exceeds eight hours")
@@ -811,7 +811,7 @@ class SharedEmmBus:
                 # more than the old 5 s fixed allowance (54 mm took 9.7 s).
                 # Keep a finite ramp/communication margin; explicit caller
                 # deadlines and STOP still take precedence.
-                timeout = self._move_timeout or (abs(delta) / actual_speed * 1.5 + 8)
+                timeout = self._move_timeout or (abs(delta) / actual_speed * 1.5 + 16)
                 if timeout > 28800:
                     raise MotionError("move_duration", "Move deadline exceeds eight hours")
                 deadline = min(time.monotonic() + timeout, operation_deadline or float("inf"))
@@ -827,7 +827,8 @@ class SharedEmmBus:
                             if (self._stop_generation, self._connection_token, self._experiment_calibration) != _approach_identity:
                                 raise MotionError("calibration_motion", "Endpoint approach identity changed before command")
                     direction = config["positive_direction"] if delta > 0 else 1 - config["positive_direction"]
-                    body = bytes([config["address"], 0xFD, direction]) + rpm.to_bytes(2, "big") + bytes([10]) + pulses.to_bytes(4, "big") + bytes([2, 0])
+                    acceleration = 10 if speed <= 2.0 else 242
+                    body = bytes([config["address"], 0xFD, direction]) + rpm.to_bytes(2, "big") + bytes([acceleration]) + pulses.to_bytes(4, "big") + bytes([2, 0])
                     command_outstanding = True
                     with self._state_lock:
                         self._automatic_motion_axis = axis
