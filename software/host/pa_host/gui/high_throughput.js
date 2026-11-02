@@ -703,8 +703,7 @@
       && keyboardControllerAvailable();
   }
   function keyboardConnectionAvailable() {
-    return snapshot.motion?.connected === true || (keyboardMode() && typeof model?.document.bindings?.motion?.port === 'string'
-      && model.document.bindings.motion.port.trim() !== '');
+    return snapshot.motion?.connected === true || keyboardMode();
   }
   function keyboardSessionOwned(allowStopping = false) {
     const manual = guided.manual || {}, alignment = manual.alignment || {};
@@ -1474,7 +1473,7 @@
     if (revision !== calibrationRevision || pendingKeyboardStopSnapshot(next)) return;
     guided = next;
     if (!model) { model = createGuidedModel(guided.document); renderDocument(); element('htEditorState').textContent = '模板已读取'; }
-    else syncServerBoardAddresses(guided.document?.bindings?.boards);
+    else { syncServerBoardAddresses(guided.document?.bindings?.boards); syncServerMotionPort(guided.document?.bindings?.motion); }
     renderCalibration();
   }
   async function refresh() {
@@ -1485,7 +1484,7 @@
       const [next, currentGuided] = await Promise.all([api('state'), api('guided')]);
       stateUnavailable = false; if (revision === calibrationRevision && !pendingKeyboardStopSnapshot(currentGuided)) guided = currentGuided;
       if (!model) { model = createGuidedModel(guided.document); renderDocument(); element('htEditorState').textContent = '模板已读取'; }
-      else if (boardRevision === boardsRevision) syncServerBoardAddresses(guided.document?.bindings?.boards);
+      else if (boardRevision === boardsRevision) { syncServerBoardAddresses(guided.document?.bindings?.boards); syncServerMotionPort(guided.document?.bindings?.motion); }
       renderCalibration(); renderState(next);
       const events = await api('events?after=' + eventSequence); renderEvents(Array.isArray(events) ? events : events.events);
     } catch (error) { stateUnavailable = true; showError(error); renderCalibration(); }
@@ -1592,11 +1591,25 @@
     if (!jsonDirty) element('htJson').value = JSON.stringify(model.document, null, 2);
     renderBoardConnections();
   }
+  function syncServerMotionPort(motionBinding) {
+    if (!model || !motionBinding || typeof motionBinding.port !== 'string' || !motionBinding.port) return;
+    if (draftAreas.has('bindings') || jsonDirty) return;
+    const current = model.document.bindings?.motion?.port || '';
+    if (current === motionBinding.port) return;
+    model.edit(document => {
+      document.bindings.motion ||= {};
+      document.bindings.motion.port = motionBinding.port;
+    });
+    runKey = null;
+    element('htPort').value = motionBinding.port;
+    element('htJson').value = JSON.stringify(model.document, null, 2);
+  }
   async function saveGuidedDocument() {
     if (snapshot.busy || guided.manual?.active || boardsPending) throw failure('BUSY', '实验或标定进行中，不能保存实验');
     const latest = await api('guided');
     if (snapshot.busy || guided.manual?.active || latest.manual?.active || boardsPending) throw failure('BUSY', '实验或标定进行中，不能保存实验');
     syncServerBoardAddresses(latest.document?.bindings?.boards);
+    syncServerMotionPort(latest.document?.bindings?.motion);
     boardsRevision++;
     const submitted = copy(model.document), submittedRevision = model.serialize();
     const result = await api('guided/experiment', {document: submitted});
@@ -1846,7 +1859,7 @@
       if (calibrationOperation !== operation) return;
       guided = next; operation.phase = 'success'; operation.context = calibrationOperationContext();
       if (route === 'finish') syncFinishedTravel(next);
-      if (route === 'begin') { jogOrigin = null; jogNotice = ''; jogSettingsDirty = false; keyboardSessionStopped = false; }
+      if (route === 'begin') { syncServerMotionPort(next.document?.bindings?.motion); jogOrigin = null; jogNotice = ''; jogSettingsDirty = false; keyboardSessionStopped = false; }
       renderCalibration();
       await refresh();
     } catch (error) {
@@ -1913,7 +1926,7 @@
       const option = node('option'); option.value = typeof port === 'string' ? port : port.device || port.port; option.textContent = port.description || option.value; element('htPortOptions').append(option);
     }
   }));
-  element('htMotionConnect').addEventListener('click', () => handle(async () => { requireDocument(); await api('motion/connect', {motion: model.document.bindings.motion}); await refresh(); }));
+  element('htMotionConnect').addEventListener('click', () => handle(async () => { requireDocument(); const connected = await api('motion/connect', {motion: model.document.bindings.motion}); syncServerMotionPort(connected?.motion); await refresh(); }));
   element('htMotionReference').addEventListener('click', () => handle(async () => {
     if (!element('htReferenceConfirmed').checked) throw failure('REFERENCE_CONFIRMATION_REQUIRED', '请先人工确认参考点');
     await api('motion/reference', {confirmed: true}); await refresh();
@@ -1947,13 +1960,14 @@
       const payload = boundary ? {boundary_at_current: boundary} : {};
       const motion = devicesCache?.snapshot?.motion || snapshot.motion || {};
       const previousPort = motion.port || currentGuided.document?.bindings?.motion?.port;
-      if (motion.connected === false && previousPort) {
+      if (snapshot.recovery_required === true && motion.connected === false && previousPort) {
         const enumerated = await api('ports'), ports = Array.isArray(enumerated) ? enumerated : enumerated.ports || [];
         if (!ports.some(port => (port.device || port.port || port) === previousPort)) {
           const selected = element('htPort').value.trim();
-          const candidates = ports.filter(port => /USB|usbserial|wchusbserial/i.test([port.device, port.description, port.hwid].join(' ')));
+          const candidates = ports.filter(port => /USB|usbserial|wchusbserial|ch340|ch341/i.test([port.device, port.description, port.hwid].join(' ')));
+          const rs485 = candidates.filter(port => /1a86|wchusbserial|ch340|ch341/i.test([port.device, port.description, port.hwid].join(' ')));
           const replacement = ports.find(port => (port.device || port.port || port) === selected)
-            || (candidates.length === 1 ? candidates[0] : null);
+            || (rs485.length === 1 ? rs485[0] : candidates.length === 1 ? candidates[0] : rs485[0] || null);
           const replacementPort = replacement && (replacement.device || replacement.port || replacement);
           if (!replacementPort) throw failure('motion_port_unavailable', '旧串口 ' + previousPort + ' 已不存在。请在高级设置中枚举并选择当前 USB–RS485 串口，再点击「重连并重置」。');
           if (typeof scope.confirm !== 'function' || !scope.confirm('旧串口 ' + previousPort + ' 已不存在。\n当前选择：' + replacementPort + '\n请确认这是原来连接 X/Z 双轴的同一个 RS485 转接器。确认后仅停止并读取，不会移动；旧四点标定作废。')) {
@@ -1965,6 +1979,7 @@
       }
       const result = await api('motion/reset', payload);
       snapshot = result.state; guided = result.guided; stateUnavailable = false;
+      syncServerMotionPort(result.guided?.document?.bindings?.motion || result.motion);
       const receivedAt = Date.now(), devices = await api('devices');
       devicesCache = {snapshot: devices, available: true, error: null, received_at_ms: receivedAt};
       scope.PAHighThroughputDevices = devicesCache;

@@ -10851,6 +10851,106 @@ def _keyboard_hardware_io(controller, service):
                 controller._manual_calibration_active = manual_active
 
 
+def _candidate_rs485_ports(exclude=()):
+    from serial.tools import list_ports
+
+    excluded = {str(item).strip() for item in exclude if item}
+    try:
+        measurement_port = APP.measurement.snapshot().get("port")
+        if measurement_port and APP.measurement.is_busy():
+            excluded.add(str(measurement_port).strip())
+    except Exception:
+        pass
+    ranked = []
+    for index, info in enumerate(list_ports.comports()):
+        device = str(getattr(info, "device", None) or getattr(info, "port", None) or info or "").strip()
+        if not device or device in excluded:
+            continue
+        lower_device = device.lower()
+        if any(token in lower_device for token in ("bluetooth-incoming-port", "debug-console", "wlan-debug")):
+            continue
+        description = str(getattr(info, "description", "") or "")
+        hwid = str(getattr(info, "hwid", "") or "")
+        text = f"{device} {description} {hwid}".lower()
+        vid = getattr(info, "vid", None)
+        if vid in (0x2FE3, 0x1366) or "2fe3:" in text or "1366:" in text or "j-link" in text:
+            continue
+        if vid == 0x1A86 or any(token in text for token in ("1a86:", "wchusbserial", "ch340", "ch341")):
+            ranked.append((0, index, device))
+        elif isinstance(vid, int) or any(token in text for token in ("usb", "usbserial", "ttyusb", "ttyacm", "cp210", "ftdi", "pl2303")):
+            ranked.append((1, index, device))
+    ranked.sort()
+    return [device for _, _, device in ranked]
+
+
+def _persist_discovered_motion_port(controller, service, port):
+    try:
+        bind = getattr(service, "bind_motion_port", None)
+        if callable(bind):
+            bind(port)
+    except Exception as error:
+        controller._event("motion_port_persist_skipped", port=port, error=str(error))
+    try:
+        with controller._lock:
+            if isinstance(getattr(controller, "_experiment", None), dict):
+                controller._experiment.setdefault("bindings", {}).setdefault("motion", {})["port"] = port
+                controller._persist_best_effort()
+    except Exception:
+        pass
+
+
+def _connect_or_discover_motion(controller, service, settings):
+    from .automation import AutomationError, default_experiment
+
+    if (controller._motion is not None
+            and isinstance(controller._motion.snapshot(), dict)
+            and controller._motion.snapshot().get("connected") is False
+            and controller.snapshot().get("recovery_required") is not True):
+        controller.disconnect_motion()
+    base = copy.deepcopy(settings) if isinstance(settings, dict) else {}
+    configured_port = str(base.get("port", "")).strip()
+    first_error = None
+    if configured_port:
+        try:
+            result = controller.connect_motion(base)
+            return result, configured_port
+        except AutomationError as error:
+            first_error = error
+            if error.code != "motion_port_unavailable" or controller.snapshot().get("recovery_required") is True:
+                raise
+    if controller.snapshot().get("recovery_required") is True:
+        if first_error is not None:
+            raise first_error
+        raise AutomationError("motion_required", "请先完成双轴停止恢复，再连接 RS485 端口", status=409)
+    defaults = copy.deepcopy(default_experiment()["bindings"]["motion"])
+    try:
+        guided_motion = service.snapshot().get("document", {}).get("bindings", {}).get("motion")
+        if isinstance(guided_motion, dict):
+            defaults.update(copy.deepcopy(guided_motion))
+    except Exception:
+        pass
+    defaults.update(base)
+    candidates = _candidate_rs485_ports(exclude={configured_port} if configured_port else ())
+    last_error = first_error
+    for candidate_port in candidates:
+        candidate_settings = copy.deepcopy(defaults)
+        candidate_settings["port"] = candidate_port
+        try:
+            result = controller.connect_motion(candidate_settings)
+            _persist_discovered_motion_port(controller, service, candidate_port)
+            controller._event("motion_port_auto_discovered", previous_port=configured_port or None, port=candidate_port)
+            return result, candidate_port
+        except Exception as error:
+            last_error = error
+            if controller.snapshot().get("recovery_required") is True:
+                raise
+    if first_error is not None:
+        raise first_error
+    if last_error is not None:
+        raise last_error
+    raise AutomationError("motion_required", "未检测到可用的 USB–RS485 电机串口，请检查 USB 连接与 24V 供电", status=409)
+
+
 def _prepare_alignment_connection(controller, service):
     from .automation import AutomationError
 
@@ -10859,7 +10959,7 @@ def _prepare_alignment_connection(controller, service):
         cached = motion.snapshot() if motion is not None else {}
         if cached.get("connected") is not True or cached.get("faulted") is not False:
             settings = service.snapshot()["document"].get("bindings", {}).get("motion")
-            if not isinstance(settings, dict) or not str(settings.get("port", "")).strip():
+            if not isinstance(settings, dict):
                 raise AutomationError("motion_required", "请先在高级设置选择共享USB–RS485端口", status=409)
             with controller._lock:
                 previous = controller._manual_calibration_active
@@ -10868,7 +10968,7 @@ def _prepare_alignment_connection(controller, service):
             try:
                 if motion is not None:
                     controller.disconnect_motion()
-                controller.connect_motion(settings)
+                _connect_or_discover_motion(controller, service, settings)
             finally:
                 with controller._lock:
                     controller._manual_calibration_active = previous
@@ -11018,12 +11118,18 @@ def _reset_automation_devices(controller, service, boundary_at_current=None, *, 
                                  or service.snapshot()["document"]["bindings"]["motion"])
         if port is not None and port != settings["port"]:
             settings = _replace_disconnected_motion_port(controller, service, settings, port, same_bus_confirmed)
+        elif (controller._motion is not None
+              and isinstance(controller._motion.snapshot(), dict)
+              and controller._motion.snapshot().get("connected") is False
+              and controller.snapshot().get("recovery_required") is not True):
+            controller.disconnect_motion()
         if controller._motion is None:
             with controller._lock:
                 manual_active = controller._manual_calibration_active
                 controller._manual_calibration_active = False
             try:
-                controller.connect_motion(settings)
+                _, discovered_port = _connect_or_discover_motion(controller, service, settings)
+                settings["port"] = discovered_port
             except Exception as error:
                 raise AutomationError("device_reset_connection", "无法重新连接 RS485，请确认 USB 和电机电源已接好：" + str(error), status=409) from error
             finally:
@@ -11048,7 +11154,8 @@ def _reset_automation_devices(controller, service, boundary_at_current=None, *, 
             controller.cancel_limits()
         try:
             controller.disconnect_motion()
-            controller.connect_motion(settings)
+            _, discovered_port = _connect_or_discover_motion(controller, service, settings)
+            settings["port"] = discovered_port
             current = controller.stop_motion()
         except Exception as error:
             raise AutomationError("device_reset_connection", "旧会话已结束，但重新连接未完成；请检查 USB 和电机供电后重试：" + str(error), status=409) from error
@@ -11323,7 +11430,8 @@ def _automation_dispatch(method: str, action: str, payload: dict, query: dict) -
                         controller._manual_calibration_active = False
                         controller._alignment_connection_io = True
                     try:
-                        return controller.connect_motion(payload.get("motion"))
+                        result, _ = _connect_or_discover_motion(controller, service, payload.get("motion"))
+                        return result
                     finally:
                         with controller._lock:
                             controller._manual_calibration_active = previous
@@ -11387,7 +11495,8 @@ def _automation_dispatch(method: str, action: str, payload: dict, query: dict) -
             return controller.start(document, mode=payload.get("mode", "simulate"),
                                     plan_hash=payload["plan_hash"], idempotency_key=payload["idempotency_key"])
         if action == "motion/connect":
-            return controller.connect_motion(payload.get("motion"))
+            result, _ = _connect_or_discover_motion(controller, APP.guided_automation, payload.get("motion"))
+            return result
         if action == "motion/reference":
             if vars(APP.guided_automation).get("_require_four_point") is True:
                 raise AutomationError("alignment_session", "生产标定请使用键盘对位流程，不单独改参考点", status=409)
@@ -12104,6 +12213,22 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
         _SHUTDOWN_REQUESTED = False
     SHUTDOWN_INTENT.clear()
     FRONTEND_UPDATER.start(APP.hardware_idle)
+
+    def _startup_auto_connect_motion() -> None:
+        try:
+            with _preempting_operation_lock():
+                if SHUTDOWN_INTENT.is_set() or APP.automation._motion is not None or APP.automation.is_busy():
+                    return
+                settings = APP.guided_automation.snapshot()["document"].get("bindings", {}).get("motion")
+                _connect_or_discover_motion(APP.automation, APP.guided_automation, settings)
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_startup_auto_connect_motion,
+        name="startup-rs485-autoconnect",
+        daemon=True,
+    ).start()
     url = f"http://{host}:{server.server_port}/"
     DIAGNOSTICS.record(
         "info", "application.ready", "Workstation backend is ready",

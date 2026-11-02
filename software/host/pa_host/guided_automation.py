@@ -711,6 +711,18 @@ class GuidedAutomation:
             self._document = validated
             return self.snapshot()
 
+    def bind_motion_port(self, port):
+        if not isinstance(port, str) or not port.strip() or len(port) > 500:
+            raise AutomationError("invalid_value", "RS485 端口必须为非空文本", "port")
+        port = port.strip()
+        with self._lock:
+            document = copy.deepcopy(self._document)
+            document["bindings"]["motion"]["port"] = port
+            validated = _validate_document(document)
+            self._persist(document=validated)
+            self._document = validated
+            return self.snapshot()
+
     def save(self, document):
         with self._lock:
             self._idle()

@@ -297,3 +297,29 @@ def test_new_external_stop_generation_prevents_candidate_adoption(recovery_app, 
     assert service.snapshot()["document"] == original["document"]
     assert service.snapshot()["manual"]["points"] == original["manual"]["points"]
     assert_read_stop_only(serials)
+
+
+@pytest.mark.parametrize("initial_port", ["", "missing-port"])
+def test_auto_discovers_rs485_port_when_empty_or_usb_slot_changed(guided_app, tmp_path, monkeypatch, initial_port):
+    controller, motion, serials = unavailable_controller(tmp_path, FileNotFoundError("USB slot moved"))
+    service = GuidedAutomation(tmp_path / "guided", require_four_point=True)
+    document = service.snapshot()["document"]
+    document["bindings"]["motion"]["port"] = initial_port
+    if initial_port:
+        service.bind_motion_port(initial_port)
+    guided_app.automation, guided_app.guided_automation = controller, service
+    monkeypatch.setattr("serial.tools.list_ports.comports", lambda: [
+        SimpleNamespace(device="/dev/cu.Bluetooth-Incoming-Port", description="n/a", hwid="n/a", vid=None),
+        SimpleNamespace(device="/dev/cu.usbmodem101", description="SensUs CDC", hwid="USB VID:PID=2FE3:0100", vid=0x2FE3),
+        SimpleNamespace(device="replacement-port", description="USB Serial", hwid="USB VID:PID=1A86:7523", vid=0x1A86),
+    ])
+    try:
+        state = dispatch("motion/connect", {"motion": {**motion, "port": initial_port}})
+        assert state["motion"]["connected"] is True
+        assert state["motion"]["port"] == "replacement-port"
+        assert service.snapshot()["document"]["bindings"]["motion"]["port"] == "replacement-port"
+    finally:
+        controller._stop_motion_feedback()
+        if controller._motion is not None:
+            controller._motion.close()
+
