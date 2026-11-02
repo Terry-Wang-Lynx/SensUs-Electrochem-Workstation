@@ -244,7 +244,10 @@
       const {electrode_potentials, ...shared} = validated;
       const hasElectrodeField = settings && typeof settings === 'object' && 'electrode_potentials' in settings;
       this.edit(document => {
+        document.bindings ||= {};
+        document.bindings.boards ||= {};
         for (const slot of ['A', 'B']) {
+          document.bindings.boards[slot] ||= {address: '', settings: {}};
           const board = document.bindings.boards[slot];
           board.settings = {...board.settings, ...shared};
           if (hasElectrodeField) {
@@ -700,11 +703,65 @@
     try { await action(); } catch (error) { showError(error); }
     finally { pending = false; updateControls(); }
   }
+  function applyPendingDrafts() {
+    if (draftAreas.has('sampling')) {
+      const electrode_potentials = {};
+      for (const id of CHANNELS) {
+        const raw = element('htElectrodePotential-' + id)?.value.trim();
+        if (raw !== undefined && raw !== '') electrode_potentials[id] = Number(raw);
+      }
+      model.applySharedSampling({potential_v: numeric('htSharedPotential'), working_electrode_v: numeric('htSharedWorkingElectrode'),
+        sens_period_code: numeric('htSharedPeriod'), fsr_nA: numeric('htSharedFsr'), offset_mode: element('htSharedOffset').value,
+        ...(Object.keys(electrode_potentials).length || model.document.electrodes?.some(e => e.potential_v !== undefined)
+            || ['A', 'B'].some(s => model.document.bindings?.boards?.[s]?.settings?.channel_potentials_v)
+            ? {electrode_potentials} : {})});
+      draftAreas.delete('sampling');
+      for (const slot of ['A', 'B']) element('htBoardSettings-' + slot).value = JSON.stringify(model.document.bindings.boards[slot].settings, null, 2);
+    }
+    if (draftAreas.has('boardMapping')) {
+      if (boardDraft) {
+        model.edit(document => {
+          document.bindings.boards ||= {};
+          for (const slot of ['A', 'B']) if (typeof boardDraft[slot] === 'string') document.bindings.boards[slot] = {...document.bindings.boards[slot], address: boardDraft[slot]};
+        });
+        for (const slot of ['A', 'B']) element('htBoardAddress-' + slot).value = model.document.bindings.boards[slot]?.address || '';
+      }
+      boardDraftDirty = false; draftAreas.delete('boardMapping');
+    }
+    if (draftAreas.has('defaults') && sectionFeedback.defaults.phase !== 'failed' && sectionFeedback.defaults.phase !== 'applying') {
+      const defaults = copy(model.document.defaults);
+      for (const [key] of movementFields) {
+        if (element('htDefault-' + key).value.trim() !== '') defaults[key] = numeric('htDefault-' + key);
+      }
+      model.edit(document => {
+        document.output_dir = element('htOutput').value; document.defaults = defaults;
+        for (const electrode of document.electrodes) electrode.name = element('htElectrode-' + electrode.id).value;
+      });
+      draftAreas.delete('defaults'); sectionFeedback.defaults.phase = 'applied'; renderDefaultsFeedback();
+    }
+    if (draftAreas.has('bindings')) {
+      const bindings = copy(model.document.bindings);
+      for (const slot of ['A', 'B']) {
+        const address = element('htBoardAddress-' + slot).value.trim();
+        if (address !== (bindings.boards[slot]?.address || '')) boardAddressEdits.add(slot);
+        bindings.boards[slot] = {address, settings: JSON.parse(element('htBoardSettings-' + slot).value)};
+      }
+      bindings.motion.port = element('htPort').value.trim(); bindings.motion.baud = numeric('htBaud');
+      for (const axis of ['X', 'Z']) for (const key of axisFields) bindings.motion.axes[axis][key] = numeric('htAxis-' + axis + '-' + key);
+      model.edit(document => { document.bindings = bindings; document.safety = {...document.safety, motion_policy_confirmed: element('htMotionPolicy').checked, electrical_policy_confirmed: element('htElectricalPolicy').checked}; });
+      boardAddressDrafts.clear(); draftAreas.delete('bindings');
+    }
+    if (draftAreas.has('execution') && !element('htExecutionStatus').textContent.startsWith('未应用保存')) {
+      model.applyExecution(element('htExecutionMode').value, Number(element('htExecutionCount').value), element('htExecutionRoute').value);
+      draftAreas.delete('execution');
+    }
+  }
   function requireDocument(allowedArea) {
     if (allowedArea !== 'calibration' && (snapshot.busy || guided.manual?.active || boardsPending)) throw failure('BUSY', '实验或标定进行中，不能修改或保存实验');
     if (limitCalibrationActive()) throw failure('LIMITS_CALIBRATING', '四边界限位读取期间，实验与普通轴操作已暂停');
     if (!model) throw failure('DOCUMENT_LOADING', '模板尚未读入');
     if (jsonDirty && allowedArea !== 'json') throw failure('JSON_NOT_APPLIED', '请先应用或还原高级 JSON 草稿');
+    if ((!allowedArea || allowedArea === 'calibration') && draftAreas.size) applyPendingDrafts();
     if ((!allowedArea || allowedArea === 'calibration') && draftAreas.size) throw failure('FIELDS_NOT_APPLIED', '请先应用已编辑的采样参数、高级参数或设备绑定');
     if ((!allowedArea || allowedArea === 'calibration') && normalDrafts.size) throw failure('FIELDS_INVALID', '请先修正正在编辑的时长或采集窗口');
   }
@@ -967,7 +1024,7 @@
     renderSelection(); renderSampling(); updateControls();
   }
   function editDocument(change, render = false) {
-    try { requireDocument(); change(); documentChanged(render); }
+    try { requireDocument('normal'); change(); documentChanged(render); }
     catch (error) { showError(error); if (model) renderColumn(); }
   }
   function syncScene() {
@@ -1565,7 +1622,6 @@
   function editNormalField(id, change) {
     try {
       requireDocument('normal');
-      if (draftAreas.size) throw failure('FIELDS_NOT_APPLIED', '请先应用已编辑的高级参数或设备绑定');
       change(); normalDrafts.delete(id); documentChanged(); renderColumnHints(); element('htError').hidden = true; element('htErrorDetails').hidden = true;
     } catch (error) {
       normalDrafts.add(id); model?.invalidate(); runKey = null; showError(error); updateControls();
@@ -1672,7 +1728,7 @@
   });
   element('htApplySharedSampling').addEventListener('click', () => handle(async () => {
     requireDocument('sampling');
-    if ([...draftAreas].some(area => area !== 'sampling') || normalDrafts.size) throw failure('FIELDS_NOT_APPLIED', '请先应用其它编辑并修正列时长 / 采集窗口');
+    if (normalDrafts.size) throw failure('FIELDS_NOT_APPLIED', '请先修正列时长 / 采集窗口');
     const electrode_potentials = {};
     for (const id of CHANNELS) {
       const raw = element('htElectrodePotential-' + id)?.value.trim();
@@ -1791,7 +1847,7 @@
   for (const id of ['htExecutionCount', 'htExecutionRoute']) element(id).addEventListener('input', executionDraftChanged);
   element('htApplyExecution').addEventListener('click', () => handle(async () => {
     requireDocument('execution');
-    if ([...draftAreas].some(area => area !== 'execution') || normalDrafts.size) throw failure('FIELDS_NOT_APPLIED', '请先应用或修正其他参数草稿');
+    if (normalDrafts.size) throw failure('FIELDS_NOT_APPLIED', '请先修正列时长或采集窗口草稿');
     const executionDraft = () => JSON.stringify(['htExecutionMode', 'htExecutionCount', 'htExecutionRoute'].map(id => element(id).value));
     const submittedDraft = executionDraft();
     try {

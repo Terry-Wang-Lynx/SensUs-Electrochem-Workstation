@@ -56,3 +56,26 @@ console.log(JSON.stringify({afterDefaultEdit,afterApplyAll,columnDurationValue:e
     assert all("60 s" in text for text in result["afterApplyAll"])
     assert result["columnDurationValue"] == ""
 
+
+def test_editing_duration_or_saving_with_dirty_subforms_never_throws_fields_not_applied():
+    result = evaluate_browser("""
+(async()=>{HighThroughput.activate();await tick();
+input('htSharedPotential',0.2);
+input('htDefault-ascend_speed_mm_s',1.5);
+input('htDefaultDuration',60);
+await click('htApplyDurationAll');
+await click('htSave');
+const saved=requests.findLast(request=>request.route==='guided/experiment')?.body.document;
+console.log(JSON.stringify({
+ error:elements.get('htError').hidden?null:elements.get('htError').textContent,
+ dwell:saved?.defaults?.dwell_s,
+ ascend:saved?.defaults?.ascend_speed_mm_s,
+ potA:saved?.bindings?.boards?.A?.settings?.potential_v,
+}));})();
+""", before_source=BOOTSTRAP)
+    assert result["error"] is None
+    assert result["dwell"] == 60
+    assert result["ascend"] == 1.5
+    assert result["potA"] == 0.2
+
+
