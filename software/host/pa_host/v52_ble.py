@@ -410,6 +410,91 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("A single V5.2 board supports at most 3 distinct WE-RE potentials (DAC B, C, D)")
         else:
             normalized_channel_potentials = None
+
+    raw_channel_settings = merged.get("channel_settings")
+    normalized_channel_settings = None
+    if raw_channel_settings is not None:
+        if not isinstance(raw_channel_settings, dict):
+            raise ValueError("channel_settings must be an object mapping channels 1..4 to sampling settings")
+        normalized_channel_settings = {}
+        allowed_ch_keys = {"potential_v", "working_electrode_v", "fsr_nA", "offset_mode", "offset_nA"}
+        for k, ch_cfg in raw_channel_settings.items():
+            ch_key = str(k)
+            if ch_key not in {"1", "2", "3", "4"}:
+                raise ValueError(f"invalid channel key {k} in channel_settings")
+            if not isinstance(ch_cfg, dict):
+                raise ValueError(f"channel_settings[{ch_key}] must be an object")
+            unexpected_ch = set(ch_cfg) - allowed_ch_keys
+            if unexpected_ch:
+                raise ValueError(f"unexpected field {sorted(unexpected_ch)[0]} in channel_settings[{ch_key}]")
+            ch_we = we_v
+            if ch_cfg.get("working_electrode_v") is not None:
+                raw_we = ch_cfg["working_electrode_v"]
+                if isinstance(raw_we, bool) or not isinstance(raw_we, (int, float)) or not math.isfinite(float(raw_we)):
+                    raise ValueError(f"channel_settings[{ch_key}].working_electrode_v must be a finite number")
+                ch_we = float(raw_we)
+            ch_pot = normalized_channel_potentials[ch_key] if normalized_channel_potentials else potential_v
+            if ch_cfg.get("potential_v") is not None:
+                raw_pot = ch_cfg["potential_v"]
+                if isinstance(raw_pot, bool) or not isinstance(raw_pot, (int, float)) or not math.isfinite(float(raw_pot)):
+                    raise ValueError(f"channel_settings[{ch_key}].potential_v must be a finite number")
+                ch_pot = float(raw_pot)
+            ch_re = ch_we - ch_pot
+            if not -0.4 <= ch_pot <= 0.4 or not 0.25 <= ch_we <= 1.535625 or not 0.1 <= ch_re <= 1.535625:
+                raise ValueError(f"channel {ch_key} WE/RE is outside the V5.2 DAC/headroom range")
+            ch_fsr = fsr
+            if ch_cfg.get("fsr_nA") is not None:
+                raw_fsr = ch_cfg["fsr_nA"]
+                if isinstance(raw_fsr, bool) or not isinstance(raw_fsr, (int, float)) or not math.isfinite(float(raw_fsr)) or float(raw_fsr) != math.trunc(float(raw_fsr)):
+                    raise ValueError(f"channel_settings[{ch_key}].fsr_nA must be an integer")
+                ch_fsr = int(raw_fsr)
+                if ch_fsr not in (50, 100, 250, 500, 1000, 2000):
+                    raise ValueError(f"channel {ch_key} unsupported V5.2 FSR")
+            ch_offset = offset
+            if ch_cfg.get("offset_mode") is not None:
+                ch_offset = str(ch_cfg["offset_mode"])
+                if ch_offset not in OFFSET_CODES:
+                    raise ValueError(f"channel {ch_key} unsupported V5.2 offset")
+            ch_offset_na = ch_fsr * int(ch_offset[:-3]) / 100 if ch_offset.endswith("pct") else int(ch_offset[:-2])
+            if ch_offset_na >= ch_fsr:
+                raise ValueError(f"channel {ch_key} offset must be below FSR")
+            normalized_channel_settings[ch_key] = {
+                "potential_v": ch_pot,
+                "working_electrode_v": ch_we,
+                "fsr_nA": ch_fsr,
+                "offset_mode": ch_offset,
+                "offset_nA": ch_offset_na,
+            }
+        if normalized_channel_settings:
+            for ch_idx in range(1, 5):
+                ch_key = str(ch_idx)
+                if ch_key not in normalized_channel_settings:
+                    ch_pot = normalized_channel_potentials[ch_key] if normalized_channel_potentials else potential_v
+                    ch_re = we_v - ch_pot
+                    if not -0.4 <= ch_pot <= 0.4 or not 0.1 <= ch_re <= 1.535625:
+                        raise ValueError(f"channel {ch_key} WE/RE is outside the V5.2 DAC/headroom range")
+                    normalized_channel_settings[ch_key] = {
+                        "potential_v": ch_pot,
+                        "working_electrode_v": we_v,
+                        "fsr_nA": fsr,
+                        "offset_mode": offset,
+                        "offset_nA": offset_na,
+                    }
+            distinct_we_q = {
+                quantize_dac(round(cfg["working_electrode_v"] * 1_000_000))
+                for cfg in normalized_channel_settings.values()
+            }
+            distinct_re_q = {
+                quantize_dac(round((cfg["working_electrode_v"] - cfg["potential_v"]) * 1_000_000))
+                for cfg in normalized_channel_settings.values()
+            }
+            if len(distinct_we_q) == 1 and len(distinct_re_q) > 3:
+                raise ValueError("A single V5.2 board supports at most 3 distinct WE-RE potentials (DAC B, C, D)")
+            if len(distinct_we_q | distinct_re_q) > 4:
+                raise ValueError("A single V5.2 board has 4 shared DACs (DAC A-D); requested per-channel WE and RE voltages require more than 4 distinct DAC levels")
+        else:
+            normalized_channel_settings = None
+
     duration = number("duration_s")
     adaptive = merged["adaptive_stop"]
     if not isinstance(adaptive, bool):
@@ -434,6 +519,10 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
         merged["channel_potentials_v"] = {str(ch): normalized_channel_potentials[str(ch)] for ch in range(1, 5)}
     else:
         merged.pop("channel_potentials_v", None)
+    if normalized_channel_settings is not None:
+        merged["channel_settings"] = {str(ch): normalized_channel_settings[str(ch)] for ch in range(1, 5)}
+    else:
+        merged.pop("channel_settings", None)
     return merged
 
 
@@ -766,7 +855,8 @@ async def configure_session(session: BleSession, settings: dict[str, Any]) -> di
     if before["mask"] != 0 or before["fault"] or before["io"]:
         raise RuntimeError("STATUS is not healthy and stopped before configuration")
     ch_potentials = settings.get("channel_potentials_v")
-    if not ch_potentials:
+    ch_settings = settings.get("channel_settings")
+    if not ch_potentials and not ch_settings:
         # Stage a new bias on unused DACs. Rewriting active WE then RE DACs in
         # separate BLE commands otherwise applies the entire common-mode change
         # temporarily as electrode polarization (for example +1.0 V instead of
@@ -806,39 +896,84 @@ async def configure_session(session: BleSession, settings: dict[str, Any]) -> di
         return {"info": info, "status": status, "requested": requested, "actual": actual,
                 "settings": settings, "config_confirmed": True, "dac_pair": pair[0] + pair[1]}
 
-    dac_names = ("B", "C", "D")
-    re_dac_by_quantized: dict[int, tuple[int, str, int]] = {}
-    channel_re_dac: dict[int, int] = {}
-    base_q = quantize_dac(base_re_uv)
-    if any(quantize_dac(round((settings["working_electrode_v"] - ch_potentials[str(ch)]) * 1_000_000)) == base_q for ch in range(1, 5)):
-        re_dac_by_quantized[base_q] = (1, "B", base_re_uv)
+    resolved_ch: dict[int, dict[str, Any]] = {}
     for ch in range(1, 5):
-        ch_re_uv = round((settings["working_electrode_v"] - ch_potentials[str(ch)]) * 1_000_000)
-        q_uv = quantize_dac(ch_re_uv)
-        if q_uv not in re_dac_by_quantized:
-            slot_idx = len(re_dac_by_quantized)
-            dac_letter = dac_names[slot_idx]
-            re_dac_by_quantized[q_uv] = (slot_idx + 1, dac_letter, ch_re_uv)
-        channel_re_dac[ch] = re_dac_by_quantized[q_uv][0]
+        ch_key = str(ch)
+        ch_cfg = (ch_settings or {}).get(ch_key) or {}
+        ch_we_v = float(ch_cfg.get("working_electrode_v", settings["working_electrode_v"]))
+        ch_pot_v = float(ch_cfg.get("potential_v", (ch_potentials or {}).get(ch_key, settings["potential_v"])))
+        ch_fsr = int(ch_cfg.get("fsr_nA", settings["fsr_nA"]))
+        ch_offset_mode = str(ch_cfg.get("offset_mode", settings["offset_mode"]))
+        ch_we_uv = round(ch_we_v * 1_000_000)
+        ch_re_uv = round((ch_we_v - ch_pot_v) * 1_000_000)
+        resolved_ch[ch] = {
+            "we_uv": ch_we_uv,
+            "re_uv": ch_re_uv,
+            "fsr_nA": ch_fsr,
+            "offset_code": OFFSET_CODES[ch_offset_mode],
+        }
+
+    distinct_we_q = {quantize_dac(resolved_ch[ch]["we_uv"]) for ch in range(1, 5)}
+    all_dac_names = ("A", "B", "C", "D")
+    channel_we_dac: dict[int, int] = {}
+    channel_re_dac: dict[int, int] = {}
+    programmed_dacs: dict[str, tuple[int, int]] = {}  # dac_letter -> (raw_uv, quantized_uv)
+
+    if len(distinct_we_q) == 1:
+        shared_we_uv = resolved_ch[1]["we_uv"]
+        shared_we_q = quantize_dac(shared_we_uv)
+        programmed_dacs["A"] = (shared_we_uv, shared_we_q)
+        re_dac_names = ("B", "C", "D")
+        re_dac_by_quantized: dict[int, tuple[int, str, int]] = {}
+        base_q = quantize_dac(base_re_uv)
+        if any(quantize_dac(resolved_ch[ch]["re_uv"]) == base_q for ch in range(1, 5)):
+            re_dac_by_quantized[base_q] = (1, "B", base_re_uv)
+        for ch in range(1, 5):
+            ch_re_uv = resolved_ch[ch]["re_uv"]
+            q_uv = quantize_dac(ch_re_uv)
+            if q_uv not in re_dac_by_quantized:
+                slot_idx = len(re_dac_by_quantized)
+                dac_letter = re_dac_names[slot_idx]
+                re_dac_by_quantized[q_uv] = (slot_idx + 1, dac_letter, ch_re_uv)
+            channel_we_dac[ch] = 0
+            channel_re_dac[ch] = re_dac_by_quantized[q_uv][0]
+        await session.command(f"DAC A {shared_we_uv}")
+        if "B" not in {item[1] for item in re_dac_by_quantized.values()}:
+            await session.command(f"DAC B {base_re_uv}")
+            programmed_dacs["B"] = (base_re_uv, base_q)
+        for _dac_idx, dac_letter, raw_uv in sorted(re_dac_by_quantized.values(), key=lambda x: x[0]):
+            await session.command(f"DAC {dac_letter} {raw_uv}")
+            programmed_dacs[dac_letter] = (raw_uv, quantize_dac(raw_uv))
+    else:
+        dac_by_quantized: dict[int, tuple[int, str, int]] = {}
+        for ch in range(1, 5):
+            for role, raw_uv in (("we", resolved_ch[ch]["we_uv"]), ("re", resolved_ch[ch]["re_uv"])):
+                q_uv = quantize_dac(raw_uv)
+                if q_uv not in dac_by_quantized:
+                    slot_idx = len(dac_by_quantized)
+                    dac_letter = all_dac_names[slot_idx]
+                    dac_by_quantized[q_uv] = (slot_idx, dac_letter, raw_uv)
+                if role == "we":
+                    channel_we_dac[ch] = dac_by_quantized[q_uv][0]
+                else:
+                    channel_re_dac[ch] = dac_by_quantized[q_uv][0]
+        for _dac_idx, dac_letter, raw_uv in sorted(dac_by_quantized.values(), key=lambda x: x[0]):
+            await session.command(f"DAC {dac_letter} {raw_uv}")
+            programmed_dacs[dac_letter] = (raw_uv, quantize_dac(raw_uv))
+
     requested["channel_potentials_uv"] = {
-        str(ch): we_uv - round((settings["working_electrode_v"] - ch_potentials[str(ch)]) * 1_000_000)
+        str(ch): resolved_ch[ch]["we_uv"] - resolved_ch[ch]["re_uv"]
         for ch in range(1, 5)
     }
-
-    await session.command(f"DAC A {we_uv}")
-    if "B" not in {item[1] for item in re_dac_by_quantized.values()}:
-        await session.command(f"DAC B {base_re_uv}")
-    for _dac_idx, dac_letter, raw_uv in sorted(re_dac_by_quantized.values(), key=lambda x: x[0]):
-        await session.command(f"DAC {dac_letter} {raw_uv}")
     await session.command(f"PERIOD {settings['sens_period_code']}")
 
     expected_channels = {}
     for channel in range(1, 5):
         cfg = {
-            "fsr_nA": settings["fsr_nA"],
-            "offset_code": OFFSET_CODES[settings["offset_mode"]],
+            "fsr_nA": resolved_ch[channel]["fsr_nA"],
+            "offset_code": resolved_ch[channel]["offset_code"],
             "conv_time_code": 0,
-            "we_dac": 0,
+            "we_dac": channel_we_dac[channel],
             "re_dac": channel_re_dac[channel],
             "cp": 0,
         }
@@ -850,18 +985,26 @@ async def configure_session(session: BleSession, settings: dict[str, Any]) -> di
         raise RuntimeError("STATUS run/period/fault mismatch")
     if any(status["channels"].get(ch_key) != expected_cfg for ch_key, expected_cfg in expected_channels.items()):
         raise RuntimeError("STATUS channel configuration mismatch")
-    actual: dict[str, Any] = {"we_uv": status["dacs"]["A"]["uv"], "re_uv": status["dacs"]["B"]["uv"]}
-    if actual["we_uv"] != quantize_dac(we_uv):
-        raise RuntimeError("STATUS DAC configuration mismatch")
-    for q_uv, (_dac_idx, dac_letter, raw_uv) in re_dac_by_quantized.items():
+    for dac_letter, (_raw_uv, q_uv) in programmed_dacs.items():
         if status["dacs"][dac_letter]["uv"] != q_uv:
             raise RuntimeError("STATUS DAC configuration mismatch")
-    if "B" not in {item[1] for item in re_dac_by_quantized.values()}:
-        if actual["re_uv"] != quantize_dac(base_re_uv):
-            raise RuntimeError("STATUS DAC configuration mismatch")
+    actual: dict[str, Any] = {"we_uv": status["dacs"]["A"]["uv"], "re_uv": status["dacs"]["B"]["uv"]}
     actual["potential_uv"] = actual["we_uv"] - actual["re_uv"]
     actual["channel_potentials_uv"] = {
-        str(ch): actual["we_uv"] - status["dacs"][dac_names[channel_re_dac[ch] - 1]]["uv"]
+        str(ch): (
+            status["dacs"][all_dac_names[channel_we_dac[ch]]]["uv"]
+            - status["dacs"][all_dac_names[channel_re_dac[ch]]]["uv"]
+        )
+        for ch in range(1, 5)
+    }
+    actual["channel_settings"] = {
+        str(ch): {
+            "we_uv": status["dacs"][all_dac_names[channel_we_dac[ch]]]["uv"],
+            "re_uv": status["dacs"][all_dac_names[channel_re_dac[ch]]]["uv"],
+            "potential_uv": actual["channel_potentials_uv"][str(ch)],
+            "fsr_nA": status["channels"][str(ch)]["fsr_nA"],
+            "offset_code": status["channels"][str(ch)]["offset_code"],
+        }
         for ch in range(1, 5)
     }
     return {"info": info, "status": status, "requested": requested, "actual": actual,

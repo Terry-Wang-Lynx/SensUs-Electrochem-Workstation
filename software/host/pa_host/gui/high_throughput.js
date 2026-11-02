@@ -33,25 +33,71 @@
     const offset = settings.offset_mode.endsWith('pct') ? settings.fsr_nA * Number(settings.offset_mode.slice(0, -3)) / 100 : Number(settings.offset_mode.slice(0, -2));
     if (offset >= settings.fsr_nA) invalid('偏置电流须小于所选量程', 'offset_mode');
     const result = Object.fromEntries(SAMPLING_FIELDS.map(field => [field, settings[field]]));
-    if (settings.electrode_potentials && typeof settings.electrode_potentials === 'object') {
+    const hasPotentialsObj = settings.electrode_potentials && typeof settings.electrode_potentials === 'object';
+    const hasSettingsObj = settings.electrode_settings && typeof settings.electrode_settings === 'object';
+    if (hasPotentialsObj || hasSettingsObj) {
       const overrides = {};
-      for (const [id, raw] of Object.entries(settings.electrode_potentials)) {
+      const electrodeSettings = {};
+      for (const id of Object.keys(settings.electrode_potentials || {})) {
         if (!CHANNELS.includes(id)) invalid('电极身份须为 A–H', 'electrode_potentials.' + id);
-        if (raw === null || raw === undefined || raw === '') continue;
-        const val = Number(raw);
-        if (!Number.isFinite(val) || val < -0.4 || val > 0.4) invalid(`电极 ${id} 电位须在 −0.4 至 +0.4 V 之间`, 'electrode_potentials.' + id);
-        const re = settings.working_electrode_v - val;
-        if (re < 0.1 || re > 1.535625) invalid(`电极 ${id} 对应的 RE 超出 0.1 至 1.535625 V 范围`, 'electrode_potentials.' + id);
-        overrides[id] = val;
+      }
+      for (const id of Object.keys(settings.electrode_settings || {})) {
+        if (!CHANNELS.includes(id)) invalid('电极身份须为 A–H', 'electrode_settings.' + id);
+      }
+      for (const id of CHANNELS) {
+        const entry = (hasSettingsObj && settings.electrode_settings[id] && typeof settings.electrode_settings[id] === 'object')
+          ? settings.electrode_settings[id] : {};
+        const rawPot = entry.potential_v !== undefined ? entry.potential_v : (hasPotentialsObj ? settings.electrode_potentials[id] : undefined);
+        const rawWe = entry.working_electrode_v;
+        const rawFsr = entry.fsr_nA;
+        const rawOffset = entry.offset_mode;
+        const elCfg = {};
+        if (rawPot !== null && rawPot !== undefined && rawPot !== '') {
+          const val = Number(rawPot);
+          if (!Number.isFinite(val) || val < -0.4 || val > 0.4) invalid(`电极 ${id} 测试电位须在 −0.4 至 +0.4 V 之间`, 'electrode_potentials.' + id);
+          overrides[id] = val;
+          elCfg.potential_v = val;
+        }
+        if (rawWe !== null && rawWe !== undefined && rawWe !== '') {
+          const weVal = Number(rawWe);
+          if (!Number.isFinite(weVal) || weVal < 0.25 || weVal > 1.535) invalid(`电极 ${id} WE 电位须在 0.25 至 1.535 V 之间`, 'electrode_settings.' + id + '.working_electrode_v');
+          elCfg.working_electrode_v = weVal;
+        }
+        const effPot = elCfg.potential_v ?? settings.potential_v;
+        const effWe = elCfg.working_electrode_v ?? settings.working_electrode_v;
+        const effRe = effWe - effPot;
+        if (effRe < 0.1 || effRe > 1.535625) invalid(`电极 ${id} 对应的 RE (${effRe.toFixed(3)} V) 超出 0.1 至 1.535625 V 范围`, 'electrode_potentials.' + id);
+        if (rawFsr !== null && rawFsr !== undefined && rawFsr !== '') {
+          const fsrVal = Number(rawFsr);
+          if (![50, 100, 250, 500, 1000, 2000].includes(fsrVal)) invalid(`电极 ${id} 电流量程须为 50–2000 nA`, 'electrode_settings.' + id + '.fsr_nA');
+          elCfg.fsr_nA = fsrVal;
+        }
+        if (rawOffset !== null && rawOffset !== undefined && rawOffset !== '') {
+          const offVal = String(rawOffset);
+          if (!SAMPLING_OFFSETS.includes(offVal)) invalid(`电极 ${id} 偏置电流无效`, 'electrode_settings.' + id + '.offset_mode');
+          elCfg.offset_mode = offVal;
+        }
+        const effFsr = elCfg.fsr_nA ?? settings.fsr_nA;
+        const effOffMode = elCfg.offset_mode ?? settings.offset_mode;
+        const effOffNa = effOffMode.endsWith('pct') ? effFsr * Number(effOffMode.slice(0, -3)) / 100 : Number(effOffMode.slice(0, -2));
+        if (effOffNa >= effFsr) invalid(`电极 ${id} 偏置电流 (${effOffNa} nA) 须小于其电流量程 (${effFsr} nA)`, 'electrode_settings.' + id + '.offset_mode');
+        if (Object.keys(elCfg).length) electrodeSettings[id] = elCfg;
       }
       for (const [slot, group] of [['A', CHANNELS.slice(0, 4)], ['B', CHANNELS.slice(4, 8)]]) {
-        const distinctRe = new Set(group.map(id => {
-          const p = overrides[id] ?? settings.potential_v;
-          return Math.round((settings.working_electrode_v - p) * 1e6 / 375) * 375;
+        const distinctWe = new Set(group.map(id => {
+          const w = electrodeSettings[id]?.working_electrode_v ?? settings.working_electrode_v;
+          return Math.round(w * 1e6 / 375) * 375;
         }));
-        if (distinctRe.size > 3) invalid(`板 ${slot} 最多同时支持 3 种不同测试电位（DAC B/C/D）`, 'electrode_potentials');
+        const distinctRe = new Set(group.map(id => {
+          const p = electrodeSettings[id]?.potential_v ?? overrides[id] ?? settings.potential_v;
+          const w = electrodeSettings[id]?.working_electrode_v ?? settings.working_electrode_v;
+          return Math.round((w - p) * 1e6 / 375) * 375;
+        }));
+        if (distinctWe.size === 1 && distinctRe.size > 3) invalid(`板 ${slot} 最多同时支持 3 种不同测试电位（DAC B/C/D）`, 'electrode_potentials');
+        if (new Set([...distinctWe, ...distinctRe]).size > 4) invalid(`板 ${slot} 共有 4 个共享 DAC（DAC A–D），当前该板 4 路电极所需的不同 WE 与 RE 电位总数超出 4 个`, 'electrode_settings');
       }
       if (Object.keys(overrides).length) result.electrode_potentials = overrides;
+      if (Object.keys(electrodeSettings).length) result.electrode_settings = electrodeSettings;
     }
     return result;
   }
@@ -241,8 +287,8 @@
     };
     model.applySharedSampling = function (settings) {
       const validated = validateSamplingParameters(settings);
-      const {electrode_potentials, ...shared} = validated;
-      const hasElectrodeField = settings && typeof settings === 'object' && 'electrode_potentials' in settings;
+      const {electrode_potentials, electrode_settings, ...shared} = validated;
+      const hasElectrodeField = settings && typeof settings === 'object' && ('electrode_potentials' in settings || 'electrode_settings' in settings);
       this.edit(document => {
         document.bindings ||= {};
         document.bindings.boards ||= {};
@@ -253,22 +299,49 @@
           if (hasElectrodeField) {
             const group = slot === 'A' ? CHANNELS.slice(0, 4) : CHANNELS.slice(4, 8);
             const boardPotentials = {};
+            const boardChannelSettings = {};
+            let hasNonPotentialOverride = false;
             for (const id of group) {
-              if (electrode_potentials && Number.isFinite(electrode_potentials[id])) {
-                boardPotentials[String(boardChannelForElectrode(id))] = electrode_potentials[id];
+              const chKey = String(boardChannelForElectrode(id));
+              const elCfg = electrode_settings?.[id] || {};
+              const potVal = elCfg.potential_v ?? electrode_potentials?.[id];
+              if (Number.isFinite(potVal)) {
+                boardPotentials[chKey] = potVal;
               }
+              const chEntry = {};
+              if (Number.isFinite(potVal)) chEntry.potential_v = potVal;
+              if (Number.isFinite(elCfg.working_electrode_v)) {
+                chEntry.working_electrode_v = elCfg.working_electrode_v;
+                hasNonPotentialOverride = true;
+              }
+              if (Number.isFinite(elCfg.fsr_nA)) {
+                chEntry.fsr_nA = elCfg.fsr_nA;
+                hasNonPotentialOverride = true;
+              }
+              if (typeof elCfg.offset_mode === 'string' && elCfg.offset_mode) {
+                chEntry.offset_mode = elCfg.offset_mode;
+                hasNonPotentialOverride = true;
+              }
+              if (Object.keys(chEntry).length) boardChannelSettings[chKey] = chEntry;
             }
             if (Object.keys(boardPotentials).length) board.settings.channel_potentials_v = boardPotentials;
             else delete board.settings.channel_potentials_v;
+            if (hasNonPotentialOverride && Object.keys(boardChannelSettings).length) board.settings.channel_settings = boardChannelSettings;
+            else delete board.settings.channel_settings;
           }
         }
         if (hasElectrodeField && Array.isArray(document.electrodes)) {
           for (const electrode of document.electrodes) {
-            if (electrode_potentials && Number.isFinite(electrode_potentials[electrode.id])) {
-              electrode.potential_v = electrode_potentials[electrode.id];
-            } else {
-              delete electrode.potential_v;
-            }
+            const elCfg = electrode_settings?.[electrode.id] || {};
+            const potVal = elCfg.potential_v ?? electrode_potentials?.[electrode.id];
+            if (Number.isFinite(potVal)) electrode.potential_v = potVal;
+            else delete electrode.potential_v;
+            if (Number.isFinite(elCfg.working_electrode_v)) electrode.working_electrode_v = elCfg.working_electrode_v;
+            else delete electrode.working_electrode_v;
+            if (Number.isFinite(elCfg.fsr_nA)) electrode.fsr_nA = elCfg.fsr_nA;
+            else delete electrode.fsr_nA;
+            if (typeof elCfg.offset_mode === 'string' && elCfg.offset_mode) electrode.offset_mode = elCfg.offset_mode;
+            else delete electrode.offset_mode;
           }
         }
       });
@@ -586,8 +659,8 @@
     '<details id="htErrorDetails" class="ht-error-details" hidden><summary>技术详情（提供给维护人员）</summary><pre id="htErrorDetailText"></pre></details>',
     '<div id="htSimulationNotice" class="ht-message ht-simulation">模拟实验 · 生成合成数据，不操作实物。3D 仅作流程示意。</div>',
     '<div id="htLiveGate" class="ht-message ht-live-gate" hidden><label class="ht-check"><input id="htLiveConfirmed" type="checkbox">本次允许驱动实物与电极，已确认装夹、工作高度、安全高度及高级设置中的运动与电气策略</label></div>',
-    '<section class="panel ht-template-panel"><div class="ht-template-fields"><label>实验模板<select id="htTemplate"><option value="template1">Template 1 · 逐列实验</option></select></label><label>实验名称<input id="htName" aria-label="实验名称"></label><label>全板每列默认时长 (s)<input id="htDefaultDuration" type="number" min="0.001" step="any" value="180"></label><button id="htApplyDurationAll" class="secondary" type="button" title="清除单列单独覆盖，让全部 12 列统一使用此默认时长">同步到全部12列</button><button id="htSave" class="secondary" type="button">保存模板</button></div><div class="ht-template-summary"><span id="htSelectionSummary">固定物理列 1–12 · 电极 A–H</span><div class="ht-template-tabs" role="tablist" aria-label="模板参数与板卡对应"><button id="htSamplingToggle" type="button" role="tab" aria-selected="false" aria-controls="htSamplingPanel">采样参数（8电极共用）</button><button id="htMappingToggle" type="button" role="tab" aria-selected="false" aria-controls="htMappingPanel">板卡与电极对应</button></div><span id="htEditorState">加载中</span></div>',
-    '<section id="htSamplingPanel" class="ht-template-pane" role="tabpanel" aria-labelledby="htSamplingToggle" hidden><p id="htSharedSamplingState" class="ht-sampling-state" role="status">正在读取两板参数…</p><div class="ht-sampling-fields"><label>默认测试电位 WE−RE (V)<input id="htSharedPotential" type="number" min="-0.4" max="0.4" step="0.01"></label><label>WE 电位 (V)<input id="htSharedWorkingElectrode" type="number" min="0.25" max="1.535" step="0.01"></label><label>硬件采样周期<select id="htSharedPeriod"></select></label><label>电流量程<select id="htSharedFsr"></select></label><label>偏置电流<select id="htSharedOffset"></select></label></div><div class="ht-small-head"><strong>各电极独立电位 WE−RE (V，留空继承默认；每板最多 3 种不同电位)</strong><div><button id="htPresetEvapCal" class="text-button" type="button">预设：A–G −0.2 V + H +0.2 V（蒸发校准）</button><button id="htPresetUniformPotential" class="text-button" type="button">8 路统一电位</button></div></div><div id="htElectrodePotentials" class="ht-window-grid"></div><p id="htSharedPotentialSummary" class="ht-hint"></p><div class="ht-sampling-footer"><p class="ht-hint">板 A（A–D）与板 B（E–H）各自包含 DAC A（共用 WE）与 DAC B/C/D（支持同板最多 3 种不同 RE 电位，如 7 路 −0.2 V + 1 路 +0.2 V 蒸发校准）。点击「应用到两块板」保存至模板，实物运行时自动下发。</p><button id="htApplySharedSampling" class="secondary" type="button">应用到两块板</button></div></section>',
+    '<section class="panel ht-template-panel"><div class="ht-template-fields"><label>实验模板<select id="htTemplate"><option value="template1">Template 1 · 逐列实验</option></select></label><label>实验名称<input id="htName" aria-label="实验名称"></label><label>全板每列默认时长 (s)<input id="htDefaultDuration" type="number" min="0.001" step="any" value="180"></label><button id="htApplyDurationAll" class="secondary" type="button" title="清除单列单独覆盖，让全部 12 列统一使用此默认时长">同步到全部12列</button><button id="htSave" class="secondary" type="button">保存模板</button></div><div class="ht-template-summary"><span id="htSelectionSummary">固定物理列 1–12 · 电极 A–H</span><div class="ht-template-tabs" role="tablist" aria-label="模板参数与板卡对应"><button id="htSamplingToggle" type="button" role="tab" aria-selected="false" aria-controls="htSamplingPanel">采样参数（支持8电极独立设置）</button><button id="htMappingToggle" type="button" role="tab" aria-selected="false" aria-controls="htMappingPanel">板卡与电极对应</button></div><span id="htEditorState">加载中</span></div>',
+    '<section id="htSamplingPanel" class="ht-template-pane" role="tabpanel" aria-labelledby="htSamplingToggle" hidden><p id="htSharedSamplingState" class="ht-sampling-state" role="status">正在读取两板参数…</p><div class="ht-small-head"><strong>全板默认采样参数（各电极留空或选“跟随默认”时自动继承）</strong></div><div class="ht-sampling-fields"><label>默认测试电位 WE−RE (V)<input id="htSharedPotential" type="number" min="-0.4" max="0.4" step="0.01"></label><label>默认 WE 电位 (V)<input id="htSharedWorkingElectrode" type="number" min="0.25" max="1.535" step="0.01"></label><label>硬件采样周期（两板公共）<select id="htSharedPeriod"></select></label><label>默认电流量程<select id="htSharedFsr"></select></label><label>默认偏置电流<select id="htSharedOffset"></select></label></div><div class="ht-small-head"><strong>各电极独立采样参数（A–H · 每个电极可单独设置测试电位、WE 电位、电流量程与偏置电流）</strong><div><button id="htPresetEvapCal" class="text-button" type="button">预设：A–G −0.2 V + H +0.2 V（蒸发校准）</button><button id="htPresetUniformPotential" class="text-button" type="button">恢复 8 路全部跟随默认</button></div></div><div id="htElectrodePotentials" class="ht-electrode-sampling-grid"></div><p id="htSharedPotentialSummary" class="ht-hint"></p><div class="ht-sampling-footer"><p class="ht-hint">每个电极可独立设置电流量程（50 nA – 2 µA）、偏置电流、测试电位 WE−RE 与 WE 电位。板 A（A–D）与板 B（E–H）各含 4 个硬件 DAC（DAC A–D，同板共用 WE 时最多支持 3 种不同 RE 电位）。点击「应用到两块板」保存至模板，实物运行时按各电极独立配置自动下发。</p><button id="htApplySharedSampling" class="secondary" type="button">应用到两块板</button></div></section>',
     '<section id="htMappingPanel" class="ht-template-pane" role="tabpanel" aria-labelledby="htMappingToggle" hidden><div class="ht-editor-actions"><button id="htBoardScan" class="secondary" type="button">扫描蓝牙板卡</button><button id="htBoardBind" class="secondary" type="button">保存 A / B 对应</button><button id="htBoardConnect" class="primary" type="button">连接已绑定板卡</button></div><p id="htBoardNotice" class="ht-hint" role="status">打开面板后读取连接状态</p><div id="htBoardMapping" class="ht-board-mapping"></div><p class="ht-hint">请自行核对实物，将前板指定为 A、后板指定为 B；软件不按扫描顺序、广播名或信号强度判断前后。可将不用的槽位留空。BLE 连接与主界面的单板测量目标独立；软件通道对应仍需核对实际接线。</p></section></section>',
     '<section class="panel ht-calibration-strip"><div><strong>本次上电四点标定</strong><p id="htCalibrationSummary">正在读取标定状态…</p></div><button id="htCalibrationToggle" class="secondary" type="button" aria-expanded="false">标定 / 查看</button></section>',
     '<section id="htCalibrationPanel" class="panel ht-calibration-panel" hidden><div class="ht-section-head"><h3>键盘四点标定 · 第 1 / 12 列与工作 / 安全高度</h3><button id="htCalibrationHide" class="text-button" type="button">收起</button></div><div class="ht-pad"><p id="htCalibrationWarning" class="ht-calibration-warning">保持电机供电，确认电极、孔板与两轴有充足运动余量。进入标定后保持锁轴，用 WASD / 方向键或按住下方箭头对位；松开即请求停止。物理第 1 / 12 列只记录 X，浸入工作 Z 与提出安全 Z 独立记录。</p><p id="htCalibrationAxisStatus" class="ht-calibration-axis-state" role="status">双轴状态未确认</p><label id="htKeyboardConfirmation" class="ht-check"><input id="htCalibrationMotionConfirmed" type="checkbox">已确认电极与孔板姿态、两轴运动余量，允许本次键盘标定运动</label><div id="htLegacyManualConfirmations" hidden><input id="htCalibrationReleaseConfirmed" type="checkbox"><input id="htCalibrationZSupported" type="checkbox"></div><button id="htCalibrationBegin" class="secondary" type="button">进入键盘标定</button><div id="htKeyboardAlignment" class="ht-keyboard-alignment"><div class="ht-jog-settings"><label>目标速度 (mm/s)<input id="htJogSpeed" type="number" min="0.001" max="1" step="0.05" value="0.5"></label><label>本次速度上限 (mm/s)<input id="htJogMaxSpeed" type="number" min="0.001" max="80" step="0.1" value="1"></label><button id="htJogApply" class="secondary" type="button">应用速度</button></div><div class="ht-editor-actions"><button id="htJogFine" class="secondary" type="button">精调 0.5 mm/s</button><button id="htJogFast" class="secondary" type="button">快移 20 mm/s</button><button id="htJogSuperFast" class="secondary" type="button">极速 60 mm/s</button><label id="htJogFastClearance" class="ht-check" hidden><input id="htJogFastConfirmed" type="checkbox">已确认电极离孔，运动方向至少有 10 mm 净空</label></div><div class="ht-jog-pad" aria-label="按住对位，松开停止"><button id="htJogUp" type="button" class="secondary" aria-label="按住 Z 上移">↑<span>W · Z 上</span></button><button id="htJogLeft" type="button" class="secondary" aria-label="按住 X 左移">←<span>A · X 左</span></button><button id="htJogStop" type="button" class="danger">停止</button><button id="htJogRight" type="button" class="secondary" aria-label="按住 X 右移">→<span>D · X 右</span></button><button id="htJogDown" type="button" class="secondary" aria-label="按住 Z 下移">↓<span>S · Z 下</span></button></div><p id="htJogStatus" class="ht-jog-status" role="status">进入键盘标定后可按住方向对位</p><p id="htJogFeedback" class="ht-hint">实际位移以编码器反馈为准。</p><p class="ht-hint">速度是指令目标值；短按包含通信、加减速时间，不能用按键时长当实测位移。按住持续移动，松开停止；不再按固定距离或时长中断。快移待执行指令缓冲 ≤6 mm（不是总行程限制），会滚动续接；断连仍可能走完已下发部分。请持续观察剩余行程并提前松键。未标定机械零点，默认 X150 / Z50 行程不作为键盘边界；请目视留足余量。仅明确设置的方向保护、控制器计数范围、活动轴反馈与停止保护有效。运动中另一轴暂停轮询、读数可过期，松开后复核双轴。仅本标定面板与窗口可见、获得焦点时接受方向键；多键同时按下会停止。软件断线停止不能替代现场急停与机械余量。</p></div><div id="htCalibrationSteps" class="ht-calibration-steps"><button id="htCaptureFirst" class="secondary" type="button">读取第 1 列 X</button><button id="htCaptureLast" class="secondary" type="button">读取第 12 列 X</button><button id="htCaptureWorking" class="secondary" type="button">读取浸入工作 Z</button><button id="htCaptureSafe" class="secondary" type="button">读取提出安全 Z</button></div><p id="htCalibrationProgress" role="status"></p><div class="ht-editor-actions"><button id="htCalibrationFinish" class="primary" type="button">完成四点标定</button><button id="htCalibrationCancel" class="secondary" type="button">取消标定</button></div><p class="ht-hint">读取、完成或取消前先停止按键运动。四点只属于本次连接；断电或重连后须重新标定。不会回零、清零或自动返回。控制器旧目标与当前位置不一致时拒绝进入，请停止操作并按提示重新上电，勿再手拧轴。</p></div></section>',
@@ -661,10 +734,34 @@
     const window = numberInput('htWindow-' + id, id, 's'); window.querySelector('input').min = '0.001'; element('htWindows').append(window);
     const delay = numberInput('htDelay-' + id, id + ' 起始延迟', 's'); delay.querySelector('input').min = '0'; element('htDelays').append(delay);
     for (const prefix of ['htWindow-', 'htDelay-']) element(prefix + id).addEventListener('input', () => updateWindow(id, prefix + id));
-    const potField = numberInput('htElectrodePotential-' + id, id + ' (' + (id < 'E' ? '板A' : '板B') + ' CH' + boardChannelForElectrode(id) + ')', 'V');
+    const sampCard = node('article', 'ht-electrode-sampling-card');
+    sampCard.id = 'htElectrodeSamplingCard-' + id;
+    const sampHead = node('div', 'ht-electrode-sampling-head');
+    sampHead.append(node('strong', '', '电极 ' + id), node('span', 'ht-pill', (id < 'E' ? '板 A' : '板 B') + ' · CH' + boardChannelForElectrode(id)));
+    const potField = numberInput('htElectrodePotential-' + id, '测试电位 WE−RE', 'V');
     const potInput = potField.querySelector('input');
     potInput.min = '-0.4'; potInput.max = '0.4'; potInput.step = '0.01'; potInput.placeholder = '跟随默认';
-    element('htElectrodePotentials')?.append(potField);
+    const weField = numberInput('htElectrodeWe-' + id, 'WE 电位', 'V');
+    const weInput = weField.querySelector('input');
+    weInput.min = '0.25'; weInput.max = '1.535'; weInput.step = '0.01'; weInput.placeholder = '跟随默认';
+    const fsrLabel = node('label', '', '电流量程'), fsrSelect = node('select');
+    fsrSelect.id = 'htElectrodeFsr-' + id;
+    const fsrInherit = node('option', '', '跟随默认'); fsrInherit.value = ''; fsrSelect.append(fsrInherit);
+    for (const fsr of [50, 100, 250, 500, 1000, 2000]) {
+      const opt = node('option', '', fsr < 1000 ? fsr + ' nA' : fsr / 1000 + ' µA'); opt.value = String(fsr); fsrSelect.append(opt);
+    }
+    fsrLabel.append(fsrSelect);
+    const offsetLabel = node('label', '', '偏置电流'), offsetSelect = node('select');
+    offsetSelect.id = 'htElectrodeOffset-' + id;
+    const offsetInherit = node('option', '', '跟随默认'); offsetInherit.value = ''; offsetSelect.append(offsetInherit);
+    for (const offset of SAMPLING_OFFSETS) {
+      const opt = node('option', '', offset); opt.value = offset; offsetSelect.append(opt);
+    }
+    offsetLabel.append(offsetSelect);
+    const sampSummary = node('small', 'ht-electrode-sampling-summary', '');
+    sampSummary.id = 'htElectrodeSummary-' + id;
+    sampCard.append(sampHead, potField, weField, fsrLabel, offsetLabel, sampSummary);
+    element('htElectrodePotentials')?.append(sampCard);
     const identity = node('label', '', id + ' · 板 ' + (id < 'E' ? 'A' : 'B') + ' CH' + boardChannelForElectrode(id));
     const name = node('input'); name.id = 'htElectrode-' + id; identity.append(name); element('htElectrodes').append(identity);
     const card = node('article', 'ht-channel-card'); card.id = 'htCard-' + id;
@@ -704,18 +801,43 @@
     try { await action(); } catch (error) { showError(error); }
     finally { pending = false; updateControls(); }
   }
+  function collectSamplingPayload() {
+    const electrode_potentials = {};
+    const electrode_settings = {};
+    for (const id of CHANNELS) {
+      const rawPot = element('htElectrodePotential-' + id)?.value.trim();
+      const rawWe = element('htElectrodeWe-' + id)?.value.trim();
+      const rawFsr = element('htElectrodeFsr-' + id)?.value.trim();
+      const rawOffset = element('htElectrodeOffset-' + id)?.value.trim();
+      const cfg = {};
+      if (rawPot !== undefined && rawPot !== '') {
+        electrode_potentials[id] = Number(rawPot);
+        cfg.potential_v = Number(rawPot);
+      }
+      if (rawWe !== undefined && rawWe !== '') cfg.working_electrode_v = Number(rawWe);
+      if (rawFsr !== undefined && rawFsr !== '') cfg.fsr_nA = Number(rawFsr);
+      if (rawOffset !== undefined && rawOffset !== '') cfg.offset_mode = rawOffset;
+      if (Object.keys(cfg).length) electrode_settings[id] = cfg;
+    }
+    const hadExistingOverrides = model?.document.electrodes?.some(e =>
+      e.potential_v !== undefined || e.working_electrode_v !== undefined || e.fsr_nA !== undefined || e.offset_mode !== undefined
+    ) || ['A', 'B'].some(s => {
+      const st = model?.document.bindings?.boards?.[s]?.settings;
+      return st?.channel_potentials_v || st?.channel_settings;
+    });
+    const includeElectrodeFields = Object.keys(electrode_potentials).length > 0 || Object.keys(electrode_settings).length > 0 || hadExistingOverrides;
+    return {
+      potential_v: numeric('htSharedPotential'),
+      working_electrode_v: numeric('htSharedWorkingElectrode'),
+      sens_period_code: numeric('htSharedPeriod'),
+      fsr_nA: numeric('htSharedFsr'),
+      offset_mode: element('htSharedOffset').value,
+      ...(includeElectrodeFields ? {electrode_potentials, electrode_settings} : {}),
+    };
+  }
   function applyPendingDrafts() {
     if (draftAreas.has('sampling')) {
-      const electrode_potentials = {};
-      for (const id of CHANNELS) {
-        const raw = element('htElectrodePotential-' + id)?.value.trim();
-        if (raw !== undefined && raw !== '') electrode_potentials[id] = Number(raw);
-      }
-      model.applySharedSampling({potential_v: numeric('htSharedPotential'), working_electrode_v: numeric('htSharedWorkingElectrode'),
-        sens_period_code: numeric('htSharedPeriod'), fsr_nA: numeric('htSharedFsr'), offset_mode: element('htSharedOffset').value,
-        ...(Object.keys(electrode_potentials).length || model.document.electrodes?.some(e => e.potential_v !== undefined)
-            || ['A', 'B'].some(s => model.document.bindings?.boards?.[s]?.settings?.channel_potentials_v)
-            ? {electrode_potentials} : {})});
+      model.applySharedSampling(collectSamplingPayload());
       draftAreas.delete('sampling');
       for (const slot of ['A', 'B']) element('htBoardSettings-' + slot).value = JSON.stringify(model.document.bindings.boards[slot].settings, null, 2);
     }
@@ -1234,28 +1356,76 @@
     const potentialText = element('htSharedPotential').value.trim(), workingText = element('htSharedWorkingElectrode').value.trim();
     const potential = Number(potentialText), working = Number(workingText), reference = working - potential;
     element('htSharedPotentialSummary').textContent = potentialText && workingText && Number.isFinite(potential) && Number.isFinite(working)
-      ? '请求 WE−RE = ' + (potential >= 0 ? '+' : '') + potential.toFixed(3) + ' V；WE = ' + working.toFixed(3) + ' V，推算 RE = ' + reference.toFixed(3) + ' V。实际 DAC 输出以运行回读为准。'
-      : '请填写测试电位与 WE 电位，以计算 RE。';
-    const fsr = Number(element('htSharedFsr').value);
-    for (const option of element('htSharedOffset').options) option.textContent = option.value.endsWith('pct') ? option.value.slice(0, -3) + '% FSR (' + fsr * Number(option.value.slice(0, -3)) / 100 + ' nA)' : option.value.slice(0, -2) + ' nA';
+      ? '默认请求 WE−RE = ' + (potential >= 0 ? '+' : '') + potential.toFixed(3) + ' V；WE = ' + working.toFixed(3) + ' V，推算 RE = ' + reference.toFixed(3) + ' V。实际 DAC 输出以运行回读为准。'
+      : '请填写默认测试电位与 WE 电位，以计算 RE。';
+    const fsr = Number(element('htSharedFsr').value) || 50;
+    const defaultOffsetMode = element('htSharedOffset').value || '20pct';
+    const formatOffset = (mode, fsrVal) => mode.endsWith('pct') ? mode.slice(0, -3) + '% FSR (' + fsrVal * Number(mode.slice(0, -3)) / 100 + ' nA)' : mode.slice(0, -2) + ' nA';
+    for (const option of element('htSharedOffset').options) option.textContent = formatOffset(option.value, fsr);
+    for (const id of CHANNELS) {
+      const potInput = element('htElectrodePotential-' + id);
+      const weInput = element('htElectrodeWe-' + id);
+      const fsrSelect = element('htElectrodeFsr-' + id);
+      const offsetSelect = element('htElectrodeOffset-' + id);
+      const summaryEl = element('htElectrodeSummary-' + id);
+      if (potInput) potInput.placeholder = '默认 ' + (Number.isFinite(potential) ? potential : -0.2);
+      if (weInput) weInput.placeholder = '默认 ' + (Number.isFinite(working) ? working : 1.2);
+      const effPot = potInput && potInput.value.trim() !== '' ? Number(potInput.value) : potential;
+      const effWe = weInput && weInput.value.trim() !== '' ? Number(weInput.value) : working;
+      const effRe = effWe - effPot;
+      const effFsr = fsrSelect && fsrSelect.value !== '' ? Number(fsrSelect.value) : fsr;
+      const effOffset = offsetSelect && offsetSelect.value !== '' ? offsetSelect.value : defaultOffsetMode;
+      if (fsrSelect && fsrSelect.options[0]) {
+        fsrSelect.options[0].textContent = '跟随默认 (' + (fsr < 1000 ? fsr + ' nA' : fsr / 1000 + ' µA') + ')';
+      }
+      if (offsetSelect) {
+        if (offsetSelect.options[0]) offsetSelect.options[0].textContent = '跟随默认 (' + formatOffset(defaultOffsetMode, effFsr) + ')';
+        for (let i = 1; i < offsetSelect.options.length; i++) {
+          const opt = offsetSelect.options[i];
+          opt.textContent = formatOffset(opt.value, effFsr);
+        }
+      }
+      if (summaryEl && Number.isFinite(effPot) && Number.isFinite(effWe)) {
+        const fsrText = effFsr < 1000 ? effFsr + ' nA' : effFsr / 1000 + ' µA';
+        summaryEl.textContent = '实际：WE−RE ' + (effPot >= 0 ? '+' : '') + effPot.toFixed(2) + ' V · WE ' + effWe.toFixed(2) + ' V (RE ' + effRe.toFixed(2) + ' V) · ' + fsrText + ' · ' + formatOffset(effOffset, effFsr);
+      }
+    }
   }
   function renderSampling() {
     if (!model) return;
     const shared = sharedSamplingParameters(model.document), draft = draftAreas.has('sampling');
-    element('htSharedSamplingState').textContent = (draft ? '采样参数草稿尚未应用 · ' : '') + (shared.shared ? '两板当前模板参数一致' : '两板参数不同 · 下方以板 A 为起点，点击“应用到两块板”才覆盖两板') + ' · 尚未写入硬件';
+    element('htSharedSamplingState').textContent = (draft ? '采样参数草稿尚未应用 · ' : '') + (shared.shared ? '两板当前默认参数一致' : '两板默认参数不同 · 下方以板 A 为起点，点击“应用到两块板”覆盖') + ' · 尚未写入硬件';
     element('htSharedSamplingState').classList.toggle('ht-sampling-warning', !shared.shared || draft);
     if (!draft) {
       element('htSharedPotential').value = shared.settings.potential_v; element('htSharedWorkingElectrode').value = shared.settings.working_electrode_v;
       element('htSharedPeriod').value = String(shared.settings.sens_period_code); element('htSharedFsr').value = String(shared.settings.fsr_nA); element('htSharedOffset').value = shared.settings.offset_mode;
       for (const id of CHANNELS) {
-        const input = element('htElectrodePotential-' + id);
-        if (!input) continue;
         const electrode = model.document.electrodes?.find(item => item.id === id);
         const slot = id < 'E' ? 'A' : 'B';
-        const boardPots = model.document.bindings?.boards?.[slot]?.settings?.channel_potentials_v || {};
-        const val = electrode?.potential_v ?? boardPots[String(boardChannelForElectrode(id))];
-        input.value = Number.isFinite(val) ? String(val) : '';
-        input.placeholder = '默认 ' + shared.settings.potential_v;
+        const chKey = String(boardChannelForElectrode(id));
+        const boardSettings = model.document.bindings?.boards?.[slot]?.settings || {};
+        const boardPots = boardSettings.channel_potentials_v || {};
+        const boardChCfg = boardSettings.channel_settings?.[chKey] || {};
+        const potInput = element('htElectrodePotential-' + id);
+        if (potInput) {
+          const val = electrode?.potential_v ?? boardChCfg.potential_v ?? boardPots[chKey];
+          potInput.value = Number.isFinite(val) ? String(val) : '';
+        }
+        const weInput = element('htElectrodeWe-' + id);
+        if (weInput) {
+          const weVal = electrode?.working_electrode_v ?? boardChCfg.working_electrode_v;
+          weInput.value = Number.isFinite(weVal) ? String(weVal) : '';
+        }
+        const fsrSelect = element('htElectrodeFsr-' + id);
+        if (fsrSelect) {
+          const fsrVal = electrode?.fsr_nA ?? boardChCfg.fsr_nA;
+          fsrSelect.value = Number.isFinite(fsrVal) ? String(fsrVal) : '';
+        }
+        const offsetSelect = element('htElectrodeOffset-' + id);
+        if (offsetSelect) {
+          const offVal = electrode?.offset_mode ?? boardChCfg.offset_mode;
+          offsetSelect.value = typeof offVal === 'string' && SAMPLING_OFFSETS.includes(offVal) ? offVal : '';
+        }
       }
     }
     renderSamplingPotential(); renderBoardConnections();
@@ -1828,10 +1998,15 @@
   });
   const markSamplingDraft = () => {
     draftAreas.add('sampling'); model?.invalidate(); runKey = null; element('htLiveConfirmed').checked = false; scene?.stopPreview();
-    element('htEditorState').textContent = '共用采样参数草稿待应用'; renderSampling(); updateControls();
+    element('htEditorState').textContent = '采样参数草稿待应用'; renderSampling(); updateControls();
   };
-  for (const id of ['htSharedPotential', 'htSharedWorkingElectrode', 'htSharedPeriod', 'htSharedFsr', 'htSharedOffset', ...CHANNELS.map(ch => 'htElectrodePotential-' + ch)]) {
+  const samplingInputIds = [
+    'htSharedPotential', 'htSharedWorkingElectrode', 'htSharedPeriod', 'htSharedFsr', 'htSharedOffset',
+    ...CHANNELS.flatMap(ch => ['htElectrodePotential-' + ch, 'htElectrodeWe-' + ch, 'htElectrodeFsr-' + ch, 'htElectrodeOffset-' + ch]),
+  ];
+  for (const id of samplingInputIds) {
     element(id)?.addEventListener('input', markSamplingDraft);
+    element(id)?.addEventListener('change', markSamplingDraft);
   }
   element('htPresetEvapCal')?.addEventListener('click', () => {
     element('htSharedPotential').value = '-0.2';
@@ -1843,24 +2018,17 @@
   });
   element('htPresetUniformPotential')?.addEventListener('click', () => {
     for (const id of CHANNELS) {
-      const input = element('htElectrodePotential-' + id);
-      if (input) input.value = '';
+      for (const prefix of ['htElectrodePotential-', 'htElectrodeWe-', 'htElectrodeFsr-', 'htElectrodeOffset-']) {
+        const ctrl = element(prefix + id);
+        if (ctrl) ctrl.value = '';
+      }
     }
     markSamplingDraft();
   });
   element('htApplySharedSampling').addEventListener('click', () => handle(async () => {
     requireDocument('sampling');
     if (normalDrafts.size) throw failure('FIELDS_NOT_APPLIED', '请先修正列时长 / 采集窗口');
-    const electrode_potentials = {};
-    for (const id of CHANNELS) {
-      const raw = element('htElectrodePotential-' + id)?.value.trim();
-      if (raw !== undefined && raw !== '') electrode_potentials[id] = Number(raw);
-    }
-    model.applySharedSampling({potential_v: numeric('htSharedPotential'), working_electrode_v: numeric('htSharedWorkingElectrode'),
-      sens_period_code: numeric('htSharedPeriod'), fsr_nA: numeric('htSharedFsr'), offset_mode: element('htSharedOffset').value,
-      ...(Object.keys(electrode_potentials).length || model.document.electrodes?.some(e => e.potential_v !== undefined)
-          || ['A', 'B'].some(s => model.document.bindings?.boards?.[s]?.settings?.channel_potentials_v)
-          ? {electrode_potentials} : {})});
+    model.applySharedSampling(collectSamplingPayload());
     draftAreas.delete('sampling'); documentChanged();
     for (const slot of ['A', 'B']) element('htBoardSettings-' + slot).value = JSON.stringify(model.document.bindings.boards[slot].settings, null, 2);
   }));

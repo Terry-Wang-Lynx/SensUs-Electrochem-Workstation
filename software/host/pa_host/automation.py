@@ -237,7 +237,7 @@ def compile_experiment(document):
         _text(board.get("address"), f"bindings.boards.{slot}.address", 200, True)
         settings = _object(board.get("settings"), f"bindings.boards.{slot}.settings")
         _keys(settings, {*v52_ble.DEFAULTS, "board_profile", "protocol", "offset_nA", "conv_time_code",
-                         "conv_code", "charge_pump", "cp", "channel_potentials_v"}, f"bindings.boards.{slot}.settings")
+                         "conv_code", "charge_pump", "cp", "channel_potentials_v", "channel_settings"}, f"bindings.boards.{slot}.settings")
         for key, value in settings.items():
             expected = v52_ble.DEFAULTS.get(key)
             if isinstance(expected, (int, float)) and not isinstance(expected, bool):
@@ -257,25 +257,55 @@ def compile_experiment(document):
     if not isinstance(electrodes, list) or len(electrodes) != 8:
         raise AutomationError("invalid_value", "Define eight electrode identities", "electrodes")
     electrode_potentials = {"A": {}, "B": {}}
+    electrode_channel_settings = {"A": {}, "B": {}}
     for index, electrode in enumerate(electrodes):
         _object(electrode, f"electrodes[{index}]")
-        _keys(electrode, {"id", "name", "potential_v"}, f"electrodes[{index}]")
+        _keys(electrode, {"id", "name", "potential_v", "working_electrode_v", "fsr_nA", "offset_mode"}, f"electrodes[{index}]")
         _text(electrode.get("id"), f"electrodes[{index}].id", 1)
         _text(electrode.get("name"), f"electrodes[{index}].name")
+        eid = electrode["id"]
+        slot = "A" if eid in CHANNELS and CHANNELS.index(eid) < 4 else "B"
+        ch_str = str(_electrode_board_channel(eid)) if eid in CHANNELS else ""
+        ch_override: dict[str, Any] = {}
         if electrode.get("potential_v") is not None:
             p_v = _number(electrode.get("potential_v"), f"electrodes[{index}].potential_v", -0.4, 0.4)
-            eid = electrode["id"]
             if eid in CHANNELS:
-                slot = "A" if CHANNELS.index(eid) < 4 else "B"
-                electrode_potentials[slot][str(_electrode_board_channel(eid))] = float(p_v)
+                electrode_potentials[slot][ch_str] = float(p_v)
+                ch_override["potential_v"] = float(p_v)
+        if electrode.get("working_electrode_v") is not None:
+            we_v = _number(electrode.get("working_electrode_v"), f"electrodes[{index}].working_electrode_v", 0.25, 1.535625)
+            ch_override["working_electrode_v"] = float(we_v)
+        if electrode.get("fsr_nA") is not None:
+            fsr_val = _number(electrode.get("fsr_nA"), f"electrodes[{index}].fsr_nA", 50, 2000)
+            if int(fsr_val) != fsr_val or int(fsr_val) not in (50, 100, 250, 500, 1000, 2000):
+                raise AutomationError("invalid_value", "Unsupported V5.2 FSR", f"electrodes[{index}].fsr_nA")
+            ch_override["fsr_nA"] = int(fsr_val)
+        if electrode.get("offset_mode") is not None:
+            off_val = _text(electrode.get("offset_mode"), f"electrodes[{index}].offset_mode", 20)
+            if off_val not in v52_ble.OFFSET_CODES:
+                raise AutomationError("invalid_value", "Unsupported V5.2 offset_mode", f"electrodes[{index}].offset_mode")
+            ch_override["offset_mode"] = off_val
+        if eid in CHANNELS and any(k in ch_override for k in ("working_electrode_v", "fsr_nA", "offset_mode")):
+            electrode_channel_settings[slot][ch_str] = ch_override
     if sorted(electrode.get("id", "") for electrode in electrodes) != list(CHANNELS):
         raise AutomationError("invalid_value", "Electrode ids must uniquely cover A–H", "electrodes")
     for slot in "AB":
         merged_potentials = dict(boards[slot]["settings"].get("channel_potentials_v") or {})
         merged_potentials.update(electrode_potentials[slot])
-        if merged_potentials:
+        merged_ch_settings = copy.deepcopy(boards[slot]["settings"].get("channel_settings") or {})
+        if merged_ch_settings or electrode_channel_settings[slot]:
+            for ch_k, ch_v in electrode_channel_settings[slot].items():
+                merged_ch_settings[ch_k] = {**(merged_ch_settings.get(ch_k) or {}), **ch_v}
+            for ch_k, p_v in merged_potentials.items():
+                merged_ch_settings.setdefault(ch_k, {}).setdefault("potential_v", p_v)
+        if merged_potentials or merged_ch_settings:
             try:
-                v52_ble.validate_settings({**boards[slot]["settings"], "channel_potentials_v": merged_potentials})
+                candidate = {**boards[slot]["settings"]}
+                if merged_potentials:
+                    candidate["channel_potentials_v"] = merged_potentials
+                if merged_ch_settings:
+                    candidate["channel_settings"] = merged_ch_settings
+                v52_ble.validate_settings(candidate)
             except (TypeError, ValueError) as error:
                 raise AutomationError("invalid_value", str(error), f"bindings.boards.{slot}.settings") from error
     columns = experiment.get("columns")
@@ -441,7 +471,14 @@ def compile_experiment(document):
                             merged_potentials = dict(boards[slot]["settings"].get("channel_potentials_v") or {})
                             merged_potentials.update(electrode_potentials[slot])
                             extra_potentials = {"channel_potentials_v": merged_potentials} if merged_potentials else {}
-                            settings[slot] = v52_ble.validate_settings({**boards[slot]["settings"], **extra_potentials,
+                            merged_ch_settings = copy.deepcopy(boards[slot]["settings"].get("channel_settings") or {})
+                            if merged_ch_settings or electrode_channel_settings[slot]:
+                                for ch_k, ch_v in electrode_channel_settings[slot].items():
+                                    merged_ch_settings[ch_k] = {**(merged_ch_settings.get(ch_k) or {}), **ch_v}
+                                for ch_k, p_v in merged_potentials.items():
+                                    merged_ch_settings.setdefault(ch_k, {}).setdefault("potential_v", p_v)
+                            extra_ch_settings = {"channel_settings": merged_ch_settings} if merged_ch_settings else {}
+                            settings[slot] = v52_ble.validate_settings({**boards[slot]["settings"], **extra_potentials, **extra_ch_settings,
                                 "duration_s": max(10, seconds) if guided else seconds,
                                 "adaptive_stop": False, "analysis_channel": next(channel for channel in range(1, 5) if mask & (1 << (channel - 1)))})
                             if seconds < v52_ble.period_seconds(settings[slot]["sens_period_code"]):
@@ -546,9 +583,18 @@ def experiment_schema(version="1.0"):
     settings_properties = {key: {"type": "boolean" if isinstance(value, bool) else "number" if isinstance(value, (int, float)) else "string"}
                            for key, value in v52_ble.DEFAULTS.items()}
     settings_properties.update({key: {"type": "number"} for key in ("offset_nA", "conv_time_code", "conv_code", "charge_pump", "cp")})
+    channel_setting_schema = {"type": "object", "additionalProperties": False, "properties": {
+        "potential_v": {"type": "number", "minimum": -0.4, "maximum": 0.4},
+        "working_electrode_v": {"type": "number", "minimum": 0.25, "maximum": 1.535625},
+        "fsr_nA": {"enum": [50, 100, 250, 500, 1000, 2000]},
+        "offset_mode": {"enum": sorted(v52_ble.OFFSET_CODES)},
+        "offset_nA": {"type": "number"},
+    }}
     settings_properties.update(board_profile={"const": "v52"}, protocol={"const": v52_ble.PROTOCOL},
                                channel_potentials_v={"type": "object", "propertyNames": {"enum": ["1", "2", "3", "4"]},
-                                                     "additionalProperties": {"type": "number", "minimum": -0.4, "maximum": 0.4}})
+                                                     "additionalProperties": {"type": "number", "minimum": -0.4, "maximum": 0.4}},
+                               channel_settings={"type": "object", "propertyNames": {"enum": ["1", "2", "3", "4"]},
+                                                 "additionalProperties": channel_setting_schema})
     board_schema = {"type": "object", "required": ["address", "settings"], "additionalProperties": False,
                     "properties": {"address": {"type": "string", "maxLength": 200},
                                    "settings": {"type": "object", "properties": settings_properties, "additionalProperties": False}}}
@@ -569,7 +615,10 @@ def experiment_schema(version="1.0"):
                            "electrodes": {"type": "array", "minItems": 8, "maxItems": 8, "items": {
                                "type": "object", "required": ["id", "name"], "additionalProperties": False,
                                "properties": {"id": {"enum": list(CHANNELS)}, "name": text_schema,
-                                              "potential_v": {"anyOf": [{"type": "number", "minimum": -0.4, "maximum": 0.4}, {"type": "null"}]}}}},
+                                              "potential_v": {"anyOf": [{"type": "number", "minimum": -0.4, "maximum": 0.4}, {"type": "null"}]},
+                                              "working_electrode_v": {"anyOf": [{"type": "number", "minimum": 0.25, "maximum": 1.535625}, {"type": "null"}]},
+                                              "fsr_nA": {"anyOf": [{"enum": [50, 100, 250, 500, 1000, 2000]}, {"type": "null"}]},
+                                              "offset_mode": {"anyOf": [{"enum": sorted(v52_ble.OFFSET_CODES)}, {"type": "null"}]}}}},
                            "columns": {"type": "array", "minItems": 1, "maxItems": 12, "items": {
                                "type": "object", "required": ["index", "solution", "concentration"], "additionalProperties": False,
                                "properties": {"index": {"type": "integer", "minimum": 1, "maximum": 12}, "solution": text_schema,

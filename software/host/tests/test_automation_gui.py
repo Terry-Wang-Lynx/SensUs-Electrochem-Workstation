@@ -553,3 +553,45 @@ console.log(JSON.stringify({supported:true,count:errors.length,max_error_mm:Math
     assert result["supported"]
     assert result["count"] == 96
     assert result["max_error_mm"] < 0.00001
+
+
+def test_per_electrode_independent_sampling_parameters_in_gui():
+    result = evaluate_browser("""
+(async()=>{
+ HighThroughput.activate();await tick();
+ input('htElectrodePotential-A', '-0.2');
+ input('htElectrodeWe-A', '1.0');
+ input('htElectrodeFsr-A', '250');
+ input('htElectrodeOffset-A', '40nA');
+ input('htElectrodePotential-H', '0.2');
+ input('htElectrodeFsr-H', '2000');
+ input('htElectrodeOffset-H', '80nA');
+ await click('htApplySharedSampling');
+ await click('htSave');
+ const saved = requests.findLast(request => request.route === 'guided/experiment')?.body.document;
+ console.log(JSON.stringify({
+   saved,
+   summaryA: elements.get('htElectrodeSummary-A')?.textContent,
+   summaryH: elements.get('htElectrodeSummary-H')?.textContent,
+   error: elements.get('htError').hidden ? null : elements.get('htError').textContent
+ }));
+})();
+""")
+    assert result["error"] is None
+    el_a = next(e for e in result["saved"]["electrodes"] if e["id"] == "A")
+    el_h = next(e for e in result["saved"]["electrodes"] if e["id"] == "H")
+    assert el_a["potential_v"] == -0.2
+    assert el_a["working_electrode_v"] == 1.0
+    assert el_a["fsr_nA"] == 250
+    assert el_a["offset_mode"] == "40nA"
+    assert el_h["potential_v"] == 0.2
+    assert el_h["fsr_nA"] == 2000
+    assert el_h["offset_mode"] == "80nA"
+    assert result["saved"]["bindings"]["boards"]["A"]["settings"]["channel_settings"]["1"] == {
+        "potential_v": -0.2, "working_electrode_v": 1.0, "fsr_nA": 250, "offset_mode": "40nA"
+    }
+    assert result["saved"]["bindings"]["boards"]["B"]["settings"]["channel_settings"]["2"] == {
+        "potential_v": 0.2, "fsr_nA": 2000, "offset_mode": "80nA"
+    }
+    assert "250 nA" in result["summaryA"]
+    assert "2 µA" in result["summaryH"]

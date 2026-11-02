@@ -291,3 +291,34 @@ def test_scan_timeout_explains_bluetooth_startup_failure(monkeypatch):
     monkeypatch.setitem(sys.modules, "bleak", SimpleNamespace(BleakScanner=SimpleNamespace(discover=discover)))
     with pytest.raises(TimeoutError, match="Bluetooth.*timed out"):
         v52_ble.scan_devices(1)
+
+
+def test_per_channel_independent_sampling_settings_programs_fsr_offset_and_dacs(fake_bleak):
+    result = v52_ble.configure_device("test", {
+        "potential_v": -0.2,
+        "working_electrode_v": 0.4,
+        "fsr_nA": 50,
+        "offset_mode": "20pct",
+        "channel_settings": {
+            "1": {"potential_v": -0.2, "fsr_nA": 50, "offset_mode": "10nA"},
+            "3": {"potential_v": -0.2, "fsr_nA": 250, "offset_mode": "40nA"},
+            "4": {"potential_v": -0.2, "fsr_nA": 1000, "offset_mode": "50pct"},
+            "2": {"potential_v": 0.2, "fsr_nA": 2000, "offset_mode": "80nA"},
+        },
+    })
+    assert result["config_confirmed"] is True
+    cmds = fake_bleak.instances[0].commands
+    assert "CONFIG 1 50 4 0 0 1 0" in cmds
+    assert "CONFIG 3 250 6 0 0 1 0" in cmds
+    assert "CONFIG 4 1000 3 0 0 1 0" in cmds
+    assert "CONFIG 2 2000 7 0 0 2 0" in cmds
+    assert result["actual"]["channel_settings"]["3"]["fsr_nA"] == 250
+    assert result["actual"]["channel_settings"]["2"]["fsr_nA"] == 2000
+    with pytest.raises(ValueError, match="offset must be below FSR"):
+        v52_ble.validate_settings({
+            "potential_v": -0.2,
+            "working_electrode_v": 0.4,
+            "fsr_nA": 1000,
+            "offset_mode": "20pct",
+            "channel_settings": {"1": {"fsr_nA": 50, "offset_mode": "80nA"}},
+        })

@@ -431,3 +431,20 @@ def test_malformed_persisted_calibration_blocks_startup_without_crashing_snapsho
     assert snapshot["manual"]["error"]["code"] == "state_read_failed"
     with pytest.raises(AutomationError):
         restored.compile(document, mode="live", motion=motion)
+
+
+def test_guided_compile_preserves_per_electrode_sampling_parameters(tmp_path):
+    service, document, motion = calibrated(tmp_path)
+    document["electrodes"][0].update(potential_v=-0.15, working_electrode_v=1.1, fsr_nA=250, offset_mode="40nA")
+    document["electrodes"][7].update(potential_v=0.2, fsr_nA=2000, offset_mode="80nA")
+    compiled = service.compile(document, mode="live", motion=motion)
+    dwell = next(step for step in compiled["steps"] if step["op"] == "dwell")
+    ch_a = dwell["resolved_params"]["settings"]["A"]["channel_settings"]["1"]
+    ch_h = dwell["resolved_params"]["settings"]["B"]["channel_settings"]["2"]
+    assert ch_a["potential_v"] == -0.15
+    assert ch_a["working_electrode_v"] == 1.1
+    assert ch_a["fsr_nA"] == 250
+    assert ch_a["offset_mode"] == "40nA"
+    assert ch_h["potential_v"] == 0.2
+    assert ch_h["fsr_nA"] == 2000
+    assert ch_h["offset_mode"] == "80nA"

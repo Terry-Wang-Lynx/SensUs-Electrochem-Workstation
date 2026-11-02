@@ -84,7 +84,8 @@ def _translated(document, calibration=None):
         experiment["defaults"].update(column_pitch_mm=min(9, axes["X"]["travel_mm"] / 12),
                                       z_immersed_mm=min(6, axes["Z"]["travel_mm"]))
     experiment["electrodes"] = [{"id": electrode["id"], "name": electrode["name"],
-                                 **({"potential_v": electrode["potential_v"]} if electrode.get("potential_v") is not None else {})}
+                                 **{k: electrode[k] for k in ("potential_v", "working_electrode_v", "fsr_nA", "offset_mode")
+                                    if electrode.get(k) is not None}}
                                 for electrode in document["electrodes"]]
     experiment["columns"] = []
     experiment["program"] = []
@@ -159,13 +160,21 @@ def _validate_document(document):
     for index, electrode in enumerate(electrodes):
         path = f"electrodes[{index}]"
         _object(electrode, path)
-        _keys(electrode, {"id", "name", "enabled", "potential_v"}, path)
+        _keys(electrode, {"id", "name", "enabled", "potential_v", "working_electrode_v", "fsr_nA", "offset_mode"}, path)
         _text(electrode.get("id"), f"{path}.id", 1)
         _text(electrode.get("name"), f"{path}.name")
         if not isinstance(electrode.get("enabled"), bool):
             raise AutomationError("invalid_value", "Electrode selection must be boolean", f"{path}.enabled")
         if electrode.get("potential_v") is not None:
             _number(electrode.get("potential_v"), f"{path}.potential_v", -0.4, 0.4)
+        if electrode.get("working_electrode_v") is not None:
+            _number(electrode.get("working_electrode_v"), f"{path}.working_electrode_v", 0.25, 1.535625)
+        if electrode.get("fsr_nA") is not None:
+            fsr_val = _number(electrode.get("fsr_nA"), f"{path}.fsr_nA", 50, 2000)
+            if int(fsr_val) != fsr_val or int(fsr_val) not in (50, 100, 250, 500, 1000, 2000):
+                raise AutomationError("invalid_value", "Unsupported V5.2 FSR", f"{path}.fsr_nA")
+        if electrode.get("offset_mode") is not None:
+            _text(electrode.get("offset_mode"), f"{path}.offset_mode", 20)
         identifiers.append(electrode["id"])
     if sorted(identifiers) != list(CHANNELS) or not any(electrode["enabled"] for electrode in electrodes):
         raise AutomationError("invalid_value", "Select at least one electrode with fixed identities A–H", "electrodes")
