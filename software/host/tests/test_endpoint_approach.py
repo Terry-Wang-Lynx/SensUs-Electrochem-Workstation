@@ -176,12 +176,12 @@ def test_close_endpoint_never_moves_away_to_create_approach(tmp_path, monkeypatc
     assert not any(frame[1] == 0xFE for frame in serial.writes)
 
 
-def test_startup_corridor_uses_only_exact_safe_target_at_slow_speed(tmp_path, monkeypatch):
+def test_startup_corridor_uses_only_exact_safe_target_at_requested_speed(tmp_path, monkeypatch):
     bus, serial, record = incident_bus(tmp_path, monkeypatch, LiveMotionSerial, enter_safe=False)
     result = bus.move_to("Z", record["z_safe_mm"], 20)
     commands = [frame for frame in serial.writes if frame[1] == 0xFD]
     assert len(commands) == 1
-    assert int.from_bytes(commands[0][3:5], "big") == 15
+    assert int.from_bytes(commands[0][3:5], "big") == 600
     assert result["axes"]["Z"]["target_mm"] == record["z_safe_mm"]
     assert not any(frame[1] == 0xFE for frame in serial.writes)
 

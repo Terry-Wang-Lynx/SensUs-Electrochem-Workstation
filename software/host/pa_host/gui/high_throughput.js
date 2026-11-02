@@ -577,6 +577,7 @@
   root.innerHTML = [
     '<div class="ht-toolbar panel"><div><span class="ht-eyebrow">高通量自动化实验</span><span id="htFrontendVersion" class="ht-frontend-version"></span><h2>模板实验</h2><p id="htStatus" role="status">正在读取模板…</p></div>',
     '<div class="ht-run-actions"><select id="htMode" aria-label="运行模式"><option value="simulate">模拟实验</option><option value="live">实物实验</option></select><label class="ht-check"><input id="htMotionOnly" type="checkbox">仅运动（不采集）</label><button id="htRun" class="primary" type="button" disabled>开始模拟实验</button><button id="htPause" class="secondary" type="button" disabled>本列结束后暂停</button><button id="htResume" class="secondary" type="button" hidden>继续实验</button><button id="htRecoverArrival" class="secondary" type="button" title="确认实物列已对齐、电极在安全高度；只读核验停止与位置后恢复原标定，不移动电机">原位核验并恢复标定</button><button id="htResetDevices" class="secondary" type="button" title="停止任务、重新连接并清除旧会话；保留数据与日志，不移动电机">重连并重置</button><button id="htStop" class="danger" type="button">停止</button></div></div>',
+    '<section id="htRunBlockers" class="panel ht-run-blockers" role="status" aria-live="polite" hidden><strong id="htRunBlockersTitle"></strong><ul id="htRunBlockersList" class="ht-run-blockers-list"></ul><div id="htRunBlockersActions" class="ht-editor-actions"></div></section>',
     '<section id="htFrontendUpdate" class="ht-frontend-update" role="status" hidden><div><strong>当前界面需要刷新</strong><p id="htFrontendUpdateText"></p></div><button id="htFrontendReload" class="secondary" type="button" disabled>确认已松键，刷新界面</button></section>',
     '<section class="panel ht-total-progress"><div class="ht-section-head"><h3>全程进度</h3><strong id="htTotalPercent">—</strong></div><progress id="htTotalProgress" max="100" aria-label="全程实验进度"></progress><p id="htTotalRoute">暂无本次进度</p><p id="htTotalTiming">等待开始</p></section>',
     '<section class="panel ht-execution-panel"><label>实验模式<select id="htExecutionMode"><option value="once">一次性实验</option><option value="repeat">重复实验</option><option value="custom">自定义路径</option></select></label><label id="htExecutionCountLabel" hidden>重复轮数<input id="htExecutionCount" type="number" min="1" max="500" step="1"></label><label id="htExecutionRouteLabel" hidden>列访问顺序<input id="htExecutionRoute" placeholder="13579 或 1,3,10,12"></label><button id="htApplyExecution" class="secondary" type="button">应用执行设置</button><p id="htExecutionStatus" role="status">一次性执行已选列，按列号升序。</p><label class="ht-check"><input id="htPbsReturn" type="checkbox">整轮完成后回 PBS 浸泡</label><label>PBS 物理列<input id="htPbsColumn" type="number" min="1" max="12" step="1" value="7"></label><p id="htPbsStatus" class="ht-hint"></p></section>',
@@ -1012,6 +1013,127 @@
     element('htTwinRegisterDatum').disabled = pending || !canRegisterTwinDatum() || !element('htTwinDatumConfirm').checked;
     updateBoardControls();
     renderFrontendUpdate();
+    renderRunBlockers();
+  }
+  function renderRunBlockers() {
+    const panel = element('htRunBlockers'), title = element('htRunBlockersTitle'), list = element('htRunBlockersList'), actions = element('htRunBlockersActions');
+    if (!panel || !title || !list || !actions) return;
+    const activeRun = snapshot.busy && ['running', 'preparing', 'paused', 'waiting_operator', 'waiting_recovery', 'stopping'].includes(snapshot.state);
+    const needMotionPolicy = requestedMode === 'live' && model && !model.document.safety?.motion_policy_confirmed;
+    const needElectricalPolicy = requestedMode === 'live' && model && !model.document.safety?.electrical_policy_confirmed;
+    if ((!element('htRun').disabled && !needMotionPolicy && !needElectricalPolicy) || activeRun) {
+      panel.hidden = true;
+      return;
+    }
+    const reasons = [], buttons = [];
+    const addButton = (label, className, onClick) => {
+      const btn = node('button', className, label);
+      btn.type = 'button';
+      btn.addEventListener('click', onClick);
+      buttons.push(btn);
+    };
+    if (stateUnavailable || !model) {
+      reasons.push('正在读取后台服务与实验模板状态，请稍候…');
+    } else {
+      if (pending || boardsPending) reasons.push('正在处理请求或蓝牙板卡操作，请等待当前操作完成。');
+      if (guided.manual?.active) {
+        const count = CALIBRATION_POINTS.filter(([key]) => guided.manual?.points?.[key]).length;
+        reasons.push('当前处于「键盘四点标定」模式中（已录 ' + count + '/4 点），标定期间不能直接启动实验。');
+        if (calibrationPointsComplete() && !element('htCalibrationFinish').disabled) {
+          addButton('✓ 完成四点标定', 'primary', () => element('htCalibrationFinish').click());
+        } else {
+          addButton('展开四点标定面板', 'secondary', () => showCalibration(true));
+        }
+        if (!element('htCalibrationCancel').disabled) {
+          addButton('取消并退出标定模式', 'secondary', () => element('htCalibrationCancel').click());
+        }
+      }
+      if (limitCalibrationActive()) {
+        reasons.push('当前正在读取「四边界限位」，请先保存或取消限位读取。');
+      }
+      if (jsonDirty) {
+        reasons.push('底部「高级设置 → 模板 JSON」有未应用的修改。');
+        addButton('应用 JSON 修改', 'secondary', () => element('htApplyJson').click());
+      }
+      if (normalDrafts.size > 0) {
+        reasons.push('存在无效的时长或采集窗口数值（请检查「默认时长」或「单列时长」是否为大于 0 的有效数字）。');
+      }
+      if (draftAreas.size > 0) {
+        const areaNames = {
+          sampling: '采样参数（8电极共用）',
+          execution: '实验模式 / 路径设置',
+          defaults: '高级设置 → 运动预设参数',
+          bindings: '高级设置 → 设备绑定与安全策略',
+          boardMapping: '板卡与电极对应（A/B 绑定）',
+        };
+        const names = [...draftAreas].map(area => '「' + (areaNames[area] || area) + '」');
+        reasons.push('以下区域修改后尚未应用保存：' + names.join('、') + '。');
+        addButton('✓ 一键应用并保存修改', 'primary', () => element('htSave').click());
+      }
+      if (model.selectedColumns().length === 0) {
+        reasons.push('未勾选任何物理列（1–12 列全部为空），请至少勾选 1 列。');
+        addButton('全选 12 列', 'secondary', () => element('htSelectAllColumns').click());
+      }
+      if (model.selectedElectrodes().length === 0 && model.document.motion_only !== true) {
+        reasons.push('未勾选任何采集电极（A–H 全部为空），请至少勾选 1 路电极或开启「仅运动」。');
+      }
+      if (requestedMode === 'live') {
+        if (!liveCalibrationReady() && !guided.manual?.active) {
+          const motion = devicesCache ? devicesCache.snapshot?.motion : snapshot.motion;
+          if (!motion?.connected) {
+            reasons.push('电机 RS485 总线未连接 → 请点击「重连并重置」连接电机。');
+            if (!element('htResetDevices').disabled) addButton('重连并重置电机', 'secondary', () => element('htResetDevices').click());
+          } else if (motion.faulted || motion.feedback_error) {
+            reasons.push('电机总线存在通信或状态故障 → 请检查电机供电与 RS485 连线后点击「重连并重置」。');
+            if (!element('htResetDevices').disabled) addButton('重连并重置电机', 'secondary', () => element('htResetDevices').click());
+          } else if (!guided.calibration || guided.calibration.four_point !== true) {
+            reasons.push('尚未完成本次上电的「四点标定」（第 1/12 列 X、浸入工作 Z、提出安全 Z）。');
+            addButton('打开四点标定面板', 'secondary', () => { showCalibration(true); element('htCalibrationPanel')?.scrollIntoView?.({behavior: 'smooth', block: 'center'}); });
+          } else if (guided.calibration.connection_token !== motion.connection_token || guided.calibration.usable !== true) {
+            reasons.push('四点标定在重连/重置后处于「待恢复核验」状态 → 若电机未断电且未手拧，请直接点击「原位核验并恢复标定」；若已断电移动则需重新四点标定。');
+            if (!element('htRecoverArrival').disabled) addButton('✓ 原位核验并恢复标定', 'primary', () => element('htRecoverArrival').click());
+            addButton('重新进入四点标定', 'secondary', () => { showCalibration(true); element('htCalibrationPanel')?.scrollIntoView?.({behavior: 'smooth', block: 'center'}); });
+          } else if (['X', 'Z'].some(axis => calibrationAxisState(axis)?.enabled !== true)) {
+            reasons.push('电机 X / Z 轴未全部锁轴使能（处于松轴或反馈过期状态）。');
+            if (!element('htResetDevices').disabled) addButton('重连并重置电机', 'secondary', () => element('htResetDevices').click());
+          } else if (['X', 'Z'].some(axis => calibrationAxisState(axis)?.speed_rpm !== 0)) {
+            reasons.push('电机当前仍在运动中，请等待双轴停稳。');
+          } else {
+            reasons.push('正在同步核验四点标定与编码器实时反馈，请稍候…');
+          }
+        }
+        if (needMotionPolicy || needElectricalPolicy || !element('htLiveConfirmed').checked) {
+          const missing = [];
+          if (!element('htLiveConfirmed').checked) missing.push('「本次允许驱动实物与电极」');
+          if (needMotionPolicy) missing.push('「运动策略确认」');
+          if (needElectricalPolicy) missing.push('「电气策略确认」');
+          reasons.push('尚未勾选实物运行安全确认项：' + missing.join('、') + '（每次运行或修改参数后需重新确认）。');
+          addButton('✓ 一键勾选全部实物安全确认', 'primary', () => {
+            if (needMotionPolicy || needElectricalPolicy) {
+              element('htMotionPolicy').checked = true;
+              element('htElectricalPolicy').checked = true;
+              model.edit(document => {
+                document.safety = {...document.safety, motion_policy_confirmed: true, electrical_policy_confirmed: true};
+              });
+              draftAreas.delete('bindings');
+              documentChanged();
+            }
+            element('htLiveConfirmed').checked = true;
+            updateControls();
+          });
+        }
+      }
+    }
+    if (!reasons.length) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    const buttonTitle = element('htRun').textContent || (requestedMode === 'live' ? '开始实物实验' : '开始模拟实验');
+    title.textContent = '⚠️ 当前无法点击「' + buttonTitle + '」，原因如下（共 ' + reasons.length + ' 项）：';
+    list.replaceChildren(...reasons.map(text => node('li', '', text)));
+    actions.replaceChildren(...buttons);
+    actions.hidden = buttons.length === 0;
   }
   function documentChanged(render = false) {
     documentDirty = true;

@@ -8,6 +8,4 @@ def endpoint_phases(current, target, speed, bounds, pulse_mm, tolerance_mm, *, s
     lower, upper = bounds
     if not lower <= target <= upper:
         return [(target, speed)]
-    if startup:
-        return [(target, min(speed, FINAL_SPEED_MM_S))]
     return [(target, speed)]
