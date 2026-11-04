@@ -236,3 +236,83 @@ def test_relative_move_after_natural_completion_tolerates_stationary_target_wind
         bus._automatic_target_observation('Z', state, quantized_target, record)
     assert caught.value.code == 'calibration_motion'
 
+
+@pytest.mark.parametrize("error,accepted", [
+    ({"code": "calibration_motion", "message": "X feedback is unavailable"}, True),
+    ({"code": "axis_fault"}, False),
+    ({"code": "calibration_motion", "cause": {"code": "axis_fault"}}, False),
+])
+@pytest.mark.parametrize("damage", [None, "stop", "hash"])
+def test_direct_guided_error_uses_same_finalized_stop_evidence(tmp_path, error, accepted, damage):
+    manifest = evidence(tmp_path)
+    manifest["error"] = error
+    if damage == "stop":
+        manifest["stop_confirmed"] = False
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    if damage == "hash":
+        (tmp_path / "events.jsonl").write_text("changed", encoding="utf-8")
+    if accepted and damage is None:
+        _, checkpoint = arrival_checkpoint(tmp_path)
+        assert checkpoint["raw_counts"] == {"X": 98304, "Z": 32768}
+    else:
+        with pytest.raises(ValueError):
+            arrival_checkpoint(tmp_path)
+
+
+@pytest.mark.parametrize("always_expire", [False, True])
+def test_refresh_reobserves_aged_axis_without_weakening_freshness(monkeypatch, always_expire):
+    bus, serial, _ = powered_bus(enabled=True)
+    read = bus._read_axis
+    visits = []
+    def delayed_second_axis(axis, **kwargs):
+        result = read(axis, **kwargs)
+        visits.append(axis)
+        if axis == "Z" and (always_expire or visits.count("Z") == 1):
+            bus._state["X"]["updated_monotonic"] = time.monotonic() - 3
+        if always_expire and axis == "X" and visits.count("X") > 1:
+            bus._state["Z"]["updated_monotonic"] = time.monotonic() - 3
+        return result
+    monkeypatch.setattr(bus, "_read_axis", delayed_second_axis)
+    serial.writes.clear()
+    try:
+        if always_expire:
+            with pytest.raises(MotionError, match="fresh feedback"):
+                bus.refresh()
+        else:
+            result = bus.refresh()
+            assert all(a["telemetry_valid"] for a in result["axes"].values())
+            assert visits == ["X", "Z", "X"]
+        assert not any(f[1] in (0xFD, 0xFE, 0xF3, 0xF6, 0x0A, 0x9A) for f in serial.writes)
+    finally:
+        bus.close()
+
+
+@pytest.mark.parametrize("drift_counts,accepted", [(8, True), (15, False)])
+def test_install_experiment_calibration_allows_submicron_holding_settle_within_stability_window(
+        tmp_path, monkeypatch, drift_counts, accepted):
+    from test_powered_manual_driver import calibrated_powered_bus
+
+    bus, serial, _, record = calibrated_powered_bus(tmp_path)
+    original_read_manual_target = bus._read_manual_target
+    shifted = []
+
+    def settle_during_target_read(axis, opcode, **kwargs):
+        if axis == "X" and opcode == 0x33 and not shifted:
+            shifted.append(True)
+            serial.positions[1] += drift_counts
+        return original_read_manual_target(axis, opcode, **kwargs)
+
+    monkeypatch.setattr(bus, "_read_manual_target", settle_during_target_read)
+    try:
+        if accepted:
+            installed = bus.install_experiment_calibration(record)
+            assert installed["experiment_calibration"]["id"] == record["id"]
+            assert bus.snapshot()["faulted"] is False
+        else:
+            with pytest.raises(MotionError) as caught:
+                bus.install_experiment_calibration(record)
+            assert caught.value.code == "calibration_motion"
+    finally:
+        bus.close()
+
+

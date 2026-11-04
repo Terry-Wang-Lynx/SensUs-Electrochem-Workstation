@@ -14,11 +14,17 @@ from .automation import AutomationError
 def arrival_checkpoint(run_dir):
     root = Path(run_dir)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    error = manifest.get("error") or {}
+    cause = error.get("cause") or {}
+    # Guided calibration preflight errors are serialized directly; motion
+    # transaction errors are wrapped in cause. Preserve an explicit nested
+    # hardware fault instead of overriding it with an outer calibration code.
+    recovery_code = cause.get("code") if cause else error.get("code")
     if (manifest.get("mode") != "live" or manifest.get("synthetic") is not False
             or manifest.get("stop_confirmed") is not True
             or manifest.get("state") not in ("completed", "stopped", "error")
             or (manifest.get("state") == "error" and
-                (manifest.get("error") or {}).get("cause", {}).get("code") not in (
+                recovery_code not in (
                     "move_timeout", "transaction_timeout", "cancelled", "calibration_motion"))
             or any(board.get("stop_confirmed") is not True or board.get("output_state") != "stopped"
                    for board in manifest.get("boards", {}).values())):
@@ -148,6 +154,10 @@ def recover_arrival(controller, service, *, position_confirmed=False):
                 raise ValueError("The saved calibration no longer matches the failed run")
             motion = controller._motion
             motion.recover_stopped_reference(checkpoint, verified_position_window=True)
+            if controller._motion_factory is None:
+                prepare = getattr(motion, "enable_responsive_keyboard", None)
+                if callable(prepare):
+                    prepare()
             current = motion.reference_identity()
             calibration = {**copy.deepcopy(saved), "reference": current, "reference_valid": True,
                            "connection_token": motion.snapshot()["connection_token"]}

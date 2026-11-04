@@ -1311,6 +1311,10 @@ class AutomationController:
                         self._state["execution_error"] = self._limits_error(error).as_dict()
                         self._retain_motion_ownership(error)
                     raise self._limits_error(error) from error
+            if self._motion_factory is None and getattr(self._motion, "_serial_factory", None) is None:
+                prepare = getattr(self._motion, "enable_responsive_keyboard", None)
+                if callable(prepare):
+                    prepare()
             motion = self._motion.refresh()
             if self._motion_calibration_validator is not None:
                 from .calibrated_motion import validate_calibrated_motion

@@ -550,7 +550,18 @@ class SharedEmmBus:
                 for axis in self.axes:
                     state = self._read_axis(axis)
                     self._healthy(axis, state)
-                return self.snapshot()
+                # A slow second-axis read can age the first sample beyond the
+                # existing two-second guard. Refresh only expired observations;
+                # never treat the old sample as current or enlarge its deadline.
+                current = self.snapshot()
+                for axis in self.axes:
+                    if current["axes"][axis]["telemetry_valid"] is not True:
+                        state = self._read_axis(axis)
+                        self._healthy(axis, state)
+                        current = self.snapshot()
+                if any(a["telemetry_valid"] is not True for a in current["axes"].values()):
+                    raise MotionError("invalid_telemetry", "Both axes must have fresh feedback after refresh")
+                return current
             except MotionError as error:
                 self._fault(error)
                 if self._manual.get("active") and self._manual.get("control_mode") == "keyboard":
@@ -1129,7 +1140,7 @@ class SharedEmmBus:
                     states = self._stationary_states(enabled=True)
                     for axis, state in states.items():
                         tolerance = max(1, state["config"]["position_window_deg"] * 65536 / 360)
-                        if (abs(state["raw_count"] - initial_counts[axis]) > 1
+                        if (abs(state["raw_count"] - initial_counts[axis]) > self._encoder_stability_counts(state)
                                 or any(abs(target - state["raw_count"]) > tolerance for target in targets[axis].values())):
                             raise MotionError("calibration_motion", f"{axis} locked target positions cannot be confirmed at the current encoder")
                     target_samples.append(targets)
