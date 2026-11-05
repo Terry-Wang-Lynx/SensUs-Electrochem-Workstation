@@ -138,6 +138,40 @@ def rewrite_manifest(tmp_path, manifest):
     (tmp_path / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
 
 
+@pytest.mark.parametrize('damage', [None, 'missing_axis', 'changed_target', 'moving', 'not_dwell', 'later_move', 'hard_fault'])
+def test_telemetry_dwell_stop_requires_exact_arrived_targets(tmp_path, damage):
+    manifest = evidence(tmp_path)
+    manifest['error'] = {'code': 'invalid_telemetry'}
+    events = [json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
+    arrivals = [{'event': 'motion_wire', 'detail': {'kind': 'arrived', 'axis': a, 'target_mm': t}}
+                for a, t in [('X', 3), ('Z', 1)]]
+    if damage == 'missing_axis':
+        arrivals.pop()
+    if damage == 'changed_target':
+        arrivals[0]['detail']['target_mm'] = 4
+    if damage == 'moving':
+        frame = bytearray.fromhex(events[2]['detail']['frame_hex'])
+        frame[15:18] = signed(1, 2)
+        events[2]['detail']['frame_hex'] = frame.hex()
+    if damage == 'hard_fault':
+        manifest['error']['cause'] = {'code': 'axis_fault'}
+    events[2:2] = arrivals
+    if damage == 'later_move':
+        events.append({'event': 'step_started', 'step': {'op': 'move_x', 'resolved_params': {'axis': 'X', 'target_mm': 3}}})
+    events.append({'event': 'step_started', 'step': {'op': 'wait' if damage == 'not_dwell' else 'dwell'}})
+    # STOP telemetry follows the dwell; the last STOP is required independently.
+    events.extend(events[2+len(arrivals):4+len(arrivals)])
+    events.append({'event': 'motion_wire', 'detail': {'kind': 'stopped', 'stop_confirmed': True}})
+    (tmp_path / 'events.jsonl').write_text('\n'.join(json.dumps(e) for e in events))
+    rewrite_manifest(tmp_path, manifest)
+    if damage:
+        with pytest.raises(ValueError):
+            arrival_checkpoint(tmp_path)
+    else:
+        _, checkpoint = arrival_checkpoint(tmp_path)
+        assert checkpoint['raw_counts'] == {'X': 98304, 'Z': 32768}
+
+
 @pytest.mark.parametrize('damage', [None, 'outside', 'moving', 'unlocked', 'drive_fault', 'missing_axis'])
 @pytest.mark.parametrize('cause', ['move_timeout', 'transaction_timeout', 'cancelled', 'calibration_motion'])
 def test_timeout_before_arrival_preserves_known_in_window_stop_coordinates(tmp_path, damage, cause):

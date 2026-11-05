@@ -1,9 +1,14 @@
-# SensUs 电化学工作站 0.5.7 预览版
+# SensUs 电化学工作站 0.5.8 预览版
 
-本版在 0.5.6（A–H 八电极全套独立采样参数设置）基础上，针对长周期（40+ 轮）高通量耐久运行中暴露的 **闭环保持亚微米编码器微调误锁、重连/恢复后 RS485 退化为 6 帧分拆轮询及双轴刷新保鲜期边界** 进行了根因级修复。本地安装包为 Apple Silicon、macOS 14+ 自包含 DMG，内置 Python、蓝牙依赖及 OpenOCD，不依赖开发目录或外部虚拟环境。
+本版在 0.5.7 基础上，合并了 140+ 轮八电极长周期耐久测试中经过实战验证的全部稳定性修复，包括 **幂等历史曲线外置存储（消除 110 MB 级 `automation.json` 检查点膨胀）、耐久模式提拉前保持电极浸润等待板卡恢复、驻留阶段瞬态遥测异常的原位核验恢复，以及 Windows 跨进程 BLE 锁与进程存活探测修复**。本地安装包为 Apple Silicon、macOS 14+ 自包含 DMG，内置 Python、蓝牙依赖及 OpenOCD，不依赖开发目录或外部虚拟环境。
 
-## 0.5.7 新增与重点更新
+## 0.5.8 新增与重点更新
 
+- **长周期耐久运行与检查点瘦身（0.5.8 合并实战修复）**：
+  - **幂等历史数据外置落盘（`_externalize_idempotency_results`）**：将 `idempotency` 历史运行的大体积采样结果外置为独立的 `idempotency-results/<sha256>.json` 旁路文件并做 SHA-256 校验，使 `automation.json` 检查点始终保持在 `<40 KB`（存盘耗时 ~2ms），彻底根除 40+ 轮后检查点膨胀至 100+ MB 导致的线程与串口阻塞。
+  - **耐久模式提拉前保持浸润恢复（`immersed=True`）**：在连续修饰电极耐久模式下，若板卡在驻留采集结束时失联或未确认 `STOP`，在执行 `withdraw` 提拉前保持电极浸泡在液体中等待重连并确认 `STOP`，避免电极暴露在空气中干涸。
+  - **驻留阶段遥测抖动原位恢复（`telemetry_dwell_stop`）**：当 X/Z 双轴均已证明到位且在 `dwell` 驻留阶段发生瞬态 `invalid_telemetry` 触发受控 `STOP` 时，允许通过 `recover-arrival` 原位核验恢复参考系；同时在每次新轴运动开始时清理旧轴到位标记。
+  - **Windows 进程存活探测与文件锁修复（`windows_file_lock.py`）**：在 Windows 下采用 `OpenProcess(QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess` 替代会终止进程的 `os.kill(pid, 0)`，并使用跨平台临时目录与字节范围锁管理 BLE 板卡租约。
 - **长周期耐久运行与 RS485 遥测稳定性修复（0.5.7）**：
   - **放宽启动前静态脉冲锁定的亚微米抖动容差**：`install_experiment_calibration` 静态核验从 `> 1 count`（`0.03 µm`）统一为 `> _encoder_stability_counts`（`10.24 counts` / `0.31 µm`），消除闭环力矩保持下编码器微调触发的误报错自锁。
   - **重连 / 恢复 / 开跑前自动恢复 `0x43` 单帧高速遥测**：在 `recover_arrival` 与实物运行预检中自动核验并启用 `0x43` 单帧汇总遥测，防止串口重连或后端重启后退化为 6 帧分拆轮询模式。
@@ -46,7 +51,7 @@
 
 ## 安装与运行
 
-打开 `SensUs-Workstation-macOS-arm64-0.5.7.dmg`，把 `SensUs Workstation.app` 拖入“应用程序”。本包采用临时签名，没有 Apple Developer ID 公证；首次打开可能需要按 macOS 提示允许打开。蓝牙采集需开启系统蓝牙并授予应用蓝牙权限。
+打开 `SensUs-Workstation-macOS-arm64-0.5.8.dmg`，把 `SensUs Workstation.app` 拖入“应用程序”。本包采用临时签名，没有 Apple Developer ID 公证；首次打开可能需要按 macOS 提示允许打开。蓝牙采集需开启系统蓝牙并授予应用蓝牙权限。
 
 高通量实物流程：绑定两块板 → 连接 RS485 → 显式进入键盘标定并读取四点 → 完成标定 → 确认运动及电气策略 → 选择“实物实验”运行。断电、重连或参考身份改变后不要沿用旧标定。完成停在末列上方安全高度，不自动返回。
 

@@ -8,10 +8,10 @@ import csv
 import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import fcntl
 import json
 import math
 import os
+import tempfile
 from pathlib import Path
 import re
 import sys
@@ -20,13 +20,18 @@ import time
 from typing import Any, Callable
 import uuid
 
+if os.name == "nt":
+    from . import windows_file_lock as fcntl
+else:
+    import fcntl
+
 NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 PROTOCOL = "v52-0.1"
 COMMAND_TIMEOUT_S = 5.0
 DEFAULT_LOCK_TIMEOUT_S = 30.0
-LOCK_DIR = Path("/tmp/pav52_ble_locks")
+LOCK_DIR = Path(tempfile.gettempdir()) / "pav52_ble_locks"
 
 BOARD_NAMES = {
     "A": "pa-v52-a",
@@ -105,6 +110,10 @@ def _lock_key_for_address(address: str) -> str:
 def _pid_alive(pid: int) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if os.name == "nt":
+        # os.kill(pid, 0) calls TerminateProcess on Windows, even for pid==self.
+        # Inspect the process without sending a signal or changing its state.
+        return fcntl.pid_alive(pid)
     try:
         os.kill(pid, 0)
         return True

@@ -9,11 +9,11 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_v050_version_metadata_agrees():
-    assert __version__ == "0.5.7"
-    assert 'version = "0.5.7"' in (ROOT / "pyproject.toml").read_text()
+    assert __version__ == "0.5.8"
+    assert 'version = "0.5.8"' in (ROOT / "pyproject.toml").read_text()
     info = plistlib.loads((ROOT / "macos/Info.plist").read_bytes())
-    assert info["CFBundleShortVersionString"] == "0.5.7"
-    assert info["CFBundleVersion"] == "0.5.7"
+    assert info["CFBundleShortVersionString"] == "0.5.8"
+    assert info["CFBundleVersion"] == "0.5.8"
     assert info["NSBluetoothAlwaysUsageDescription"]
 
 
