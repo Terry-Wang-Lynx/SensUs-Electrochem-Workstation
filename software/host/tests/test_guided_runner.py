@@ -323,11 +323,14 @@ def test_pause_is_effective_after_withdraw_and_resume_keeps_last_column(tmp_path
     assert state["position"] == {"X": 56, "Z": 0}
 
 
-def test_guided_recovery_waits_at_safe_height_for_stop_before_next_x(tmp_path, monkeypatch):
+@pytest.mark.parametrize("endurance", [False, True])
+def test_guided_recovery_keeps_endurance_immersed_before_withdraw_and_next_x(tmp_path, monkeypatch, endurance):
     from test_automation import MotionBus
 
     controller, factory, clock, compiled = deterministic_controller(tmp_path, monkeypatch, unavailable="AB", loss_at=100)
     document = copy.deepcopy(compiled["experiment"])
+    if endurance:
+        document["endurance"] = True
     document["program"] = [{"op": "move_to_column", "column": 1}, {"op": "immerse"},
                            {"op": "dwell", "seconds": 180, "acquire": ["A", "F"]}, {"op": "withdraw"},
                            {"op": "move_to_column", "column": 2}]
@@ -347,7 +350,8 @@ def test_guided_recovery_waits_at_safe_height_for_stop_before_next_x(tmp_path, m
         controller._check_cancelled()
         if controller._state["state"] == "waiting_recovery":
             observed.append(controller._motion.position.copy())
-            assert controller._motion.position == {"X": 110, "Z": 0}
+            assert controller._motion.position == {
+                "X": 110, "Z": document["defaults"]["z_immersed_mm"] if endurance else 0}
             assert controller._state["column_timing"]["remaining_s"] == 0
             factory.unavailable = ()
         clock.sleep(max(seconds, 1))

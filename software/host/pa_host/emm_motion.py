@@ -550,7 +550,18 @@ class SharedEmmBus:
                 for axis in self.axes:
                     state = self._read_axis(axis)
                     self._healthy(axis, state)
-                return self.snapshot()
+                # A slow second-axis read can age the first sample beyond the
+                # existing two-second guard. Refresh only expired observations;
+                # never treat the old sample as current or enlarge its deadline.
+                current = self.snapshot()
+                for axis in self.axes:
+                    if current["axes"][axis]["telemetry_valid"] is not True:
+                        state = self._read_axis(axis)
+                        self._healthy(axis, state)
+                        current = self.snapshot()
+                if any(a["telemetry_valid"] is not True for a in current["axes"].values()):
+                    raise MotionError("invalid_telemetry", "Both axes must have fresh feedback after refresh")
+                return current
             except MotionError as error:
                 self._fault(error)
                 if self._manual.get("active") and self._manual.get("control_mode") == "keyboard":

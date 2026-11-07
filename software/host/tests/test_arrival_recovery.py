@@ -138,6 +138,40 @@ def rewrite_manifest(tmp_path, manifest):
     (tmp_path / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
 
 
+@pytest.mark.parametrize('damage', [None, 'missing_axis', 'changed_target', 'moving', 'not_dwell', 'later_move', 'hard_fault'])
+def test_telemetry_dwell_stop_requires_exact_arrived_targets(tmp_path, damage):
+    manifest = evidence(tmp_path)
+    manifest['error'] = {'code': 'invalid_telemetry'}
+    events = [json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
+    arrivals = [{'event': 'motion_wire', 'detail': {'kind': 'arrived', 'axis': a, 'target_mm': t}}
+                for a, t in [('X', 3), ('Z', 1)]]
+    if damage == 'missing_axis':
+        arrivals.pop()
+    if damage == 'changed_target':
+        arrivals[0]['detail']['target_mm'] = 4
+    if damage == 'moving':
+        frame = bytearray.fromhex(events[2]['detail']['frame_hex'])
+        frame[15:18] = signed(1, 2)
+        events[2]['detail']['frame_hex'] = frame.hex()
+    if damage == 'hard_fault':
+        manifest['error']['cause'] = {'code': 'axis_fault'}
+    events[2:2] = arrivals
+    if damage == 'later_move':
+        events.append({'event': 'step_started', 'step': {'op': 'move_x', 'resolved_params': {'axis': 'X', 'target_mm': 3}}})
+    events.append({'event': 'step_started', 'step': {'op': 'wait' if damage == 'not_dwell' else 'dwell'}})
+    # STOP telemetry follows the dwell; the last STOP is required independently.
+    events.extend(events[2+len(arrivals):4+len(arrivals)])
+    events.append({'event': 'motion_wire', 'detail': {'kind': 'stopped', 'stop_confirmed': True}})
+    (tmp_path / 'events.jsonl').write_text('\n'.join(json.dumps(e) for e in events))
+    rewrite_manifest(tmp_path, manifest)
+    if damage:
+        with pytest.raises(ValueError):
+            arrival_checkpoint(tmp_path)
+    else:
+        _, checkpoint = arrival_checkpoint(tmp_path)
+        assert checkpoint['raw_counts'] == {'X': 98304, 'Z': 32768}
+
+
 @pytest.mark.parametrize('damage', [None, 'outside', 'moving', 'unlocked', 'drive_fault', 'missing_axis'])
 @pytest.mark.parametrize('cause', ['move_timeout', 'transaction_timeout', 'cancelled', 'calibration_motion'])
 def test_timeout_before_arrival_preserves_known_in_window_stop_coordinates(tmp_path, damage, cause):
@@ -236,3 +270,53 @@ def test_relative_move_after_natural_completion_tolerates_stationary_target_wind
         bus._automatic_target_observation('Z', state, quantized_target, record)
     assert caught.value.code == 'calibration_motion'
 
+
+
+@pytest.mark.parametrize("error,accepted", [
+    ({"code": "calibration_motion", "message": "X feedback is unavailable"}, True),
+    ({"code": "axis_fault"}, False),
+    ({"code": "calibration_motion", "cause": {"code": "axis_fault"}}, False),
+])
+@pytest.mark.parametrize("damage", [None, "stop", "hash"])
+def test_direct_guided_error_uses_same_finalized_stop_evidence(tmp_path, error, accepted, damage):
+    manifest = evidence(tmp_path)
+    manifest["error"] = error
+    if damage == "stop":
+        manifest["stop_confirmed"] = False
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    if damage == "hash":
+        (tmp_path / "events.jsonl").write_text("changed", encoding="utf-8")
+    if accepted and damage is None:
+        _, checkpoint = arrival_checkpoint(tmp_path)
+        assert checkpoint["raw_counts"] == {"X": 98304, "Z": 32768}
+    else:
+        with pytest.raises(ValueError):
+            arrival_checkpoint(tmp_path)
+
+
+@pytest.mark.parametrize("always_expire", [False, True])
+def test_refresh_reobserves_aged_axis_without_weakening_freshness(monkeypatch, always_expire):
+    bus, serial, _ = powered_bus(enabled=True)
+    read = bus._read_axis
+    visits = []
+    def delayed_second_axis(axis, **kwargs):
+        result = read(axis, **kwargs)
+        visits.append(axis)
+        if axis == "Z" and (always_expire or visits.count("Z") == 1):
+            bus._state["X"]["updated_monotonic"] = time.monotonic() - 3
+        if always_expire and axis == "X" and visits.count("X") > 1:
+            bus._state["Z"]["updated_monotonic"] = time.monotonic() - 3
+        return result
+    monkeypatch.setattr(bus, "_read_axis", delayed_second_axis)
+    serial.writes.clear()
+    try:
+        if always_expire:
+            with pytest.raises(MotionError, match="fresh feedback"):
+                bus.refresh()
+        else:
+            result = bus.refresh()
+            assert all(a["telemetry_valid"] for a in result["axes"].values())
+            assert visits == ["X", "Z", "X"]
+        assert not any(f[1] in (0xFD, 0xFE, 0xF3, 0xF6, 0x0A, 0x9A) for f in serial.writes)
+    finally:
+        bus.close()

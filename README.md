@@ -4,7 +4,7 @@ SensUs 是一套基于 MAX30131/MAX30134 与 nRF52833 的三电极电化学工�
 
 ## 当前交接基线
 
-- 当前版本：`0.5.0` 预览版，新增 V5.2 四路蓝牙、双板八电极高通量模板、键盘四点对位与编码器反馈模型。[版本说明与验收边界](docs/RELEASE_NOTES.md)，安装包见 [v0.5.0 Release](https://github.com/Terry-Wang-Lynx/SensUs-Electrochem-Workstation/releases/tag/v0.5.0)，原稳定更新通道不变。
+- 本分支为 `windows-v0.5.6-20261107` Windows 现场修复版，包含双板八路、覆膜运动、四点标定及本机连续实验中的兼容与恢复修复。[现场版说明](docs/WINDOWS-FIELD-20261107.md)。独立发布，不替换 v0.5.8 主线。
 - 完整维护说明：[docs/HANDOFF.md](docs/HANDOFF.md)
 - 从干净克隆运行、构建和验收：[复现指南](docs/REPRODUCING-0.5.0.md)。已知故障的回归映射和未验收边界：[问题清单](docs/KNOWN-ISSUES-0.5.0.md)。不承诺零缺陷或跨硬件逐样本完全相同。
 - [键盘四点标定](docs/KEYBOARD-ALIGNMENT.md)：每次开机显式进入、保持锁轴，不再手拧。读取物理第1/12列X、工作Z、安全Z；默认0.5mm/s，可明确确认并调至20mm/s硬上限，松键/失焦/过期停止。独立机械四边界仅作历史可选功能，不是普通页前提。

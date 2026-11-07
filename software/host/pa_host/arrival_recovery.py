@@ -14,12 +14,18 @@ from .automation import AutomationError
 def arrival_checkpoint(run_dir):
     root = Path(run_dir)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    error = manifest.get("error") or {}
+    cause = error.get("cause") or {}
+    # Guided calibration preflight errors are serialized directly; motion
+    # transaction errors are wrapped in cause. Preserve an explicit nested
+    # hardware fault instead of overriding it with an outer calibration code.
+    recovery_code = cause.get("code") if cause else error.get("code")
     if (manifest.get("mode") != "live" or manifest.get("synthetic") is not False
             or manifest.get("stop_confirmed") is not True
             or manifest.get("state") not in ("completed", "stopped", "error")
             or (manifest.get("state") == "error" and
-                (manifest.get("error") or {}).get("cause", {}).get("code") not in (
-                    "move_timeout", "transaction_timeout", "cancelled", "calibration_motion"))
+                recovery_code not in (
+                    "move_timeout", "transaction_timeout", "cancelled", "calibration_motion", "invalid_telemetry"))
             or any(board.get("stop_confirmed") is not True or board.get("output_state") != "stopped"
                    for board in manifest.get("boards", {}).values())):
         raise ValueError("A finalized healthy completion or confirmed motion-timeout STOP is required")
@@ -37,6 +43,7 @@ def arrival_checkpoint(run_dir):
             step, settled, stopped, counts = event["step"], None, None, {}
             if step["op"] in ("move_x", "move_z"):
                 expected_targets[step["resolved_params"]["axis"]] = step["resolved_params"]["target_mm"]
+                arrivals.pop(step["resolved_params"]["axis"], None)
         if event.get("event") == "motion_naturally_parked":
             proof = event.get("proof", {})
             if proof.get("basis") == "natural_finite_completion":
@@ -86,11 +93,17 @@ def arrival_checkpoint(run_dir):
     # A timeout can interrupt a finite move before arrival was proved. A fresh
     # acknowledged STOP still supplies a valid absolute encoder checkpoint;
     # this restores coordinates only, never marks that move as completed.
-    timed_out_in_window = (manifest["state"] == "error" and stopped is not None
+    telemetry_dwell_stop = (manifest["state"] == "error" and recovery_code == "invalid_telemetry"
+                            and step is not None and step["op"] == "dwell"
+                            and set(arrivals) == {"X", "Z"} and stopped is not None
+                            and stopped.get("stop_confirmed") is True)
+    if recovery_code == "invalid_telemetry" and not telemetry_dwell_stop:
+        raise ValueError("Telemetry recovery requires both proved arrivals at a stationary dwell STOP")
+    timed_out_in_window = (manifest["state"] == "error" and recovery_code != "invalid_telemetry" and stopped is not None
                            and stopped.get("stop_confirmed") is True and set(counts) >=
                            {c["address"] for c in record["motion"]["axes"].values()})
     stopped_after_arrival = manifest["state"] == "stopped" and set(arrivals) == {"X", "Z"}
-    if not stopped_after_arrival and not timed_out_in_window and (not step or step["op"] not in ("move_x", "move_z") or not settled or settled.get("axis") != step["resolved_params"].get("axis")
+    if not telemetry_dwell_stop and not stopped_after_arrival and not timed_out_in_window and (not step or step["op"] not in ("move_x", "move_z") or not settled or settled.get("axis") != step["resolved_params"].get("axis")
             or settled.get("basis") != "natural_finite_completion" or not stopped
             or stopped.get("stop_confirmed") is not True):
         raise ValueError("No complete naturally settled arrival and confirmed STOP proof")
@@ -115,7 +128,7 @@ def arrival_checkpoint(run_dir):
                 raise ValueError("Stopped encoder is outside the captured experiment window")
         elif abs(sample["raw"] - expected) > tolerance:
             raise ValueError("The stopped axis is outside the proved target/safe height")
-        if not stopped_after_arrival and not timed_out_in_window and axis == settled["axis"] and abs(settled["target_signature"][0] - expected) > tolerance:
+        if not telemetry_dwell_stop and not stopped_after_arrival and not timed_out_in_window and axis == settled["axis"] and abs(settled["target_signature"][0] - expected) > tolerance:
             raise ValueError("The arrival proof belongs to another target")
         checkpoint["raw_counts"][axis] = sample["raw"]
     return record, checkpoint

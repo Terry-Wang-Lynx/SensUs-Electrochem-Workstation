@@ -30,6 +30,7 @@ def test_clean_environment_discards_developer_settings(tmp_path):
     })
     assert not {"PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "SENSUS_FAULT", "SENSUS_SERVER_PORT"} & result.keys()
     assert result["SENSUS_STATE_DIR"] == str(tmp_path / "state")
+    assert result["SENSUS_MOTION_AUTOCONNECT"] == "0"
 
 
 def test_manifest_verification_rejects_tampering(tmp_path):

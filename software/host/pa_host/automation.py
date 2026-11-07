@@ -867,10 +867,18 @@ class AutomationController:
             self._experiment = compile_experiment(stored["experiment"])["experiment"]
             self._idempotency = stored.get("idempotency", {})
             previous = stored.get("state", {})
-            if not previous.get("stop_confirmed", True):
-                self._state.update(previous, state="error", message="Previous STOP is unconfirmed; verify outputs before reuse")
+            # A global recovery STOP must agree with each acquired board. Older
+            # builds could retain retrying/unknown board snapshots after a real
+            # STOP acknowledgement. Reacquire proof through explicit STOP;
+            # never promote those persisted snapshots to confirmed outputs.
+            unverified_boards = (previous.get("mode") == "live" and any(
+                board.get("stop_confirmed") is not True or board.get("output_state") != "stopped"
+                for board in previous.get("boards", {}).values()))
+            if not previous.get("stop_confirmed", True) or unverified_boards:
+                self._state.update(previous, state="error", stop_confirmed=False,
+                                   message="Previous STOP is unconfirmed; verify outputs before reuse")
                 self._recovery_required = True
-                ownership = stored.get("ownership")
+                ownership = None if unverified_boards else stored.get("ownership")
                 if ownership is None:
                     self._set_ownership(compile_experiment(self._experiment))
                 else:
@@ -982,11 +990,56 @@ class AutomationController:
             name="automation-motion-feedback", daemon=True)
         self._motion_feedback_thread.start()
 
+    def _externalize_idempotency_results(self):
+        # Historical replay payloads can contain thousands of plotted samples.
+        # Persist them once, retaining the exact API response, instead of
+        # re-encoding every previous run at each board-retirement checkpoint.
+        # The active state and ownership still use the same atomic checkpoint.
+        for entry in self._idempotency.values():
+            if "result" not in entry:
+                continue
+            payload = json.dumps(entry["result"], ensure_ascii=False, allow_nan=False,
+                                 separators=(",", ":")).encode("utf-8")
+            digest = hashlib.sha256(payload).hexdigest()
+            path = self.state_dir / "idempotency-results" / (digest + ".json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                    raise AutomationError("audit_failed", "Saved idempotency result hash differs", "idempotency")
+            else:
+                temporary = path.with_name("." + uuid.uuid4().hex + ".tmp")
+                try:
+                    temporary.write_bytes(payload)
+                    temporary.replace(path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            entry["result_ref"] = digest
+            del entry["result"]
     def _persist(self):
-        _write_json(self.state_dir / "automation.json", {"experiment": self._experiment,
+        with self._lock:
+            self._externalize_idempotency_results()
+            checkpoint = copy.deepcopy({"experiment": self._experiment,
                     "idempotency": self._idempotency, "state": self._state,
                     "ownership": {"boards": self._owned_boards, "motion": self._owns_motion,
                                   "motion_config": self._recovery_motion_config}})
+        _write_json(self.state_dir / "automation.json", checkpoint)
+
+    def _idempotency_result(self, entry):
+        if "result" in entry:  # Backward-compatible with an old checkpoint.
+            return copy.deepcopy(entry["result"])
+        digest = entry.get("result_ref")
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise AutomationError("idempotency_evidence", "Invalid saved idempotency result reference", "idempotency", 409)
+        try:
+            payload = (self.state_dir / "idempotency-results" / (digest + ".json")).read_bytes()
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise ValueError("result hash differs")
+            result = json.loads(payload)
+            if not isinstance(result, dict):
+                raise ValueError("result is not an object")
+            return result
+        except (OSError, ValueError, TypeError) as error:
+            raise AutomationError("idempotency_evidence", f"Saved replay result unavailable: {error}", "idempotency", 409) from error
 
     def _audit_failed(self, error):
         self._audit_failure = AutomationError("audit_failed", f"Experiment audit could not be saved: {error}", "artifacts").as_dict()
@@ -1361,7 +1414,7 @@ class AutomationController:
             if previous:
                 if previous["identity"] != identity:
                     raise AutomationError("idempotency_conflict", "This idempotency key belongs to a different mode or plan", "idempotency_key", 409)
-                return self.snapshot() if previous["run_id"] == self._state["run_id"] else copy.deepcopy(previous["result"])
+                return self.snapshot() if previous["run_id"] == self._state["run_id"] else self._idempotency_result(previous)
             self._idle()
             if len(self._idempotency) >= 10000:
                 raise AutomationError("idempotency_limit", "Idempotency registry reached its safety limit; archive this state directory", status=409)
@@ -1518,6 +1571,17 @@ class AutomationController:
                             for b in self._state.get("boards", {}).values())):
                         raise AutomationError("pbs_output_active", "PBS return requires confirmed acquisition STOP", "pbs_column")
                 if step["op"].startswith("move_"):
+                    # Continuous modified electrodes must stay in liquid while
+                    # an acquisition board's STOP/connection is being recovered.
+                    # Resolve the existing ownership guard BEFORE withdrawal;
+                    # neither unknown outputs nor a total board outage permit
+                    # the next X move. All motion/STOP guards remain in force.
+                    if (self._experiment.get("endurance") is True and self._state["mode"] == "live"
+                            and self._experiment["schema_version"] == "1.1"
+                            and params.get("purpose") == "withdraw" and self._guided_last_step is not None):
+                        slots = {slot for slot, mask in self._guided_last_step["resolved_params"]["channel_masks"].items() if mask}
+                        if self._guided_unknown_slots or slots and slots <= self._guided_missing_slots:
+                            self._guided_wait_recovery(immersed=True)
                     if self._experiment["schema_version"] == "1.1" and step["op"] == "move_x" and self._guided_unknown_slots:
                         self._guided_wait_recovery()
                     if self._state["mode"] == "live":
@@ -1729,6 +1793,18 @@ class AutomationController:
                 self._thread.start()
             return self.snapshot()
 
+    def _record_recovery_board_stop(self, address, stopped):
+        # Publish only the result of this actual address's supported STOP.
+        with self._lock:
+            for slot, board in self._state.get("boards", {}).items():
+                if board.get("address", "").casefold() != address.casefold():
+                    continue
+                board.update(phase="stopped" if stopped else "retrying",
+                             stop_confirmed=stopped,
+                             output_state="stopped" if stopped else "unknown")
+                if stopped:
+                    self._guided_unknown_slots.discard(slot)
+
     def _recover_stop(self):
         confirmed, errors = True, []
         self._audit_failure = None
@@ -1758,10 +1834,12 @@ class AutomationController:
                     stopped = isinstance(result, dict) and result.get("stop_confirmed") is True
                     confirmed = confirmed and stopped
                     self._event("recovery_board_stop", address=address, stop_confirmed=stopped, result=result)
+                    self._record_recovery_board_stop(address, stopped)
                 except Exception as error:
                     confirmed = False
                     errors.append(str(error))
                     self._event("recovery_board_stop", address=address, stop_confirmed=False, error=str(error))
+                    self._record_recovery_board_stop(address, False)
         except Exception as error:
             confirmed = False
             errors.append(str(error))
@@ -2259,15 +2337,18 @@ class AutomationController:
         self._check_cancelled()
         self._state["state"] = "running"
 
-    def _guided_wait_recovery(self):
+    def _guided_wait_recovery(self, *, immersed=False):
         step = self._guided_last_step
         if step is None:
             raise AutomationError("stop_unconfirmed", "Board output ownership remains unknown")
         masks = step["resolved_params"]["channel_masks"]
         needed = set(self._guided_unknown_slots) or {slot for slot, mask in masks.items() if mask}
         available = {slot for slot, mask in masks.items() if mask} - self._guided_missing_slots
-        self._state.update(state="waiting_recovery", message="At safe height; waiting for board recovery and confirmed STOP")
-        self._event("waiting_recovery", unknown_output_slots=sorted(self._guided_unknown_slots))
+        self._state.update(state="waiting_recovery", message=(
+            "Keeping electrodes immersed; waiting for board recovery and confirmed STOP" if immersed else
+            "At safe height; waiting for board recovery and confirmed STOP"))
+        self._event("waiting_recovery", unknown_output_slots=sorted(self._guided_unknown_slots),
+                    keeping_immersed=immersed)
         active, retries = {}, dict.fromkeys(needed, 0.0)
         while self._guided_unknown_slots or not available:
             self._check_cancelled()
@@ -2296,7 +2377,7 @@ class AutomationController:
             self._guided_retire(child, step)
         self._state["state"] = "running"
         self._event("board_recovery_ready", slots=sorted(available))
-        if self._state["pause_requested"]:
+        if self._state["pause_requested"] and not immersed:
             self._guided_pause_at_safe_height()
 
     def _acquire(self, step):
