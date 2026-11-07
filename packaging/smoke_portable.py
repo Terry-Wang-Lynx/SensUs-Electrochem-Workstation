@@ -28,7 +28,8 @@ def clean_environment(root, resources, inherited=None):
         environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
     environment.update(SENSUS_PROJECT_DIR=str(resources), SENSUS_RESOURCE_DIR=str(resources),
                        SENSUS_STATE_DIR=str(root / "state"), SENSUS_LOG_DIR=str(root / "logs"),
-                       SENSUS_MEASUREMENTS_DIR=str(root / "measurements"))
+                       SENSUS_MEASUREMENTS_DIR=str(root / "measurements"),
+                       SENSUS_MOTION_AUTOCONNECT="0")
     return environment
 
 
@@ -81,7 +82,7 @@ def smoke(backend, resources, expected_version, report):
         assert report["runtime"]["version"] == expected_version
         assert report["runtime"]["scipy_welch"] is True
         assert report["runtime"]["protocol"] == "v52-0.1"
-        assert report["runtime"]["endpoint_phases"] == [[9.0, 2.0], [10.0, 0.5]]
+        assert report["runtime"]["endpoint_phases"] == [[10.0, 2.0]]
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
@@ -109,16 +110,17 @@ def smoke(backend, resources, expected_version, report):
                 capabilities = request(base, API + "capabilities")
                 assert capabilities["guided_execution"]["preserve_order_and_duplicates"] is True
                 assert capabilities["guided_execution"]["modes"] == ["once", "repeat", "custom"]
-                assert capabilities["automatic_motion_bus"]["endpoint_approach"]["revision"] == "20261024-endpoint-approach-r1"
+                assert capabilities["automatic_motion_bus"]["endpoint_approach"]["revision"] == "20261102-direct-endpoint-r2"
                 report["capabilities"] = capabilities
                 html = request(base, "/", text=True)
                 assert "<html" in html.lower()
                 cad = request(base, "/assets/ht-apparatus.json")
                 assert isinstance(cad, dict) and cad, "CAD JSON missing"
                 javascript = request(base, "/assets/high_throughput.js", text=True)
-                assert "endpoint-approach-r1" in javascript, "frontend endpoint revision missing"
+                assert "PHYSICAL_BOARD_CHANNELS = [1, 3, 4, 2]" in javascript and "guided/preview" in javascript, "current frontend channel mapping or guided control missing"
                 report["frontend"] = request(base, "/api/frontend")
                 initial_state = request(base, API + "state")
+                report["initial_state"] = initial_state
                 assert not initial_state.get("error") and not initial_state["motion"].get("connected")
                 assert not initial_state["motion"].get("faulted")
                 assert not initial_state["motion"].get("serial_opened_once")

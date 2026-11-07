@@ -867,10 +867,18 @@ class AutomationController:
             self._experiment = compile_experiment(stored["experiment"])["experiment"]
             self._idempotency = stored.get("idempotency", {})
             previous = stored.get("state", {})
-            if not previous.get("stop_confirmed", True):
-                self._state.update(previous, state="error", message="Previous STOP is unconfirmed; verify outputs before reuse")
+            # A global recovery STOP must agree with each acquired board. Older
+            # builds could retain retrying/unknown board snapshots after a real
+            # STOP acknowledgement. Reacquire proof through explicit STOP;
+            # never promote those persisted snapshots to confirmed outputs.
+            unverified_boards = (previous.get("mode") == "live" and any(
+                board.get("stop_confirmed") is not True or board.get("output_state") != "stopped"
+                for board in previous.get("boards", {}).values()))
+            if not previous.get("stop_confirmed", True) or unverified_boards:
+                self._state.update(previous, state="error", stop_confirmed=False,
+                                   message="Previous STOP is unconfirmed; verify outputs before reuse")
                 self._recovery_required = True
-                ownership = stored.get("ownership")
+                ownership = None if unverified_boards else stored.get("ownership")
                 if ownership is None:
                     self._set_ownership(compile_experiment(self._experiment))
                 else:
@@ -1790,6 +1798,18 @@ class AutomationController:
                 self._thread.start()
             return self.snapshot()
 
+    def _record_recovery_board_stop(self, address, stopped):
+        # Publish only the result of this actual address's supported STOP.
+        with self._lock:
+            for slot, board in self._state.get("boards", {}).items():
+                if board.get("address", "").casefold() != address.casefold():
+                    continue
+                board.update(phase="stopped" if stopped else "retrying",
+                             stop_confirmed=stopped,
+                             output_state="stopped" if stopped else "unknown")
+                if stopped:
+                    self._guided_unknown_slots.discard(slot)
+
     def _recover_stop(self):
         confirmed, errors = True, []
         self._audit_failure = None
@@ -1819,10 +1839,12 @@ class AutomationController:
                     stopped = isinstance(result, dict) and result.get("stop_confirmed") is True
                     confirmed = confirmed and stopped
                     self._event("recovery_board_stop", address=address, stop_confirmed=stopped, result=result)
+                    self._record_recovery_board_stop(address, stopped)
                 except Exception as error:
                     confirmed = False
                     errors.append(str(error))
                     self._event("recovery_board_stop", address=address, stop_confirmed=False, error=str(error))
+                    self._record_recovery_board_stop(address, False)
         except Exception as error:
             confirmed = False
             errors.append(str(error))

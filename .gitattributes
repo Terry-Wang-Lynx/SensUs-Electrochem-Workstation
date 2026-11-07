@@ -4,3 +4,6 @@ packaging/resources/v51/images/*.zip binary
 software/firmware/prebuilt/*.elf binary
 software/firmware/prebuilt/*.hex binary
 packaging/licenses/*.txt text eol=lf
+*.bat text eol=crlf
+*.command text eol=lf
+*.sh text eol=lf

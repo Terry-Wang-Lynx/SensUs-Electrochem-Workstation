@@ -12224,11 +12224,14 @@ def serve(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
         except Exception:
             pass
 
-    threading.Thread(
-        target=_startup_auto_connect_motion,
-        name="startup-rs485-autoconnect",
-        daemon=True,
-    ).start()
+    # Preserve normal discovery while allowing software-only validation to
+    # start a backend without probing serial devices on the host machine.
+    if os.environ.get("SENSUS_MOTION_AUTOCONNECT", "1") != "0":
+        threading.Thread(
+            target=_startup_auto_connect_motion,
+            name="startup-rs485-autoconnect",
+            daemon=True,
+        ).start()
     url = f"http://{host}:{server.server_port}/"
     DIAGNOSTICS.record(
         "info", "application.ready", "Workstation backend is ready",
